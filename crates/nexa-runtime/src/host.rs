@@ -2201,11 +2201,33 @@ pub enum HostCallOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostTrap {
     UnknownFunction(StableId),
+    InvalidFunctionSlot(HostFunctionSlot),
     Arity,
     Type,
     ResourceCapacity,
     Panicked,
     Host(crate::RuntimeMessage),
+}
+
+/// Registry-local dense identity for one Host function.
+///
+/// Stable IDs remain the portable linking identity. A Realm resolves them to
+/// these slots exactly once during module admission, then the interpreter
+/// carries only the dense slot across the Host boundary.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostFunctionSlot(u32);
+
+impl HostFunctionSlot {
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
 }
 
 /// Immutable runtime authority for one Host function in a Contract.
@@ -2333,18 +2355,44 @@ impl HostFunctionAuthority {
     }
 }
 
+/// Load-time binding between portable Host authority and registry-local slot.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedHostFunction<'a> {
+    slot: HostFunctionSlot,
+    authority: &'a HostFunctionAuthority,
+}
+
+impl<'a> ResolvedHostFunction<'a> {
+    #[must_use]
+    pub const fn new(slot: HostFunctionSlot, authority: &'a HostFunctionAuthority) -> Self {
+        Self { slot, authority }
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> HostFunctionSlot {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn authority(self) -> &'a HostFunctionAuthority {
+        self.authority
+    }
+}
+
 pub trait HostRegistry {
     fn contract_runtime_id(&self) -> Option<StableId> {
         None
     }
 
-    fn function_authority(&self, _id: StableId) -> Option<&HostFunctionAuthority> {
-        None
-    }
+    /// Resolve a portable Stable ID during module admission.
+    ///
+    /// The returned authority and slot are one indivisible binding: admission
+    /// validates the authority once and records the slot for every hot call.
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>>;
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap>;

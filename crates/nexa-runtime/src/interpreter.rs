@@ -2733,6 +2733,9 @@ impl CheckedInterpreter {
                                 crate::HostTrap::UnknownFunction(function) => {
                                     ("NX4001", function.0)
                                 }
+                                crate::HostTrap::InvalidFunctionSlot(slot) => {
+                                    ("NX4001", u64::from(slot.index()))
+                                }
                                 crate::HostTrap::Arity => ("NX4003", 0),
                                 crate::HostTrap::Type => ("NX4003", 1),
                                 crate::HostTrap::ResourceCapacity => ("NX5004", 0),

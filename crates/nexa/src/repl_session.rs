@@ -16,11 +16,11 @@ use nexa_analysis::{
 };
 use nexa_diagnostics::{DiagnosticBatch, DiagnosticRenderer, SourceIdentity};
 use nexa_runtime::{
-    CancelReason, HostCallMode, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
-    ModuleHandle, RealmConfig, RealmRuntime, ResourceContext, RestartReloadPolicy, RuntimeHost,
-    RuntimeHostArgs, RuntimeMessage, RuntimeValue, ScopeHandle, StepConfig, TaskLimits,
-    TransactionalCellEntrypoint, TransactionalCellFailure, TransactionalCellFailureCause,
-    TransactionalCellPoll, ValueType,
+    CancelReason, HostCallMode, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot,
+    HostRegistry, HostTrap, ModuleHandle, RealmConfig, RealmRuntime, ResolvedHostFunction,
+    ResourceContext, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeMessage,
+    RuntimeValue, ScopeHandle, StepConfig, TaskLimits, TransactionalCellEntrypoint,
+    TransactionalCellFailure, TransactionalCellFailureCause, TransactionalCellPoll, ValueType,
 };
 
 use crate::{CompiledReplCellArtifact, HostContractInput, PackageBuildError, PackageBuildSession};
@@ -390,16 +390,16 @@ impl ReplConsoleState {
 }
 
 #[derive(Clone, Copy)]
-struct ConsoleFunctionIds {
-    write: nexa_core::StableId,
-    write_line: nexa_core::StableId,
-    write_error: nexa_core::StableId,
-    write_error_line: nexa_core::StableId,
+struct ConsoleFunctionSlots {
+    write: HostFunctionSlot,
+    write_line: HostFunctionSlot,
+    write_error: HostFunctionSlot,
+    write_error_line: HostFunctionSlot,
 }
 
 struct ConsoleRegistry {
     contract_runtime_id: nexa_core::StableId,
-    functions: ConsoleFunctionIds,
+    functions: ConsoleFunctionSlots,
     authorities: Vec<HostFunctionAuthority>,
     state: Arc<Mutex<ReplConsoleState>>,
 }
@@ -409,12 +409,13 @@ impl ConsoleRegistry {
         contract: &nexa_idl::ValidatedContract,
         state: Arc<Mutex<ReplConsoleState>>,
     ) -> Result<Self, ReplSessionError> {
-        let function = |name: &str| {
+        let function_slot = |name: &str| {
             contract
                 .host_functions
                 .iter()
-                .find(|function| function.name == name)
-                .map(|function| function.stable_id)
+                .position(|function| function.name == name)
+                .and_then(|index| u32::try_from(index).ok())
+                .map(HostFunctionSlot::new)
                 .ok_or_else(|| {
                     ReplSessionError::Internal(format!(
                         "built-in Console contract is missing Host function `{name}`"
@@ -428,11 +429,11 @@ impl ConsoleRegistry {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             contract_runtime_id: nexa_idl::contract_runtime_id(contract),
-            functions: ConsoleFunctionIds {
-                write: function("write")?,
-                write_line: function("write_line")?,
-                write_error: function("write_error")?,
-                write_error_line: function("write_error_line")?,
+            functions: ConsoleFunctionSlots {
+                write: function_slot("write")?,
+                write_line: function_slot("write_line")?,
+                write_error: function_slot("write_error")?,
+                write_error_line: function_slot("write_error_line")?,
             },
             authorities,
             state,
@@ -471,28 +472,34 @@ impl HostRegistry for ConsoleRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: nexa_core::StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: nexa_core::StableId) -> Option<ResolvedHostFunction<'_>> {
         self.authorities
             .iter()
-            .find(|authority| authority.stable_id() == id)
+            .enumerate()
+            .find(|(_, authority)| authority.stable_id() == id)
+            .and_then(|(index, authority)| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| ResolvedHostFunction::new(HostFunctionSlot::new(index), authority))
+            })
     }
 
     fn call_runtime(
         &mut self,
-        id: nexa_core::StableId,
+        slot: HostFunctionSlot,
         _context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        let (stream, line_terminated) = if id == self.functions.write {
+        let (stream, line_terminated) = if slot == self.functions.write {
             (ReplConsoleStream::Stdout, false)
-        } else if id == self.functions.write_line {
+        } else if slot == self.functions.write_line {
             (ReplConsoleStream::Stdout, true)
-        } else if id == self.functions.write_error {
+        } else if slot == self.functions.write_error {
             (ReplConsoleStream::Stderr, false)
-        } else if id == self.functions.write_error_line {
+        } else if slot == self.functions.write_error_line {
             (ReplConsoleStream::Stderr, true)
         } else {
-            return Err(HostTrap::UnknownFunction(id));
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         };
         if args.len() != 1 {
             return Err(HostTrap::Arity);

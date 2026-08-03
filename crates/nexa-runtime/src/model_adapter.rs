@@ -9,12 +9,13 @@ use nexa_bytecode::{
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
-    CancelReason, HostCallOutcome, HostCompletionResult, HostFunctionAuthority, HostPayload,
-    HostRegistry, HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, PendingHostRequest,
-    RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState, ResourceContext,
-    RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeFailurePoint, RuntimeHost,
-    RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger, ScopeHandle, SlotAllocError, StepConfig,
-    TaskError, TaskHandle, TaskLimits, TaskPoll, TaskState, TickBudget, ValueType,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostFunctionAuthority, HostFunctionSlot,
+    HostPayload, HostRegistry, HostRequestHandle, HostRequestState, HostTrap, ModuleHandle,
+    PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState,
+    ResolvedHostFunction, ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError,
+    RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger,
+    ScopeHandle, SlotAllocError, StepConfig, TaskError, TaskHandle, TaskLimits, TaskPoll,
+    TaskState, TickBudget, ValueType,
 };
 
 const MODEL_HOST: crate::StableId = crate::StableId(0x4d31_5245_414c_484f);
@@ -1085,7 +1086,7 @@ impl HostRegistry for ModelHost {
         Some(MODEL_HOST)
     }
 
-    fn function_authority(&self, id: crate::StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: crate::StableId) -> Option<ResolvedHostFunction<'_>> {
         static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
         let authority = AUTHORITY.get_or_init(|| {
             let stable_id = crate::StableId::from_name("ModelHost::request");
@@ -1109,17 +1110,20 @@ impl HostRegistry for ModelHost {
                 &[],
             )
         });
-        (id == authority.stable_id()).then_some(authority)
+        (id == authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: crate::StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != crate::StableId::from_name("ModelHost::request") {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if !arguments.is_empty() {
             return Err(HostTrap::Arity);

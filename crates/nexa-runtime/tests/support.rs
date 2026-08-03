@@ -3,9 +3,9 @@ use nexa_bytecode::{
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, RealmConfig, RealmRuntime,
-    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StepConfig,
-    TaskHandle, TaskLimits, TaskPoll,
+    HostCallOutcome, HostFunctionSlot, HostRegistry, HostTrap, ModuleHandle, RealmConfig,
+    RealmRuntime, ResolvedHostFunction, ResourceContext, RuntimeHost, RuntimeHostArgs,
+    RuntimeValue, ScopeHandle, StepConfig, TaskHandle, TaskLimits, TaskPoll,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -78,13 +78,17 @@ impl HostRegistry for NoHost {
         Some(self.0)
     }
 
+    fn resolve_function(&self, _: StableId) -> Option<ResolvedHostFunction<'_>> {
+        None
+    }
+
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(id))
+        Err(HostTrap::InvalidFunctionSlot(slot))
     }
 }
 

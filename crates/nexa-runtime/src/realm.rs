@@ -18,14 +18,14 @@ use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
     FuelState, GcBudget, GcPhase, GcRef, GcRoots, Heap, HeapError, HostCallOutcome,
-    HostCompletionDelivery, HostCompletionResult, HostErrorPayload, HostPayload, HostRegistry,
-    HostRequestError, HostRequestHandle, HostTrap, IncrementalGcReport, InterpreterError,
-    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object,
-    OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
-    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeHostState, RuntimeLimits,
-    RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError,
-    SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
-    TrapKind,
+    HostCompletionDelivery, HostCompletionResult, HostErrorPayload, HostFunctionSlot, HostPayload,
+    HostRegistry, HostRequestError, HostRequestHandle, HostTrap, IncrementalGcReport,
+    InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
+    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
+    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
+    RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue,
+    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
+    TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +57,7 @@ pub struct ModuleEpochRoot {
     /// consumes them instead of recomputing static fuel and safepoints.
     pub executable: Arc<crate::executable::ExecutableModule>,
     pub host_contract_id: StableId,
+    host_function_slots: Box<[HostFunctionSlot]>,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
     state: Arc<StatefulRegistry>,
@@ -198,7 +199,7 @@ struct RealmHostBridge<'a> {
     task: TaskHandle,
     module_id: u32,
     epoch: u64,
-    imports: &'a [HostImport],
+    function_slots: &'a [HostFunctionSlot],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -208,7 +209,7 @@ impl InterpreterHost for RealmHostBridge<'_> {
         arguments: &[RuntimeValue],
         heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
-        let metadata = self.imports.get(import as usize).ok_or_else(|| {
+        let slot = self.function_slots.get(import as usize).ok_or_else(|| {
             HostTrap::Host("host import index is outside the verified module".into())
         })?;
         let values = RuntimeHostArgs::new(arguments, heap)?;
@@ -216,8 +217,7 @@ impl InterpreterHost for RealmHostBridge<'_> {
             .resources
             .context(self.task, self.module_id, self.epoch);
         match crate::invoke_host_boundary(|| {
-            self.registry
-                .call_runtime(metadata.stable_id, &mut context, values)
+            self.registry.call_runtime(*slot, &mut context, values)
         })? {
             HostCallOutcome::RuntimeImmediate(value) => {
                 Ok(InterpreterHostOutcome::Immediate(value))
@@ -1583,18 +1583,23 @@ impl RealmRuntime {
         self.last_migration_hash
     }
 
-    fn validate_host_function_authorities(&self, imports: &[HostImport]) -> Result<(), RealmError> {
+    fn resolve_host_functions(
+        &self,
+        imports: &[HostImport],
+    ) -> Result<Box<[HostFunctionSlot]>, RealmError> {
         if imports.is_empty() {
-            return Ok(());
+            return Ok(Box::new([]));
         }
         let registry = self
             .host_registry
             .as_deref()
             .ok_or(RealmError::HostCapabilitiesUnavailable)?;
+        let mut slots = Vec::with_capacity(imports.len());
         for import in imports {
-            let contract = registry
-                .function_authority(import.stable_id)
+            let resolved = registry
+                .resolve_function(import.stable_id)
                 .ok_or(RealmError::MissingHostFunctionAuthority(import.stable_id))?;
+            let contract = resolved.authority();
             let mismatch = |field| RealmError::HostFunctionAuthorityMismatch {
                 stable_id: import.stable_id,
                 field,
@@ -1655,8 +1660,9 @@ impl RealmRuntime {
                     }
                 }
             }
+            slots.push(resolved.slot());
         }
-        Ok(())
+        Ok(slots.into_boxed_slice())
     }
 
     pub fn load_module(
@@ -1677,7 +1683,7 @@ impl RealmRuntime {
         if verified.module().host_contract_id != Some(host_contract_id) {
             return Err(RealmError::HostContractIdMismatch);
         }
-        self.validate_host_function_authorities(&verified.module().host_imports)?;
+        let host_function_slots = self.resolve_host_functions(&verified.module().host_imports)?;
         if verified.module().state_schema_fingerprint != state_schema_fingerprint {
             return Err(RealmError::SchemaHashMismatch);
         }
@@ -1708,6 +1714,7 @@ impl RealmRuntime {
                 verified: image.verified,
                 executable: image.executable,
                 host_contract_id,
+                host_function_slots,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
                 state: Arc::new(StatefulRegistry::new(stateful_domain)),
@@ -1752,7 +1759,7 @@ impl RealmRuntime {
         if old.verified.module().host_contract_id != Some(host_contract_id) {
             return Err(RealmError::HostContractIdMismatch);
         }
-        self.validate_host_function_authorities(&candidate.module().host_imports)?;
+        self.resolve_host_functions(&candidate.module().host_imports)?;
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
@@ -1818,7 +1825,7 @@ impl RealmRuntime {
             candidate.module(),
             extension.environment(),
         )?;
-        self.validate_host_function_authorities(&candidate.module().host_imports)?;
+        self.resolve_host_functions(&candidate.module().host_imports)?;
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
@@ -3143,7 +3150,7 @@ impl RealmRuntime {
                 task,
                 module_id: snapshot.module_id,
                 epoch: snapshot.module_epoch,
-                imports: &verified.module().host_imports,
+                function_slots: &module.host_function_slots,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
                 &verified,

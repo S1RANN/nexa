@@ -6,9 +6,10 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap, Object,
-    RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue,
-    StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, YieldReason,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry, HostTrap,
+    Object, RealmConfig, RealmRuntime, ResolvedHostFunction, ResourceContext, RuntimeHost,
+    RuntimeHostArgs, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll,
+    YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -154,7 +155,6 @@ fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
 struct HandleHost {
     contract_runtime_id: StableId,
     ticket_type: StableId,
-    function: nexa_bytecode::HostImport,
     authority: HostFunctionAuthority,
 }
 
@@ -163,18 +163,21 @@ impl HostRegistry for HandleHost {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.function.stable_id {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if !arguments.is_empty() {
             return Err(HostTrap::Arity);
@@ -252,7 +255,6 @@ fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
         Box::new(HandleHost {
             contract_runtime_id,
             ticket_type,
-            function: host_function,
             authority,
         }),
     )

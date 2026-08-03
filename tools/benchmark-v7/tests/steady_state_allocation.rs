@@ -15,8 +15,9 @@ use std::cell::Cell;
 use std::sync::OnceLock;
 
 use nexa::prelude::{
-    FunctionEffect, HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeHostArgs,
-    RuntimeValue, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
+    FunctionEffect, HostCallOutcome, HostFunctionSlot, HostRegistry, HostTrap,
+    ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
+    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
     ScriptOutputReader, Signature, StableId, ValueType,
 };
 use nexa_embed::{
@@ -146,13 +147,17 @@ impl HostRegistry for EmptyRegistry {
         Some(self.0)
     }
 
+    fn resolve_function(&self, _: StableId) -> Option<ResolvedHostFunction<'_>> {
+        None
+    }
+
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(id))
+        Err(HostTrap::InvalidFunctionSlot(slot))
     }
 }
 

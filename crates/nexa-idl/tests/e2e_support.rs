@@ -469,11 +469,12 @@ impl MutationProbe {
         format!(
             r#"
     let probe_values = {arguments};
+    let affected_slot = probe_registry.resolve_function(affected_stable_id).expect("affected Registry binding").slot();
     let probe_outcome = {{
         let mut probe_context = probe_resources.context(probe_task, 0, 1);
         probe_registry
             .call_runtime(
-                affected_stable_id,
+                affected_slot,
                 &mut probe_context,
                 nexa_runtime::RuntimeHostArgs::new(
                     &probe_values,

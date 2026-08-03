@@ -1290,7 +1290,7 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
 
 fn host_trap_code(error: &HostTrap) -> ErrorCode {
     match error {
-        HostTrap::UnknownFunction(_) => ErrorCode::NX4001,
+        HostTrap::UnknownFunction(_) | HostTrap::InvalidFunctionSlot(_) => ErrorCode::NX4001,
         HostTrap::Arity | HostTrap::Type => ErrorCode::NX4003,
         HostTrap::ResourceCapacity => ErrorCode::NX5004,
         HostTrap::Panicked | HostTrap::Host(_) => ErrorCode::NX5001,

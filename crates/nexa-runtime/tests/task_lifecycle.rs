@@ -8,10 +8,10 @@ use nexa_bytecode::{
 use nexa_core::{FileId, SourceSpan, StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostFunctionAuthority,
-    HostPayload, HostRegistry, HostRequestError, HostTrap, Object, PendingHostRequest, RealmConfig,
-    RealmError, RealmRuntime, ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint,
-    RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
-    TaskTerminalReason, TickBudget, YieldReason,
+    HostFunctionSlot, HostPayload, HostRegistry, HostRequestError, HostTrap, Object,
+    PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReleaseKind, ResolvedHostFunction,
+    ResourceContext, RuntimeError, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeValue,
+    StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget, YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -36,74 +36,75 @@ impl HostRegistry for AsyncRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         static REQUEST: OnceLock<HostFunctionAuthority> = OnceLock::new();
         static TYPED_ERROR: OnceLock<HostFunctionAuthority> = OnceLock::new();
         if id == StableId::from_name("TaskHost::request") {
-            return Some(REQUEST.get_or_init(|| {
-                let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
-                HostFunctionAuthority::new(
-                    id,
-                    [0; 32],
-                    &[],
-                    Some(ValueType::Named(result.type_id)),
-                    HostCallMode::Async,
-                    1,
-                    Some(AsyncResultType {
-                        result_type: result.type_id,
-                        success: ValueType::I32,
-                        error: ValueType::I32,
-                        cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
-                        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
-                        cancel_error: Some(1),
-                        abandon_error: None,
-                    }),
-                    &[],
-                )
-            }));
+            return Some(ResolvedHostFunction::new(
+                HostFunctionSlot::new(0),
+                REQUEST.get_or_init(|| {
+                    let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+                    HostFunctionAuthority::new(
+                        id,
+                        [0; 32],
+                        &[],
+                        Some(ValueType::Named(result.type_id)),
+                        HostCallMode::Async,
+                        1,
+                        Some(AsyncResultType {
+                            result_type: result.type_id,
+                            success: ValueType::I32,
+                            error: ValueType::I32,
+                            cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                            cancel_error: Some(1),
+                            abandon_error: None,
+                        }),
+                        &[],
+                    )
+                }),
+            ));
         }
         if id == StableId::from_name("TaskHost::typed_error") {
-            return Some(TYPED_ERROR.get_or_init(|| {
-                let success = ValueType::Named(StableId::from_name("Payload"));
-                let error = ValueType::Named(StableId::from_name("Failure"));
-                let result = nexa_bytecode::result_type(success, error);
-                HostFunctionAuthority::new(
-                    id,
-                    [0; 32],
-                    &[],
-                    Some(ValueType::Named(result.type_id)),
-                    HostCallMode::Async,
-                    1,
-                    Some(AsyncResultType {
-                        result_type: result.type_id,
-                        success,
-                        error,
-                        cancel_policy: nexa_bytecode::CancelPolicy::CancelTask,
-                        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
-                        cancel_error: None,
-                        abandon_error: None,
-                    }),
-                    &[],
-                )
-            }));
+            return Some(ResolvedHostFunction::new(
+                HostFunctionSlot::new(1),
+                TYPED_ERROR.get_or_init(|| {
+                    let success = ValueType::Named(StableId::from_name("Payload"));
+                    let error = ValueType::Named(StableId::from_name("Failure"));
+                    let result = nexa_bytecode::result_type(success, error);
+                    HostFunctionAuthority::new(
+                        id,
+                        [0; 32],
+                        &[],
+                        Some(ValueType::Named(result.type_id)),
+                        HostCallMode::Async,
+                        1,
+                        Some(AsyncResultType {
+                            result_type: result.type_id,
+                            success,
+                            error,
+                            cancel_policy: nexa_bytecode::CancelPolicy::CancelTask,
+                            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                            cancel_error: None,
+                            abandon_error: None,
+                        }),
+                        &[],
+                    )
+                }),
+            ));
         }
         None
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         assert!(!self.panic, "injected host panic");
-        if ![
-            StableId::from_name("TaskHost::request"),
-            StableId::from_name("TaskHost::typed_error"),
-        ]
-        .contains(&id)
-        {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() > 1 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if !arguments.is_empty() {
             return Err(HostTrap::Arity);

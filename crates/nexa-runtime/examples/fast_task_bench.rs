@@ -8,9 +8,10 @@ use nexa_bytecode::{
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
-    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs,
-    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
+    HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostPayload, HostRegistry, HostTrap,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResolvedHostFunction, ResourceContext,
+    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits,
+    TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -126,7 +127,7 @@ fn main() {
         let outcome = realm
             .with_resource_context(task, |context| {
                 registry.call_runtime(
-                    StableId::from_name("BenchHost::add"),
+                    HostFunctionSlot::new(0),
                     context,
                     RuntimeHostArgs::new(&[RuntimeValue::I32(20), RuntimeValue::I32(22)], None)
                         .unwrap(),
@@ -589,7 +590,7 @@ impl HostRegistry for AddRegistry {
         Some(HOST)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
         let authority = AUTHORITY.get_or_init(|| {
             HostFunctionAuthority::new(
@@ -603,17 +604,20 @@ impl HostRegistry for AddRegistry {
                 &[],
             )
         });
-        (id == authority.stable_id()).then_some(authority)
+        (id == authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != StableId::from_name("BenchHost::add") {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 2 {
             return Err(HostTrap::Arity);
@@ -634,7 +638,7 @@ impl HostRegistry for AsyncRegistry {
         Some(HOST)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
         let authority = AUTHORITY.get_or_init(|| {
             let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
@@ -657,17 +661,20 @@ impl HostRegistry for AsyncRegistry {
                 &[],
             )
         });
-        (id == authority.stable_id()).then_some(authority)
+        (id == authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != StableId::from_name("BenchHost::async") {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 1 {
             return Err(HostTrap::Arity);

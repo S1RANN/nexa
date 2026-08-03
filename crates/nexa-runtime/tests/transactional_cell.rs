@@ -8,11 +8,11 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
-    ModuleHandle, Object, PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext,
-    RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeValue, StateObject, StateValue,
-    StepConfig, TaskLimits, TransactionalCellEntrypoint, TransactionalCellFailureCause,
-    TransactionalCellPoll,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostPayload,
+    HostRegistry, HostTrap, ModuleHandle, Object, PendingHostRequest, RealmConfig, RealmRuntime,
+    ResolvedHostFunction, ResourceContext, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs,
+    RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TransactionalCellEntrypoint,
+    TransactionalCellFailureCause, TransactionalCellPoll,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -340,7 +340,7 @@ impl HostRegistry for PendingHost {
         Some(HOST_CONTRACT_ID)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
         let authority = AUTHORITY.get_or_init(|| {
             let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
@@ -363,17 +363,20 @@ impl HostRegistry for PendingHost {
                 &[],
             )
         });
-        (id == authority.stable_id()).then_some(authority)
+        (id == authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != StableId::from_name("ReplHost::wait") {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if !arguments.is_empty() {
             return Err(HostTrap::Arity);

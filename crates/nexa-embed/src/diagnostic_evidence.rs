@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use nexa::prelude::{
-    FunctionEffect, HostCallOutcome, HostCompletionTicket, HostFunctionAuthority, HostRegistry,
-    HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements,
-    ScriptCallError, ScriptCallWriter, ScriptExport, ScriptOutputReader, Signature, StableId,
-    ValueType,
+    FunctionEffect, HostCallOutcome, HostCompletionTicket, HostFunctionAuthority, HostFunctionSlot,
+    HostRegistry, HostTrap, ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
+    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, Signature, StableId, ValueType,
 };
 use serde::Deserialize;
 
@@ -134,18 +134,21 @@ impl HostRegistry for Registry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.authority.stable_id() {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         let pending = context
             .create_request()

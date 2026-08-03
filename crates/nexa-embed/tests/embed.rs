@@ -12,9 +12,10 @@ use nexa_embed::{
     PackageStatus, SourceId, TrustLevel,
 };
 use nexa_runtime::{
-    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
-    ResourceContext, RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements, ScriptCallError,
-    ScriptCallWriter, ScriptExport, ScriptOutputReader, Signature, StableId, ValueType,
+    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry,
+    HostTrap, ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
+    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, Signature, StableId, ValueType,
 };
 
 const IDL_SOURCE: &str = "contract TestHost {
@@ -92,23 +93,26 @@ impl HostRegistry for Registry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id == self.authority.stable_id() {
+        if slot.index() == 0 {
             let pending = context
                 .create_request()
                 .map_err(|_| HostTrap::ResourceCapacity)?;
             Ok(HostCallOutcome::Pending(pending.request))
         } else {
-            Err(HostTrap::UnknownFunction(id))
+            Err(HostTrap::InvalidFunctionSlot(slot))
         }
     }
 }
@@ -123,20 +127,23 @@ impl HostRegistry for TrappingRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id == self.authority.stable_id() {
+        if slot.index() == 0 {
             Err(HostTrap::Panicked)
         } else {
-            Err(HostTrap::UnknownFunction(id))
+            Err(HostTrap::InvalidFunctionSlot(slot))
         }
     }
 }
@@ -151,18 +158,21 @@ impl HostRegistry for MeteredRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.authority.stable_id() {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
             args.i32(0)?.saturating_add(1),

@@ -88,7 +88,9 @@ fn generated_tokens_are_parsed_formatted_and_parsed_again() {
         "pub static HOST_FUNCTION_AUTHORITIES",
         "::std::sync::LazyLock",
         "nexa_runtime::HostFunctionAuthority::new",
-        "fn function_authority(",
+        "fn resolve_function(",
+        "nexa_runtime::HostFunctionSlot::new",
+        "match slot.index()",
         "pub struct Entity",
         "pub struct EntityToken",
         "pub struct PositionSnapshot",
@@ -114,7 +116,7 @@ fn generated_tokens_are_parsed_formatted_and_parsed_again() {
 }
 
 #[test]
-fn generated_registry_dispatches_by_host_function_stable_id() {
+fn generated_registry_resolves_stable_ids_to_dense_slots() {
     let contract = parse(
         "contract Dispatch { host { \
          fn first() -> i32; \
@@ -137,8 +139,13 @@ fn generated_registry_dispatches_by_host_function_stable_id() {
             "nexa_runtime::StableId({}u64) =>",
             third.identity.stable_id.0
         )),
-        "third Host function is not dispatched by its stable identity:\n{source}"
+        "third Host function is not resolved by its stable identity:\n{source}"
     );
+    assert!(
+        source.contains("nexa_runtime::HostFunctionSlot::new(2u32)"),
+        "third Host function did not resolve to dense slot 2:\n{source}"
+    );
+    assert!(source.contains("match slot.index()"));
 }
 
 #[test]

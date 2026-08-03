@@ -12,12 +12,13 @@ use nexa_bytecode::{
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     CancelReason, CollectionView, CopyBuffer, EncodeHostReturn, Heap, HeapError, HostCallOutcome,
-    HostErrorPayload, HostFunctionAuthority, HostPayload, HostRegistry, HostReturnRequirements,
-    HostTrap, MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
-    RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RestartReloadOutcome,
-    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskPoll, TaskRuntime, TaskState, TickBudget, YieldReason, set_migration_allocation_observer,
+    HostErrorPayload, HostFunctionAuthority, HostFunctionSlot, HostPayload, HostRegistry,
+    HostReturnRequirements, HostTrap, MigrationAllocationPhase, ModuleHandle, PendingHostRequest,
+    RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResolvedHostFunction,
+    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost,
+    RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeValue, StateObject,
+    StateValue, StepConfig, TaskLimits, TaskPoll, TaskRuntime, TaskState, TickBudget, YieldReason,
+    set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -203,8 +204,8 @@ impl MatrixFunction {
         &host_matrix::HOST_FUNCTION_AUTHORITIES[self as usize]
     }
 
-    fn stable_id(self) -> StableId {
-        self.authority().stable_id()
+    fn slot(self) -> HostFunctionSlot {
+        HostFunctionSlot::new(self as u32)
     }
 }
 
@@ -998,14 +999,14 @@ fn complex_host_allocation_matrix() {
     }
     registry
         .call_runtime(
-            MatrixFunction::ReturnScalar.stable_id(),
+            MatrixFunction::ReturnScalar.slot(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (_, scalar_counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::ReturnScalar.stable_id(),
+            MatrixFunction::ReturnScalar.slot(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
@@ -1023,14 +1024,14 @@ fn complex_host_allocation_matrix() {
     ];
     registry
         .call_runtime(
-            MatrixFunction::Baseline8.stable_id(),
+            MatrixFunction::Baseline8.slot(),
             &mut context,
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (_, eight_argument_counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::Baseline8.stable_id(),
+            MatrixFunction::Baseline8.slot(),
             &mut context,
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
@@ -1038,14 +1039,14 @@ fn complex_host_allocation_matrix() {
     assert_eq!(eight_argument_counts, AllocationCounts::default());
     registry
         .call_runtime(
-            MatrixFunction::Inspect.stable_id(),
+            MatrixFunction::Inspect.slot(),
             &mut context,
             RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::Inspect.stable_id(),
+            MatrixFunction::Inspect.slot(),
             &mut context,
             RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
         )
@@ -1078,14 +1079,14 @@ fn complex_host_allocation_matrix() {
     let scalar_collections = [scalar_array, scalar_buffer];
     registry
         .call_runtime(
-            MatrixFunction::InspectScalarCollections.stable_id(),
+            MatrixFunction::InspectScalarCollections.slot(),
             &mut context,
             RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::InspectScalarCollections.stable_id(),
+            MatrixFunction::InspectScalarCollections.slot(),
             &mut context,
             RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
         )
@@ -1120,17 +1121,17 @@ fn complex_host_allocation_matrix() {
     let mut separated_host_allocations = 0;
     let mut generated_non_empty_lengths = BTreeMap::new();
     for (name, function) in return_cases {
-        let id = function.stable_id();
+        let slot = function.slot();
         registry
             .call_runtime(
-                id,
+                slot,
                 &mut context,
                 RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
             )
             .unwrap();
         let (outcome, counts) = observed_host_split(|| {
             registry.call_runtime(
-                id,
+                slot,
                 &mut context,
                 RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
             )
@@ -1163,7 +1164,7 @@ fn complex_host_allocation_matrix() {
     wrong_arguments[1] = wrong_record;
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::Inspect.stable_id(),
+            MatrixFunction::Inspect.slot(),
             &mut context,
             RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
         )
@@ -1182,7 +1183,7 @@ fn complex_host_allocation_matrix() {
     wrong_arguments[2] = wrong_event;
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::Inspect.stable_id(),
+            MatrixFunction::Inspect.slot(),
             &mut context,
             RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
         )
@@ -1278,7 +1279,7 @@ fn complex_host_allocation_matrix() {
     std::panic::set_hook(Box::new(|_| {}));
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            MatrixFunction::PanicHost.stable_id(),
+            MatrixFunction::PanicHost.slot(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
@@ -1318,13 +1319,13 @@ fn complex_host_allocation_matrix() {
         ),
     ];
     for (point, function) in injected_cases {
-        let id = function.stable_id();
+        let slot = function.slot();
         let mut injected_heap = Heap::new_with_arena_limits(32, 256, 16, 64, 33);
         let before = injected_heap.collection_inspection();
         let _probe = injected_heap.failure_injector().arm_once(point);
         let (outcome, counts) = observed_host_split(|| {
             registry.call_runtime(
-                id,
+                slot,
                 &mut context,
                 RuntimeHostArgs::new(&[], Some(&mut injected_heap)).unwrap(),
             )
@@ -1348,7 +1349,7 @@ fn complex_host_allocation_matrix() {
         assert!(
             registry
                 .call_runtime(
-                    id,
+                    slot,
                     &mut context,
                     RuntimeHostArgs::new(&[], Some(&mut injected_heap)).unwrap(),
                 )
@@ -2758,18 +2759,21 @@ impl HostRegistry for AsyncHost {
         Some(self.host_contract_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.host_function.stable_id).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.host_function.stable_id).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.host_function.stable_id {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 1 {
             return Err(HostTrap::Arity);
@@ -2787,18 +2791,21 @@ impl HostRegistry for ImmediateHost {
         Some(self.host_contract_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.host_function.stable_id).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.host_function.stable_id).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.host_function.stable_id {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 8 {
             return Err(HostTrap::Arity);
@@ -2821,12 +2828,16 @@ impl HostRegistry for NoHost {
         Some(self.0)
     }
 
+    fn resolve_function(&self, _: StableId) -> Option<ResolvedHostFunction<'_>> {
+        None
+    }
+
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(id))
+        Err(HostTrap::InvalidFunctionSlot(slot))
     }
 }

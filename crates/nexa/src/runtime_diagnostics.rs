@@ -19,11 +19,11 @@ use nexa_diagnostics::{
     ErrorCode as LeafErrorCode, Label as LeafLabel, RelatedLocation, Severity as LeafSeverity,
 };
 use nexa_runtime::{
-    GcRef, HostCallOutcome, HostErrorPayload, HostFunctionAuthority, HostRegistry,
-    HostRequestHandle, HostTrap, ModuleHandle, PendingHostRequest, RealmConfig, RealmRuntime,
-    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeHost,
-    RuntimeHostArgs, RuntimeLimits, RuntimeValue, StatefulDomainId, StepConfig, TaskHandle,
-    TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
+    GcRef, HostCallOutcome, HostErrorPayload, HostFunctionAuthority, HostFunctionSlot,
+    HostRegistry, HostRequestHandle, HostTrap, ModuleHandle, PendingHostRequest, RealmConfig,
+    RealmRuntime, ResolvedHostFunction, ResourceContext, RestartReloadOutcome, RestartReloadPolicy,
+    RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeValue, StatefulDomainId,
+    StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits};
 use serde::Serialize;
@@ -317,24 +317,21 @@ impl HostRegistry for DiagnosticRegistry {
         Some(self.hash)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         self.authority
             .as_ref()
             .filter(|authority| authority.stable_id() == id)
+            .map(|authority| ResolvedHostFunction::new(HostFunctionSlot::new(0), authority))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if self
-            .authority
-            .as_ref()
-            .is_none_or(|authority| authority.stable_id() != id)
-        {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 || self.authority.is_none() {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         match self.mode {
             RegistryMode::StrictArity => {

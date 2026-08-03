@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nexa::prelude::{
-    HostCallOutcome, HostFunctionAuthority, HostImport, HostPayload, HostRegistry, HostTrap,
-    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RestartReloadOutcome,
-    RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StateObject,
-    StateValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget, ValueType,
-    YieldReason,
+    HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostImport, HostPayload,
+    HostRegistry, HostTrap, PendingHostRequest, RealmConfig, RealmRuntime, ResolvedHostFunction,
+    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs,
+    RuntimeValue, ScopeHandle, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll,
+    TaskTerminalReason, TickBudget, ValueType, YieldReason,
 };
 use nexa::{
     CandidateIdentity, CompiledPackageArtifact, HostContractInput, PackageBuildSession,
@@ -83,24 +83,21 @@ impl HostRegistry for WaitRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: nexa::StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: nexa::StableId) -> Option<ResolvedHostFunction<'_>> {
         self.authority
             .as_ref()
             .filter(|authority| authority.stable_id() == id)
+            .map(|authority| ResolvedHostFunction::new(HostFunctionSlot::new(0), authority))
     }
 
     fn call_runtime(
         &mut self,
-        id: nexa::StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if self
-            .authority
-            .as_ref()
-            .is_none_or(|authority| id != authority.stable_id())
-        {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 || self.authority.is_none() {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 1 {
             return Err(HostTrap::Arity);

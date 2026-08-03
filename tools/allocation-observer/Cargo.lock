@@ -136,6 +136,7 @@ name = "nexa-verifier"
 version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
+ "nexa-core",
 ]
 
 [[package]]

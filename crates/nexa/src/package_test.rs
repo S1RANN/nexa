@@ -15,9 +15,10 @@ use nexa_compiler::{
 };
 use nexa_core::{FileId, SourceSpan as CoreSourceSpan, StableId};
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeValue,
-    StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, Trap, TrapKind, YieldReason,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry, HostTrap,
+    RealmConfig, RealmRuntime, ResolvedHostFunction, ResourceContext, RuntimeError, RuntimeHost,
+    RuntimeHostArgs, RuntimeValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, Trap,
+    TrapKind, YieldReason,
 };
 use nexa_test_runner::{
     CallGraph, CallGraphNode, EligibilityViolationReason, ExecutionReport, ExecutionTermination,
@@ -1202,18 +1203,28 @@ impl HostRegistry for RejectingRuntimeHost {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         self.authorities
             .iter()
-            .find(|authority| authority.stable_id() == id)
+            .enumerate()
+            .find(|(_, authority)| authority.stable_id() == id)
+            .and_then(|(index, authority)| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| ResolvedHostFunction::new(HostFunctionSlot::new(index), authority))
+            })
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _context: &mut ResourceContext<'_>,
         _args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
+        let Some(authority) = self.authorities.get(slot.index() as usize) else {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
+        };
+        let id = authority.stable_id();
         Err(HostTrap::UnknownFunction(id))
     }
 }

@@ -15,10 +15,11 @@ use nexa_migrate::{
 };
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, ExecutableModule, ExecutionCharge, FrameLimits,
-    FuelState, GcBudget, Heap, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry,
-    HostTrap, InterpreterOutcome, Object, OpcodeCostTable, PendingHostRequest, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger,
-    RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
+    FuelState, GcBudget, Heap, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot,
+    HostPayload, HostRegistry, HostTrap, InterpreterOutcome, Object, OpcodeCostTable,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResolvedHostFunction, ResourceContext,
+    RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue, StateObject, StateValue,
+    StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
@@ -1963,13 +1964,17 @@ impl HostRegistry for NullRegistry {
         Some(HOST)
     }
 
+    fn resolve_function(&self, _: StableId) -> Option<ResolvedHostFunction<'_>> {
+        None
+    }
+
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(id))
+        Err(HostTrap::InvalidFunctionSlot(slot))
     }
 }
 
@@ -1982,7 +1987,7 @@ impl HostRegistry for AsyncRegistry {
         Some(HOST)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
         let authority = AUTHORITY.get_or_init(|| {
             let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
@@ -2005,17 +2010,20 @@ impl HostRegistry for AsyncRegistry {
                 &[],
             )
         });
-        (id == authority.stable_id()).then_some(authority)
+        (id == authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != StableId::from_name("BenchHost::value") {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if args.len() != 1 {
             return Err(HostTrap::Arity);

@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nexa::prelude::{
-    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
-    ResourceContext, RuntimeValue, Signature, StableId, ValueType,
+    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry,
+    HostTrap, ResolvedHostFunction, ResourceContext, RuntimeValue, Signature, StableId, ValueType,
 };
 use nexa::{
     RuntimeHostArgs, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
@@ -257,18 +257,21 @@ impl HostRegistry for NidlReloadRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.authority.stable_id() {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         if !args.is_empty() {
             return Err(HostTrap::Arity);
@@ -284,18 +287,21 @@ impl HostRegistry for Registry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != self.authority.stable_id() {
-            return Err(HostTrap::UnknownFunction(id));
+        if slot.index() != 0 {
+            return Err(HostTrap::InvalidFunctionSlot(slot));
         }
         let pending = context
             .create_request()

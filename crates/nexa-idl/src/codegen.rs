@@ -2587,7 +2587,8 @@ fn generate_host_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
     let dispatch_arms = model
         .host_functions
         .iter()
-        .map(|function| generate_host_dispatch_arm(model, function))
+        .enumerate()
+        .map(|(index, function)| generate_host_dispatch_arm(model, index, function))
         .collect::<Result<Vec<_>, CodegenError>>()?;
     let function_authorities = model
         .host_functions
@@ -2601,9 +2602,15 @@ fn generate_host_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
             .enumerate()
             .map(|(index, function)| {
                 let stable_id = function.identity.stable_id.0;
+                let slot = u32::try_from(index).expect("NIDL host function count fits u32");
                 quote!(
                     nexa_runtime::StableId(#stable_id) =>
-                    ::std::option::Option::Some(&HOST_FUNCTION_AUTHORITIES[#index])
+                    ::std::option::Option::Some(
+                        nexa_runtime::ResolvedHostFunction::new(
+                            nexa_runtime::HostFunctionSlot::new(#slot),
+                            &HOST_FUNCTION_AUTHORITIES[#index],
+                        )
+                    )
                 )
             });
     let contract_runtime_id = model.contract_runtime_id.0;
@@ -2643,10 +2650,10 @@ fn generate_host_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
                 ::std::option::Option::Some(nexa_runtime::StableId(#contract_runtime_id))
             }
 
-            fn function_authority(
+            fn resolve_function(
                 &self,
                 id: nexa_runtime::StableId,
-            ) -> Option<&nexa_runtime::HostFunctionAuthority> {
+            ) -> Option<nexa_runtime::ResolvedHostFunction<'_>> {
                 match id {
                     #(#function_authority_arms),*,
                     _ => ::std::option::Option::None,
@@ -2655,17 +2662,17 @@ fn generate_host_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
 
             fn call_runtime(
                 &mut self,
-                id: nexa_runtime::StableId,
+                slot: nexa_runtime::HostFunctionSlot,
                 context: &mut nexa_runtime::ResourceContext<'_>,
                 args: nexa_runtime::RuntimeHostArgs<'_>,
             ) -> ::std::result::Result<
                 nexa_runtime::HostCallOutcome,
                 nexa_runtime::HostTrap,
             > {
-                match id {
+                match slot.index() {
                     #(#dispatch_arms),*,
                     _ => ::std::result::Result::Err(
-                        nexa_runtime::HostTrap::UnknownFunction(id)
+                        nexa_runtime::HostTrap::InvalidFunctionSlot(slot)
                     ),
                 }
             }
@@ -2924,9 +2931,10 @@ fn generate_completion_ticket(
 
 fn generate_host_dispatch_arm(
     model: &BindingModel,
+    index: usize,
     function: &BindingFunction,
 ) -> Result<TokenStream, CodegenError> {
-    let stable_id = function.identity.stable_id.0;
+    let slot = u32::try_from(index).expect("NIDL host function count fits u32");
     let method_ident = &function.identity.rust_ident;
     let arity = function.parameters.len();
     let arity_mismatch = if arity == 0 {
@@ -2992,7 +3000,7 @@ fn generate_host_dispatch_arm(
         }
     };
     Ok(quote! {
-        nexa_runtime::StableId(#stable_id) => {
+        #slot => {
             if #arity_mismatch {
                 return ::std::result::Result::Err(nexa_runtime::HostTrap::Arity);
             }

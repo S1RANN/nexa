@@ -122,16 +122,17 @@ pub mod prelude {
     pub use nexa_runtime::{
         CancelReason, CompletionAccounting, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostFunctionAuthority, HostFunctionAuthorityField,
-        HostPayload, HostRegistry, HostRequestHandle, HostTrap, MigrationCapacityReport,
-        MigrationLimitError, MigrationLimits, MigrationUsageReport, ModuleHandle,
-        PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ResourceContext,
-        ResourceTokenHandle, RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy,
-        RestartReloadResult, RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode,
-        RuntimeFailurePoint, RuntimeHost, RuntimeHostCloseError, RuntimeHostCloseStatus,
-        RuntimeHostDomain, RuntimeHostState, RuntimeResourceLedger, RuntimeValue, ScopeHandle,
-        ScopeSnapshot, SnapshotHandle, StateHandle, StateHandleError, StateValue, StatefulDomainId,
-        StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
-        TickBudget, TickReport, YieldReason,
+        HostFunctionSlot, HostPayload, HostRegistry, HostRequestHandle, HostTrap,
+        MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
+        ModuleHandle, PendingHostRequest, RealmConfig, RealmError, RealmRuntime,
+        ResolvedHostFunction, ResourceContext, ResourceTokenHandle, RestartReloadMetrics,
+        RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult, RuntimeFailureConfigError,
+        RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint, RuntimeHost,
+        RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
+        RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot, SnapshotHandle,
+        StateHandle, StateHandleError, StateValue, StatefulDomainId, StepConfig, TaskHandle,
+        TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+        YieldReason,
     };
     pub use nexa_verifier::VerifierLimits;
 

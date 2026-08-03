@@ -244,19 +244,27 @@ impl nexa::prelude::HostRegistry for ConsoleRegistry {
         Some(self.contract_runtime_id)
     }
 
-    fn function_authority(
+    fn resolve_function(
         &self,
         id: nexa::StableId,
-    ) -> Option<&nexa::prelude::HostFunctionAuthority> {
+    ) -> Option<nexa::prelude::ResolvedHostFunction<'_>> {
         self.operations
             .iter()
-            .find(|binding| binding.authority.stable_id() == id)
-            .map(|binding| &binding.authority)
+            .enumerate()
+            .find(|(_, binding)| binding.authority.stable_id() == id)
+            .and_then(|(index, binding)| {
+                u32::try_from(index).ok().map(|index| {
+                    nexa::prelude::ResolvedHostFunction::new(
+                        nexa::prelude::HostFunctionSlot::new(index),
+                        &binding.authority,
+                    )
+                })
+            })
     }
 
     fn call_runtime(
         &mut self,
-        id: nexa::StableId,
+        slot: nexa::prelude::HostFunctionSlot,
         _context: &mut nexa::prelude::ResourceContext<'_>,
         arguments: nexa::RuntimeHostArgs<'_>,
     ) -> Result<nexa::prelude::HostCallOutcome, nexa::prelude::HostTrap> {
@@ -264,10 +272,9 @@ impl nexa::prelude::HostRegistry for ConsoleRegistry {
 
         let operation = self
             .operations
-            .iter()
-            .find(|binding| binding.authority.stable_id() == id)
+            .get(slot.index() as usize)
             .map(|binding| &binding.operation)
-            .ok_or(nexa::prelude::HostTrap::UnknownFunction(id))?;
+            .ok_or(nexa::prelude::HostTrap::InvalidFunctionSlot(slot))?;
         let value = arguments.string(0)?;
         let result = match operation {
             ConsoleOperation::Write => {

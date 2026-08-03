@@ -6,9 +6,10 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostCallOutcome, HostFunctionAuthority, HostFunctionAuthorityField, HostRegistry, HostTrap,
-    RealmConfig, RealmError, RealmRuntime, ResourceContext, RuntimeError, RuntimeHost,
-    RuntimeHostArgs, RuntimeValue, StepConfig, TaskLimits, TaskPoll,
+    HostCallOutcome, HostFunctionAuthority, HostFunctionAuthorityField, HostFunctionSlot,
+    HostRegistry, HostTrap, RealmConfig, RealmError, RealmRuntime, ResolvedHostFunction,
+    ResourceContext, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig,
+    TaskLimits, TaskPoll,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -18,7 +19,7 @@ const DISPATCH_EXPORT_ID: StableId = StableId(0x4449_5350_4154_4348);
 struct OrderedContractRegistry {
     functions: [StableId; 3],
     authorities: [HostFunctionAuthority; 3],
-    calls: Arc<Mutex<Vec<StableId>>>,
+    calls: Arc<Mutex<Vec<u32>>>,
 }
 
 impl HostRegistry for OrderedContractRegistry {
@@ -26,13 +27,22 @@ impl HostRegistry for OrderedContractRegistry {
         Some(HOST_CONTRACT_ID)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
         if id == self.functions[0] {
-            Some(&self.authorities[0])
+            Some(ResolvedHostFunction::new(
+                HostFunctionSlot::new(0),
+                &self.authorities[0],
+            ))
         } else if id == self.functions[1] {
-            Some(&self.authorities[1])
+            Some(ResolvedHostFunction::new(
+                HostFunctionSlot::new(1),
+                &self.authorities[1],
+            ))
         } else if id == self.functions[2] {
-            Some(&self.authorities[2])
+            Some(ResolvedHostFunction::new(
+                HostFunctionSlot::new(2),
+                &self.authorities[2],
+            ))
         } else {
             None
         }
@@ -40,7 +50,7 @@ impl HostRegistry for OrderedContractRegistry {
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
@@ -50,15 +60,12 @@ impl HostRegistry for OrderedContractRegistry {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(id);
-        let value = if id == self.functions[0] {
-            1
-        } else if id == self.functions[1] {
-            2
-        } else if id == self.functions[2] {
-            3
-        } else {
-            return Err(HostTrap::UnknownFunction(id));
+            .push(slot.index());
+        let value = match slot.index() {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            _ => return Err(HostTrap::InvalidFunctionSlot(slot)),
         };
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(value)))
     }
@@ -73,17 +80,20 @@ impl HostRegistry for SingleAuthorityRegistry {
         Some(HOST_CONTRACT_ID)
     }
 
-    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
-        (id == self.authority.stable_id()).then_some(&self.authority)
+    fn resolve_function(&self, id: StableId) -> Option<ResolvedHostFunction<'_>> {
+        (id == self.authority.stable_id()).then_some(ResolvedHostFunction::new(
+            HostFunctionSlot::new(0),
+            &self.authority,
+        ))
     }
 
     fn call_runtime(
         &mut self,
-        id: StableId,
+        slot: HostFunctionSlot,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(id))
+        Err(HostTrap::InvalidFunctionSlot(slot))
     }
 }
 
@@ -164,7 +174,7 @@ fn assert_authority_mismatch(
 }
 
 #[test]
-fn module_local_host_import_dispatches_by_stable_function_id() {
+fn module_local_host_import_resolves_to_registry_dense_slot() {
     let contract_functions = [
         StableId::from_name("DispatchContract::first"),
         StableId::from_name("DispatchContract::second"),
@@ -263,7 +273,7 @@ fn module_local_host_import_dispatches_by_stable_function_id() {
         *calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![contract_functions[2]]
+        vec![2]
     );
 }
 
