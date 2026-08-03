@@ -6485,6 +6485,7 @@ fn optimize_emitted_bytecode(
     if code.is_empty() {
         return;
     }
+    simplify_emitted_control_flow(code, spans, loop_bounds);
     let blocks = emitted_basic_blocks(code);
     let mut keep = vec![true; code.len()];
     for (start, end) in blocks {
@@ -6561,6 +6562,86 @@ fn optimize_emitted_bytecode(
         }
         compact_emitted_bytecode(code, spans, loop_bounds, &keep);
     }
+    let forwarded = forward_adjacent_class_fields(code);
+    if simplify_emitted_control_flow(code, spans, loop_bounds) || forwarded {
+        optimize_emitted_bytecode(code, spans, loop_bounds);
+    }
+}
+
+fn simplify_emitted_control_flow(
+    code: &mut Vec<Instruction>,
+    spans: &mut Vec<SourceSpan>,
+    loop_bounds: &mut Vec<LoopBound>,
+) -> bool {
+    if code.is_empty() {
+        return false;
+    }
+    let mut reachable = vec![false; code.len()];
+    let mut pending = vec![0_usize];
+    while let Some(pc) = pending.pop() {
+        if pc >= code.len() || std::mem::replace(&mut reachable[pc], true) {
+            continue;
+        }
+        match code[pc] {
+            Instruction::Jump { target } => {
+                pending.push(usize::try_from(target).unwrap_or(code.len()));
+            }
+            Instruction::JumpIfFalse { target, .. } => {
+                pending.push(pc + 1);
+                pending.push(usize::try_from(target).unwrap_or(code.len()));
+            }
+            Instruction::Return { .. }
+            | Instruction::ReturnVoid
+            | Instruction::CleanupReturn
+            | Instruction::Trap => {}
+            _ => pending.push(pc + 1),
+        }
+    }
+    let mut changed = reachable.iter().any(|reachable| !reachable);
+    if changed {
+        compact_emitted_bytecode(code, spans, loop_bounds, &reachable);
+    }
+    let keep = code
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(pc, instruction)| {
+            !matches!(instruction, Instruction::Jump { target }
+                if usize::try_from(target).ok() == Some(pc + 1))
+        })
+        .collect::<Vec<_>>();
+    if keep.iter().any(|keep| !keep) {
+        compact_emitted_bytecode(code, spans, loop_bounds, &keep);
+        changed = true;
+    }
+    changed
+}
+
+fn forward_adjacent_class_fields(code: &mut [Instruction]) -> bool {
+    let mut changed = false;
+    for pc in 0..code.len().saturating_sub(1) {
+        let Instruction::ClassSet {
+            source,
+            field,
+            value,
+        } = code[pc]
+        else {
+            continue;
+        };
+        let Instruction::ClassGet {
+            source: read_source,
+            field: read_field,
+            dst,
+        } = code[pc + 1]
+        else {
+            continue;
+        };
+        if source == read_source && field == read_field {
+            code[pc + 1] = Instruction::Move { dst, source: value };
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn emitted_basic_blocks(code: &[Instruction]) -> Vec<(usize, usize)> {
@@ -6629,12 +6710,14 @@ fn compact_emitted_bytecode(
         code.push(instruction);
         spans.push(span);
     }
-    for bound in loop_bounds {
-        bound.back_edge = boundary
-            .get(usize::try_from(bound.back_edge).unwrap_or(usize::MAX))
-            .copied()
-            .unwrap_or(next);
-    }
+    loop_bounds.retain_mut(|bound| {
+        let old = usize::try_from(bound.back_edge).unwrap_or(usize::MAX);
+        if !keep.get(old).copied().unwrap_or(false) {
+            return false;
+        }
+        bound.back_edge = boundary.get(old).copied().unwrap_or(next);
+        true
+    });
 }
 
 const fn emitted_instruction_is_dead_pure(instruction: Instruction) -> bool {
@@ -10125,16 +10208,32 @@ mod tests {
                     lhs: 0,
                     rhs: 3,
                 },
-                // The value crosses the jump boundary, so this publication
-                // remains materialized.
-                Instruction::Move { dst: 4, source: 1 },
-                Instruction::Jump { target: 5 },
-                Instruction::Trap,
-                Instruction::Return { source: 4 },
+                Instruction::Return { source: 1 },
             ]
         );
         assert_eq!(spans.len(), code.len());
-        assert_eq!(loop_bounds[0].back_edge, 3);
+        assert!(loop_bounds.is_empty());
+
+        let mut loop_code = vec![
+            Instruction::LoadBool {
+                dst: 1,
+                value: true,
+            },
+            Instruction::JumpIfFalse {
+                condition: 1,
+                target: 4,
+            },
+            Instruction::LoadI32 { dst: 2, value: 9 },
+            Instruction::Jump { target: 0 },
+            Instruction::Return { source: 0 },
+        ];
+        let mut loop_spans = vec![SourceSpan::default(); loop_code.len()];
+        let mut retained_bound = vec![LoopBound {
+            back_edge: 3,
+            max_iterations: 3,
+        }];
+        optimize_emitted_bytecode(&mut loop_code, &mut loop_spans, &mut retained_bound);
+        assert_eq!(retained_bound[0].back_edge, 2);
     }
 
     #[test]
