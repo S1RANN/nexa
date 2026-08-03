@@ -48,6 +48,7 @@ struct RepoHealth {
     reload_pause_symbol_violations: usize,
     retired_epoch_business_api_violations: usize,
     deprecated_allow_violations: usize,
+    unsafe_containment_violations: Vec<String>,
     versioned_model_file_count: usize,
     historical_tag_type: String,
     historical_tag_target: String,
@@ -3638,6 +3639,39 @@ fn repo_audit() -> Result<(), DynError> {
     let retired_epoch_business_api_violations =
         count_occurrences(&audit_sources, &["RetiredEpoch", "retired_epoch"]);
     let deprecated_allow_violations = count_occurrences(&audit_sources, &["#![allow(deprecated)]"]);
+    // M5 K1 unsafe containment: the trusted kernel is the only crates/
+    // source allowed to contain unsafe code, and it must justify every
+    // block with a SAFETY comment. Tools keep their own lint tables.
+    let unsafe_containment_violations = {
+        let kernel_path = "crates/nexa-runtime/src/trusted.rs";
+        let mut violations = audit_sources
+            .iter()
+            .filter(|(path, _)| {
+                path.starts_with("crates/") && path.ends_with(".rs") && path.as_str() != kernel_path
+            })
+            .filter(|(_, source)| {
+                ["unsafe fn ", "unsafe impl ", "unsafe {"]
+                    .iter()
+                    .any(|needle| source.contains(needle))
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if let Some(kernel) = audit_sources.get(kernel_path) {
+            if kernel.matches("unsafe {").count() > kernel.matches("// SAFETY:").count() {
+                violations.push(format!(
+                    "{kernel_path}: unsafe block without a SAFETY comment"
+                ));
+            }
+            if !kernel.contains("#![deny(unsafe_op_in_unsafe_fn)]") {
+                violations.push(format!(
+                    "{kernel_path}: missing unsafe_op_in_unsafe_fn deny"
+                ));
+            }
+        } else {
+            violations.push(format!("{kernel_path}: trusted kernel module is missing"));
+        }
+        violations
+    };
     let versioned_model_file_count = tracked
         .iter()
         .filter(|path| {
@@ -3677,6 +3711,7 @@ fn repo_audit() -> Result<(), DynError> {
         && reload_pause_symbol_violations == 0
         && retired_epoch_business_api_violations == 0
         && deprecated_allow_violations == 0
+        && unsafe_containment_violations.is_empty()
         && versioned_model_file_count == 0
         && tag_valid;
     let report = RepoHealth {
@@ -3714,6 +3749,7 @@ fn repo_audit() -> Result<(), DynError> {
         reload_pause_symbol_violations,
         retired_epoch_business_api_violations,
         deprecated_allow_violations,
+        unsafe_containment_violations,
         versioned_model_file_count,
         historical_tag_type,
         historical_tag_target,

@@ -362,6 +362,20 @@ impl FrameArena {
         self.frames.last().ok_or(FrameError::NoFrame)
     }
 
+    /// M5 K1 kernel view: the live frame stack and register store,
+    /// borrowed together so the trusted kernel (`trusted.rs`) can index
+    /// them without re-deriving the current frame per access. Safe by
+    /// itself - every unchecked access lives in the kernel module with
+    /// its `SAFETY:` justification.
+    pub(crate) fn trusted_parts(&self) -> (&[Frame], &[RuntimeValue]) {
+        (&self.frames, &self.registers)
+    }
+
+    /// Mutable sibling of [`Self::trusted_parts`].
+    pub(crate) fn trusted_parts_mut(&mut self) -> (&mut [Frame], &mut [RuntimeValue]) {
+        (&mut self.frames, &mut self.registers)
+    }
+
     pub fn current_mut(&mut self) -> Result<&mut Frame, FrameError> {
         self.frames.last_mut().ok_or(FrameError::NoFrame)
     }

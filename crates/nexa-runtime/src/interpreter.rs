@@ -4004,10 +4004,14 @@ fn ensure_host_call_available(migration_active: bool) -> Result<(), InterpreterE
     }
 }
 
+// The three hot register/pc funnels below carry every instruction arm's
+// register traffic (WP69). They delegate to the trusted kernel
+// (`trusted.rs`), which drops only the re-checks the verifier has already
+// discharged; the error mapping is bit-identical to the checked arena
+// path, and the checked `FrameArena` API remains the boundary for every
+// non-interpreter caller.
 fn register(arena: &FrameArena, register: u16) -> Result<RuntimeValue, InterpreterError> {
-    arena
-        .register(usize::from(register))
-        .map_err(|_| InterpreterError::RegisterOutOfRange(register))
+    crate::trusted::read_register(arena, register)
 }
 
 fn set_register(
@@ -4015,18 +4019,11 @@ fn set_register(
     register: u16,
     value: RuntimeValue,
 ) -> Result<(), InterpreterError> {
-    arena
-        .set_register(usize::from(register), value)
-        .map_err(|_| InterpreterError::RegisterOutOfRange(register))
+    crate::trusted::write_register(arena, register, value)
 }
 
 fn increment_pc(arena: &mut FrameArena) -> Result<(), InterpreterError> {
-    let frame = arena.current_mut()?;
-    frame.pc = frame
-        .pc
-        .checked_add(1)
-        .ok_or(InterpreterError::FellOffFunction)?;
-    Ok(())
+    crate::trusted::advance_pc(arena)
 }
 
 #[allow(clippy::float_cmp)]

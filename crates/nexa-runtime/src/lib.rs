@@ -22,6 +22,7 @@ mod slot_pool;
 mod stateful;
 mod task;
 mod trace;
+mod trusted;
 
 #[allow(dead_code, clippy::all, clippy::pedantic)]
 #[path = "generated/machines.rs"]

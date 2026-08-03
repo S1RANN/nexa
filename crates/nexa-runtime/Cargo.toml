@@ -21,5 +21,19 @@ allocation-counting = []
 fuzzing = ["model-adapter"]
 model-adapter = ["dep:nexa-compiler", "dep:nexa-idl"]
 
-[lints]
-workspace = true
+# M5 K1: the runtime hosts the single sanctioned unsafe kernel
+# (src/trusted.rs). The crate lowers the workspace's `forbid` to `deny`
+# so exactly that module can opt in with `#![allow(unsafe_code)]`; every
+# other module stays effectively forbidden, and `cargo xtask repo-audit`
+# fails if `unsafe` appears anywhere else under crates/. The clippy table
+# mirrors the workspace lints verbatim.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
