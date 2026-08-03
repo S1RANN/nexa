@@ -105,6 +105,8 @@ impl std::error::Error for VerifyError {}
 #[derive(Clone, Debug)]
 pub struct VerifiedModule {
     module: Module,
+    layout_table: Arc<nexa_bytecode::layout::LayoutTable>,
+    module_abi: Arc<nexa_bytecode::layout::ModuleAbi>,
     nominal_indexes: NominalIndexes,
     resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
     portable_fingerprint: [u8; 32],
@@ -347,13 +349,20 @@ impl NominalIndexes {
 }
 
 impl VerifiedModule {
-    fn new(module: Module, resolved_operands: Vec<Vec<ResolvedNominalOperand>>) -> Self {
+    fn new(
+        module: Module,
+        resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
+        layout_table: nexa_bytecode::layout::LayoutTable,
+        module_abi: nexa_bytecode::layout::ModuleAbi,
+    ) -> Self {
         let nominal_indexes = NominalIndexes::new(&module);
         let mut fingerprint = FingerprintBuilder::new("nexa.bytecode.portable-module", 1);
         fingerprint.field_bytes("module", &module.encode());
         let portable_fingerprint = fingerprint.finish_bytes();
         Self {
             module,
+            layout_table: Arc::new(layout_table),
+            module_abi: Arc::new(module_abi),
             nominal_indexes,
             resolved_operands,
             portable_fingerprint,
@@ -365,6 +374,21 @@ impl VerifiedModule {
     #[must_use]
     pub const fn module(&self) -> &Module {
         &self.module
+    }
+
+    /// The verifier-derived physical layout authority for this exact module.
+    ///
+    /// Runtime frame planning and aggregate operations consume this table
+    /// directly; they must never rederive a potentially divergent view.
+    #[must_use]
+    pub fn layout_table(&self) -> &nexa_bytecode::layout::LayoutTable {
+        &self.layout_table
+    }
+
+    /// The verifier-derived physical calling convention indexed by function.
+    #[must_use]
+    pub fn module_abi(&self) -> &nexa_bytecode::layout::ModuleAbi {
+        &self.module_abi
     }
 
     /// Canonical portable-bytecode identity computed once at verification.
@@ -534,7 +558,7 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     verify_source_map(&module)?;
     verify_named_type_metadata(&module)?;
     verify_host_import_metadata(&module)?;
-    verify_value_layouts(&module)?;
+    let (layout_table, module_abi) = verify_value_layouts(&module)?;
     let mut export_ids = BTreeSet::new();
     for export in &module.exports {
         if !export_ids.insert(export.stable_id) {
@@ -589,7 +613,12 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
             });
         }
     }
-    Ok(VerifiedModule::new(module, resolved_operands))
+    Ok(VerifiedModule::new(
+        module,
+        resolved_operands,
+        layout_table,
+        module_abi,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1045,19 +1074,30 @@ fn has_state_handle_type(module: &Module, target: ValueType) -> bool {
 
 /// M5 WP35: bytecode v7 carries a complete nominal closure, so both every
 /// layout and every function ABI must derive before execution.
-fn verify_value_layouts(module: &Module) -> Result<(), VerifyError> {
+fn verify_value_layouts(
+    module: &Module,
+) -> Result<
+    (
+        nexa_bytecode::layout::LayoutTable,
+        nexa_bytecode::layout::ModuleAbi,
+    ),
+    VerifyError,
+> {
     let table =
         nexa_bytecode::layout::LayoutTable::for_module(module).map_err(|error| VerifyError {
             function: 0,
             instruction: None,
             kind: VerifyErrorKind::InvalidValueLayout(error),
         })?;
-    nexa_bytecode::layout::ModuleAbi::for_module(module, &table).map_err(|error| VerifyError {
-        function: 0,
-        instruction: None,
-        kind: VerifyErrorKind::InvalidValueLayout(error),
-    })?;
-    Ok(())
+    let module_abi =
+        nexa_bytecode::layout::ModuleAbi::for_module(module, &table).map_err(|error| {
+            VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidValueLayout(error),
+            }
+        })?;
+    Ok((table, module_abi))
 }
 
 fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
@@ -3847,6 +3887,50 @@ mod tests {
     use super::{
         ResolvedNominalOperand, VerifierLimits, VerifyErrorKind, verify, verify_reload_transition,
     };
+
+    #[test]
+    fn verified_module_owns_the_exact_physical_layout_and_function_abi() {
+        let record = StableId::from_name("PhysicalRecord");
+        let mut module = ModuleBuilder::new();
+        module.struct_type(StructType {
+            type_id: record,
+            fields: vec![
+                StructField {
+                    stable_id: StableId::from_name("PhysicalRecord::wide"),
+                    ty: ValueType::I64,
+                },
+                StructField {
+                    stable_id: StableId::from_name("PhysicalRecord::flag"),
+                    ty: ValueType::Bool,
+                },
+            ],
+        });
+        let mut identity = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(record)],
+                result: Some(ValueType::Named(record)),
+            },
+            1,
+        );
+        identity
+            .set_root(0)
+            .expect("legacy aggregate register is rooted")
+            .emit(Instruction::Return { source: 0 });
+        module.function(identity.finish().expect("identity function"));
+
+        let verified =
+            verify(module.finish(), VerifierLimits::default()).expect("verified physical module");
+        let layout = verified
+            .layout_table()
+            .layout_of(ValueType::Named(record))
+            .expect("record layout");
+        let abi = verified.module_abi().function(0).expect("function ABI");
+
+        assert_eq!(layout.physical_slots, 2);
+        assert_eq!(abi.parameter_slots, 2);
+        assert_eq!(abi.parameters[0].slot_count, 2);
+        assert_eq!(abi.result.as_ref().map(|result| result.slot_count), Some(2));
+    }
 
     #[test]
     fn host_import_authority_metadata_is_canonical() {
