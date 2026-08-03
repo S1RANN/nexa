@@ -14,8 +14,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nexa_bytecode::Instruction;
-use nexa_verifier::{ResolvedNominalOperand, VerifiedModule};
+use nexa_bytecode::{Function, Instruction};
+use nexa_core::StableId;
+use nexa_verifier::{NominalIndexShape, ResolvedNominalOperand, VerifiedModule};
 
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 
@@ -60,6 +61,9 @@ pub struct ExecutableFunction {
     /// Load-time proof for the bounded static leaf executor.
     /// `None` keeps the full continuation interpreter as the only path.
     static_leaf: Option<StaticLeafCertificate>,
+    /// Load-time partial evaluation for a straight-line leaf returning a
+    /// constant i32 while replaying at most one allocation effect.
+    constant_leaf: Option<StaticLeafConstantKernel>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,16 +96,37 @@ pub(crate) struct StaticLeafBufferGet {
     pub index: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StaticLeafConstantEffect {
+    None,
+    LoadString {
+        string: u32,
+    },
+    EnumNew {
+        type_id: StableId,
+        variant: StableId,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticLeafConstantKernel {
+    pub result: i32,
+    pub instructions: u8,
+    pub effect: StaticLeafConstantEffect,
+}
+
 impl ExecutableFunction {
     fn new(
         function: &nexa_bytecode::Function,
         rows: Vec<ExecutableInstruction>,
         static_leaf: Option<StaticLeafCertificate>,
+        constant_leaf: Option<StaticLeafConstantKernel>,
     ) -> Self {
         Self {
             rows,
             code_identity: function.code.as_ptr() as usize,
             static_leaf,
+            constant_leaf,
         }
     }
 
@@ -120,6 +145,10 @@ impl ExecutableFunction {
 
     pub(crate) const fn static_leaf_certificate(&self) -> Option<StaticLeafCertificate> {
         self.static_leaf
+    }
+
+    pub(crate) const fn static_leaf_constant_kernel(&self) -> Option<StaticLeafConstantKernel> {
+        self.constant_leaf
     }
 
     pub(crate) const fn code_identity(&self) -> usize {
@@ -212,81 +241,13 @@ impl ExecutableModule {
             })
             .collect();
         let mut functions = Vec::with_capacity(bytecode.functions.len());
-        for (function_index, function) in bytecode.functions.iter().enumerate() {
-            let function_index = u32::try_from(function_index).unwrap_or(u32::MAX);
-            let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
-            for root_map in &function.root_maps {
-                if root_map.pc >= code_len {
-                    return Err(ExecutableBuildError::RootMapOutOfFunction {
-                        function: function_index,
-                        pc: root_map.pc,
-                    });
-                }
-            }
-            let mut rows = Vec::with_capacity(function.code.len());
-            for (pc, instruction) in function.code.iter().copied().enumerate() {
-                let pc = u32::try_from(pc).unwrap_or(u32::MAX);
-                match instruction {
-                    Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
-                        if target > code_len =>
-                    {
-                        return Err(ExecutableBuildError::JumpOutOfFunction {
-                            function: function_index,
-                            pc,
-                            target,
-                        });
-                    }
-                    _ => {}
-                }
-                let Ok(static_fuel) =
-                    static_instruction_fuel(bytecode, nominal_shape, instruction, costs)
-                else {
-                    return Err(ExecutableBuildError::FuelOverflow {
-                        function: function_index,
-                        pc,
-                    });
-                };
-                // The interpreter charges the host-import surcharge on top
-                // of the attempt fuel; the row folds it at build time.
-                let static_fuel = if let Instruction::HostCall { import, .. } = instruction {
-                    let host_import = bytecode.host_imports.get(import as usize).ok_or(
-                        ExecutableBuildError::MissingHostImport {
-                            function: function_index,
-                            pc,
-                            import,
-                        },
-                    )?;
-                    match static_fuel {
-                        Some(fuel) => {
-                            Some(fuel.checked_add(u64::from(host_import.fuel_cost)).ok_or(
-                                ExecutableBuildError::FuelOverflow {
-                                    function: function_index,
-                                    pc,
-                                },
-                            )?)
-                        }
-                        None => None,
-                    }
-                } else {
-                    static_fuel
-                };
-                rows.push(ExecutableInstruction {
-                    resolved_nominal: module.resolved_operand(function_index as usize, pc as usize),
-                    attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
-                    dynamic_fuel: static_fuel.is_none(),
-                    safepoint: crate::interpreter::is_safepoint(instruction, pc),
-                    fuel_boundary: pc == 0
-                        || crate::interpreter::is_safepoint(instruction, pc)
-                        || function
-                            .code
-                            .get(pc.saturating_sub(1) as usize)
-                            .is_some_and(|previous| {
-                                matches!(previous, Instruction::HostCall { .. })
-                            }),
-                });
-            }
-            let static_leaf = certify_static_leaf(function, &rows);
-            functions.push(ExecutableFunction::new(function, rows, static_leaf));
+        for function_index in 0..bytecode.functions.len() {
+            functions.push(build_executable_function(
+                module,
+                nominal_shape,
+                function_index,
+                costs,
+            )?);
         }
         Ok(Self {
             functions,
@@ -325,6 +286,115 @@ impl ExecutableModule {
         }
         (static_rows, total)
     }
+}
+
+fn build_executable_function(
+    module: &VerifiedModule,
+    nominal_shape: NominalIndexShape,
+    function_index: usize,
+    costs: &OpcodeCostTable,
+) -> Result<ExecutableFunction, ExecutableBuildError> {
+    let bytecode = module.module();
+    let function = &bytecode.functions[function_index];
+    let function_id = u32::try_from(function_index).unwrap_or(u32::MAX);
+    let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
+    for root_map in &function.root_maps {
+        if root_map.pc >= code_len {
+            return Err(ExecutableBuildError::RootMapOutOfFunction {
+                function: function_id,
+                pc: root_map.pc,
+            });
+        }
+    }
+    let mut rows = Vec::with_capacity(function.code.len());
+    for (pc, instruction) in function.code.iter().copied().enumerate() {
+        rows.push(build_executable_row(
+            module,
+            nominal_shape,
+            function,
+            function_id,
+            u32::try_from(pc).unwrap_or(u32::MAX),
+            instruction,
+            costs,
+        )?);
+    }
+    let static_leaf = certify_static_leaf(function, &rows);
+    let constant_leaf =
+        static_leaf.and_then(|_| certify_static_leaf_constant_kernel(module, function));
+    Ok(ExecutableFunction::new(
+        function,
+        rows,
+        static_leaf,
+        constant_leaf,
+    ))
+}
+
+fn build_executable_row(
+    module: &VerifiedModule,
+    nominal_shape: NominalIndexShape,
+    function: &Function,
+    function_id: u32,
+    pc: u32,
+    instruction: Instruction,
+    costs: &OpcodeCostTable,
+) -> Result<ExecutableInstruction, ExecutableBuildError> {
+    let bytecode = module.module();
+    let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
+    match instruction {
+        Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
+            if target > code_len =>
+        {
+            return Err(ExecutableBuildError::JumpOutOfFunction {
+                function: function_id,
+                pc,
+                target,
+            });
+        }
+        _ => {}
+    }
+    let Ok(static_fuel) = static_instruction_fuel(bytecode, nominal_shape, instruction, costs)
+    else {
+        return Err(ExecutableBuildError::FuelOverflow {
+            function: function_id,
+            pc,
+        });
+    };
+    // The interpreter charges the host-import surcharge on top of the
+    // attempt fuel; the row folds it at build time.
+    let static_fuel = if let Instruction::HostCall { import, .. } = instruction {
+        let host_import = bytecode.host_imports.get(import as usize).ok_or(
+            ExecutableBuildError::MissingHostImport {
+                function: function_id,
+                pc,
+                import,
+            },
+        )?;
+        static_fuel
+            .map(|fuel| {
+                fuel.checked_add(u64::from(host_import.fuel_cost)).ok_or(
+                    ExecutableBuildError::FuelOverflow {
+                        function: function_id,
+                        pc,
+                    },
+                )
+            })
+            .transpose()?
+    } else {
+        static_fuel
+    };
+    let safepoint = crate::interpreter::is_safepoint(instruction, pc);
+    Ok(ExecutableInstruction {
+        resolved_nominal: module.resolved_operand(function_id as usize, pc as usize),
+        attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
+        dynamic_fuel: static_fuel.is_none(),
+        safepoint,
+        fuel_boundary: pc == 0
+            || safepoint
+            || function
+                .code
+                .get(pc.saturating_sub(1) as usize)
+                .is_some_and(|previous| matches!(previous, Instruction::HostCall { .. })),
+    })
 }
 
 struct StaticLeafAnalysis {
@@ -693,6 +763,76 @@ fn certify_static_leaf_buffer_kernel(function: &nexa_bytecode::Function) -> Opti
         return None;
     }
     u8::try_from(function.code.len()).ok()
+}
+
+#[derive(Clone, Copy)]
+enum StaticConstantValue {
+    Unknown,
+    I32(i32),
+    StringLength(i32),
+}
+
+fn certify_static_leaf_constant_kernel(
+    module: &VerifiedModule,
+    function: &nexa_bytecode::Function,
+) -> Option<StaticLeafConstantKernel> {
+    let mut values = [StaticConstantValue::Unknown; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+    let mut effect = None;
+    let mut result = None;
+    for (pc, instruction) in function.code.iter().copied().enumerate() {
+        match instruction {
+            Instruction::LoadI32 { dst, value } => {
+                *values.get_mut(usize::from(dst))? = StaticConstantValue::I32(value);
+            }
+            Instruction::LoadString { dst, string } if effect.is_none() => {
+                let length = module.module().strings.get(string as usize)?.len();
+                let length = i32::try_from(length).ok()?;
+                effect = Some(StaticLeafConstantEffect::LoadString { string });
+                *values.get_mut(usize::from(dst))? = StaticConstantValue::StringLength(length);
+            }
+            Instruction::Move { dst, source } => {
+                *values.get_mut(usize::from(dst))? = *values.get(usize::from(source))?;
+            }
+            Instruction::Add { dst, lhs, rhs } => {
+                let (StaticConstantValue::I32(lhs), StaticConstantValue::I32(rhs)) = (
+                    *values.get(usize::from(lhs))?,
+                    *values.get(usize::from(rhs))?,
+                ) else {
+                    return None;
+                };
+                *values.get_mut(usize::from(dst))? =
+                    StaticConstantValue::I32(lhs.wrapping_add(rhs));
+            }
+            Instruction::StringByteLen { dst, source } => {
+                let StaticConstantValue::StringLength(length) = *values.get(usize::from(source))?
+                else {
+                    return None;
+                };
+                *values.get_mut(usize::from(dst))? = StaticConstantValue::I32(length);
+            }
+            Instruction::EnumNew {
+                type_id,
+                variant,
+                payload: None,
+                dst,
+            } if effect.is_none() => {
+                effect = Some(StaticLeafConstantEffect::EnumNew { type_id, variant });
+                *values.get_mut(usize::from(dst))? = StaticConstantValue::Unknown;
+            }
+            Instruction::Return { source } if pc + 1 == function.code.len() => {
+                let StaticConstantValue::I32(value) = *values.get(usize::from(source))? else {
+                    return None;
+                };
+                result = Some(value);
+            }
+            _ => return None,
+        }
+    }
+    Some(StaticLeafConstantKernel {
+        result: result?,
+        instructions: u8::try_from(function.code.len()).ok()?,
+        effect: effect.unwrap_or(StaticLeafConstantEffect::None),
+    })
 }
 
 const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {

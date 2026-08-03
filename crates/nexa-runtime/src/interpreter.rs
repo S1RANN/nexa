@@ -684,27 +684,8 @@ fn execute_static_leaf_value(
             crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(value));
         }
         Instruction::LoadString { dst, string } => {
-            let (reference, hash) = if let Some((pool, constant)) = executable.pooled_string(string)
-            {
-                heap.load_pooled_string(
-                    pool,
-                    string,
-                    std::sync::Arc::clone(&constant.value),
-                    constant.hash,
-                )?
-            } else {
-                let value = module
-                    .module()
-                    .strings
-                    .get(string as usize)
-                    .ok_or(InterpreterError::TypeMismatch)?;
-                heap.load_string_literal_with_hash(value)?
-            };
-            crate::trusted::write_static_leaf(
-                registers,
-                dst,
-                RuntimeValue::String { reference, hash },
-            );
+            let value = load_static_leaf_string(module, heap, executable, string)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
         }
         Instruction::Move { dst, source } => {
             let value = crate::trusted::read_static_leaf(registers, source);
@@ -735,6 +716,30 @@ fn execute_static_leaf_value(
         _ => unreachable!("value leaf helper receives only value instructions"),
     }
     Ok(StaticLeafStep::Next)
+}
+
+fn load_static_leaf_string(
+    module: &VerifiedModule,
+    heap: &mut Heap,
+    executable: &crate::executable::ExecutableModule,
+    string: u32,
+) -> Result<RuntimeValue, InterpreterError> {
+    let (reference, hash) = if let Some((pool, constant)) = executable.pooled_string(string) {
+        heap.load_pooled_string(
+            pool,
+            string,
+            std::sync::Arc::clone(&constant.value),
+            constant.hash,
+        )?
+    } else {
+        let value = module
+            .module()
+            .strings
+            .get(string as usize)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        heap.load_string_literal_with_hash(value)?
+    };
+    Ok(RuntimeValue::String { reference, hash })
 }
 
 fn execute_static_leaf_control(
@@ -1011,7 +1016,7 @@ fn execute_static_leaf_buffer(
 fn execute_prepared_buffer_kernel(
     certificate: crate::executable::StaticLeafCertificate,
     buffers: &PreparedStaticLeafBuffers,
-    mut fuel: FuelState,
+    fuel: FuelState,
     fuel_used: u64,
     heap: &mut Heap,
 ) -> Result<StaticLeafOutcome, InterpreterError> {
@@ -1021,6 +1026,43 @@ fn execute_prepared_buffer_kernel(
     heap.execute_prepared_buffer_copy(buffers.copy.ok_or(InterpreterError::TypeMismatch)?)?;
     let value =
         heap.execute_prepared_buffer_get(buffers.get.ok_or(InterpreterError::TypeMismatch)?)?;
+    settle_static_leaf_return(value, u64::from(instructions), fuel, fuel_used)
+}
+
+fn execute_static_leaf_constant_kernel(
+    kernel: crate::executable::StaticLeafConstantKernel,
+    module: &VerifiedModule,
+    executable: &crate::executable::ExecutableModule,
+    fuel: FuelState,
+    fuel_used: u64,
+    heap: &mut Heap,
+) -> Result<StaticLeafOutcome, InterpreterError> {
+    match kernel.effect {
+        crate::executable::StaticLeafConstantEffect::None => {}
+        crate::executable::StaticLeafConstantEffect::LoadString { string } => {
+            let _ = load_static_leaf_string(module, heap, executable, string)?;
+        }
+        crate::executable::StaticLeafConstantEffect::EnumNew { type_id, variant } => {
+            let variant = module
+                .enum_variant(type_id.0, variant.0)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let _ = heap.allocate_enum(type_id, variant.stable_id, variant.tag, None)?;
+        }
+    }
+    settle_static_leaf_return(
+        RuntimeValue::I32(kernel.result),
+        u64::from(kernel.instructions),
+        fuel,
+        fuel_used,
+    )
+}
+
+fn settle_static_leaf_return(
+    value: RuntimeValue,
+    instructions: u64,
+    mut fuel: FuelState,
+    fuel_used: u64,
+) -> Result<StaticLeafOutcome, InterpreterError> {
     fuel.slice_remaining = fuel
         .slice_remaining
         .checked_sub(fuel_used)
@@ -1032,7 +1074,7 @@ fn execute_prepared_buffer_kernel(
     Ok(StaticLeafOutcome {
         result: Ok(Some(value)),
         charge: ExecutionCharge {
-            instructions: u64::from(instructions),
+            instructions,
             fuel_used,
         },
         fuel,
@@ -1384,6 +1426,12 @@ impl CheckedInterpreter {
                 fuel,
                 upper_fuel,
                 heap,
+            )
+            .map(Some);
+        }
+        if let Some(kernel) = executable_function.static_leaf_constant_kernel() {
+            return execute_static_leaf_constant_kernel(
+                kernel, module, executable, fuel, upper_fuel, heap,
             )
             .map(Some);
         }
@@ -5589,6 +5637,98 @@ mod tests {
             )
             .expect("source buffer");
         (heap, [destination, source])
+    }
+
+    fn assert_constant_leaf_parity(
+        module: &nexa_verifier::VerifiedModule,
+        executable: &ExecutableModule,
+        function: u32,
+    ) {
+        let costs = OpcodeCostTable::canonical();
+        let limits = FrameLimits::default();
+        let mut full_heap = Heap::new_with_limits(16, 128, 16);
+        let continuation = CheckedInterpreter::start(
+            module,
+            function,
+            &[],
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )
+        .expect("start full constant leaf");
+        let full = CheckedInterpreter::poll_with_heap_and_executable(
+            module,
+            continuation,
+            FuelState::new(256, 0, u64::MAX),
+            costs,
+            &mut full_heap,
+            executable,
+        )
+        .expect("full constant leaf");
+        let InterpreterOutcome::Returned {
+            value: full_value,
+            charge: full_charge,
+            fuel: full_fuel,
+            ..
+        } = full
+        else {
+            panic!("full constant leaf must return");
+        };
+
+        let mut leaf_heap = Heap::new_with_limits(16, 128, 16);
+        let leaf = CheckedInterpreter::try_run_static_leaf(
+            module,
+            function,
+            &[],
+            FuelState::new(256, 0, u64::MAX),
+            costs,
+            &mut leaf_heap,
+            executable,
+        )
+        .expect("constant kernel executes")
+        .expect("constant function is certified");
+        assert_eq!(leaf.result.expect("constant kernel returns"), full_value);
+        assert_eq!(leaf.charge, full_charge);
+        assert_eq!(leaf.fuel, full_fuel);
+        assert_eq!(leaf_heap.byte_inspection(), full_heap.byte_inspection());
+    }
+
+    #[test]
+    fn static_leaf_constant_kernel_replays_string_and_enum_effects() {
+        let source = r#"
+class Cell { mut value: i32, next: Option<Cell>, }
+fn string_constant() -> i32 {
+    let text: string = "kernel";
+    return text.byte_len();
+}
+fn class_constant() -> i32 {
+    let cell: Cell = new Cell { value: 7, next: Option::None };
+    cell.value = cell.value + 1;
+    return cell.value;
+}
+fn arithmetic_constant() -> i32 {
+    let values: Array<i32> = Array::new();
+    values.push(1);
+    values.push(2);
+    values.set(0, 3);
+    return values.get(0) + values.len();
+}
+"#;
+        let module = nexa_compiler::compile(source).expect("constant kernels compile");
+        let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
+            .expect("constant kernels build");
+        for function in 0..3 {
+            assert!(
+                executable.functions()[function]
+                    .static_leaf_constant_kernel()
+                    .is_some(),
+                "function {function} must receive a constant-kernel certificate"
+            );
+            assert_constant_leaf_parity(
+                &module,
+                &executable,
+                u32::try_from(function).expect("small fixture index"),
+            );
+        }
     }
 
     #[test]
