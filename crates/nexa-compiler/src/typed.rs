@@ -19,13 +19,14 @@ use nexa_analysis::{
     TypedPatternIr, TypedPatternKind, TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr,
     UnaryOperator,
 };
+use nexa_bytecode::layout::LayoutTable;
 use nexa_bytecode::{
     AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
     EnumVariant, Function, FunctionEffect, HostCallMode, HostImport, Instruction, LoopBound,
-    MapType, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature, SnapshotType,
-    SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
-    StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type, map_type,
-    option_type, parameterized_type_id, resource_token_type, result_type, snapshot_type,
+    MapType, Module, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature,
+    SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema,
+    StateType, StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type,
+    map_type, option_type, parameterized_type_id, resource_token_type, result_type, snapshot_type,
     state_handle_type,
 };
 use nexa_core::{CanonicalSymbolIdentity, FileId, SourceSpan, StableId, StableSymbolId};
@@ -411,6 +412,24 @@ struct TypedLayoutContext {
     fields: BTreeMap<DefinitionId, (DefinitionId, TypedFieldLayout)>,
     enums: BTreeMap<DefinitionId, TypedEnumLayout>,
     variants: BTreeMap<DefinitionId, (DefinitionId, TypedVariantLayout)>,
+    layout_table: LayoutTable,
+}
+
+impl TypedLayoutContext {
+    fn physical_slots(&self, ty: ValueType, span: SourceSpan) -> Result<u16, CompileError> {
+        let slots = self
+            .layout_table
+            .layout_of(ty)
+            .map_err(|error| CompileError::unknown_type(error.to_string(), span))?
+            .physical_slots;
+        if slots == 0 {
+            return Err(CompileError::unknown_type(
+                "zero-slot value parameters are not supported by bytecode v7".into(),
+                span,
+            ));
+        }
+        Ok(slots)
+    }
 }
 
 fn migration_field_owner(
@@ -552,7 +571,7 @@ struct FunctionEmitter<'a> {
     /// reference pipeline keeps every fused form disabled.
     optimize: bool,
     register_types: Vec<Option<ValueType>>,
-    parameter_count: usize,
+    parameter_slots: usize,
     function_effect: IrEffect,
     function_return_type: &'a IrType,
     code: Vec<Instruction>,
@@ -859,8 +878,8 @@ fn compile_typed_package_with_profile(
         .collect::<BTreeMap<_, _>>();
 
     let state_schema = typed_state_schema(package, &files)?;
-    builder.state_schema(state_schema);
-    let layouts = emit_typed_type_metadata(package, &modules, &files, &mut builder)?;
+    builder.state_schema(state_schema.clone());
+    let layouts = emit_typed_type_metadata(package, &modules, &files, &state_schema, &mut builder)?;
     let (host_imports, host_contract_id) =
         emit_typed_host_imports(package, &codegen_inputs.host_functions, &mut builder)?;
     let standard_functions = typed_standard_functions(package, &files)?;
@@ -1974,6 +1993,8 @@ fn append_repl_task_wrapper(
     )?;
     compiled.module.functions.push(Function {
         signature: signature.clone(),
+        parameter_slots: u16::try_from(signature.parameters.len())
+            .map_err(|_| CompileError::too_many_registers(source_debug.definition_span))?,
         registers: 1,
         frame_bytes: 8,
         root_bitmap,
@@ -2237,6 +2258,7 @@ fn emit_standalone_main_export(
             }));
             builder.function(Function {
                 signature: standalone_main_signature(),
+                parameter_slots: 1,
                 registers: 2,
                 frame_bytes: 16,
                 root_bitmap,
@@ -3357,6 +3379,50 @@ fn collect_expression_children<'expr>(
     }
 }
 
+struct AllocatedFunctionBindings {
+    locals: BTreeMap<DefinitionId, u16>,
+    register_types: Vec<Option<ValueType>>,
+    parameter_slots: usize,
+}
+
+fn allocate_function_bindings(
+    package: &TypedPackageIr,
+    layouts: &TypedLayoutContext,
+    function: &TypedFunctionIr,
+    span: SourceSpan,
+) -> Result<AllocatedFunctionBindings, CompileError> {
+    let mut locals = BTreeMap::new();
+    let mut register_types = Vec::new();
+    for definition in &function.parameters {
+        let metadata = package
+            .definition(*definition)
+            .expect("TypedPackageIr validates local IDs");
+        let ty = lower_type(package, &metadata.ty, span)?;
+        let register = u16::try_from(register_types.len())
+            .map_err(|_| CompileError::too_many_registers(span))?;
+        locals.insert(*definition, register);
+        register_types.push(Some(ty));
+        let physical_slots = layouts.physical_slots(ty, span)?;
+        register_types.extend((1..physical_slots).map(|_| None));
+    }
+    let parameter_slots = register_types.len();
+    for definition in &function.locals {
+        let metadata = package
+            .definition(*definition)
+            .expect("TypedPackageIr validates local IDs");
+        let ty = lower_type(package, &metadata.ty, span)?;
+        let register = u16::try_from(register_types.len())
+            .map_err(|_| CompileError::too_many_registers(span))?;
+        locals.insert(*definition, register);
+        register_types.push(Some(ty));
+    }
+    Ok(AllocatedFunctionBindings {
+        locals,
+        register_types,
+        parameter_slots,
+    })
+}
+
 impl<'a> FunctionEmitter<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -3372,18 +3438,11 @@ impl<'a> FunctionEmitter<'a> {
         function_span: SourceSpan,
         optimize: bool,
     ) -> Result<Self, CompileError> {
-        let mut locals = BTreeMap::new();
-        let mut register_types = Vec::new();
-        for definition in function.parameters.iter().chain(&function.locals) {
-            let metadata = package
-                .definition(*definition)
-                .expect("TypedPackageIr validates local IDs");
-            let ty = lower_type(package, &metadata.ty, function_span)?;
-            let register = u16::try_from(register_types.len())
-                .map_err(|_| CompileError::too_many_registers(function_span))?;
-            locals.insert(*definition, register);
-            register_types.push(Some(ty));
-        }
+        let AllocatedFunctionBindings {
+            locals,
+            mut register_types,
+            parameter_slots,
+        } = allocate_function_bindings(package, layouts, function, function_span)?;
         // M5 WP27/WP45 slice: immutable struct locals used exclusively
         // through direct field reads get one register per field and skip
         // heap materialization entirely. Their primary register is never
@@ -3468,7 +3527,7 @@ impl<'a> FunctionEmitter<'a> {
             inline_classes,
             optimize,
             register_types,
-            parameter_count: function.parameters.len(),
+            parameter_slots,
             function_effect: function.effect,
             function_return_type: &function.return_type,
             code: Vec::new(),
@@ -7074,7 +7133,7 @@ impl<'a> FunctionEmitter<'a> {
         if self.optimize {
             optimize_emitted_bytecode(&mut self.code, &mut self.spans, &mut self.loop_bounds);
             self.register_types
-                .truncate(emitted_register_count(&self.code, self.parameter_count));
+                .truncate(emitted_register_count(&self.code, self.parameter_slots));
         }
         let registers = u16::try_from(self.register_types.len().max(1))
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
@@ -7084,7 +7143,7 @@ impl<'a> FunctionEmitter<'a> {
         let safepoints = collect_safepoints(&self.code);
         let (root_bitmap, root_maps) = typed_exact_root_maps(
             &self.register_types,
-            self.parameter_count,
+            self.parameter_slots,
             &self.code,
             &safepoints,
             self.function_span,
@@ -7103,6 +7162,8 @@ impl<'a> FunctionEmitter<'a> {
         Ok((
             Function {
                 signature,
+                parameter_slots: u16::try_from(self.parameter_slots)
+                    .map_err(|_| CompileError::too_many_registers(self.function_span))?,
                 registers,
                 frame_bytes: u32::from(registers).saturating_mul(8),
                 root_bitmap,
@@ -8435,12 +8496,14 @@ fn emit_typed_type_metadata(
     package: &TypedPackageIr,
     modules: &[&nexa_analysis::TypedModuleIr],
     files: &BTreeMap<SourceKey, FileId>,
+    state_schema: &StateSchema,
     builder: &mut ModuleBuilder,
 ) -> Result<TypedLayoutContext, CompileError> {
     let mut context = TypedLayoutContext::default();
     let mut enum_types = BTreeMap::<StableId, EnumType>::new();
     let mut struct_types = BTreeMap::<StableId, StructType>::new();
     let mut class_types = BTreeMap::<StableId, ClassType>::new();
+    let mut opaque_types = BTreeSet::new();
 
     for module in modules {
         for declaration in module.declarations.iter() {
@@ -8626,6 +8689,7 @@ fn emit_typed_type_metadata(
             match &ty.layout {
                 HostTypeLayoutIr::Opaque => {
                     builder.opaque_type(ty.stable_id);
+                    opaque_types.insert(ty.stable_id);
                 }
                 HostTypeLayoutIr::Struct { fields } => {
                     let mut fields = fields.iter().collect::<Vec<_>>();
@@ -8778,6 +8842,22 @@ fn emit_typed_type_metadata(
             SourceSpan::default(),
         )?;
     }
+    let layout_module = Module {
+        state_handle_types: generics.state_handles.values().copied().collect(),
+        array_types: generics.arrays.values().copied().collect(),
+        map_types: generics.maps.values().copied().collect(),
+        buffer_types: generics.buffers.values().copied().collect(),
+        snapshot_types: generics.snapshots.values().copied().collect(),
+        resource_token_types: generics.resource_tokens.values().copied().collect(),
+        opaque_types: opaque_types.into_iter().collect(),
+        enum_types: enum_types.values().cloned().collect(),
+        struct_types: struct_types.values().cloned().collect(),
+        class_types: class_types.values().cloned().collect(),
+        state_schema: state_schema.clone(),
+        ..Module::default()
+    };
+    context.layout_table = LayoutTable::for_module(&layout_module)
+        .map_err(|error| CompileError::unknown_type(error.to_string(), SourceSpan::default()))?;
     for value in enum_types.into_values() {
         builder.enum_type(value);
     }
@@ -11529,6 +11609,7 @@ mod tests {
         let registers = u16::try_from(register_types.len()).unwrap();
         Function {
             signature,
+            parameter_slots: u16::try_from(parameter_count).unwrap(),
             registers,
             frame_bytes: u32::from(registers).saturating_mul(8),
             root_bitmap,

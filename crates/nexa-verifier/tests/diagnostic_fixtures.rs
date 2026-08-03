@@ -14,7 +14,7 @@ const ALL_BINARY_FIXTURES: [&str; 5] = [
     "NX6005.bin",
 ];
 
-const GENERATED_BYTECODE_V6_FIXTURES: [&str; 5] =
+const GENERATED_BYTECODE_V7_FIXTURES: [&str; 5] =
     ["NX3001", "NX3002", "NX3003", "NX3004", "NX6005"];
 
 fn fixture_directory() -> std::path::PathBuf {
@@ -76,7 +76,7 @@ fn binary_diagnostic_fixture_inventory_is_exact_and_nonempty() {
 }
 
 #[test]
-fn generated_diagnostic_fixtures_are_the_exact_bytecode_v6_set() {
+fn generated_diagnostic_fixtures_are_the_exact_bytecode_v7_set() {
     let directory = fixture_directory();
     let fixtures = generator::encoded_fixtures();
     let generated_names = fixtures
@@ -90,7 +90,7 @@ fn generated_diagnostic_fixtures_are_the_exact_bytecode_v6_set() {
     );
     assert_eq!(
         generated_names,
-        GENERATED_BYTECODE_V6_FIXTURES.into_iter().collect(),
+        GENERATED_BYTECODE_V7_FIXTURES.into_iter().collect(),
         "the generator omitted a required fixture or retained an obsolete fixture"
     );
 
@@ -131,7 +131,7 @@ fn generated_diagnostic_fixtures_are_the_exact_bytecode_v6_set() {
 }
 
 #[test]
-fn decodable_bytecode_v6_fixtures_round_trip_canonically() {
+fn decodable_bytecode_v7_fixtures_round_trip_canonically() {
     let mut round_tripped = BTreeSet::new();
     for fixture in generator::encoded_fixtures() {
         let Ok(module) = Module::decode(&fixture.bytes) else {
@@ -140,7 +140,7 @@ fn decodable_bytecode_v6_fixtures_round_trip_canonically() {
         assert_eq!(
             module.encode(),
             fixture.bytes,
-            "{} must round-trip through the canonical v6 section encoding",
+            "{} must round-trip through the canonical v7 section encoding",
             fixture.name
         );
         let constants = Module::inspect_section_directory(&fixture.bytes, DecodeLimits::default())

@@ -1501,6 +1501,10 @@ pub enum Instruction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     pub signature: Signature,
+    /// Width of the verifier-derived physical parameter prefix. Logical
+    /// parameter types remain in `signature`; execution places each value at
+    /// its `FunctionAbi::parameters[*].slot_offset`.
+    pub parameter_slots: u16,
     pub registers: u16,
     pub frame_bytes: u32,
     pub root_bitmap: Vec<bool>,
@@ -1981,6 +1985,7 @@ impl Module {
             if let Some(result) = function.signature.result {
                 encode_type(&mut output, result);
             }
+            put_u16(&mut output, function.parameter_slots);
             put_u16(&mut output, function.registers);
             put_u32(&mut output, function.frame_bytes);
             output.push(encode_effect(function.effect));
@@ -2605,6 +2610,7 @@ impl Module {
                 1 => Some(decode_type(&mut reader)?),
                 value => return Err(DecodeError::InvalidBoolean(value)),
             };
+            let parameter_slots = reader.u16()?;
             let registers = reader.u16()?;
             if usize::from(registers) > limits.max_registers {
                 return Err(DecodeError::ResourceLimit("registers"));
@@ -2690,6 +2696,7 @@ impl Module {
             }
             functions.push(Function {
                 signature: Signature { parameters, result },
+                parameter_slots,
                 registers,
                 frame_bytes,
                 root_bitmap,
@@ -2805,7 +2812,7 @@ fn encode_sections(sections: &[(SectionKind, Vec<u8>)]) -> Vec<u8> {
             u32::from_le_bytes(
                 bytes
                     .get(..4)
-                    .expect("every v6 section starts with a count")
+                    .expect("every v7 section starts with a count")
                     .try_into()
                     .expect("section count occupies four bytes"),
             ),
@@ -4693,6 +4700,7 @@ impl ModuleBuilder {
 
 pub struct FunctionBuilder {
     signature: Signature,
+    parameter_slots: u16,
     registers: u16,
     frame_bytes: u32,
     root_bitmap: Vec<bool>,
@@ -4704,8 +4712,10 @@ pub struct FunctionBuilder {
 impl FunctionBuilder {
     #[must_use]
     pub fn new(signature: Signature, registers: u16) -> Self {
+        let parameter_slots = u16::try_from(signature.parameters.len()).unwrap_or(u16::MAX);
         Self {
             signature,
+            parameter_slots,
             registers,
             frame_bytes: u32::from(registers) * 8,
             root_bitmap: vec![false; usize::from(registers)],
@@ -4717,6 +4727,13 @@ impl FunctionBuilder {
 
     pub fn effect(&mut self, effect: FunctionEffect) -> &mut Self {
         self.effect = effect;
+        self
+    }
+
+    /// Declares the physical parameter-prefix width derived from the
+    /// module's authoritative layout table.
+    pub fn parameter_slots(&mut self, parameter_slots: u16) -> &mut Self {
+        self.parameter_slots = parameter_slots;
         self
     }
 
@@ -4847,6 +4864,7 @@ impl FunctionBuilder {
             .collect();
         Ok(Function {
             signature: self.signature,
+            parameter_slots: self.parameter_slots,
             registers: self.registers,
             frame_bytes: self.frame_bytes,
             root_bitmap: self.root_bitmap,
@@ -5404,7 +5422,7 @@ mod tests {
     }
 
     #[test]
-    fn state_current_get_round_trips_in_bytecode_v6() {
+    fn state_current_get_round_trips_in_bytecode_v7() {
         let stable_id = StableId::from_name("repl::environment");
         let type_id = StableId::from_name("repl::Environment");
         let signature = Signature {
@@ -5442,7 +5460,7 @@ mod tests {
     }
 
     #[test]
-    fn state_handle_opcodes_round_trip_in_bytecode_v6() {
+    fn state_handle_opcodes_round_trip_in_bytecode_v7() {
         let target = ValueType::Named(nexa_core::StableId::from_name("EnemyBrain"));
         let result = result_type(target, ValueType::Named(state_handle_error_type().type_id));
         let mut function = FunctionBuilder::new(
@@ -5504,7 +5522,7 @@ mod tests {
     }
 
     #[test]
-    fn array_metadata_and_opcodes_round_trip_in_bytecode_v6() {
+    fn array_metadata_and_opcodes_round_trip_in_bytecode_v7() {
         let array = ArrayType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -5560,7 +5578,7 @@ mod tests {
     }
 
     #[test]
-    fn map_metadata_and_opcodes_round_trip_in_bytecode_v6() {
+    fn map_metadata_and_opcodes_round_trip_in_bytecode_v7() {
         let map = MapType::new(ValueType::I32, ValueType::String);
         let option = option_type(ValueType::String);
         let mut function = FunctionBuilder::new(
@@ -5615,7 +5633,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v6() {
+    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v7() {
         let buffer = BufferType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -5664,7 +5682,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_snapshot_metadata_round_trips_in_bytecode_v6() {
+    fn typed_snapshot_metadata_round_trips_in_bytecode_v7() {
         let content_type = StableId::from_name("EnemyView");
         let snapshot = SnapshotType::new(content_type);
         let mut builder = ModuleBuilder::new();
@@ -5680,7 +5698,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_resource_token_metadata_round_trips_in_bytecode_v6() {
+    fn typed_resource_token_metadata_round_trips_in_bytecode_v7() {
         let action_lock = StableId::from_name("ActionLock");
         let motion_lock = StableId::from_name("MotionLock");
         let action_token = ResourceTokenType::new(action_lock);
@@ -5700,7 +5718,7 @@ mod tests {
     }
 
     #[test]
-    fn host_import_authority_metadata_round_trips_in_bytecode_v6() {
+    fn host_import_authority_metadata_round_trips_in_bytecode_v7() {
         let import = HostImport {
             stable_id: StableId::from_name("Host::read_profile"),
             declaration_fingerprint: [0xa5; 32],
@@ -5720,7 +5738,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn scalar_types_and_opcodes_round_trip_in_bytecode_v6() {
+    fn scalar_types_and_opcodes_round_trip_in_bytecode_v7() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: vec![
@@ -5844,7 +5862,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_to_string_opcodes_round_trip_in_bytecode_v6() {
+    fn scalar_to_string_opcodes_round_trip_in_bytecode_v7() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: vec![
@@ -5896,7 +5914,7 @@ mod tests {
     }
 
     #[test]
-    fn bytecode_v6_rejects_a_v5_header() {
+    fn bytecode_v7_rejects_an_older_header() {
         let module = ModuleBuilder::new().finish();
         let mut bytes = module.encode();
         bytes[4..6].copy_from_slice(&5_u16.to_le_bytes());
@@ -5907,7 +5925,7 @@ mod tests {
     }
 
     #[test]
-    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v6() {
+    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v7() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -5976,7 +5994,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v6() {
+    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v7() {
         let type_id = nexa_core::StableId::from_name("Position");
         let x = nexa_core::StableId::from_parts(&["Position", "::x"]);
         let fields = vec![
@@ -6040,7 +6058,7 @@ mod tests {
     }
 
     #[test]
-    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v6() {
+    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v7() {
         let type_id = nexa_core::StableId::from_name("Node");
         let value = nexa_core::StableId::from_parts(&["Node", "::value"]);
         let mut function = FunctionBuilder::new(

@@ -71,6 +71,7 @@ pub enum VerifyErrorKind {
     InvalidSnapshotMetadata,
     InvalidResourceTokenMetadata,
     InvalidOpaqueMetadata,
+    InvalidPhysicalAbi,
     InvalidSourceMap,
     /// M5 WP35: every verified module must yield a deterministic layout
     /// table and function ABI; recursion, dangling types, and slot
@@ -1100,6 +1101,23 @@ fn verify_value_layouts(
                 kind: VerifyErrorKind::InvalidValueLayout(error),
             }
         })?;
+    for (function_index, function) in module.functions.iter().enumerate() {
+        let abi = module_abi.function(function_index).ok_or(VerifyError {
+            function: function_index,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidPhysicalAbi,
+        })?;
+        if function.parameter_slots != abi.parameter_slots
+            || function.registers < function.parameter_slots
+            || function.frame_bytes != u32::from(function.registers).saturating_mul(8)
+        {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidPhysicalAbi,
+            });
+        }
+    }
     Ok((table, module_abi))
 }
 
@@ -1472,13 +1490,15 @@ fn verify_function(
     }
     verify_loop_bounds(function_index, function, limits)?;
     let register_count = usize::from(function.registers);
-    let parameter_count = function.signature.parameters.len();
-    if parameter_count > register_count {
+    let function_abi = module_abi
+        .function(function_index)
+        .ok_or_else(|| error(None, VerifyErrorKind::InvalidPhysicalAbi))?;
+    if usize::from(function_abi.parameter_slots) > register_count {
         return Err(error(None, VerifyErrorKind::RegisterOutOfRange(u16::MAX)));
     }
     let mut entry = vec![None; register_count];
-    for (register, ty) in function.signature.parameters.iter().copied().enumerate() {
-        entry[register] = Some(ty);
+    for parameter in &function_abi.parameters {
+        entry[usize::from(parameter.slot_offset)] = Some(parameter.logical_type);
     }
     let mut states = vec![None; function.code.len()];
     let mut resolved_operands = vec![ResolvedNominalOperand::None; function.code.len()];
@@ -3923,9 +3943,10 @@ mod tests {
                 parameters: vec![ValueType::Named(record)],
                 result: Some(ValueType::Named(record)),
             },
-            1,
+            2,
         );
         identity
+            .parameter_slots(2)
             .set_root(0)
             .expect("legacy aggregate register is rooted")
             .emit(Instruction::Return { source: 0 });
@@ -3935,29 +3956,30 @@ mod tests {
                 parameters: vec![ValueType::Named(record)],
                 result: Some(ValueType::Named(record)),
             },
-            2,
+            4,
         );
         wrapper
+            .parameter_slots(2)
             .set_root(0)
             .expect("aggregate argument root")
-            .set_root(1)
+            .set_root(2)
             .expect("aggregate result root")
             .emit(Instruction::Call {
                 function: 0,
                 args_base: 0,
                 args_count: 1,
-                dst: 1,
+                dst: 2,
             })
-            .emit(Instruction::Return { source: 1 });
+            .emit(Instruction::Return { source: 2 });
         let mut wrapper = wrapper.finish().expect("wrapper function");
         wrapper.root_maps = vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![true, false],
+                bitmap: vec![true, false, false, false],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, true],
+                bitmap: vec![false, false, true, false],
             },
         ];
         module.function(wrapper);
@@ -3977,10 +3999,16 @@ mod tests {
         assert_eq!(
             verified.resolved_operand(1, 0),
             ResolvedNominalOperand::CallFrame {
-                register_count: 1,
+                register_count: 2,
                 parameter_slots: 2,
                 result_slots: 2,
             }
+        );
+        let mut forged = verified.module().clone();
+        forged.functions[0].parameter_slots = 1;
+        assert_eq!(
+            verify(forged, VerifierLimits::default()).unwrap_err().kind,
+            VerifyErrorKind::InvalidPhysicalAbi
         );
     }
 
@@ -6270,6 +6298,7 @@ mod tests {
                 parameters,
                 result: Some(result),
             },
+            parameter_slots: dst,
             registers,
             frame_bytes: u32::from(registers) * 8,
             root_bitmap,

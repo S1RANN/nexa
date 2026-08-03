@@ -2466,6 +2466,7 @@ fn make_async_host_realm_with_spec(
             parameters: vec![ValueType::I32],
             result: Some(ValueType::Named(result.type_id)),
         },
+        parameter_slots: 1,
         registers: 2,
         frame_bytes: 16,
         root_bitmap: vec![false, true],

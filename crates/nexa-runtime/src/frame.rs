@@ -178,6 +178,17 @@ impl ReturnRange {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct VerifiedCallPlan<'abi> {
+    pub function: u32,
+    pub register_count: u16,
+    pub return_range: ReturnRange,
+    pub call_site_pc: u32,
+    pub args_base: u16,
+    pub args_count: u16,
+    pub abi: &'abi nexa_bytecode::layout::FunctionAbi,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContinuationReservation {
     pub frame_capacity: u32,
@@ -412,41 +423,24 @@ impl FrameArena {
         Ok(())
     }
 
-    /// Pushes a verifier-planned call and copies its contiguous argument
-    /// window directly into the callee frame. All checks that can fail are
-    /// completed before [`Self::push_call_at`] mutates the arena; the copy is
-    /// then an in-bounds move between disjoint live frame ranges.
-    pub(crate) fn push_verified_call(
+    /// Pushes a bytecode-v7 call whose logical arguments occupy a compact
+    /// caller staging window and scatters their base values to the
+    /// verifier-derived physical parameter offsets. Aggregate continuation
+    /// slots are initialized to `Unit` until their fully flattened lowering
+    /// replaces the transitional base carrier.
+    pub(crate) fn push_verified_abi_call(
         &mut self,
-        function: u32,
-        register_count: u16,
-        return_target: u16,
-        call_site_pc: u32,
-        args_base: u16,
-        args_count: u16,
+        plan: VerifiedCallPlan<'_>,
     ) -> Result<(), FrameError> {
-        self.push_verified_call_range(
+        let VerifiedCallPlan {
             function,
             register_count,
-            ReturnRange::scalar(return_target),
+            return_range,
             call_site_pc,
             args_base,
             args_count,
-        )
-    }
-
-    /// Physical sibling of [`Self::push_verified_call`]. Argument slots and
-    /// the caller-allocated result range are validated before the arena is
-    /// mutated, then copied directly between disjoint frame ranges.
-    pub(crate) fn push_verified_call_range(
-        &mut self,
-        function: u32,
-        register_count: u16,
-        return_range: ReturnRange,
-        call_site_pc: u32,
-        args_base: u16,
-        args_count: u16,
-    ) -> Result<(), FrameError> {
+            abi,
+        } = plan;
         let caller_index = self
             .frames
             .len()
@@ -456,7 +450,8 @@ impl FrameArena {
         let caller_next_pc = call_site_pc
             .checked_add(1)
             .ok_or(FrameError::RegisterOutOfRange)?;
-        if args_count > register_count
+        if usize::from(args_count) != abi.parameters.len()
+            || abi.parameter_slots > register_count
             || args_base
                 .checked_add(args_count)
                 .is_none_or(|end| end > caller.register_count)
@@ -465,25 +460,67 @@ impl FrameArena {
                 .start
                 .checked_add(return_range.slots)
                 .is_none_or(|end| end > caller.register_count)
+            || abi.parameters.iter().any(|parameter| {
+                parameter.slot_count == 0
+                    || parameter
+                        .slot_offset
+                        .checked_add(parameter.slot_count)
+                        .is_none_or(|end| end > register_count)
+            })
         {
             return Err(FrameError::RegisterOutOfRange);
         }
-        let source_start = caller.register_start as usize + usize::from(args_base);
-        let source_end = source_start + usize::from(args_count);
+        let source_frame_start = caller.register_start as usize;
         self.push_call_range_at(
             function,
             register_count,
             Some(return_range),
             Some(call_site_pc),
         )?;
-        let destination = self
+        let target_frame_start = self
             .frames
             .last()
-            .expect("the verified call frame was just pushed")
+            .expect("the verified ABI frame was just pushed")
             .register_start as usize;
-        self.registers
-            .copy_within(source_start..source_end, destination);
+        for (argument, parameter) in (0..args_count).zip(&abi.parameters) {
+            let source =
+                self.registers[source_frame_start + usize::from(args_base) + usize::from(argument)];
+            let start = target_frame_start + usize::from(parameter.slot_offset);
+            let end = start + usize::from(parameter.slot_count);
+            self.registers[start..end].fill(RuntimeValue::Unit);
+            self.registers[start] = source;
+        }
         self.frames[caller_index].pc = caller_next_pc;
+        Ok(())
+    }
+
+    /// Initializes an entry or detached frame from logical API arguments
+    /// using the exact same physical parameter placement as nested calls.
+    pub(crate) fn initialize_abi_arguments(
+        &mut self,
+        abi: &nexa_bytecode::layout::FunctionAbi,
+        arguments: &[RuntimeValue],
+    ) -> Result<(), FrameError> {
+        let frame = *self.current()?;
+        if arguments.len() != abi.parameters.len()
+            || abi.parameter_slots > frame.register_count
+            || abi.parameters.iter().any(|parameter| {
+                parameter.slot_count == 0
+                    || parameter
+                        .slot_offset
+                        .checked_add(parameter.slot_count)
+                        .is_none_or(|end| end > frame.register_count)
+            })
+        {
+            return Err(FrameError::RegisterOutOfRange);
+        }
+        let frame_start = frame.register_start as usize;
+        for (argument, parameter) in arguments.iter().copied().zip(&abi.parameters) {
+            let start = frame_start + usize::from(parameter.slot_offset);
+            let end = start + usize::from(parameter.slot_count);
+            self.registers[start..end].fill(RuntimeValue::Unit);
+            self.registers[start] = argument;
+        }
         Ok(())
     }
 
@@ -807,11 +844,31 @@ fn clear_gc_values(values: &mut [RuntimeValue]) {
 
 #[cfg(test)]
 mod tests {
+    use nexa_bytecode::ValueType;
+    use nexa_bytecode::layout::{FunctionAbi, ParameterAbi};
+
     use super::{
         ContinuationReservation, DeferAction, FrameArena, FrameError, FrameLimits, ReturnRange,
-        RuntimeValue,
+        RuntimeValue, VerifiedCallPlan,
     };
     use crate::GcRef;
+
+    fn test_abi(parameters: &[(ValueType, u16, u16)], parameter_slots: u16) -> FunctionAbi {
+        FunctionAbi {
+            parameters: parameters
+                .iter()
+                .map(|(logical_type, slot_offset, slot_count)| ParameterAbi {
+                    logical_type: *logical_type,
+                    slot_offset: *slot_offset,
+                    slot_count: *slot_count,
+                    gc_bitmap: vec![false; usize::from(*slot_count)],
+                })
+                .collect(),
+            parameter_slots,
+            parameter_gc_bitmap: vec![false; usize::from(parameter_slots)],
+            result: None,
+        }
+    }
 
     #[test]
     fn register_slot_footprint_is_pinned() {
@@ -858,11 +915,22 @@ mod tests {
 
     #[test]
     fn verified_call_copies_one_argument_window_and_is_fail_atomic() {
+        let abi = test_abi(&[(ValueType::I32, 0, 1), (ValueType::Bool, 1, 1)], 2);
         let mut arena = FrameArena::new(FrameLimits::default());
         arena.push(1, 4).unwrap();
         arena.set_register(1, RuntimeValue::I32(7)).unwrap();
         arena.set_register(2, RuntimeValue::Bool(true)).unwrap();
-        arena.push_verified_call(2, 4, 3, 5, 1, 2).unwrap();
+        arena
+            .push_verified_abi_call(VerifiedCallPlan {
+                function: 2,
+                register_count: 4,
+                return_range: ReturnRange::scalar(3),
+                call_site_pc: 5,
+                args_base: 1,
+                args_count: 2,
+                abi: &abi,
+            })
+            .unwrap();
         assert_eq!(arena.depth(), 2);
         assert_eq!(arena.current().unwrap().function, 2);
         assert_eq!(arena.register(0), Ok(RuntimeValue::I32(7)));
@@ -872,7 +940,15 @@ mod tests {
 
         let before = arena.clone();
         assert_eq!(
-            arena.push_verified_call(3, 1, 4, 6, 0, 2),
+            arena.push_verified_abi_call(VerifiedCallPlan {
+                function: 3,
+                register_count: 1,
+                return_range: ReturnRange::scalar(3),
+                call_site_pc: 6,
+                args_base: 0,
+                args_count: 2,
+                abi: &abi,
+            }),
             Err(FrameError::RegisterOutOfRange)
         );
         assert_eq!(arena.frames, before.frames);
@@ -882,15 +958,25 @@ mod tests {
 
     #[test]
     fn physical_call_returns_a_contiguous_range_atomically() {
+        let abi = test_abi(&[(ValueType::I64, 0, 2), (ValueType::I64, 2, 1)], 3);
         let mut arena = FrameArena::new(FrameLimits::default());
         arena.push(1, 8).unwrap();
         arena.set_register(1, RuntimeValue::I64(11)).unwrap();
         arena.set_register(2, RuntimeValue::I64(13)).unwrap();
         arena
-            .push_verified_call_range(2, 6, ReturnRange { start: 4, slots: 2 }, 7, 1, 2)
+            .push_verified_abi_call(VerifiedCallPlan {
+                function: 2,
+                register_count: 6,
+                return_range: ReturnRange { start: 4, slots: 2 },
+                call_site_pc: 7,
+                args_base: 1,
+                args_count: 2,
+                abi: &abi,
+            })
             .unwrap();
         assert_eq!(arena.register(0), Ok(RuntimeValue::I64(11)));
-        assert_eq!(arena.register(1), Ok(RuntimeValue::I64(13)));
+        assert_eq!(arena.register(1), Ok(RuntimeValue::Unit));
+        assert_eq!(arena.register(2), Ok(RuntimeValue::I64(13)));
         arena.set_register(3, RuntimeValue::I64(17)).unwrap();
         arena.set_register(4, RuntimeValue::I64(19)).unwrap();
 

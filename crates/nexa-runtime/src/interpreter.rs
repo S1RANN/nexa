@@ -21,9 +21,10 @@ use nexa_core::{
 };
 use nexa_verifier::VerifiedModule;
 
+use crate::frame::VerifiedCallPlan;
 use crate::{
     ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, Heap, HeapError,
-    MapSetOutcome, RuntimeMessage, RuntimeValue, executable::ExecutableNominalOperand,
+    MapSetOutcome, ReturnRange, RuntimeMessage, RuntimeValue, executable::ExecutableNominalOperand,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +110,10 @@ impl InterpreterContinuation {
             .functions
             .get(function as usize)
             .ok_or(InterpreterError::MissingFunction(function))?;
+        let function_abi = module
+            .module_abi()
+            .function(function as usize)
+            .ok_or(InterpreterError::TypeMismatch)?;
         validate_arguments(arguments, &function_meta.signature.parameters)?;
         let mut arena = match storage {
             Some(mut arena) => {
@@ -121,9 +126,7 @@ impl InterpreterContinuation {
             None => FrameArena::with_reserved_capacity(limits, reservation)?,
         };
         arena.push_call(function, function_meta.registers, None)?;
-        for (index, argument) in arguments.iter().copied().enumerate() {
-            arena.set_register(index, argument)?;
-        }
+        arena.initialize_abi_arguments(function_abi, arguments)?;
         Ok(Self {
             arena,
             current_function: function,
@@ -3046,19 +3049,30 @@ impl CheckedInterpreter {
                     dst,
                 } => {
                     if function_rows.is_some() {
-                        let ExecutableNominalOperand::CallFrame { register_count, .. } =
-                            resolved_nominal
+                        let ExecutableNominalOperand::CallFrame {
+                            register_count,
+                            parameter_slots,
+                            ..
+                        } = resolved_nominal
                         else {
                             return Err(InterpreterError::TypeMismatch);
                         };
-                        continuation.arena.push_verified_call(
-                            callee_id,
-                            register_count,
-                            dst,
-                            frame.pc,
-                            args_base,
-                            args_count,
-                        )?;
+                        let abi = module
+                            .module_abi()
+                            .function(callee_id as usize)
+                            .filter(|abi| abi.parameter_slots == parameter_slots)
+                            .ok_or(InterpreterError::TypeMismatch)?;
+                        continuation
+                            .arena
+                            .push_verified_abi_call(VerifiedCallPlan {
+                                function: callee_id,
+                                register_count,
+                                return_range: ReturnRange::scalar(dst),
+                                call_site_pc: frame.pc,
+                                args_base,
+                                args_count,
+                                abi,
+                            })?;
                     } else {
                         let callee = module
                             .module()
@@ -3080,26 +3094,21 @@ impl CheckedInterpreter {
                                 return Err(InterpreterError::TypeMismatch);
                             }
                         }
-                        let caller_index = continuation.arena.depth() - 1;
-                        continuation.arena.push_call_at(
-                            callee_id,
-                            callee.registers,
-                            Some(dst),
-                            Some(frame.pc),
-                        )?;
-                        for offset in 0..args_count {
-                            let argument = args_base
-                                .checked_add(offset)
-                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-                            let value =
-                                continuation.arena.frame_register(caller_index, argument)?;
-                            continuation
-                                .arena
-                                .set_register(usize::from(offset), value)?;
-                        }
+                        let abi = module
+                            .module_abi()
+                            .function(callee_id as usize)
+                            .ok_or(InterpreterError::TypeMismatch)?;
                         continuation
                             .arena
-                            .set_frame_pc(caller_index, frame.pc + 1)?;
+                            .push_verified_abi_call(VerifiedCallPlan {
+                                function: callee_id,
+                                register_count: callee.registers,
+                                return_range: ReturnRange::scalar(dst),
+                                call_site_pc: frame.pc,
+                                args_base,
+                                args_count,
+                                abi,
+                            })?;
                     }
                     if let Some(migration) = migration.as_deref_mut() {
                         migration.observe_call_depth(continuation.arena.depth());
@@ -4256,10 +4265,12 @@ fn start_next_defer(
                 .functions
                 .get(function as usize)
                 .ok_or(InterpreterError::MissingFunction(function))?;
+            let abi = module
+                .module_abi()
+                .function(function as usize)
+                .ok_or(InterpreterError::TypeMismatch)?;
             arena.push_call(function, cleanup.registers, None)?;
-            for (index, value) in args[..usize::from(args_count)].iter().copied().enumerate() {
-                arena.set_register(index, value)?;
-            }
+            arena.initialize_abi_arguments(abi, &args[..usize::from(args_count)])?;
         }
         crate::DeferAction::Trap => return Err(InterpreterError::TypeMismatch),
         crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
@@ -6102,6 +6113,68 @@ mod tests {
         ContinuationReservation, ExecutableModule, FrameError, FrameLimits, GcRoots, Heap,
         HeapError, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
     };
+
+    #[test]
+    fn physical_abi_scatter_preserves_aggregate_and_following_scalar_parameters() {
+        let source = r"
+struct Pair { first: i32, second: i32, }
+
+fn sum(pair: Pair, bias: i32) -> i32 {
+    return pair.first + pair.second + bias;
+}
+
+fn work() -> i32 {
+    return sum(Pair { first: 3, second: 5 }, 4);
+}
+";
+        let module = nexa_compiler::compile(source).expect("physical ABI corpus compiles");
+        let function = module
+            .module()
+            .functions
+            .iter()
+            .position(|function| function.signature.parameters.is_empty())
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("work function");
+        let sum = module
+            .module()
+            .functions
+            .iter()
+            .find(|function| function.signature.parameters.len() == 2)
+            .expect("sum function");
+        assert_eq!(sum.parameter_slots, 3);
+        assert!(sum.registers >= 3);
+
+        let mut portable_heap = Heap::new_with_limits(64, 4_096, 64);
+        let portable =
+            CheckedInterpreter::run_with_heap(&module, function, &[], 1_000, &mut portable_heap)
+                .expect("portable execution");
+        let executable =
+            ExecutableModule::build(&module, OpcodeCostTable::canonical()).expect("dense image");
+        let mut dense_heap = Heap::new_with_limits(64, 4_096, 64);
+        let dense = CheckedInterpreter::run_with_heap_and_executable(
+            &module,
+            function,
+            &[],
+            1_000,
+            &mut dense_heap,
+            &executable,
+        )
+        .expect("dense execution");
+        assert!(matches!(
+            portable,
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(12)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            dense,
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(12)),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn static_leaf_trap_matches_full_outcome_and_rejects_foreign_code_backing() {
