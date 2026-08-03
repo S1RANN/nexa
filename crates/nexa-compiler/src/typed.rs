@@ -5964,6 +5964,9 @@ impl<'a> FunctionEmitter<'a> {
         effect: FunctionEffect,
         function_index: u32,
     ) -> Result<(Function, Vec<SourceMapEntry>), CompileError> {
+        if self.optimize {
+            optimize_emitted_bytecode(&mut self.code, &mut self.spans, &mut self.loop_bounds);
+        }
         let registers = u16::try_from(self.register_types.len().max(1))
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
         while self.register_types.len() < usize::from(registers) {
@@ -6463,6 +6466,366 @@ fn typed_exact_root_maps(
         })
         .collect();
     Ok((root_bitmap, root_maps))
+}
+
+/// Removes codegen-only register traffic after structured lowering.
+///
+/// This pass is deliberately narrower than a general bytecode optimizer:
+/// aliases never cross a basic-block boundary, a source register may not be
+/// overwritten before the last rewritten use, and destinations used outside
+/// the block remain materialized. It therefore needs no SSA repair or phi
+/// nodes. The second phase removes only dead scalar constants and moves;
+/// instructions that can allocate, trap, call, mutate, or publish a value are
+/// never classified as dead-pure.
+fn optimize_emitted_bytecode(
+    code: &mut Vec<Instruction>,
+    spans: &mut Vec<SourceSpan>,
+    loop_bounds: &mut Vec<LoopBound>,
+) {
+    if code.is_empty() {
+        return;
+    }
+    let blocks = emitted_basic_blocks(code);
+    let mut keep = vec![true; code.len()];
+    for (start, end) in blocks {
+        for pc in start..end {
+            let Instruction::Move { dst, source } = code[pc] else {
+                continue;
+            };
+            let used_outside = code.iter().enumerate().any(|(candidate, instruction)| {
+                (candidate < start || candidate >= end)
+                    && typed_instruction_sources(*instruction).contains(&dst)
+            });
+            if used_outside {
+                continue;
+            }
+            let last_use = (pc + 1..end)
+                .rev()
+                .find(|candidate| typed_instruction_sources(code[*candidate]).contains(&dst));
+            let Some(last_use) = last_use else {
+                keep[pc] = false;
+                continue;
+            };
+            if (pc + 1..=last_use).any(|candidate| {
+                typed_instruction_destination(code[candidate]).is_some_and(|written| {
+                    written == source || (written == dst && candidate != last_use)
+                })
+            }) {
+                continue;
+            }
+            if !(pc + 1..=last_use).all(|candidate| {
+                let mut instruction = code[candidate];
+                rewrite_emitted_source(&mut instruction, dst, source)
+            }) {
+                continue;
+            }
+            for instruction in &mut code[pc + 1..=last_use] {
+                let rewritten = rewrite_emitted_source(instruction, dst, source);
+                debug_assert!(rewritten);
+            }
+            keep[pc] = false;
+        }
+    }
+    compact_emitted_bytecode(code, spans, loop_bounds, &keep);
+
+    loop {
+        let register_count = code
+            .iter()
+            .flat_map(|instruction| {
+                typed_instruction_sources(*instruction)
+                    .into_iter()
+                    .chain(typed_instruction_destination(*instruction))
+            })
+            .map(usize::from)
+            .max()
+            .map_or(0, |maximum| maximum + 1);
+        let mut used = vec![false; register_count];
+        for instruction in code.iter().copied() {
+            for source in typed_instruction_sources(instruction) {
+                if let Some(slot) = used.get_mut(usize::from(source)) {
+                    *slot = true;
+                }
+            }
+        }
+        let keep = code
+            .iter()
+            .copied()
+            .map(|instruction| {
+                let dead_destination = typed_instruction_destination(instruction)
+                    .is_some_and(|dst| !used.get(usize::from(dst)).copied().unwrap_or(false));
+                !(dead_destination && emitted_instruction_is_dead_pure(instruction))
+            })
+            .collect::<Vec<_>>();
+        if keep.iter().all(|keep| *keep) {
+            break;
+        }
+        compact_emitted_bytecode(code, spans, loop_bounds, &keep);
+    }
+}
+
+fn emitted_basic_blocks(code: &[Instruction]) -> Vec<(usize, usize)> {
+    let mut starts = BTreeSet::from([0_usize, code.len()]);
+    for (pc, instruction) in code.iter().copied().enumerate() {
+        match instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                starts.insert(
+                    usize::try_from(target)
+                        .unwrap_or(code.len())
+                        .min(code.len()),
+                );
+                starts.insert((pc + 1).min(code.len()));
+            }
+            Instruction::Return { .. }
+            | Instruction::ReturnVoid
+            | Instruction::CleanupReturn
+            | Instruction::Trap
+            | Instruction::Yield => {
+                starts.insert((pc + 1).min(code.len()));
+            }
+            _ => {}
+        }
+    }
+    let starts = starts.into_iter().collect::<Vec<_>>();
+    starts
+        .windows(2)
+        .filter_map(|range| (range[0] < range[1]).then_some((range[0], range[1])))
+        .collect()
+}
+
+fn compact_emitted_bytecode(
+    code: &mut Vec<Instruction>,
+    spans: &mut Vec<SourceSpan>,
+    loop_bounds: &mut Vec<LoopBound>,
+    keep: &[bool],
+) {
+    debug_assert_eq!(code.len(), spans.len());
+    debug_assert_eq!(code.len(), keep.len());
+    let mut boundary = vec![0_u32; code.len() + 1];
+    let mut next = 0_u32;
+    for (pc, retained) in keep.iter().copied().enumerate() {
+        boundary[pc] = next;
+        if retained {
+            next = next.saturating_add(1);
+        }
+    }
+    boundary[code.len()] = next;
+    let old_code = std::mem::take(code);
+    let old_spans = std::mem::take(spans);
+    code.reserve(old_code.len());
+    spans.reserve(old_spans.len());
+    for (pc, (mut instruction, span)) in old_code.into_iter().zip(old_spans).enumerate() {
+        if !keep[pc] {
+            continue;
+        }
+        match &mut instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                *target = boundary
+                    .get(usize::try_from(*target).unwrap_or(usize::MAX))
+                    .copied()
+                    .unwrap_or(next);
+            }
+            _ => {}
+        }
+        code.push(instruction);
+        spans.push(span);
+    }
+    for bound in loop_bounds {
+        bound.back_edge = boundary
+            .get(usize::try_from(bound.back_edge).unwrap_or(usize::MAX))
+            .copied()
+            .unwrap_or(next);
+    }
+}
+
+const fn emitted_instruction_is_dead_pure(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::LoadI32 { .. }
+            | Instruction::LoadI64 { .. }
+            | Instruction::LoadF32 { .. }
+            | Instruction::LoadF64 { .. }
+            | Instruction::LoadBool { .. }
+            | Instruction::LoadRune { .. }
+            | Instruction::Move { .. }
+            | Instruction::Add { .. }
+            | Instruction::Sub { .. }
+            | Instruction::Mul { .. }
+            | Instruction::AddI64 { .. }
+            | Instruction::SubI64 { .. }
+            | Instruction::MulI64 { .. }
+            | Instruction::AddF32 { .. }
+            | Instruction::SubF32 { .. }
+            | Instruction::MulF32 { .. }
+            | Instruction::AddF64 { .. }
+            | Instruction::SubF64 { .. }
+            | Instruction::MulF64 { .. }
+            | Instruction::CompareEq { .. }
+            | Instruction::CompareLtI32 { .. }
+            | Instruction::CompareLtI64 { .. }
+            | Instruction::CompareLtF32 { .. }
+            | Instruction::CompareLtF64 { .. }
+    )
+}
+
+/// Rewrites explicit scalar operands. Contiguous argument/field ranges are
+/// intentionally rejected: replacing one member would destroy their ABI
+/// contiguity, so the originating Move stays materialized.
+#[allow(clippy::too_many_lines)]
+fn rewrite_emitted_source(instruction: &mut Instruction, from: u16, to: u16) -> bool {
+    if !typed_instruction_sources(*instruction).contains(&from) {
+        return true;
+    }
+    let replace = |register: &mut u16| {
+        if *register == from {
+            *register = to;
+        }
+    };
+    match instruction {
+        Instruction::Move { source, .. }
+        | Instruction::StringLen { source, .. }
+        | Instruction::StringByteLen { source, .. }
+        | Instruction::StringHash { source, .. }
+        | Instruction::I32ToString { source, .. }
+        | Instruction::I64ToString { source, .. }
+        | Instruction::F32ToString { source, .. }
+        | Instruction::F64ToString { source, .. }
+        | Instruction::BoolToString { source, .. }
+        | Instruction::RuneToString { source, .. }
+        | Instruction::StringToString { source, .. }
+        | Instruction::EnumTag { source, .. }
+        | Instruction::EnumPayload { source, .. }
+        | Instruction::StructGet { source, .. }
+        | Instruction::ClassGet { source, .. }
+        | Instruction::ArrayLen { source, .. }
+        | Instruction::ArrayPop { source, .. }
+        | Instruction::ArrayClear { source }
+        | Instruction::MapLen { source, .. }
+        | Instruction::MapClear { source }
+        | Instruction::BufferLen { source, .. }
+        | Instruction::Return { source } => replace(source),
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::RemI32 { lhs, rhs, .. }
+        | Instruction::AddI64 { lhs, rhs, .. }
+        | Instruction::SubI64 { lhs, rhs, .. }
+        | Instruction::MulI64 { lhs, rhs, .. }
+        | Instruction::DivI64 { lhs, rhs, .. }
+        | Instruction::RemI64 { lhs, rhs, .. }
+        | Instruction::AddF32 { lhs, rhs, .. }
+        | Instruction::SubF32 { lhs, rhs, .. }
+        | Instruction::MulF32 { lhs, rhs, .. }
+        | Instruction::DivF32 { lhs, rhs, .. }
+        | Instruction::RemF32 { lhs, rhs, .. }
+        | Instruction::AddF64 { lhs, rhs, .. }
+        | Instruction::SubF64 { lhs, rhs, .. }
+        | Instruction::MulF64 { lhs, rhs, .. }
+        | Instruction::DivF64 { lhs, rhs, .. }
+        | Instruction::RemF64 { lhs, rhs, .. }
+        | Instruction::StringEqual { lhs, rhs, .. }
+        | Instruction::StringConcat { lhs, rhs, .. }
+        | Instruction::CompareEq { lhs, rhs, .. }
+        | Instruction::CompareLtI32 { lhs, rhs, .. }
+        | Instruction::CompareLtI64 { lhs, rhs, .. }
+        | Instruction::CompareLtF32 { lhs, rhs, .. }
+        | Instruction::CompareLtF64 { lhs, rhs, .. }
+        | Instruction::EnumEqual { lhs, rhs, .. }
+        | Instruction::StructEqual { lhs, rhs, .. }
+        | Instruction::ClassEqual { lhs, rhs, .. }
+        | Instruction::StateHandleEqual { lhs, rhs, .. } => {
+            replace(lhs);
+            replace(rhs);
+        }
+        Instruction::StringRuneAt { source, index, .. }
+        | Instruction::ArrayGet { source, index, .. }
+        | Instruction::ArrayFieldGet { source, index, .. }
+        | Instruction::ArrayRemove { source, index, .. }
+        | Instruction::BufferGet { source, index, .. } => {
+            replace(source);
+            replace(index);
+        }
+        Instruction::JumpIfFalse { condition, .. } => replace(condition),
+        Instruction::StateNewSet { object, source, .. } => {
+            replace(object);
+            replace(source);
+        }
+        Instruction::StateReplace { target, .. } => replace(target),
+        Instruction::EnumNew { payload, .. } => {
+            if let Some(payload) = payload {
+                replace(payload);
+            }
+        }
+        Instruction::StructWith { source, value, .. }
+        | Instruction::ClassSet { source, value, .. }
+        | Instruction::ArrayPush { source, value } => {
+            replace(source);
+            replace(value);
+        }
+        Instruction::ArraySet {
+            source,
+            index,
+            value,
+        }
+        | Instruction::ArrayInsert {
+            source,
+            index,
+            value,
+        }
+        | Instruction::BufferSet {
+            source,
+            index,
+            value,
+        } => {
+            replace(source);
+            replace(index);
+            replace(value);
+        }
+        Instruction::MapGet { source, key, .. }
+        | Instruction::MapRemove { source, key, .. }
+        | Instruction::MapContains { source, key, .. } => {
+            replace(source);
+            replace(key);
+        }
+        Instruction::MapSet { source, key, value } => {
+            replace(source);
+            replace(key);
+            replace(value);
+        }
+        Instruction::BufferSlice {
+            source,
+            start,
+            length,
+            ..
+        } => {
+            replace(source);
+            replace(start);
+            replace(length);
+        }
+        Instruction::BufferCopy {
+            destination,
+            source,
+            source_start,
+            destination_start,
+            length,
+        } => {
+            replace(destination);
+            replace(source);
+            replace(source_start);
+            replace(destination_start);
+            replace(length);
+        }
+        Instruction::StateOldFieldGet { object, .. } => replace(object),
+        Instruction::StateHandleResolve { handle, .. }
+        | Instruction::StateHandleIsAlive { handle, .. }
+        | Instruction::StateHandleStableId { handle, .. }
+        | Instruction::StateHandleGeneration { handle, .. }
+        | Instruction::StateHandleHash { handle, .. } => replace(handle),
+        // Unsupported operands include contiguous argument/field ranges;
+        // replacing one member would destroy their ABI contiguity.
+        _ => return false,
+    }
+    true
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9688,7 +10051,7 @@ mod tests {
     use super::{
         STANDALONE_MAIN_IDENTITY, STANDALONE_MAIN_STABLE_ID, checked_async_result,
         collect_safepoints, migration_field_owner, migration_state_type_exists,
-        typed_exact_root_maps, validate_static_range_bound,
+        optimize_emitted_bytecode, typed_exact_root_maps, validate_static_range_bound,
     };
     use nexa_analysis::{
         DefinitionId, HostAsyncResultIr, IrAbandonPolicy, IrCancelPolicy, IrEffect, IrLiteral,
@@ -9697,8 +10060,8 @@ mod tests {
     };
     use nexa_bytecode::{
         AbandonPolicy, AsyncResultType, CancelPolicy, Function, FunctionEffect, HostCallMode,
-        HostImport, Instruction, ModuleBuilder, Signature, StandardIntrinsic, StateSchema,
-        ValueType, result_type,
+        HostImport, Instruction, LoopBound, ModuleBuilder, Signature, StandardIntrinsic,
+        StateSchema, ValueType, result_type,
     };
     use nexa_core::{SourceSpan, StableId, StableSymbolId};
 
@@ -9725,6 +10088,54 @@ mod tests {
     }
     use nexa_verifier::{VerifierLimits, verify};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn emitted_peephole_rewrites_local_moves_and_remaps_control_metadata() {
+        let mut code = vec![
+            Instruction::Move { dst: 2, source: 0 },
+            Instruction::LoadI32 { dst: 3, value: 1 },
+            Instruction::Add {
+                dst: 1,
+                lhs: 2,
+                rhs: 3,
+            },
+            Instruction::Move { dst: 4, source: 1 },
+            Instruction::LoadBool {
+                dst: 9,
+                value: true,
+            },
+            Instruction::Jump { target: 7 },
+            Instruction::Trap,
+            Instruction::Return { source: 4 },
+        ];
+        let mut spans = vec![SourceSpan::default(); code.len()];
+        let mut loop_bounds = vec![LoopBound {
+            back_edge: 5,
+            max_iterations: 3,
+        }];
+
+        optimize_emitted_bytecode(&mut code, &mut spans, &mut loop_bounds);
+
+        assert_eq!(
+            code,
+            vec![
+                Instruction::LoadI32 { dst: 3, value: 1 },
+                Instruction::Add {
+                    dst: 1,
+                    lhs: 0,
+                    rhs: 3,
+                },
+                // The value crosses the jump boundary, so this publication
+                // remains materialized.
+                Instruction::Move { dst: 4, source: 1 },
+                Instruction::Jump { target: 5 },
+                Instruction::Trap,
+                Instruction::Return { source: 4 },
+            ]
+        );
+        assert_eq!(spans.len(), code.len());
+        assert_eq!(loop_bounds[0].back_edge, 3);
+    }
 
     #[test]
     fn standalone_main_constant_matches_its_normative_identity() {
