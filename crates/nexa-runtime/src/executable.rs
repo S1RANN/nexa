@@ -329,6 +329,7 @@ pub enum ExecutableBuildError {
     RootMapOutOfFunction { function: u32, pc: u32 },
     RootMapIndexOverflow { function: u32, pc: u32 },
     RootMapPlanMismatch { function: u32, pc: u32 },
+    DensePlanMismatch { function: u32, pc: u32 },
     FuelOverflow { function: u32, pc: u32 },
 }
 
@@ -366,6 +367,10 @@ impl std::fmt::Display for ExecutableBuildError {
             Self::RootMapPlanMismatch { function, pc } => write!(
                 formatter,
                 "function {function} pc {pc} has inconsistent safepoint/root-map metadata"
+            ),
+            Self::DensePlanMismatch { function, pc } => write!(
+                formatter,
+                "function {function} pc {pc} has missing or inconsistent dense operand metadata"
             ),
             Self::FuelOverflow { function, pc } => write!(
                 formatter,
@@ -644,10 +649,17 @@ fn build_executable_row(
     if fuel_boundary {
         flags |= ExecutableInstruction::FUEL_BOUNDARY;
     }
+    let resolved_nominal: ExecutableNominalOperand = module
+        .resolved_operand(function_id as usize, pc as usize)
+        .into();
+    if !dense_plan_matches(instruction, resolved_nominal) {
+        return Err(ExecutableBuildError::DensePlanMismatch {
+            function: function_id,
+            pc,
+        });
+    }
     Ok(ExecutableInstruction {
-        resolved_nominal: module
-            .resolved_operand(function_id as usize, pc as usize)
-            .into(),
+        resolved_nominal,
         attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
         flags,
         root_map_index,
@@ -656,6 +668,33 @@ fn build_executable_row(
 
 fn function_has_root_map(function: &Function, pc: u32) -> bool {
     function.safepoints.binary_search(&pc).is_ok()
+}
+
+const fn dense_plan_matches(instruction: Instruction, resolved: ExecutableNominalOperand) -> bool {
+    match instruction {
+        Instruction::EnumNew { .. } => {
+            matches!(resolved, ExecutableNominalOperand::EnumVariant { .. })
+        }
+        Instruction::StructGet { .. } | Instruction::StructWith { .. } => {
+            matches!(resolved, ExecutableNominalOperand::StructField { .. })
+        }
+        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
+            matches!(resolved, ExecutableNominalOperand::ClassField { .. })
+        }
+        Instruction::StateOldFieldGet { .. } | Instruction::StateNewSet { .. } => {
+            matches!(resolved, ExecutableNominalOperand::StateField { .. })
+        }
+        Instruction::ArrayNew { .. } => {
+            matches!(resolved, ExecutableNominalOperand::ArrayType { .. })
+        }
+        Instruction::MapNew { .. } => {
+            matches!(resolved, ExecutableNominalOperand::MapType { .. })
+        }
+        Instruction::Call { .. } => {
+            matches!(resolved, ExecutableNominalOperand::CallFrame { .. })
+        }
+        _ => matches!(resolved, ExecutableNominalOperand::None),
+    }
 }
 
 struct StaticLeafAnalysis {
@@ -1358,6 +1397,64 @@ fn update_counter() -> i32 {
             executable.export_index(StableId::from_name("missing.executable.export")),
             None
         );
+    }
+
+    #[test]
+    fn dense_plan_validation_is_fail_closed() {
+        let id = StableId(1);
+        let planned = [
+            Instruction::EnumNew {
+                type_id: id,
+                variant: id,
+                payload: None,
+                dst: 0,
+            },
+            Instruction::StructGet {
+                source: 0,
+                field: id,
+                dst: 1,
+            },
+            Instruction::ClassSet {
+                source: 0,
+                field: id,
+                value: 1,
+            },
+            Instruction::StateOldFieldGet {
+                object: 0,
+                field_id: id,
+                ty: ValueType::I32,
+                dst: 1,
+            },
+            Instruction::StateNewSet {
+                object: 0,
+                field_id: id,
+                source: 1,
+            },
+            Instruction::ArrayNew {
+                type_id: id,
+                dst: 0,
+            },
+            Instruction::MapNew {
+                type_id: id,
+                dst: 0,
+            },
+            Instruction::Call {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            },
+        ];
+        for instruction in planned {
+            assert!(
+                !super::dense_plan_matches(instruction, super::ExecutableNominalOperand::None),
+                "{instruction:?} must fail closed without its verifier plan"
+            );
+        }
+        assert!(!super::dense_plan_matches(
+            Instruction::LoadI32 { dst: 0, value: 1 },
+            super::ExecutableNominalOperand::StructField { index: 0 }
+        ));
     }
 
     #[test]
