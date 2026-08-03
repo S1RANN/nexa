@@ -121,7 +121,10 @@ fn insertion_barrier_keeps_a_hidden_pointer_alive_during_mark() {
     // already-black root, then erase the gray path to it.
     heap.set_class_field(root, 1, hidden)
         .expect("publish hidden into black root");
-    heap.array_set(holder, 0, RuntimeValue::I32(0))
+    let replacement = heap
+        .allocate_class(node, &[RuntimeValue::I32(0)])
+        .expect("typed replacement node");
+    heap.array_set(holder, 0, replacement)
         .expect("erase the gray path");
     let stats = run_cycle(&mut heap, &roots, 1);
     assert!(
@@ -603,7 +606,7 @@ fn heap_byte_ceiling_refuses_growth_until_collection_frees_it() {
 #[test]
 fn array_growth_stops_at_the_byte_ceiling_without_corruption() {
     let mut heap = Heap::new(64);
-    heap.set_max_heap_bytes(1_024);
+    heap.set_max_heap_bytes(128);
     let element = nexa_bytecode::ValueType::I32;
     let array = heap
         .allocate_array(nexa_bytecode::array_type(element), element)

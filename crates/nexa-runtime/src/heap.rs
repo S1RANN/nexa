@@ -180,6 +180,15 @@ impl CollectionRange {
     }
 }
 
+fn restore_reserved_vec<T>(target: &mut Vec<T>, snapshot: Vec<T>) {
+    debug_assert!(
+        snapshot.len() <= target.capacity(),
+        "heap restore must fit the constructor-reserved capacity"
+    );
+    target.clear();
+    target.extend(snapshot);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionArena {
     values: Vec<RuntimeValue>,
@@ -244,13 +253,16 @@ impl<T: Copy> ScalarArena<T> {
     }
 
     fn checkpoint_clone(&self) -> Self {
-        let mut values = Vec::with_capacity(self.values.capacity());
-        values.extend_from_slice(&self.values);
         Self {
-            values,
+            values: self.values.clone(),
             capacity: self.capacity,
             empty: self.empty,
         }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: Self) {
+        debug_assert_eq!(self.capacity, checkpoint.capacity);
+        restore_reserved_vec(&mut self.values, checkpoint.values);
     }
 }
 
@@ -373,14 +385,17 @@ impl MapSlotArena {
 
 impl Clone for MapSlotArena {
     fn clone(&self) -> Self {
-        let mut values = Vec::with_capacity(self.values.capacity());
-        values.extend_from_slice(&self.values);
-        let mut free_ranges = Vec::with_capacity(self.free_ranges.capacity());
-        free_ranges.extend_from_slice(&self.free_ranges);
         Self {
-            values,
-            free_ranges,
+            values: self.values.clone(),
+            free_ranges: self.free_ranges.clone(),
         }
+    }
+}
+
+impl MapSlotArena {
+    fn restore_checkpoint(&mut self, checkpoint: Self) {
+        restore_reserved_vec(&mut self.values, checkpoint.values);
+        restore_reserved_vec(&mut self.free_ranges, checkpoint.free_ranges);
     }
 }
 
@@ -436,7 +451,7 @@ impl CollectionArena {
             });
         }
         Self {
-            values: vec![RuntimeValue::Unit; capacity],
+            values: Vec::with_capacity(capacity),
             free_ranges,
             capacity,
         }
@@ -504,7 +519,10 @@ impl CollectionArena {
         if range.length == 0 {
             return;
         }
-        self.values[range.start..range.end()].fill(RuntimeValue::Unit);
+        if range.start < self.values.len() {
+            let initialized_end = range.end().min(self.values.len());
+            self.values[range.start..initialized_end].fill(RuntimeValue::Unit);
+        }
         let insertion = self
             .free_ranges
             .partition_point(|candidate| candidate.start < range.start);
@@ -542,16 +560,28 @@ impl CollectionArena {
             })
     }
 
+    fn initialize(&mut self, range: CollectionRange) -> Result<(), HeapError> {
+        if range.end() > self.capacity {
+            return Err(HeapError::CapacityExhausted);
+        }
+        if self.values.len() < range.end() {
+            self.values.resize(range.end(), RuntimeValue::Unit);
+        }
+        Ok(())
+    }
+
     fn checkpoint_clone(&self) -> Self {
-        let mut values = Vec::with_capacity(self.values.capacity());
-        values.extend_from_slice(&self.values);
-        let mut free_ranges = Vec::with_capacity(self.free_ranges.capacity());
-        free_ranges.extend_from_slice(&self.free_ranges);
         Self {
-            values,
-            free_ranges,
+            values: self.values.clone(),
+            free_ranges: self.free_ranges.clone(),
             capacity: self.capacity,
         }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: Self) {
+        debug_assert_eq!(self.capacity, checkpoint.capacity);
+        restore_reserved_vec(&mut self.values, checkpoint.values);
+        restore_reserved_vec(&mut self.free_ranges, checkpoint.free_ranges);
     }
 }
 
@@ -1311,21 +1341,11 @@ impl Heap {
 
     #[must_use]
     pub(crate) fn checkpoint(&self) -> HeapCheckpoint {
-        let mut slots = Vec::with_capacity(self.slots.capacity());
-        slots.extend_from_slice(&self.slots);
-        let mut free = Vec::with_capacity(self.free.capacity());
-        free.extend_from_slice(&self.free);
-        let mut maps = Vec::with_capacity(self.maps.capacity());
-        maps.extend_from_slice(&self.maps);
-        let mut free_maps = Vec::with_capacity(self.free_maps.capacity());
-        free_maps.extend_from_slice(&self.free_maps);
-        let mut host_staging = Vec::with_capacity(self.host_staging.capacity());
-        host_staging.extend_from_slice(&self.host_staging);
         HeapCheckpoint {
-            slots,
-            free,
-            maps,
-            free_maps,
+            slots: self.slots.clone(),
+            free: self.free.clone(),
+            maps: self.maps.clone(),
+            free_maps: self.free_maps.clone(),
             map_slots: self.map_slots.clone(),
             collections: self.collections.checkpoint_clone(),
             i32_collections: self.i32_collections.checkpoint_clone(),
@@ -1336,7 +1356,7 @@ impl Heap {
             rune_collections: self.rune_collections.checkpoint_clone(),
             string_collections: self.string_collections.checkpoint_clone(),
             ref_collections: self.ref_collections.checkpoint_clone(),
-            host_staging,
+            host_staging: self.host_staging.clone(),
             host_transaction_active: self.host_transaction_active,
             collection_elements_used: self.collection_elements_used,
         }
@@ -1350,21 +1370,29 @@ impl Heap {
         // different content; the cache trades that ambiguity for a rebuild.
         self.string_literal_cache.clear();
         self.pooled_string_cache.clear();
-        self.slots = checkpoint.slots;
-        self.free = checkpoint.free;
-        self.maps = checkpoint.maps;
-        self.free_maps = checkpoint.free_maps;
-        self.map_slots = checkpoint.map_slots;
-        self.collections = checkpoint.collections;
-        self.i32_collections = checkpoint.i32_collections;
-        self.i64_collections = checkpoint.i64_collections;
-        self.f32_collections = checkpoint.f32_collections;
-        self.f64_collections = checkpoint.f64_collections;
-        self.bool_collections = checkpoint.bool_collections;
-        self.rune_collections = checkpoint.rune_collections;
-        self.string_collections = checkpoint.string_collections;
-        self.ref_collections = checkpoint.ref_collections;
-        self.host_staging = checkpoint.host_staging;
+        restore_reserved_vec(&mut self.slots, checkpoint.slots);
+        restore_reserved_vec(&mut self.free, checkpoint.free);
+        restore_reserved_vec(&mut self.maps, checkpoint.maps);
+        restore_reserved_vec(&mut self.free_maps, checkpoint.free_maps);
+        self.map_slots.restore_checkpoint(checkpoint.map_slots);
+        self.collections.restore_checkpoint(checkpoint.collections);
+        self.i32_collections
+            .restore_checkpoint(checkpoint.i32_collections);
+        self.i64_collections
+            .restore_checkpoint(checkpoint.i64_collections);
+        self.f32_collections
+            .restore_checkpoint(checkpoint.f32_collections);
+        self.f64_collections
+            .restore_checkpoint(checkpoint.f64_collections);
+        self.bool_collections
+            .restore_checkpoint(checkpoint.bool_collections);
+        self.rune_collections
+            .restore_checkpoint(checkpoint.rune_collections);
+        self.string_collections
+            .restore_checkpoint(checkpoint.string_collections);
+        self.ref_collections
+            .restore_checkpoint(checkpoint.ref_collections);
+        restore_reserved_vec(&mut self.host_staging, checkpoint.host_staging);
         self.host_transaction_active = checkpoint.host_transaction_active;
         self.collection_elements_used = checkpoint.collection_elements_used;
         // G6: the restored object population owns a different footprint;
@@ -1939,6 +1967,11 @@ impl Heap {
         // For regrow this is conservative - the old extent is still held -
         // which is exactly the safe direction.
         let range = self.claim_global_collection_range(element_count, size_of::<RuntimeValue>())?;
+        if let Err(error) = self.collections.initialize(range) {
+            self.collections.release(range);
+            self.release_collection_quota(range.length);
+            return Err(error);
+        }
         Ok(CollectionReservation {
             range,
             written: 0,
@@ -2061,7 +2094,7 @@ impl Heap {
         range: CollectionRange,
     ) -> Result<(), HeapError> {
         match storage {
-            CollectionStorage::Values => Ok(()),
+            CollectionStorage::Values => self.collections.initialize(range),
             CollectionStorage::I32 => self.i32_collections.claim_exact(range),
             CollectionStorage::I64 => self.i64_collections.claim_exact(range),
             CollectionStorage::F32 => self.f32_collections.claim_exact(range),
@@ -2709,6 +2742,11 @@ impl Heap {
             HeapError::CapacityExhausted
         })?;
         if let Err(error) = self.collections.claim(range) {
+            self.release_collection_quota(fields.len());
+            return Err(error);
+        }
+        if let Err(error) = self.collections.initialize(range) {
+            self.collections.release(range);
             self.release_collection_quota(fields.len());
             return Err(error);
         }
@@ -5663,6 +5701,39 @@ mod tests {
         // Counters are monotonic work totals: rollback keeps them.
         heap.restore_checkpoint(checkpoint);
         assert_eq!(heap.vm_allocation_counters(), counters);
+    }
+
+    #[test]
+    fn checkpoints_copy_live_prefixes_and_restore_into_reserved_arenas() {
+        let mut heap = Heap::new_with_arena_limits(32, 4_096, 16, 1_024, 64);
+        let array = heap
+            .allocate_array(
+                nexa_bytecode::array_type(nexa_bytecode::ValueType::I32),
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        heap.array_push(array, RuntimeValue::I32(7)).unwrap();
+        let reserved = heap.i32_collections.values.capacity();
+        let checkpoint = heap.checkpoint();
+        assert_eq!(reserved, 1_024);
+        assert!(
+            checkpoint.i32_collections.values.capacity() < reserved,
+            "checkpoint owns only the initialized prefix, not the reserved arena"
+        );
+        assert!(
+            checkpoint.collections.values.capacity() < heap.collections.values.capacity(),
+            "generic arena slack is not cloned into a transactional snapshot"
+        );
+
+        heap.array_push(array, RuntimeValue::I32(8)).unwrap();
+        heap.restore_checkpoint(checkpoint);
+        assert_eq!(heap.array_len(array), Ok(1));
+        assert_eq!(heap.array_get(array, 0), Ok(RuntimeValue::I32(7)));
+        assert_eq!(
+            heap.i32_collections.values.capacity(),
+            reserved,
+            "restore reuses the heap's constructor-reserved backing"
+        );
     }
 
     #[test]
