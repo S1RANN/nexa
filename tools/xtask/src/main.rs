@@ -410,6 +410,7 @@ fn main() -> Result<(), DynError> {
         "test-performance-counters" => test_performance_counters(),
         "test-profiler-overhead" => test_profiler_overhead(),
         "test-value-layout" => test_value_layout(),
+        "test-typed-collections" => test_typed_collections(),
         "test-ir-optimizations" => test_ir_optimizations(),
         "test-optimization-differential" => test_optimization_differential(),
         "test-executable-parity" => test_executable_parity(),
@@ -449,7 +450,12 @@ fn main() -> Result<(), DynError> {
                  test-m4-tooling|m4-scale-stress|finalize-m4|test-language-v2|\
                  test-object-model-v2|test-async-v2|test-nidl-v2|\
                  test-structured-codegen|test-standalone|test-repl|test-entrypoints|\
-                 m4r1-scale-stress|finalize-m4-r1"
+                 m4r1-scale-stress|finalize-m4-r1|test-performance-counters|\
+                 test-profiler-overhead|test-value-layout|test-typed-collections|\
+                 test-ir-optimizations|test-optimization-differential|\
+                 test-executable-parity|test-incremental-gc|test-source-cache|\
+                 test-artifact-cache|test-runtime-fast-paths|m5-final-report|\
+                 m5-v8-comparison|m5-performance-regression"
             );
             Err("unknown xtask command".into())
         }
@@ -1595,6 +1601,19 @@ fn test_profiler_overhead() -> Result<(), DynError> {
 /// M5 WP19-WP22 gate: deterministic physical layout derivation.
 fn test_value_layout() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-bytecode", "--test", "layout"])
+}
+
+/// M5 WP47-WP58 gate: typed scalar/row storage, amortized push/pop,
+/// incremental map rehash, Unicode `StringBuild`, container GC barriers, and
+/// execution-image constant-pool retirement at their required stress scales.
+fn test_typed_collections() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "collection_string_stress",
+    ])
 }
 
 /// M5 WP37/WP38 gate: Typed IR pass manager and constant folding.

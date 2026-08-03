@@ -3297,50 +3297,18 @@ impl Heap {
                     return Err(invalid_value_reference());
                 };
                 let stored = $stored;
-                if current < parts.range.length {
-                    self.scalar_collections.$arena().values_mut(parts.range)?[current] = stored;
-                } else {
+                let range = if current == parts.range.length {
                     let capacity = grown_array_capacity(
                         parts.range.length,
                         length,
                         self.max_collection_length,
                     );
-                    let global_range =
-                        self.claim_global_collection_range(capacity, size_of_val(&stored))?;
-                    let new_range = match {
-                        let mut arena = self.scalar_collections.$arena();
-                        claim_scalar_regrow(
-                            &mut arena,
-                            global_range,
-                            parts.range,
-                            current,
-                            |values| values[current] = stored,
-                        )
-                    } {
-                        Ok(range) => range,
-                        Err(error) => {
-                            self.collections.release(global_range);
-                            self.release_collection_quota(capacity);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = self.set_array_range(parts.reference, new_range) {
-                        self.scalar_collections.$arena().release(new_range);
-                        self.collections.release(new_range);
-                        self.release_collection_quota(new_range.length);
-                        return Err(error);
-                    }
-                    self.scalar_collections.$arena().release(parts.range);
-                    self.collections.release(parts.range);
-                    self.release_collection_quota(parts.range.length);
-                    let element_bytes = size_of_val(&stored) as u64;
-                    self.charge_live_payload(
-                        (new_range.length as u64).saturating_mul(element_bytes),
-                    );
-                    self.release_live_payload(
-                        (parts.range.length as u64).saturating_mul(element_bytes),
-                    );
-                }
+                    self.resize_array_capacity(parts, capacity)?;
+                    self.array_range(parts.reference)?
+                } else {
+                    parts.range
+                };
+                self.scalar_collections.$arena().values_mut(range)?[current] = stored;
                 self.set_array_length(parts.reference, length)
             }};
         }
@@ -3394,17 +3362,15 @@ impl Heap {
         }
         let Some(stride) = parts.rows() else {
             self.shade_on_write(element);
-            if current < parts.range.length {
-                // WP49 amortized fast path: spare capacity, write in place.
-                self.collections.values_mut(parts.range)?[current] = element;
-                self.set_array_length(parts.reference, length)?;
-                return Ok(());
-            }
-            let capacity =
-                grown_array_capacity(parts.range.length, length, self.max_collection_length);
-            self.regrow_array(parts.reference, parts.range, current, capacity, |values| {
-                values[current] = element;
-            })?;
+            let range = if current == parts.range.length {
+                let capacity =
+                    grown_array_capacity(parts.range.length, length, self.max_collection_length);
+                self.resize_array_capacity(parts, capacity)?;
+                self.array_range(parts.reference)?
+            } else {
+                parts.range
+            };
+            self.collections.values_mut(range)?[current] = element;
             return self.set_array_length(parts.reference, length);
         };
         let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
@@ -3456,30 +3422,21 @@ impl Heap {
         let needed_cells = length
             .checked_mul(stride)
             .ok_or(HeapError::CapacityExhausted)?;
-        if needed_cells <= parts.range.length {
-            // WP49 amortized fast path: spare row capacity, write in place.
-            self.collections.values_mut(parts.range)?[current * stride..needed_cells]
-                .copy_from_slice(row);
-            self.set_array_length(parts.reference, length)?;
-            return Ok(());
-        }
-        // Growth is computed in logical elements so the new extent stays
-        // row-aligned; the arena works in cells.
-        let capacity_cells = grown_array_capacity(
-            parts.range.length / stride,
-            length,
-            self.max_collection_length,
-        )
-        .saturating_mul(stride);
-        self.regrow_array(
-            parts.reference,
-            parts.range,
-            current * stride,
-            capacity_cells,
-            |values| {
-                values[current * stride..(current + 1) * stride].copy_from_slice(row);
-            },
-        )?;
+        let range = if needed_cells > parts.range.length {
+            // Growth is computed in logical elements so the new extent stays
+            // row-aligned; `resize_array_capacity` first extends the arena
+            // tail in place and relocates only when another extent blocks it.
+            let capacity = grown_array_capacity(
+                parts.range.length / stride,
+                length,
+                self.max_collection_length,
+            );
+            self.resize_array_capacity(parts, capacity)?;
+            self.array_range(parts.reference)?
+        } else {
+            parts.range
+        };
+        self.collections.values_mut(range)?[current * stride..needed_cells].copy_from_slice(row);
         self.set_array_length(parts.reference, length)
     }
 
@@ -3911,6 +3868,13 @@ impl Heap {
                 *length = new_length;
                 Ok(())
             }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn array_range(&self, reference: GcRef) -> Result<CollectionRange, HeapError> {
+        match self.resolve(reference)? {
+            Object::Array { range, .. } => Ok(*range),
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
