@@ -1488,7 +1488,14 @@ fn test_source_cache() -> Result<(), DynError> {
 /// portable artifacts, discards corruption, stores atomically, and
 /// enforces its byte budget.
 fn test_artifact_cache() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-compiler", "--test", "artifact_cache"])
+    cargo(&["test", "-p", "nexa-compiler", "--test", "artifact_cache"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "execution_image_cache",
+    ])
 }
 
 /// M5 stage-H gate: the WP89 immediate entrypoint settles with no Task,

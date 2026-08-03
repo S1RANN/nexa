@@ -8,6 +8,7 @@ use nexa_bytecode::{
     SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES,
     StandardIntrinsic, StructField, StructType, ValueType, minimum_migration_limits,
 };
+use nexa_core::FingerprintBuilder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifierLimits {
@@ -104,6 +105,7 @@ pub struct VerifiedModule {
     module: Module,
     nominal_indexes: NominalIndexes,
     resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
+    portable_fingerprint: [u8; 32],
 }
 
 /// Dense nominal metadata proven by the verifier for one instruction.
@@ -230,16 +232,28 @@ impl NominalIndexes {
 impl VerifiedModule {
     fn new(module: Module, resolved_operands: Vec<Vec<ResolvedNominalOperand>>) -> Self {
         let nominal_indexes = NominalIndexes::new(&module);
+        let mut fingerprint = FingerprintBuilder::new("nexa.bytecode.portable-module", 1);
+        fingerprint.field_bytes("module", &module.encode());
         Self {
             module,
             nominal_indexes,
             resolved_operands,
+            portable_fingerprint: fingerprint.finish_bytes(),
         }
     }
 
     #[must_use]
     pub const fn module(&self) -> &Module {
         &self.module
+    }
+
+    /// Canonical portable-bytecode identity computed once at verification.
+    ///
+    /// Runtime execution-image caches combine this value with the opcode-cost
+    /// table version; process-local dense metadata is never serialized.
+    #[must_use]
+    pub const fn portable_fingerprint(&self) -> [u8; 32] {
+        self.portable_fingerprint
     }
 
     #[must_use]

@@ -94,13 +94,13 @@ pub use profiler::{
     PROFILER_SITE_CAPACITY, ProfilerReport,
 };
 pub use realm::{
-    CancelReason, CompletionDisposition, HostFunctionAuthorityField, HostResult, ModuleHandle,
-    ModuleLifecycle, NexaValue, RealmConfig, RealmError, RealmRuntime, ReloadAccounting,
-    RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult,
-    RuntimeCapacityReport, StagedCellTransaction, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
-    TickBudget, TickReport, TransactionalCellCommit, TransactionalCellEntrypoint,
-    TransactionalCellFailure, TransactionalCellFailureCause, TransactionalCellPoll,
-    TransactionalCellRollback, YieldReason,
+    CancelReason, CompletionDisposition, ExecutionImageCacheInspection, HostFunctionAuthorityField,
+    HostResult, ModuleHandle, ModuleLifecycle, NexaValue, RealmConfig, RealmError, RealmRuntime,
+    ReloadAccounting, RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy,
+    RestartReloadResult, RuntimeCapacityReport, StagedCellTransaction, TaskPoll,
+    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport, TransactionalCellCommit,
+    TransactionalCellEntrypoint, TransactionalCellFailure, TransactionalCellFailureCause,
+    TransactionalCellPoll, TransactionalCellRollback, YieldReason,
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{

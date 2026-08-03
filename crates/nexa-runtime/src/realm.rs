@@ -7,7 +7,7 @@ use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, FunctionEffect, HostImport,
     MigrationLimitRequirements, Signature, ValueType,
 };
-use nexa_core::{RawHandle, StableId, StateSchemaFingerprint};
+use nexa_core::{FingerprintBuilder, RawHandle, StableId, StateSchemaFingerprint};
 use nexa_verifier::VerifiedModule;
 
 use crate::heap::HeapReservation;
@@ -61,6 +61,94 @@ pub struct ModuleEpochRoot {
     globals: Vec<GcRef>,
     state: Arc<StatefulRegistry>,
     staging_roots: Vec<GcRef>,
+}
+
+#[derive(Clone)]
+struct ExecutionImage {
+    verified: Arc<VerifiedModule>,
+    executable: Arc<crate::executable::ExecutableModule>,
+}
+
+struct ExecutionImageEntry {
+    key: [u8; 32],
+    image: ExecutionImage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionImageCacheInspection {
+    pub entries: usize,
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+struct ExecutionImageCache {
+    entries: VecDeque<ExecutionImageEntry>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ExecutionImageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        verified: VerifiedModule,
+        costs: &OpcodeCostTable,
+    ) -> Result<ExecutionImage, crate::ExecutableBuildError> {
+        let key = execution_image_key(&verified, costs);
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self
+                .entries
+                .remove(index)
+                .expect("the located execution image entry exists");
+            let image = entry.image.clone();
+            self.entries.push_back(entry);
+            self.hits = self.hits.saturating_add(1);
+            return Ok(image);
+        }
+
+        self.misses = self.misses.saturating_add(1);
+        let executable = crate::executable::ExecutableModule::build(&verified, costs)?;
+        let image = ExecutionImage {
+            verified: Arc::new(verified),
+            executable: Arc::new(executable),
+        };
+        if self.capacity != 0 {
+            if self.entries.len() == self.capacity {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(ExecutionImageEntry {
+                key,
+                image: image.clone(),
+            });
+        }
+        Ok(image)
+    }
+
+    fn inspection(&self) -> ExecutionImageCacheInspection {
+        ExecutionImageCacheInspection {
+            entries: self.entries.len(),
+            capacity: self.capacity,
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+}
+
+fn execution_image_key(verified: &VerifiedModule, costs: &OpcodeCostTable) -> [u8; 32] {
+    let mut fingerprint = FingerprintBuilder::new("nexa.runtime.execution-image", 1);
+    fingerprint.field_bytes("portable_module", &verified.portable_fingerprint());
+    fingerprint.field_u32("opcode_cost_table_version", costs.version);
+    fingerprint.finish_bytes()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +319,9 @@ pub struct RealmConfig {
     pub realm_id: u32,
     pub runtime_limits: RuntimeLimits,
     pub max_modules: u32,
+    /// Maximum immutable verified/executable image pairs retained for
+    /// content-identical load and reload reuse.
+    pub execution_image_cache_capacity: usize,
     pub max_heap_objects: u32,
     /// G6: ceiling over live out-of-slot payload bytes (`GC_V1` heap
     /// accounting); `u64::MAX` disables the byte limit.
@@ -251,6 +342,7 @@ impl Default for RealmConfig {
             realm_id: 1,
             runtime_limits: RuntimeLimits::default(),
             max_modules: 16,
+            execution_image_cache_capacity: 8,
             max_heap_objects: 4_096,
             max_heap_bytes: u64::MAX,
             max_string_bytes: 1024 * 1024,
@@ -1165,6 +1257,10 @@ pub struct RealmRuntime {
     host_registry_contract_id: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
     failure_injector: crate::RuntimeFailureInjector,
+    /// WP95/WP96: process-local predecoded images keyed by portable artifact
+    /// identity. The cache is realm-bounded and never serializes dense slots
+    /// or runtime pointers.
+    execution_images: ExecutionImageCache,
     /// G2 trigger baseline: cumulative object allocations at the moment
     /// the last incremental cycle completed.
     gc_cycle_baseline: u64,
@@ -1177,6 +1273,9 @@ pub struct RealmRuntime {
 
 impl RealmRuntime {
     fn base(config: RealmConfig) -> Self {
+        let execution_image_cache_capacity = config
+            .execution_image_cache_capacity
+            .min(config.max_modules as usize);
         let failure_injector = crate::RuntimeFailureInjector::default();
         let mut tasks = TaskRuntime::new(config.realm_id, config.runtime_limits);
         tasks.set_failure_injector(failure_injector.clone());
@@ -1225,6 +1324,7 @@ impl RealmRuntime {
             host_registry_contract_id: None,
             runtime_host: None,
             failure_injector,
+            execution_images: ExecutionImageCache::new(execution_image_cache_capacity),
             gc_cycle_baseline: 0,
             // H1: preallocated so terminal-path pushes never allocate; the
             // allocation-observer gates pin task terminals at zero.
@@ -1591,9 +1691,13 @@ impl RealmRuntime {
             .next_stateful_domain
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
-        // F2: the predecoded rows are part of module admission; a module
-        // that cannot build them never becomes executable.
-        let executable = crate::executable::ExecutableModule::build(&verified, &self.cost_table)
+        // WP95: the predecoded rows remain part of admission, but an
+        // identical portable artifact reuses its immutable verified module
+        // and executable rows. Reusing the pair together preserves the
+        // code-backing identity held by static-leaf certificates.
+        let image = self
+            .execution_images
+            .resolve(verified, &self.cost_table)
             .map_err(RealmError::ExecutableBuild)?;
         let raw = self
             .modules
@@ -1601,8 +1705,8 @@ impl RealmRuntime {
                 module_id: 0,
                 stateful_domain,
                 epoch,
-                verified: Arc::new(verified),
-                executable: Arc::new(executable),
+                verified: image.verified,
+                executable: image.executable,
                 host_contract_id,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
@@ -1622,6 +1726,11 @@ impl RealmRuntime {
             self.set_active_root(handle);
         }
         Ok(handle)
+    }
+
+    #[must_use]
+    pub fn execution_image_cache_inspection(&self) -> ExecutionImageCacheInspection {
+        self.execution_images.inspection()
     }
 
     pub(crate) fn prepare_reload(
