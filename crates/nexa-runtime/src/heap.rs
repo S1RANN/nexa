@@ -1009,6 +1009,17 @@ impl ArrayParts {
     }
 }
 
+/// One validated buffer header. Buffer operations keep this compact copy
+/// instead of resolving the same heap object separately for type, storage,
+/// and range metadata.
+#[derive(Clone, Copy)]
+struct BufferParts {
+    type_id: StableId,
+    element_type: nexa_bytecode::ValueType,
+    storage: CollectionStorage,
+    range: CollectionRange,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
@@ -3913,30 +3924,17 @@ impl Heap {
     }
 
     pub fn buffer_values(&self, value: RuntimeValue) -> Result<CollectionView<'_>, HeapError> {
-        let RuntimeValue::NamedRef { reference, type_id } = value else {
-            return Err(invalid_value_reference());
-        };
-        match self.resolve(reference)? {
-            Object::Buffer {
-                type_id: actual,
-                element_type,
-                storage,
-                range,
-            } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                self.typed_collection_view(*storage, *element_type, *range)
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
-        }
+        let parts = self.buffer_parts(value)?;
+        self.typed_collection_view(parts.storage, parts.element_type, parts.range)
     }
 
     pub fn buffer_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
-        Ok(self.buffer_values(value)?.len())
+        Ok(self.buffer_parts(value)?.range.length)
     }
 
     pub fn buffer_get(&self, value: RuntimeValue, index: usize) -> Result<RuntimeValue, HeapError> {
-        let (_, element_type, storage) = self.buffer_metadata(value)?;
-        let (_, range) = self.buffer_range(value)?;
-        self.typed_collection_get(storage, element_type, range, index)
+        let parts = self.buffer_parts(value)?;
+        self.typed_collection_get(parts.storage, parts.element_type, parts.range, index)
     }
 
     pub fn buffer_set(
@@ -3945,9 +3943,14 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let (_, element_type, storage) = self.buffer_metadata(value)?;
-        let (_, range) = self.buffer_range(value)?;
-        self.typed_collection_set(storage, element_type, range, index, replacement)
+        let parts = self.buffer_parts(value)?;
+        self.typed_collection_set(
+            parts.storage,
+            parts.element_type,
+            parts.range,
+            index,
+            replacement,
+        )
     }
 
     pub fn buffer_slice(
@@ -3956,26 +3959,40 @@ impl Heap {
         start: usize,
         length: usize,
     ) -> Result<RuntimeValue, HeapError> {
-        let (type_id, element_type, storage) = self.buffer_metadata(value)?;
-        let (_, source_range) = self.buffer_range(value)?;
-        let end = checked_collection_end(start, length, source_range.length)?;
+        let source = self.buffer_parts(value)?;
+        let end = checked_collection_end(start, length, source.range.length)?;
         // Reserve the object slot before claiming/copying collection storage,
         // so a full heap cannot strand an otherwise unreachable arena range.
         let mut heap = self.preflight(1)?;
-        let range = self.claim_typed_collection(storage, length)?;
-        for (destination, source) in (start..end).enumerate() {
-            let item = self.typed_collection_get(storage, element_type, source_range, source)?;
-            if let Err(error) =
-                self.typed_collection_set(storage, element_type, range, destination, item)
-            {
-                self.release_typed_collection(storage, range);
+        let range = self.claim_typed_collection(source.storage, length)?;
+        for (destination, source_index) in (start..end).enumerate() {
+            let item = self.typed_collection_get(
+                source.storage,
+                source.element_type,
+                source.range,
+                source_index,
+            )?;
+            if let Err(error) = self.typed_collection_set(
+                source.storage,
+                source.element_type,
+                range,
+                destination,
+                item,
+            ) {
+                self.release_typed_collection(source.storage, range);
                 return Err(error);
             }
         }
-        match self.commit_buffer_reserved(&mut heap, type_id, element_type, storage, range) {
+        match self.commit_buffer_reserved(
+            &mut heap,
+            source.type_id,
+            source.element_type,
+            source.storage,
+            range,
+        ) {
             Ok(value) => Ok(value),
             Err(error) => {
-                self.release_typed_collection(storage, range);
+                self.release_typed_collection(source.storage, range);
                 Err(error)
             }
         }
@@ -3989,22 +4006,20 @@ impl Heap {
         destination_start: usize,
         length: usize,
     ) -> Result<(), HeapError> {
-        self.validate_buffer_copy(destination, source, source_start, destination_start, length)?;
-        let destination_metadata = self.buffer_metadata(destination)?;
-        let source_end =
-            checked_collection_end(source_start, length, self.buffer_range(source)?.1.length)?;
-        let destination_end = checked_collection_end(
+        let destination = self.buffer_parts(destination)?;
+        let source = self.buffer_parts(source)?;
+        let (source_end, destination_end) = validate_buffer_parts_copy(
+            destination,
+            source,
+            source_start,
             destination_start,
             length,
-            self.buffer_range(destination)?.1.length,
         )?;
-        let (_, source_range) = self.buffer_range(source)?;
-        let (_, destination_range) = self.buffer_range(destination)?;
-        let source_absolute = source_range.start + source_start;
-        let destination_absolute = destination_range.start + destination_start;
+        let source_absolute = source.range.start + source_start;
+        let destination_absolute = destination.range.start + destination_start;
         let copied = source_end - source_start;
-        let element_type = destination_metadata.1;
-        let storage = destination_metadata.2;
+        let element_type = destination.element_type;
+        let storage = destination.storage;
         let element_bytes = storage.cell_size();
         self.counters.collection_relocation_bytes = self
             .counters
@@ -4036,7 +4051,7 @@ impl Heap {
         if self.gc_phase == GcPhase::Mark {
             for offset in 0..(source_end - source_start) {
                 if let Some(value) = self
-                    .typed_collection_view(storage, element_type, destination_range)?
+                    .typed_collection_view(storage, element_type, destination.range)?
                     .get(destination_start + offset)
                 {
                     self.shade_on_write(value);
@@ -4055,42 +4070,13 @@ impl Heap {
         destination_start: usize,
         length: usize,
     ) -> Result<(), HeapError> {
-        if self.buffer_metadata(source)? != self.buffer_metadata(destination)? {
-            return Err(invalid_value_reference());
-        }
-        checked_collection_end(source_start, length, self.buffer_range(source)?.1.length)?;
-        checked_collection_end(
-            destination_start,
-            length,
-            self.buffer_range(destination)?.1.length,
-        )?;
+        let destination = self.buffer_parts(destination)?;
+        let source = self.buffer_parts(source)?;
+        validate_buffer_parts_copy(destination, source, source_start, destination_start, length)?;
         Ok(())
     }
 
-    fn buffer_metadata(
-        &self,
-        value: RuntimeValue,
-    ) -> Result<(StableId, nexa_bytecode::ValueType, CollectionStorage), HeapError> {
-        let RuntimeValue::NamedRef { type_id, .. } = value else {
-            return Err(invalid_value_reference());
-        };
-        let RuntimeValue::NamedRef { reference, .. } = value else {
-            unreachable!("named reference checked")
-        };
-        match self.resolve(reference)? {
-            Object::Buffer {
-                type_id: actual,
-                element_type,
-                storage,
-                ..
-            } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                Ok((type_id, *element_type, *storage))
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
-        }
-    }
-
-    fn buffer_range(&self, value: RuntimeValue) -> Result<(GcRef, CollectionRange), HeapError> {
+    fn buffer_parts(&self, value: RuntimeValue) -> Result<BufferParts, HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
@@ -4098,10 +4084,15 @@ impl Heap {
             Object::Buffer {
                 type_id: actual,
                 element_type,
+                storage,
                 range,
-                ..
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                Ok((reference, *range))
+                Ok(BufferParts {
+                    type_id,
+                    element_type: *element_type,
+                    storage: *storage,
+                    range: *range,
+                })
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -4275,11 +4266,20 @@ impl Heap {
         // (a pending rehash publishes nothing yet) but always safe.
         self.shade_on_write(key);
         self.shade_on_write(replacement);
+        // Resolve and validate the public map handle once. The previous
+        // implementation repeatedly walked heap slot -> map arena for every
+        // branch below, even though neither identity can change during one
+        // synchronous insertion.
+        let storage = self.map_storage_index(value)?;
         // A retry resumes only the bounded rehash chunk. Looking up the key
         // again here would repeat an entire map scan on every retry and make
         // deterministic attempt-based fuel either free or overcharged.
-        if self.map(value)?.rehash.is_some() {
-            let storage = self.map_storage_index(value)?;
+        if self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists")
+            .rehash
+            .is_some()
+        {
             let released = progress_map_rehash(
                 self.maps[storage]
                     .as_mut()
@@ -4293,11 +4293,12 @@ impl Heap {
 
         let hash = self.runtime_value_hash(key)?;
         let location = {
-            let map = self.map(value)?;
+            let map = self.maps[storage]
+                .as_ref()
+                .expect("validated map storage exists");
             self.find_map_entry(map, key, hash)?
         };
         if let Some(location) = location {
-            let storage = self.map_storage_index(value)?;
             let map = self.maps[storage]
                 .as_ref()
                 .expect("validated map storage exists");
@@ -4309,16 +4310,19 @@ impl Heap {
             return Ok(MapSetOutcome::Complete);
         }
 
-        if self.map(value)?.length >= self.max_collection_length {
+        let map = self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists");
+        if map.length >= self.max_collection_length {
             return Err(HeapError::CollectionTooLarge {
-                length: self.map(value)?.length.saturating_add(1),
+                length: map.length.saturating_add(1),
                 max_length: self.max_collection_length,
             });
         }
-        if map_needs_rehash(self.map(value)?) {
-            let old_capacity = self.map(value)?.slots.length;
-            let new_capacity = next_map_capacity(self.map(value)?, self.max_collection_length)
-                .expect("map needs rehash");
+        if map_needs_rehash(map) {
+            let old_capacity = map.slots.length;
+            let new_capacity =
+                next_map_capacity(map, self.max_collection_length).expect("map needs rehash");
             if new_capacity > old_capacity {
                 let entry_bytes = size_of::<Option<MapEntry>>() as u64;
                 // G6 admission and charge: the new slot vector joins the
@@ -4335,7 +4339,6 @@ impl Heap {
                     .counters
                     .map_slot_allocations
                     .saturating_add(new_capacity as u64);
-                let storage = self.map_storage_index(value)?;
                 let map = self.maps[storage]
                     .as_mut()
                     .expect("validated map storage exists");
@@ -4356,7 +4359,6 @@ impl Heap {
             hash,
         };
         self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
-        let storage = self.map_storage_index(value)?;
         let range = self.maps[storage]
             .as_ref()
             .expect("validated map storage exists")
@@ -5328,6 +5330,28 @@ impl Heap {
     fn validate_reference(&self, reference: GcRef) -> Result<(), HeapError> {
         self.resolve(reference).map(|_| ())
     }
+}
+
+fn validate_buffer_parts_copy(
+    destination: BufferParts,
+    source: BufferParts,
+    source_start: usize,
+    destination_start: usize,
+    length: usize,
+) -> Result<(usize, usize), HeapError> {
+    if (source.type_id, source.element_type, source.storage)
+        != (
+            destination.type_id,
+            destination.element_type,
+            destination.storage,
+        )
+    {
+        return Err(invalid_value_reference());
+    }
+    let source_end = checked_collection_end(source_start, length, source.range.length)?;
+    let destination_end =
+        checked_collection_end(destination_start, length, destination.range.length)?;
+    Ok((source_end, destination_end))
 }
 
 fn checked_collection_end(
