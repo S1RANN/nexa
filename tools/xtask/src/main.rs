@@ -414,6 +414,7 @@ fn main() -> Result<(), DynError> {
         "test-incremental-gc" => test_incremental_gc(),
         "test-source-cache" => test_source_cache(),
         "test-artifact-cache" => test_artifact_cache(),
+        "test-runtime-fast-paths" => test_runtime_fast_paths(),
         "m5-final-report" => m5_final_report(),
         "m5-v8-comparison" => m5_v8_comparison(),
         "m5-performance-regression" => m5_performance_regression(),
@@ -529,6 +530,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_incremental_gc()?;
     test_source_cache()?;
     test_artifact_cache()?;
+    test_runtime_fast_paths()?;
     cargo(&[
         "run",
         "--release",
@@ -1486,6 +1488,20 @@ fn test_source_cache() -> Result<(), DynError> {
 /// enforces its byte budget.
 fn test_artifact_cache() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-compiler", "--test", "artifact_cache"])
+}
+
+/// M5 stage-H gate: the WP89 immediate entrypoint settles with no Task,
+/// scheduler token, or tombstone, and the H1 continuation pool feeds
+/// steady-state admissions.
+fn test_runtime_fast_paths() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "immediate_entrypoint",
+    ])?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "continuation_pool"])
 }
 
 /// M5 stage-J: produces the decision artifacts named by

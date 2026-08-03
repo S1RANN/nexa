@@ -2833,6 +2833,80 @@ impl RealmRuntime {
         }
     }
 
+    /// WP89: calls an `@immediate` export straight through the predecoded
+    /// interpreter. Fuel, traps, the script source stack, permissions,
+    /// and GC roots apply exactly as on the Task path, but no Task,
+    /// scheduler token, or tombstone is ever created: the continuation
+    /// storage cycles through the realm pool (H1) and the call settles in
+    /// one poll. Only exports declared `@immediate` qualify; every other
+    /// effect keeps the full lifecycle path.
+    pub fn call_export_immediate<E: crate::ScriptExport>(
+        &mut self,
+        module: ModuleHandle,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
+        let function = self.resolve_export_index::<E>(module)?;
+        if E::effect() != FunctionEffect::Immediate {
+            return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
+        }
+        let requirements = E::argument_requirements(args)?;
+        let values = {
+            let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+            let values = E::encode_args(&mut writer, args)?;
+            writer
+                .commit_arguments(values)
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?
+        };
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(|error| crate::ScriptCallError::Runtime(format!("{error:?}")))?;
+        let verified = Arc::clone(&loaded.verified);
+        let executable = Arc::clone(&loaded.executable);
+        let limits = crate::TaskLimits::default();
+        let reservation = reservation_for_module(&verified, limits.frames);
+        let continuation = crate::InterpreterContinuation::new_with_storage(
+            &verified,
+            function,
+            &values,
+            limits.frames,
+            reservation,
+            self.continuation_pool.pop(),
+        )
+        .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))?;
+        let mut recycled = None;
+        let outcome = crate::CheckedInterpreter::poll_recycling(
+            &verified,
+            continuation,
+            FuelState::new(policy.fuel, 0, policy.cumulative_budget),
+            &self.cost_table,
+            Some(&mut self.heap),
+            Some(&executable),
+            &mut recycled,
+        );
+        if let Some(storage) = recycled {
+            self.recycle_continuation_storage(storage);
+        }
+        match outcome.map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))? {
+            InterpreterOutcome::Returned { value, charge, .. } => {
+                let reader = crate::ScriptOutputReader::new(&self.heap);
+                let output = E::decode_output(&reader, value.unwrap_or(crate::RuntimeValue::Unit))?;
+                Ok((output, charge))
+            }
+            InterpreterOutcome::Trapped { trap, .. } => {
+                Err(crate::ScriptCallError::HandlerTrapped(Box::new(trap)))
+            }
+            // The verifier rejects suspension points inside Immediate
+            // functions; this arm is a defensive seal, not a reachable
+            // path.
+            InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
+                Err(crate::ScriptCallError::HandlerDidNotComplete)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn poll_task_raw(
         &mut self,

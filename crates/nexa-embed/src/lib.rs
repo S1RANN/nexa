@@ -2934,12 +2934,19 @@ impl NexaEngine {
             EngineError::InvalidState(manifest.id.clone(), PackageStatus::Enabled)
         })?;
         record.handler_calls_this_tick = record.handler_calls_this_tick.saturating_add(1);
-        match runtime.realm.call_export_metered::<E>(
-            runtime.module,
-            runtime.root_scope,
-            args,
-            policy,
-        ) {
+        // WP89: `@immediate` exports skip the Task/scheduler/tombstone
+        // lifecycle entirely (the realm settles them in one predecoded
+        // poll); every other effect keeps the metered Task path.
+        let called = if E::effect() == nexa_runtime::FunctionEffect::Immediate {
+            runtime
+                .realm
+                .call_export_immediate::<E>(runtime.module, args, policy)
+        } else {
+            runtime
+                .realm
+                .call_export_metered::<E>(runtime.module, runtime.root_scope, args, policy)
+        };
+        match called {
             Ok((value, charge)) => {
                 record.handler_instructions_this_tick = record
                     .handler_instructions_this_tick
