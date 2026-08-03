@@ -3073,7 +3073,7 @@ impl CheckedInterpreter {
                                 },
                                 call_site_pc: frame.pc,
                                 args_base,
-                                args_count,
+                                args_slots: args_count,
                                 abi,
                             })?;
                     } else {
@@ -3082,25 +3082,13 @@ impl CheckedInterpreter {
                             .functions
                             .get(callee_id as usize)
                             .ok_or(InterpreterError::MissingFunction(callee_id))?;
-                        if usize::from(args_count) != callee.signature.parameters.len() {
-                            return Err(InterpreterError::ArgumentCount);
-                        }
-                        for (offset, expected) in
-                            (0..args_count).zip(callee.signature.parameters.iter().copied())
-                        {
-                            let argument = args_base
-                                .checked_add(offset)
-                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-                            if runtime_value_type(register(&continuation.arena, argument)?)
-                                != Some(expected)
-                            {
-                                return Err(InterpreterError::TypeMismatch);
-                            }
-                        }
                         let abi = module
                             .module_abi()
                             .function(callee_id as usize)
                             .ok_or(InterpreterError::TypeMismatch)?;
+                        if args_count != abi.parameter_slots {
+                            return Err(InterpreterError::ArgumentCount);
+                        }
                         let result_slots =
                             abi.result.as_ref().map_or(0, |result| result.slot_count);
                         continuation
@@ -3114,7 +3102,7 @@ impl CheckedInterpreter {
                                 },
                                 call_site_pc: frame.pc,
                                 args_base,
-                                args_count,
+                                args_slots: args_count,
                                 abi,
                             })?;
                     }
@@ -6182,6 +6170,15 @@ fn work() -> i32 {
                 .map(|result| result.slot_count),
             Some(2)
         );
+        let call_slots = module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter_map(|instruction| match instruction {
+                Instruction::Call { args_count, .. } => Some(*args_count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_slots, [2, 3]);
 
         let mut portable_heap = Heap::new_with_limits(64, 4_096, 64);
         let portable =

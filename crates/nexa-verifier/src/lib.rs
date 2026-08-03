@@ -1842,16 +1842,17 @@ fn verify_function(
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
-                if usize::from(args_count) != callee.signature.parameters.len() {
+                if args_count != callee_abi.parameter_slots {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
-                for (argument, ty) in callee.signature.parameters.iter().copied().enumerate() {
-                    let argument = args_base
-                        .checked_add(u16::try_from(argument).unwrap())
-                        .ok_or_else(|| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?;
-                    require(&state, argument, ty)?;
+                for parameter in &callee_abi.parameters {
+                    let argument =
+                        args_base
+                            .checked_add(parameter.slot_offset)
+                            .ok_or_else(|| {
+                                error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                            })?;
+                    require(&state, argument, parameter.logical_type)?;
                 }
                 resolved_operands[pc] = ResolvedNominalOperand::CallFrame {
                     register_count: callee.registers,
@@ -3993,7 +3994,7 @@ mod tests {
             .emit(Instruction::Call {
                 function: 0,
                 args_base: 0,
-                args_count: 1,
+                args_count: 2,
                 dst: 2,
             })
             .emit(Instruction::Return { source: 2 });

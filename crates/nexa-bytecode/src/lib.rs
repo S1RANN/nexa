@@ -1224,7 +1224,10 @@ pub enum Instruction {
     },
     Call {
         function: u32,
+        /// Base of the caller-owned packed physical argument range.
         args_base: u16,
+        /// Exact physical slot width of that range. Logical arity is the
+        /// callee signature length and is not duplicated in the instruction.
         args_count: u16,
         dst: u16,
     },

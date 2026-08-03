@@ -185,7 +185,7 @@ pub(crate) struct VerifiedCallPlan<'abi> {
     pub return_range: ReturnRange,
     pub call_site_pc: u32,
     pub args_base: u16,
-    pub args_count: u16,
+    pub args_slots: u16,
     pub abi: &'abi nexa_bytecode::layout::FunctionAbi,
 }
 
@@ -423,11 +423,10 @@ impl FrameArena {
         Ok(())
     }
 
-    /// Pushes a bytecode-v7 call whose logical arguments occupy a compact
-    /// caller staging window and scatters their base values to the
-    /// verifier-derived physical parameter offsets. Aggregate continuation
-    /// slots are initialized to `Unit` until their fully flattened lowering
-    /// replaces the transitional base carrier.
+    /// Pushes a bytecode-v7 call whose arguments already occupy the exact
+    /// packed physical ABI range in the caller. Caller and callee use the
+    /// same verifier-derived offsets, so the complete range is copied once;
+    /// aggregate continuation slots are never synthesized or discarded.
     pub(crate) fn push_verified_abi_call(
         &mut self,
         plan: VerifiedCallPlan<'_>,
@@ -438,7 +437,7 @@ impl FrameArena {
             return_range,
             call_site_pc,
             args_base,
-            args_count,
+            args_slots,
             abi,
         } = plan;
         let caller_index = self
@@ -450,10 +449,10 @@ impl FrameArena {
         let caller_next_pc = call_site_pc
             .checked_add(1)
             .ok_or(FrameError::RegisterOutOfRange)?;
-        if usize::from(args_count) != abi.parameters.len()
+        if args_slots != abi.parameter_slots
             || abi.parameter_slots > register_count
             || args_base
-                .checked_add(args_count)
+                .checked_add(args_slots)
                 .is_none_or(|end| end > caller.register_count)
             || return_range.slots == 0
             || return_range
@@ -482,14 +481,11 @@ impl FrameArena {
             .last()
             .expect("the verified ABI frame was just pushed")
             .register_start as usize;
-        for (argument, parameter) in (0..args_count).zip(&abi.parameters) {
-            let source =
-                self.registers[source_frame_start + usize::from(args_base) + usize::from(argument)];
-            let start = target_frame_start + usize::from(parameter.slot_offset);
-            let end = start + usize::from(parameter.slot_count);
-            self.registers[start..end].fill(RuntimeValue::Unit);
-            self.registers[start] = source;
-        }
+        let source_start = source_frame_start + usize::from(args_base);
+        let source_end = source_start + usize::from(args_slots);
+        let target_start = target_frame_start;
+        self.registers
+            .copy_within(source_start..source_end, target_start);
         self.frames[caller_index].pc = caller_next_pc;
         Ok(())
     }
@@ -927,7 +923,7 @@ mod tests {
                 return_range: ReturnRange::scalar(3),
                 call_site_pc: 5,
                 args_base: 1,
-                args_count: 2,
+                args_slots: 2,
                 abi: &abi,
             })
             .unwrap();
@@ -946,7 +942,7 @@ mod tests {
                 return_range: ReturnRange::scalar(3),
                 call_site_pc: 6,
                 args_base: 0,
-                args_count: 2,
+                args_slots: 2,
                 abi: &abi,
             }),
             Err(FrameError::RegisterOutOfRange)
@@ -963,6 +959,7 @@ mod tests {
         arena.push(1, 8).unwrap();
         arena.set_register(1, RuntimeValue::I64(11)).unwrap();
         arena.set_register(2, RuntimeValue::I64(13)).unwrap();
+        arena.set_register(3, RuntimeValue::I64(15)).unwrap();
         arena
             .push_verified_abi_call(VerifiedCallPlan {
                 function: 2,
@@ -970,13 +967,13 @@ mod tests {
                 return_range: ReturnRange { start: 4, slots: 2 },
                 call_site_pc: 7,
                 args_base: 1,
-                args_count: 2,
+                args_slots: 3,
                 abi: &abi,
             })
             .unwrap();
         assert_eq!(arena.register(0), Ok(RuntimeValue::I64(11)));
-        assert_eq!(arena.register(1), Ok(RuntimeValue::Unit));
-        assert_eq!(arena.register(2), Ok(RuntimeValue::I64(13)));
+        assert_eq!(arena.register(1), Ok(RuntimeValue::I64(13)));
+        assert_eq!(arena.register(2), Ok(RuntimeValue::I64(15)));
         arena.set_register(3, RuntimeValue::I64(17)).unwrap();
         arena.set_register(4, RuntimeValue::I64(19)).unwrap();
 

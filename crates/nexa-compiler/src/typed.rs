@@ -4508,22 +4508,20 @@ impl<'a> FunctionEmitter<'a> {
                 let function = *self.function_indices.get(callee).ok_or_else(|| {
                     CompileError::unknown_name(self.definition_name(*callee), span)
                 })?;
-                let args_base = self.reserve_arguments(arguments)?;
-                for (offset, argument) in arguments.iter().enumerate() {
-                    let register =
-                        args_base
-                            .checked_add(u16::try_from(offset).map_err(|_| {
-                                CompileError::too_many_registers(self.function_span)
-                            })?)
-                            .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+                let (args_base, argument_registers, argument_slots) =
+                    self.reserve_physical_arguments(arguments)?;
+                for (argument, register) in arguments.iter().zip(argument_registers) {
                     self.emit_expression(argument, register)?;
                 }
                 self.push(
                     Instruction::Call {
                         function,
                         args_base,
-                        args_count: u16::try_from(arguments.len())
-                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        // Bytecode v7 counts the exact packed physical
+                        // argument range. Logical arity remains available
+                        // from the callee signature and is independently
+                        // checked by the verifier.
+                        args_count: argument_slots,
                         dst: destination,
                     },
                     span,
@@ -6882,6 +6880,30 @@ impl<'a> FunctionEmitter<'a> {
             self.allocate_staging(ty)?;
         }
         Ok(base)
+    }
+
+    /// Reserves the packed physical ABI range of an ordinary Nexa call.
+    ///
+    /// Unlike Host, standard-intrinsic, and persistent-storage staging
+    /// windows, every logical argument here owns its complete `ValueLayout`
+    /// range. The returned register list contains each logical base while
+    /// `slots` is the exact contiguous width encoded in `Call.args_count`.
+    fn reserve_physical_arguments(
+        &mut self,
+        arguments: &[TypedExpressionIr],
+    ) -> Result<(u16, Vec<u16>, u16), CompileError> {
+        let base = u16::try_from(self.register_types.len())
+            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
+        let mut registers = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            registers.push(self.allocate_expression(argument)?);
+        }
+        let end = u16::try_from(self.register_types.len())
+            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
+        let slots = end
+            .checked_sub(base)
+            .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+        Ok((base, registers, slots))
     }
 
     fn reserve_types(&mut self, types: &[ValueType]) -> Result<u16, CompileError> {
