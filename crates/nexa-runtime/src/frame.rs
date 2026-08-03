@@ -616,6 +616,17 @@ mod tests {
     use crate::GcRef;
 
     #[test]
+    fn register_slot_footprint_is_pinned() {
+        // K4 baseline pin: every register and collection cell currently
+        // carries the full 40-byte tagged RuntimeValue enum, even when it
+        // holds one i32. The RawSlot arc shrinks this footprint
+        // deliberately; any change to this number must be a conscious
+        // layout decision, never an accident.
+        assert_eq!(std::mem::size_of::<RuntimeValue>(), 40);
+        assert_eq!(std::mem::size_of::<Option<RuntimeValue>>(), 40);
+    }
+
+    #[test]
     fn frame_limits_fail_before_mutation_and_pop_restores_segments() {
         let mut arena = FrameArena::new(FrameLimits {
             max_frame_bytes: 2 * std::mem::size_of::<RuntimeValue>(),
