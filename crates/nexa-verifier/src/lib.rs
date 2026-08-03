@@ -1112,6 +1112,7 @@ const fn collection_instruction_requires_heap(instruction: Instruction) -> bool 
             | Instruction::ArrayFieldGet { .. }
             | Instruction::ArraySet { .. }
             | Instruction::ArrayPush { .. }
+            | Instruction::ArrayPushRow { .. }
             | Instruction::ArrayPop { .. }
             | Instruction::ArrayInsert { .. }
             | Instruction::ArrayRemove { .. }
@@ -1243,6 +1244,7 @@ fn verify_function(
                 | Instruction::ArrayFieldGet { .. }
                 | Instruction::ArraySet { .. }
                 | Instruction::ArrayPush { .. }
+                | Instruction::ArrayPushRow { .. }
                 | Instruction::ArrayPop { .. }
                 | Instruction::ArrayInsert { .. }
                 | Instruction::ArrayRemove { .. }
@@ -2075,6 +2077,35 @@ fn verify_function(
                 let element = array_element(&state, source)?;
                 require(&state, value, element)?;
             }
+            Instruction::ArrayPushRow {
+                source,
+                fields_base,
+                fields_count,
+            } => {
+                // WP52 push-side fusion: the register range must carry the
+                // element struct's declared fields, in order.
+                let element = array_element(&state, source)?;
+                let ValueType::Named(type_id) = element else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let struct_type = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                if usize::from(fields_count) != struct_type.fields.len() {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                for (offset, field) in struct_type.fields.iter().enumerate() {
+                    let register = fields_base
+                        .checked_add(
+                            u16::try_from(offset)
+                                .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                        )
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                    require(&state, register, field.ty)?;
+                }
+            }
             Instruction::ArrayPop { source, dst } => {
                 let element = array_element(&state, source)?;
                 state[register(dst)?] = Some(element);
@@ -2589,6 +2620,15 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         Instruction::StructWith { source, value, .. }
         | Instruction::ClassSet { source, value, .. }
         | Instruction::ArrayPush { source, value } => vec![source, value],
+        Instruction::ArrayPushRow {
+            source,
+            fields_base,
+            fields_count,
+        } => {
+            let mut reads = range(fields_base, fields_count);
+            reads.push(source);
+            reads
+        }
         Instruction::ArraySet {
             source,
             index,
@@ -2754,6 +2794,7 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::ClassSet { .. }
         | Instruction::ArraySet { .. }
         | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPushRow { .. }
         | Instruction::ArrayInsert { .. }
         | Instruction::ArrayClear { .. }
         | Instruction::MapSet { .. }
@@ -2814,6 +2855,7 @@ fn instruction_requires_safepoint(
                 | Instruction::ArrayFieldGet { .. }
                 | Instruction::ArraySet { .. }
                 | Instruction::ArrayPush { .. }
+                | Instruction::ArrayPushRow { .. }
                 | Instruction::ArrayPop { .. }
                 | Instruction::ArrayInsert { .. }
                 | Instruction::ArrayRemove { .. }

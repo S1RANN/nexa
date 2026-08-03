@@ -1306,6 +1306,14 @@ pub enum Instruction {
         source: u16,
         value: u16,
     },
+    /// WP52: pushes one struct element built from a contiguous register
+    /// range - flattened rows receive the fields directly, so no source
+    /// struct object is ever materialized on the push path.
+    ArrayPushRow {
+        source: u16,
+        fields_base: u16,
+        fields_count: u16,
+    },
     ArrayPop {
         source: u16,
         dst: u16,
@@ -3490,6 +3498,16 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, field);
             put_u16(output, dst);
         }
+        Instruction::ArrayPushRow {
+            source,
+            fields_base,
+            fields_count,
+        } => {
+            output.push(108);
+            put_u16(output, source);
+            put_u16(output, fields_base);
+            put_u16(output, fields_count);
+        }
         Instruction::ArraySet {
             source,
             index,
@@ -4150,6 +4168,11 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             field: reader.u16()?,
             dst: reader.u16()?,
         },
+        108 => Instruction::ArrayPushRow {
+            source: reader.u16()?,
+            fields_base: reader.u16()?,
+            fields_count: reader.u16()?,
+        },
         71 => Instruction::ArraySet {
             source: reader.u16()?,
             index: reader.u16()?,
@@ -4668,6 +4691,7 @@ impl FunctionBuilder {
                         | Instruction::ArrayFieldGet { .. }
                         | Instruction::ArraySet { .. }
                         | Instruction::ArrayPush { .. }
+                        | Instruction::ArrayPushRow { .. }
                         | Instruction::ArrayPop { .. }
                         | Instruction::ArrayInsert { .. }
                         | Instruction::ArrayRemove { .. }

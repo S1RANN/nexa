@@ -2078,7 +2078,49 @@ impl Heap {
             return self.set_array_length(parts.reference, length);
         };
         let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
-        for field in &row[..stride] {
+        self.push_row_cells(parts, length, &row[..stride])
+    }
+
+    /// WP52 push-side fusion: pushes one struct element built directly
+    /// from `fields` (declared order). Flattened rows receive the fields
+    /// with no source object; cell-layout arrays (host-decoded) fall back
+    /// to exactly the unfused materialize-then-push path.
+    pub fn array_push_row(
+        &mut self,
+        value: RuntimeValue,
+        fields: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        let length = parts
+            .length
+            .checked_add(1)
+            .ok_or(HeapError::CollectionTooLarge {
+                length: usize::MAX,
+                max_length: self.max_collection_length,
+            })?;
+        self.validate_collection_length(length)?;
+        let Some(stride) = parts.rows() else {
+            let element = self.allocate_struct(parts.element_struct_type()?, fields)?;
+            return self.array_push(value, element);
+        };
+        if fields.len() != stride {
+            return Err(invalid_value_reference());
+        }
+        self.push_row_cells(parts, length, fields)
+    }
+
+    /// Shared row-append tail for [`Self::array_push`] and
+    /// [`Self::array_push_row`]: shades every stored field, then writes in
+    /// place or grows row-aligned (WP49 amortized).
+    fn push_row_cells(
+        &mut self,
+        parts: ArrayParts,
+        length: usize,
+        row: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let stride = row.len();
+        let current = parts.length;
+        for field in row {
             self.shade_on_write(*field);
         }
         let needed_cells = length
@@ -2087,7 +2129,7 @@ impl Heap {
         if needed_cells <= parts.range.length {
             // WP49 amortized fast path: spare row capacity, write in place.
             self.collections.values_mut(parts.range)?[current * stride..needed_cells]
-                .copy_from_slice(&row[..stride]);
+                .copy_from_slice(row);
             self.set_array_length(parts.reference, length)?;
             return Ok(());
         }
@@ -2105,7 +2147,7 @@ impl Heap {
             current * stride,
             capacity_cells,
             |values| {
-                values[current * stride..(current + 1) * stride].copy_from_slice(&row[..stride]);
+                values[current * stride..(current + 1) * stride].copy_from_slice(row);
             },
         )?;
         self.set_array_length(parts.reference, length)

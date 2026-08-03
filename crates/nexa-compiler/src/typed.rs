@@ -537,6 +537,9 @@ struct FunctionEmitter<'a> {
     /// Inlined enum locals: statically known variant plus the optional
     /// payload register (M5 stage-C enum slice).
     inline_enums: BTreeMap<DefinitionId, (DefinitionId, Option<u16>)>,
+    /// Whether the M5 optimized emission profile is active; the WP36
+    /// reference pipeline keeps every fused form disabled.
+    optimize: bool,
     register_types: Vec<Option<ValueType>>,
     parameter_count: usize,
     function_effect: IrEffect,
@@ -2760,6 +2763,7 @@ impl<'a> FunctionEmitter<'a> {
             locals,
             inline_structs,
             inline_enums,
+            optimize,
             register_types,
             parameter_count: function.parameters.len(),
             function_effect: function.effect,
@@ -4300,6 +4304,70 @@ impl<'a> FunctionEmitter<'a> {
             IrEffect::Migration | IrEffect::Cleanup
         ) {
             return Err(CompileError::invalid_effect(span));
+        }
+
+        // WP52 push-side fusion: a struct literal pushed into an array
+        // writes its fields straight into the element row - no StructNew,
+        // no source object. Evaluation order matches the unfused pipeline
+        // exactly: the array first, then every field in declared layout
+        // order (the same order the construct emission uses).
+        if self.optimize
+            && matches!(operation, BuiltinOperationIr::ArrayPush)
+            && arguments.len() == 2
+            && let TypedExpressionKind::Construct {
+                definition: owner,
+                fields,
+                ..
+            } = &arguments[1].kind
+            && let Some(layout) = self.layouts.aggregates.get(owner).cloned()
+            && layout.kind == TypedAggregateKind::Struct
+        {
+            let source = self.allocate_expression(&arguments[0])?;
+            self.emit_expression(&arguments[0], source)?;
+            let values = fields
+                .iter()
+                .map(|(field, value)| (*field, value))
+                .collect::<BTreeMap<_, _>>();
+            if values.len() != fields.len() || values.len() != layout.fields.len() {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            let field_types = layout
+                .fields
+                .iter()
+                .map(|field| field.ty)
+                .collect::<Vec<_>>();
+            let fields_base = self.reserve_types(&field_types)?;
+            for (offset, field) in layout.fields.iter().enumerate() {
+                let value = values
+                    .get(&field.definition)
+                    .copied()
+                    .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
+                let register = fields_base
+                    .checked_add(
+                        u16::try_from(offset)
+                            .map_err(|_| CompileError::too_many_registers(span))?,
+                    )
+                    .ok_or_else(|| CompileError::too_many_registers(span))?;
+                self.emit_expression(value, register)?;
+            }
+            let fields_count = u16::try_from(layout.fields.len())
+                .map_err(|_| CompileError::too_many_registers(span))?;
+            self.push(
+                Instruction::ArrayPushRow {
+                    source,
+                    fields_base,
+                    fields_count,
+                },
+                span,
+            );
+            self.push(
+                Instruction::LoadBool {
+                    dst: destination,
+                    value: true,
+                },
+                span,
+            );
+            return Ok(());
         }
 
         let args_base = self.reserve_arguments(arguments)?;
@@ -6500,6 +6568,15 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         Instruction::StructWith { source, value, .. }
         | Instruction::ClassSet { source, value, .. }
         | Instruction::ArrayPush { source, value } => vec![source, value],
+        Instruction::ArrayPushRow {
+            source,
+            fields_base,
+            fields_count,
+        } => {
+            let mut reads = range(fields_base, fields_count);
+            reads.push(source);
+            reads
+        }
         Instruction::ArraySet {
             source,
             index,
@@ -6659,6 +6736,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::ClassSet { .. }
         | Instruction::ArraySet { .. }
         | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPushRow { .. }
         | Instruction::ArrayInsert { .. }
         | Instruction::ArrayClear { .. }
         | Instruction::MapSet { .. }
@@ -9546,6 +9624,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::ArrayFieldGet { .. }
                     | Instruction::ArraySet { .. }
                     | Instruction::ArrayPush { .. }
+                    | Instruction::ArrayPushRow { .. }
                     | Instruction::ArrayPop { .. }
                     | Instruction::ArrayInsert { .. }
                     | Instruction::ArrayRemove { .. }

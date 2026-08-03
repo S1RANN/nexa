@@ -350,6 +350,29 @@ fn reference_pipeline_actually_disables_the_optimizations() {
         0,
         "reference pipeline keeps the materializing array get"
     );
+    // WP52 push side: the pushed struct literal fuses into ArrayPushRow,
+    // so the optimized row_projection body materializes no struct at all.
+    let push_rows = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::ArrayPushRow { .. }))
+            .count()
+    };
+    assert!(
+        push_rows(&optimized, ROW_PROJECTION) > 0,
+        "optimized pipeline pushes struct literals as rows"
+    );
+    assert_eq!(
+        push_rows(&reference, ROW_PROJECTION),
+        0,
+        "reference pipeline keeps the materializing push"
+    );
+    assert_eq!(
+        materializations(&optimized, ROW_PROJECTION),
+        0,
+        "the fused row workload emits no StructNew anywhere"
+    );
     // WP37/WP38: constant folding shortens the arithmetic chain, so the
     // optimized body must be strictly smaller. If this ever fails the
     // reference switch is wired wrong and the gate is comparing a pipeline

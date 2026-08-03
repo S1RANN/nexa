@@ -491,7 +491,7 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 108],
+    costs: [u16; 109],
 }
 
 impl Default for OpcodeCostTable {
@@ -2469,6 +2469,28 @@ impl CheckedInterpreter {
                         .array_push(array, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::ArrayPushRow {
+                    source,
+                    fields_base,
+                    fields_count,
+                } => {
+                    // WP52 push-side fusion: the element's fields flow from
+                    // their registers straight into the row storage.
+                    let array = register(&continuation.arena, source)?;
+                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+                    for index in 0..fields_count {
+                        fields[usize::from(index)] = register(
+                            &continuation.arena,
+                            fields_base
+                                .checked_add(index)
+                                .ok_or(InterpreterError::TypeMismatch)?,
+                        )?;
+                    }
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .array_push_row(array, &fields[..usize::from(fields_count)])?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::ArrayPop { source, dst } => {
                     let array = register(&continuation.arena, source)?;
                     let value = array_operation!(
@@ -2954,6 +2976,7 @@ pub(crate) fn static_instruction_fuel(
         | Instruction::EnumEqual { .. }
         | Instruction::StructEqual { .. }
         | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPushRow { .. }
         | Instruction::ArrayInsert { .. }
         | Instruction::ArrayPop { .. }
         | Instruction::ArrayRemove { .. }
@@ -3105,6 +3128,29 @@ pub(crate) fn dynamic_instruction_fuel(
             fuel_add(
                 element_work,
                 collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+            )?
+        }
+        Instruction::ArrayPushRow {
+            source,
+            fields_base,
+            fields_count,
+        } => {
+            // WP52: the fused push settles the same growth shape as
+            // ArrayPush plus the structural-hash work the replaced
+            // StructNew would have charged, so the fused sequence stays in
+            // the same fuel regime as the unfused one.
+            let heap = heap_required()?;
+            let array = register(arena, source)?;
+            let (live, capacity) = heap.array_fuel_shape(array)?;
+            let moved = if live < capacity { 1 } else { live.max(1) };
+            let element_work =
+                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            fuel_add(
+                fuel_add(
+                    element_work,
+                    collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+                )?,
+                register_structural_hash_fuel(arena, heap, fields_base, fields_count)?,
             )?
         }
         Instruction::ArrayInsert { source, .. } => {
@@ -4095,6 +4141,7 @@ pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::ArrayFieldGet { .. }
         | Instruction::ArraySet { .. }
         | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPushRow { .. }
         | Instruction::ArrayPop { .. }
         | Instruction::ArrayInsert { .. }
         | Instruction::ArrayRemove { .. }
@@ -4166,13 +4213,13 @@ macro_rules! define_opcode_cost_schedule {
             }
         ),+ $(,)?
     ) => {
-        const DEFAULT_OPCODE_COSTS: [u16; 108] = [$($base_cost),+];
+        const DEFAULT_OPCODE_COSTS: [u16; 109] = [$($base_cost),+];
 
         /// Stable opcode display names indexed by `opcode_index` (WP15).
-        pub(crate) const OPCODE_NAMES: [&str; 108] = [$($name),+];
+        pub(crate) const OPCODE_NAMES: [&str; 109] = [$($name),+];
 
         #[cfg(test)]
-        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 108] = [
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 109] = [
             $(
                 OpcodeCostScheduleEntry {
                     index: $index,
@@ -4498,6 +4545,12 @@ define_opcode_cost_schedule! {
         dynamic_work: "lhs_recursive_enum_comparison_shape"
     },
     Instruction::ArrayFieldGet { .. } => { index: 107, name: "ArrayFieldGet", base_cost: 1 },
+    Instruction::ArrayPushRow { .. } => {
+        index: 108,
+        name: "ArrayPushRow",
+        base_cost: 1,
+        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata+fields_hash"
+    },
 }
 
 #[cfg(test)]
@@ -4623,7 +4676,7 @@ fn work(x: i32) -> i32 {
     #[test]
     fn bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture() {
         assert_eq!(nexa_bytecode::BYTECODE_VERSION, 7);
-        assert_eq!(OPCODE_COST_SCHEDULE.len(), 108);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 109);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
         assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);
