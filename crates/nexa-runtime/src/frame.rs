@@ -158,8 +158,24 @@ pub struct Frame {
     pub call_site_pc: Option<u32>,
     pub register_start: u32,
     pub register_count: u16,
-    pub return_target: Option<u16>,
+    /// Caller-owned contiguous result range. Cleanup and entry frames have
+    /// no result range.
+    pub return_range: Option<ReturnRange>,
     pub defer_start: u32,
+}
+
+/// Physical result slots reserved in the caller before entering a callee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReturnRange {
+    pub start: u16,
+    pub slots: u16,
+}
+
+impl ReturnRange {
+    #[must_use]
+    pub const fn scalar(start: u16) -> Self {
+        Self { start, slots: 1 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,7 +336,12 @@ impl FrameArena {
         register_count: u16,
         return_target: Option<u16>,
     ) -> Result<(), FrameError> {
-        self.push_call_at(function, register_count, return_target, None)
+        self.push_call_range_at(
+            function,
+            register_count,
+            return_target.map(ReturnRange::scalar),
+            None,
+        )
     }
 
     pub fn push_call_at(
@@ -330,8 +351,34 @@ impl FrameArena {
         return_target: Option<u16>,
         call_site_pc: Option<u32>,
     ) -> Result<(), FrameError> {
+        self.push_call_range_at(
+            function,
+            register_count,
+            return_target.map(ReturnRange::scalar),
+            call_site_pc,
+        )
+    }
+
+    pub(crate) fn push_call_range_at(
+        &mut self,
+        function: u32,
+        register_count: u16,
+        return_range: Option<ReturnRange>,
+        call_site_pc: Option<u32>,
+    ) -> Result<(), FrameError> {
         if self.frames.len() >= self.limits.max_call_depth as usize {
             return Err(FrameError::CallDepthLimit);
+        }
+        if return_range.is_some_and(|range| {
+            range.slots == 0
+                || self.frames.last().is_none_or(|caller| {
+                    range
+                        .start
+                        .checked_add(range.slots)
+                        .is_none_or(|end| end > caller.register_count)
+                })
+        }) {
+            return Err(FrameError::RegisterOutOfRange);
         }
         let next_registers = self
             .register_top
@@ -354,7 +401,7 @@ impl FrameArena {
             register_start: u32::try_from(self.register_top)
                 .map_err(|_| FrameError::FrameByteLimit)?,
             register_count,
-            return_target,
+            return_range,
             defer_start: u32::try_from(self.defer_records.len())
                 .map_err(|_| FrameError::DeferLimit)?,
         });
@@ -378,6 +425,28 @@ impl FrameArena {
         args_base: u16,
         args_count: u16,
     ) -> Result<(), FrameError> {
+        self.push_verified_call_range(
+            function,
+            register_count,
+            ReturnRange::scalar(return_target),
+            call_site_pc,
+            args_base,
+            args_count,
+        )
+    }
+
+    /// Physical sibling of [`Self::push_verified_call`]. Argument slots and
+    /// the caller-allocated result range are validated before the arena is
+    /// mutated, then copied directly between disjoint frame ranges.
+    pub(crate) fn push_verified_call_range(
+        &mut self,
+        function: u32,
+        register_count: u16,
+        return_range: ReturnRange,
+        call_site_pc: u32,
+        args_base: u16,
+        args_count: u16,
+    ) -> Result<(), FrameError> {
         let caller_index = self
             .frames
             .len()
@@ -387,20 +456,24 @@ impl FrameArena {
         let caller_next_pc = call_site_pc
             .checked_add(1)
             .ok_or(FrameError::RegisterOutOfRange)?;
-        if return_target >= caller.register_count
-            || args_count > register_count
+        if args_count > register_count
             || args_base
                 .checked_add(args_count)
+                .is_none_or(|end| end > caller.register_count)
+            || return_range.slots == 0
+            || return_range
+                .start
+                .checked_add(return_range.slots)
                 .is_none_or(|end| end > caller.register_count)
         {
             return Err(FrameError::RegisterOutOfRange);
         }
         let source_start = caller.register_start as usize + usize::from(args_base);
         let source_end = source_start + usize::from(args_count);
-        self.push_call_at(
+        self.push_call_range_at(
             function,
             register_count,
-            Some(return_target),
+            Some(return_range),
             Some(call_site_pc),
         )?;
         let destination = self
@@ -412,6 +485,45 @@ impl FrameArena {
             .copy_within(source_start..source_end, destination);
         self.frames[caller_index].pc = caller_next_pc;
         Ok(())
+    }
+
+    /// Copies a verified multi-slot result into its caller-owned range and
+    /// then removes the callee frame. Every range check happens before either
+    /// the copy or the pop, so failure leaves the continuation unchanged.
+    pub(crate) fn return_verified_range(
+        &mut self,
+        source: u16,
+        slots: u16,
+    ) -> Result<Frame, FrameError> {
+        let child_index = self
+            .frames
+            .len()
+            .checked_sub(1)
+            .ok_or(FrameError::NoFrame)?;
+        let caller_index = child_index
+            .checked_sub(1)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        let child = self.frames[child_index];
+        let caller = self.frames[caller_index];
+        let range = child.return_range.ok_or(FrameError::RegisterOutOfRange)?;
+        if slots == 0
+            || range.slots != slots
+            || source
+                .checked_add(slots)
+                .is_none_or(|end| end > child.register_count)
+            || range
+                .start
+                .checked_add(slots)
+                .is_none_or(|end| end > caller.register_count)
+        {
+            return Err(FrameError::RegisterOutOfRange);
+        }
+        let source_start = child.register_start as usize + usize::from(source);
+        let source_end = source_start + usize::from(slots);
+        let destination = caller.register_start as usize + usize::from(range.start);
+        self.registers
+            .copy_within(source_start..source_end, destination);
+        self.pop_mode(false)
     }
 
     pub fn pop(&mut self) -> Result<Frame, FrameError> {
@@ -696,7 +808,8 @@ fn clear_gc_values(values: &mut [RuntimeValue]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContinuationReservation, DeferAction, FrameArena, FrameError, FrameLimits, RuntimeValue,
+        ContinuationReservation, DeferAction, FrameArena, FrameError, FrameLimits, ReturnRange,
+        RuntimeValue,
     };
     use crate::GcRef;
 
@@ -765,6 +878,39 @@ mod tests {
         assert_eq!(arena.frames, before.frames);
         assert_eq!(arena.register_top, before.register_top);
         assert_eq!(arena.registers, before.registers);
+    }
+
+    #[test]
+    fn physical_call_returns_a_contiguous_range_atomically() {
+        let mut arena = FrameArena::new(FrameLimits::default());
+        arena.push(1, 8).unwrap();
+        arena.set_register(1, RuntimeValue::I64(11)).unwrap();
+        arena.set_register(2, RuntimeValue::I64(13)).unwrap();
+        arena
+            .push_verified_call_range(2, 6, ReturnRange { start: 4, slots: 2 }, 7, 1, 2)
+            .unwrap();
+        assert_eq!(arena.register(0), Ok(RuntimeValue::I64(11)));
+        assert_eq!(arena.register(1), Ok(RuntimeValue::I64(13)));
+        arena.set_register(3, RuntimeValue::I64(17)).unwrap();
+        arena.set_register(4, RuntimeValue::I64(19)).unwrap();
+
+        let before = arena.clone();
+        assert_eq!(
+            arena.return_verified_range(3, 1),
+            Err(FrameError::RegisterOutOfRange)
+        );
+        assert_eq!(arena.frames, before.frames);
+        assert_eq!(arena.register_top, before.register_top);
+        assert_eq!(arena.registers, before.registers);
+
+        let completed = arena.return_verified_range(3, 2).unwrap();
+        assert_eq!(
+            completed.return_range,
+            Some(ReturnRange { start: 4, slots: 2 })
+        );
+        assert_eq!(arena.depth(), 1);
+        assert_eq!(arena.register(4), Ok(RuntimeValue::I64(17)));
+        assert_eq!(arena.register(5), Ok(RuntimeValue::I64(19)));
     }
 
     #[test]

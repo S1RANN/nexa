@@ -56,7 +56,7 @@ pub use nexa_core::{
 mod micro;
 pub use frame::{
     ContinuationReservation, DeferAction, Frame, FrameArena, FrameError, FrameLimits,
-    MigrationOldObjectHandle, MigrationStagingObjectHandle, RuntimeValue,
+    MigrationOldObjectHandle, MigrationStagingObjectHandle, ReturnRange, RuntimeValue,
 };
 pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,

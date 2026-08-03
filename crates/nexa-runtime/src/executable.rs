@@ -205,6 +205,10 @@ pub(crate) struct ExecutableProfileRow {
 
 #[derive(Clone, Debug)]
 pub struct ExecutableFunction {
+    /// Cold, verifier-derived physical calling convention. The hot Call
+    /// path reads slot counts and offsets from this authority instead of
+    /// rebuilding layouts from logical signatures.
+    abi: nexa_bytecode::layout::FunctionAbi,
     rows: Vec<ExecutableInstruction>,
     profile_rows: Vec<ExecutableProfileRow>,
     /// Process-local identity of the verifier-owned instruction backing used
@@ -271,12 +275,14 @@ pub(crate) struct StaticLeafConstantKernel {
 impl ExecutableFunction {
     fn new(
         function: &nexa_bytecode::Function,
+        abi: nexa_bytecode::layout::FunctionAbi,
         rows: Vec<ExecutableInstruction>,
         profile_rows: Vec<ExecutableProfileRow>,
         static_leaf: Option<StaticLeafCertificate>,
         constant_leaf: Option<StaticLeafConstantKernel>,
     ) -> Self {
         Self {
+            abi,
             rows,
             profile_rows,
             code_identity: function.code.as_ptr() as usize,
@@ -288,6 +294,11 @@ impl ExecutableFunction {
     #[must_use]
     pub fn rows(&self) -> &[ExecutableInstruction] {
         &self.rows
+    }
+
+    #[must_use]
+    pub const fn abi(&self) -> &nexa_bytecode::layout::FunctionAbi {
+        &self.abi
     }
 
     pub(crate) fn profile_rows(&self) -> &[ExecutableProfileRow] {
@@ -331,6 +342,7 @@ pub enum ExecutableBuildError {
     RootMapPlanMismatch { function: u32, pc: u32 },
     DensePlanMismatch { function: u32, pc: u32 },
     FuelOverflow { function: u32, pc: u32 },
+    MissingFunctionAbi { function: u32 },
 }
 
 impl std::fmt::Display for ExecutableBuildError {
@@ -376,6 +388,12 @@ impl std::fmt::Display for ExecutableBuildError {
                 formatter,
                 "function {function} pc {pc} overflows the static fuel charge"
             ),
+            Self::MissingFunctionAbi { function } => {
+                write!(
+                    formatter,
+                    "function {function} has no verified physical ABI"
+                )
+            }
         }
     }
 }
@@ -499,6 +517,13 @@ fn build_executable_function(
     let bytecode = module.module();
     let function = &bytecode.functions[function_index];
     let function_id = u32::try_from(function_index).unwrap_or(u32::MAX);
+    let abi = module
+        .module_abi()
+        .function(function_index)
+        .cloned()
+        .ok_or(ExecutableBuildError::MissingFunctionAbi {
+            function: function_id,
+        })?;
     let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
     let mut root_map_indices = vec![ExecutableInstruction::NO_ROOT_MAP; function.code.len()];
     for (root_index, root_map) in function.root_maps.iter().enumerate() {
@@ -564,6 +589,7 @@ fn build_executable_function(
         static_leaf.and_then(|_| certify_static_leaf_constant_kernel(module, function));
     Ok(ExecutableFunction::new(
         function,
+        abi,
         rows,
         profile_rows,
         static_leaf,
@@ -1260,6 +1286,20 @@ fn update_counter() -> i32 {
         )
     }
 
+    fn assert_function_abi(
+        module: &VerifiedModule,
+        executable: &ExecutableModule,
+        function: usize,
+    ) {
+        assert_eq!(
+            executable.functions()[function].abi(),
+            module
+                .module_abi()
+                .function(function)
+                .expect("verified function ABI")
+        );
+    }
+
     #[test]
     fn rows_cover_the_corpus_and_pin_the_dynamic_surface() {
         assert!(
@@ -1276,7 +1316,14 @@ fn update_counter() -> i32 {
             executable.functions().len(),
             module.module().functions.len()
         );
-        for (function, rows) in module.module().functions.iter().zip(executable.functions()) {
+        for (function_index, (function, rows)) in module
+            .module()
+            .functions
+            .iter()
+            .zip(executable.functions())
+            .enumerate()
+        {
+            assert_function_abi(&module, &executable, function_index);
             assert_eq!(function.code.len(), rows.rows().len());
             for (pc, (instruction, row)) in
                 function.code.iter().copied().zip(rows.rows()).enumerate()

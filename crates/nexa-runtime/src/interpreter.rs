@@ -4086,10 +4086,17 @@ impl CheckedInterpreter {
                         pending_cost = 0;
                         continue;
                     }
+                    if continuation.arena.depth() > 1
+                        && continuation.arena.current()?.return_range.is_some()
+                    {
+                        continuation.arena.return_verified_range(source, 1)?;
+                        pending_cost = 0;
+                        continue;
+                    }
                     let result = register(&continuation.arena, source)?;
                     let completed = continuation.arena.pop_verified()?;
                     let returning_cleanup =
-                        completed.return_target.is_none() && continuation.arena.depth() > 0;
+                        completed.return_range.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
                         if continuation.cleanup_mode
                             && !start_next_defer(module, &mut continuation.arena)?
@@ -4103,23 +4110,13 @@ impl CheckedInterpreter {
                         }
                         pending_cost = 0;
                         continue;
-                    } else if continuation.arena.depth() > 0 {
-                        set_register(
-                            &mut continuation.arena,
-                            completed
-                                .return_target
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                            result,
-                        )?;
-                    } else {
-                        reclaim_storage!();
-                        return Ok(InterpreterOutcome::Returned {
-                            value: Some(result),
-                            charge,
-                            fuel,
-                        });
                     }
-                    pending_cost = 0;
+                    reclaim_storage!();
+                    return Ok(InterpreterOutcome::Returned {
+                        value: Some(result),
+                        charge,
+                        fuel,
+                    });
                 }
                 Instruction::ReturnVoid => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
@@ -4135,7 +4132,7 @@ impl CheckedInterpreter {
                     }
                     let completed = continuation.arena.pop_verified()?;
                     let returning_cleanup =
-                        completed.return_target.is_none() && continuation.arena.depth() > 0;
+                        completed.return_range.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
                         if continuation.cleanup_mode
                             && !start_next_defer(module, &mut continuation.arena)?
@@ -4581,7 +4578,7 @@ fn return_defer_attempt_fuel(
                 Some(action)
             } else {
                 let current = arena.current()?;
-                if current.return_target.is_none() {
+                if current.return_range.is_none() {
                     arena
                         .depth()
                         .checked_sub(2)
