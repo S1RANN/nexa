@@ -219,6 +219,10 @@ impl std::error::Error for FrameError {}
 #[derive(Clone, Debug)]
 pub struct FrameArena {
     frames: Vec<Frame>,
+    /// Logical end of the live register stack. The backing vector keeps its
+    /// initialized high-water mark across pooled continuations so a fresh
+    /// call does not rewrite every wide `RuntimeValue` slot to `Unit`.
+    register_top: usize,
     registers: Vec<RuntimeValue>,
     defer_records: Vec<DeferAction>,
     limits: FrameLimits,
@@ -245,6 +249,7 @@ impl FrameArena {
         crate::allocation::record(crate::allocation::AllocationPhase::Admission, 3);
         Ok(Self {
             frames: Vec::with_capacity(reservation.frame_capacity as usize),
+            register_top: 0,
             registers: Vec::with_capacity(reservation.register_capacity as usize),
             defer_records: Vec::with_capacity(reservation.defer_capacity as usize),
             limits,
@@ -257,6 +262,7 @@ impl FrameArena {
     pub(crate) fn empty_shell() -> Self {
         Self {
             frames: Vec::new(),
+            register_top: 0,
             registers: Vec::new(),
             defer_records: Vec::new(),
             limits: FrameLimits::default(),
@@ -287,7 +293,13 @@ impl FrameArena {
             return Err(FrameError::ReservationExceedsLimit);
         }
         self.frames.clear();
-        self.registers.clear();
+        // Verified definite-initialization guarantees that an instruction
+        // never observes an old slot before writing it. Keep scalar bits at
+        // the initialized high-water mark, but clear GC-backed values before
+        // the range becomes available to a new frame: the conservative
+        // `gc_roots` view must never retain a stale object.
+        clear_gc_values(&mut self.registers[..self.register_top]);
+        self.register_top = 0;
         self.defer_records.clear();
         self.limits = limits;
         crate::allocation::record(crate::allocation::AllocationPhase::Admission, 0);
@@ -322,8 +334,7 @@ impl FrameArena {
             return Err(FrameError::CallDepthLimit);
         }
         let next_registers = self
-            .registers
-            .len()
+            .register_top
             .checked_add(usize::from(register_count))
             .ok_or(FrameError::FrameByteLimit)?;
         let next_bytes = next_registers
@@ -340,20 +351,24 @@ impl FrameArena {
             function,
             pc: 0,
             call_site_pc,
-            register_start: u32::try_from(self.registers.len())
+            register_start: u32::try_from(self.register_top)
                 .map_err(|_| FrameError::FrameByteLimit)?,
             register_count,
             return_target,
             defer_start: u32::try_from(self.defer_records.len())
                 .map_err(|_| FrameError::DeferLimit)?,
         });
-        self.registers.resize(next_registers, RuntimeValue::Unit);
+        if next_registers > self.registers.len() {
+            self.registers.resize(next_registers, RuntimeValue::Unit);
+        }
+        self.register_top = next_registers;
         Ok(())
     }
 
     pub fn pop(&mut self) -> Result<Frame, FrameError> {
         let frame = self.frames.pop().ok_or(FrameError::NoFrame)?;
-        self.registers.truncate(frame.register_start as usize);
+        clear_gc_values(&mut self.registers[frame.register_start as usize..self.register_top]);
+        self.register_top = frame.register_start as usize;
         self.defer_records.truncate(frame.defer_start as usize);
         Ok(frame)
     }
@@ -368,12 +383,12 @@ impl FrameArena {
     /// itself - every unchecked access lives in the kernel module with
     /// its `SAFETY:` justification.
     pub(crate) fn trusted_parts(&self) -> (&[Frame], &[RuntimeValue]) {
-        (&self.frames, &self.registers)
+        (&self.frames, &self.registers[..self.register_top])
     }
 
     /// Mutable sibling of [`Self::trusted_parts`].
     pub(crate) fn trusted_parts_mut(&mut self) -> (&mut [Frame], &mut [RuntimeValue]) {
-        (&mut self.frames, &mut self.registers)
+        (&mut self.frames, &mut self.registers[..self.register_top])
     }
 
     pub fn current_mut(&mut self) -> Result<&mut Frame, FrameError> {
@@ -509,7 +524,7 @@ impl FrameArena {
 
     #[must_use]
     pub fn register_len(&self) -> usize {
-        self.registers.len()
+        self.register_top
     }
 
     #[must_use]
@@ -517,6 +532,7 @@ impl FrameArena {
         let mut roots = self
             .registers
             .iter()
+            .take(self.register_top)
             .filter_map(|value| runtime_gc_root(*value))
             .collect::<Vec<_>>();
         self.extend_defer_gc_roots(&mut roots);
@@ -610,9 +626,19 @@ fn runtime_gc_root(value: RuntimeValue) -> Option<GcRef> {
     }
 }
 
+fn clear_gc_values(values: &mut [RuntimeValue]) {
+    for value in values {
+        if runtime_gc_root(*value).is_some() {
+            *value = RuntimeValue::Unit;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DeferAction, FrameArena, FrameError, FrameLimits, RuntimeValue};
+    use super::{
+        ContinuationReservation, DeferAction, FrameArena, FrameError, FrameLimits, RuntimeValue,
+    };
     use crate::GcRef;
 
     #[test]
@@ -656,6 +682,35 @@ mod tests {
         });
         assert_eq!(arena.push(1, 2), Err(FrameError::FrameByteLimit));
         assert_eq!(arena.depth(), 0);
+    }
+
+    #[test]
+    fn pooled_reset_retains_scalar_storage_but_clears_stale_gc_roots() {
+        let limits = FrameLimits::default();
+        let reservation = ContinuationReservation::for_limits(limits);
+        let mut arena = FrameArena::with_reserved_capacity(limits, reservation).unwrap();
+        arena.push(1, 2).unwrap();
+        arena.set_register(0, RuntimeValue::I32(41)).unwrap();
+        arena
+            .set_register(
+                1,
+                RuntimeValue::Ref(GcRef {
+                    index: 7,
+                    generation: 3,
+                }),
+            )
+            .unwrap();
+        let initialized_high_water = arena.registers.len();
+
+        arena.reset_for(limits, reservation).unwrap();
+        assert_eq!(arena.register_len(), 0);
+        assert_eq!(arena.registers.len(), initialized_high_water);
+        assert_eq!(arena.registers[0], RuntimeValue::I32(41));
+        assert_eq!(arena.registers[1], RuntimeValue::Unit);
+
+        arena.push(2, 2).unwrap();
+        assert!(arena.gc_roots().is_empty());
+        assert_eq!(arena.registers.len(), initialized_high_water);
     }
 
     #[test]

@@ -649,7 +649,7 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -670,7 +670,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         host: &mut dyn InterpreterHost,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -691,7 +691,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -716,7 +716,7 @@ impl CheckedInterpreter {
         heap: &mut Heap,
         executable: &crate::executable::ExecutableModule,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<true>(
             module,
             continuation,
             fuel,
@@ -747,18 +747,32 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         recycle: &mut Option<FrameArena>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
-            module,
-            continuation,
-            fuel,
-            costs,
-            None,
-            None,
-            None,
-            heap,
-            executable,
-            Some(recycle),
-        )
+        match (heap, executable) {
+            (Some(heap), Some(executable)) => Self::execute::<true>(
+                module,
+                continuation,
+                fuel,
+                costs,
+                None,
+                None,
+                None,
+                Some(heap),
+                Some(executable),
+                Some(recycle),
+            ),
+            (heap, executable) => Self::execute::<false>(
+                module,
+                continuation,
+                fuel,
+                costs,
+                None,
+                None,
+                None,
+                heap,
+                executable,
+                Some(recycle),
+            ),
+        }
     }
 
     pub fn poll_with_host_and_heap(
@@ -769,7 +783,7 @@ impl CheckedInterpreter {
         host: &mut dyn InterpreterHost,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -794,7 +808,7 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -820,7 +834,7 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             fuel,
@@ -923,7 +937,7 @@ impl CheckedInterpreter {
             limits,
             ContinuationReservation::for_limits(limits),
         )?;
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
@@ -953,7 +967,7 @@ impl CheckedInterpreter {
             limits,
             ContinuationReservation::for_limits(limits),
         )?;
-        Self::execute(
+        Self::execute::<false>(
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
@@ -1062,7 +1076,7 @@ impl CheckedInterpreter {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn execute(
+    fn execute<const PREDECODED: bool>(
         module: &VerifiedModule,
         mut continuation: InterpreterContinuation,
         mut fuel: FuelState,
@@ -1074,7 +1088,17 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         mut recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        costs.validate_version()?;
+        if PREDECODED {
+            let executable = executable.ok_or(InterpreterError::TypeMismatch)?;
+            if executable.cost_table_version() != costs.version {
+                return Err(InterpreterError::OpcodeCostTableVersion {
+                    expected: executable.cost_table_version(),
+                    actual: costs.version,
+                });
+            }
+        } else {
+            costs.validate_version()?;
+        }
         // H1: on terminal exits the caller may reclaim the continuation's
         // arena storage through this slot; suspension paths never touch it.
         macro_rules! reclaim_storage {
@@ -1208,14 +1232,21 @@ impl CheckedInterpreter {
                         .functions
                         .get(frame.function as usize)
                         .ok_or(InterpreterError::MissingFunction(frame.function))?;
-                    let rows = match executable {
-                        Some(rows) => Some(
-                            rows.functions()
+                    let rows = if PREDECODED {
+                        Some(
+                            executable
+                                .expect("predecoded execution requires an executable module")
+                                .functions()
                                 .get(frame.function as usize)
                                 .ok_or(InterpreterError::FellOffFunction)?
                                 .rows(),
-                        ),
-                        None => None,
+                        )
+                    } else {
+                        executable.and_then(|rows| {
+                            rows.functions()
+                                .get(frame.function as usize)
+                                .map(crate::executable::ExecutableFunction::rows)
+                        })
                     };
                     cached_function = Some((frame.function, function, rows));
                     (function, rows)
@@ -1228,11 +1259,32 @@ impl CheckedInterpreter {
                 .code
                 .get(frame.pc as usize)
                 .ok_or(InterpreterError::FellOffFunction)?;
-            if let Some(rows) = function_rows {
+            if PREDECODED {
+                let rows =
+                    function_rows.expect("predecoded execution caches executable metadata rows");
                 // F2: the predecoded row carries the full static charge
                 // (HostCall import surcharge folded at build time) and the
                 // load-time safepoint flag; only operand-dependent
                 // surcharges still consult the arena and heap.
+                let row = rows
+                    .get(frame.pc as usize)
+                    .ok_or(InterpreterError::FellOffFunction)?;
+                resolved_nominal = row.resolved_nominal;
+                instruction_cost = if row.dynamic_fuel {
+                    dynamic_instruction_fuel(
+                        module.module(),
+                        module.nominal_index_shape(),
+                        instruction,
+                        &continuation.arena,
+                        heap.as_deref(),
+                        costs,
+                        Some(row.attempt_fuel),
+                    )?
+                } else {
+                    row.attempt_fuel
+                };
+                fuel_boundary = row.fuel_boundary;
+            } else if let Some(rows) = function_rows {
                 let row = rows
                     .get(frame.pc as usize)
                     .ok_or(InterpreterError::FellOffFunction)?;
@@ -4638,6 +4690,7 @@ mod tests {
     /// bit-identical fuel and suspend at identical points across a
     /// slice-by-slice replay of a mixed program.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn predecoded_rows_charge_identical_fuel_and_suspend_points() {
         let source = r#"
 struct Pair { first: i32, second: i32, }
@@ -4679,18 +4732,32 @@ fn work(x: i32) -> i32 {
             let mut cumulative = 0;
             let mut trace = Vec::new();
             loop {
-                let outcome = CheckedInterpreter::execute(
-                    &module,
-                    continuation,
-                    FuelState::new(64, cumulative, u64::MAX),
-                    &costs,
-                    None,
-                    None,
-                    None,
-                    Some(&mut heap),
-                    rows,
-                    None,
-                )
+                let outcome = match rows {
+                    Some(rows) => CheckedInterpreter::execute::<true>(
+                        &module,
+                        continuation,
+                        FuelState::new(64, cumulative, u64::MAX),
+                        &costs,
+                        None,
+                        None,
+                        None,
+                        Some(&mut heap),
+                        Some(rows),
+                        None,
+                    ),
+                    None => CheckedInterpreter::execute::<false>(
+                        &module,
+                        continuation,
+                        FuelState::new(64, cumulative, u64::MAX),
+                        &costs,
+                        None,
+                        None,
+                        None,
+                        Some(&mut heap),
+                        None,
+                        None,
+                    ),
+                }
                 .expect("row parity slice");
                 match outcome {
                     InterpreterOutcome::Suspended {

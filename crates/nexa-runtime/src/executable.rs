@@ -361,14 +361,12 @@ fn update_counter() -> i32 {
                 if row.dynamic_fuel {
                     assert!(
                         dynamic_surface(instruction),
-                        "instruction unexpectedly dynamic at pc {pc}: {:?}",
-                        instruction
+                        "instruction unexpectedly dynamic at pc {pc}: {instruction:?}"
                     );
                 } else {
                     assert!(
                         !dynamic_surface(instruction),
-                        "operand-dependent instruction misclassified static at pc {pc}: {:?}",
-                        instruction
+                        "operand-dependent instruction misclassified static at pc {pc}: {instruction:?}"
                     );
                     assert!(row.attempt_fuel > 0, "static rows charge fuel");
                 }
