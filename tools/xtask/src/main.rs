@@ -414,6 +414,7 @@ fn main() -> Result<(), DynError> {
         "test-ir-optimizations" => test_ir_optimizations(),
         "test-optimization-differential" => test_optimization_differential(),
         "test-executable-parity" => test_executable_parity(),
+        "test-executable-module" => test_executable_module(),
         "test-incremental-gc" => test_incremental_gc(),
         "test-source-cache" => test_source_cache(),
         "test-artifact-cache" => test_artifact_cache(),
@@ -453,7 +454,7 @@ fn main() -> Result<(), DynError> {
                  m4r1-scale-stress|finalize-m4-r1|test-performance-counters|\
                  test-profiler-overhead|test-value-layout|test-typed-collections|\
                  test-ir-optimizations|test-optimization-differential|\
-                 test-executable-parity|test-incremental-gc|test-source-cache|\
+                 test-executable-parity|test-executable-module|test-incremental-gc|test-source-cache|\
                  test-artifact-cache|test-runtime-fast-paths|m5-final-report|\
                  m5-v8-comparison|m5-performance-regression"
             );
@@ -1639,6 +1640,15 @@ fn test_optimization_differential() -> Result<(), DynError> {
 /// points, and fuel totals must match item by item.
 fn test_executable_parity() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "executable_parity"])
+}
+
+/// M5 WP59-WP70 gate: load-time executable plan completeness, compact row
+/// bounds, dense identities/call frames/root maps, static-leaf equivalence,
+/// and portable-versus-executable replay.
+fn test_executable_module() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-runtime", "--lib", "executable::tests::"])?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "executable_parity"])?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "root_map_liveness"])
 }
 
 /// M5 stage-G gate (G1): budgeted incremental Mark/Sweep equivalence,
