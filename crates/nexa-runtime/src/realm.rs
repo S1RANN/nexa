@@ -3522,9 +3522,10 @@ impl RealmRuntime {
             let snapshot = self.tasks.task_snapshot(task)?;
             let module = self.module_for_task(snapshot)?;
             let continuation = self.tasks.execution(task)?.continuation();
-            roots
-                .suspended_tasks
-                .extend(continuation.checked_gc_roots(&module.verified)?);
+            roots.suspended_tasks.extend(
+                continuation
+                    .checked_gc_roots_with_executable(&module.verified, &module.executable)?,
+            );
         }
         roots
             .suspended_tasks
@@ -4097,7 +4098,7 @@ impl RealmRuntime {
                 let execution = self.tasks.execution(task).ok()?;
                 execution
                     .continuation()
-                    .checked_gc_roots(&module.verified)
+                    .checked_gc_roots_with_executable(&module.verified, &module.executable)
                     .ok()
             })
             .map(|roots| roots.len())

@@ -598,9 +598,9 @@ impl FrameArena {
         roots
     }
 
-    pub fn iter_gc_roots(
+    pub fn iter_gc_roots<'a>(
         &self,
-        mut root_bitmap: impl FnMut(u32, u32) -> Option<Vec<bool>>,
+        mut root_bitmap: impl FnMut(u32, u32) -> Option<&'a [bool]>,
     ) -> Result<Vec<GcRef>, FrameError> {
         let mut roots = Vec::new();
         for (frame_index, frame) in self.frames.iter().enumerate() {
@@ -614,7 +614,7 @@ impl FrameArena {
             if bitmap.len() != usize::from(frame.register_count) {
                 return Err(FrameError::RootMapMismatch);
             }
-            for (register, is_root) in bitmap.into_iter().enumerate() {
+            for (register, is_root) in bitmap.iter().copied().enumerate() {
                 if is_root {
                     match self.registers[frame.register_start as usize + register] {
                         RuntimeValue::String { reference, .. }
@@ -792,9 +792,10 @@ mod tests {
         assert!(matches!(arena.registers[1], RuntimeValue::Ref(_)));
 
         arena.push(2, 2).unwrap();
+        let no_roots = [false, false];
         assert!(
             arena
-                .iter_gc_roots(|_, _| Some(vec![false, false]))
+                .iter_gc_roots(|_, _| Some(&no_roots))
                 .unwrap()
                 .is_empty()
         );
@@ -836,21 +837,24 @@ mod tests {
             )
             .unwrap();
 
+        let opaque_roots = [false, false, true, true];
         assert_eq!(
             arena
                 .iter_gc_roots(|function, _| {
                     assert_eq!(function, 7);
-                    Some(vec![false, false, true, true])
+                    Some(&opaque_roots)
                 })
                 .unwrap(),
             Vec::new()
         );
+        let forged_scalar_root = [false, true, false, false];
         assert_eq!(
-            arena.iter_gc_roots(|_, _| Some(vec![false, true, false, false])),
+            arena.iter_gc_roots(|_, _| Some(&forged_scalar_root)),
             Err(FrameError::RootMapMismatch)
         );
+        let wrong_width = [false];
         assert_eq!(
-            arena.iter_gc_roots(|_, _| Some(vec![false])),
+            arena.iter_gc_roots(|_, _| Some(&wrong_width)),
             Err(FrameError::RootMapMismatch)
         );
         assert_eq!(
@@ -899,8 +903,9 @@ mod tests {
 
         let expected = references[..4].to_vec();
         assert_eq!(arena.gc_roots(), expected);
+        let no_roots = [false];
         assert_eq!(
-            arena.iter_gc_roots(|_, _| Some(vec![false])).unwrap(),
+            arena.iter_gc_roots(|_, _| Some(&no_roots)).unwrap(),
             expected
         );
     }

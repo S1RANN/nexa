@@ -654,6 +654,6 @@ fn nested_call_fuel_suspend_uses_pre_call_scalar_map_until_string_return() {
     };
     assert!(matches!(
         realm.resolve_heap_object(reference),
-        Ok(Object::String(value)) if value == "callee result"
+        Ok(Object::SharedString(value)) if value.as_ref() == "callee result"
     ));
 }

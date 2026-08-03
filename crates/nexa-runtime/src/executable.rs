@@ -138,6 +138,9 @@ pub struct ExecutableInstruction {
     /// Three execution flags plus the eight-bit profiler code share one word.
     /// This keeps the row at 24 bytes while avoiding a cold metadata read.
     flags: u16,
+    /// Dense index into the portable function's verified root-map table.
+    /// Non-safepoints carry [`Self::NO_ROOT_MAP`].
+    root_map_index: u16,
 }
 
 impl ExecutableInstruction {
@@ -145,6 +148,7 @@ impl ExecutableInstruction {
     const SAFEPOINT: u16 = 1 << 1;
     const FUEL_BOUNDARY: u16 = 1 << 2;
     const PROFILE_SHIFT: u32 = 3;
+    const NO_ROOT_MAP: u16 = u16::MAX;
 
     #[inline]
     pub(crate) const fn dynamic_fuel(self) -> bool {
@@ -159,6 +163,15 @@ impl ExecutableInstruction {
     #[inline]
     pub(crate) const fn fuel_boundary(self) -> bool {
         self.flags & Self::FUEL_BOUNDARY != 0
+    }
+
+    #[inline]
+    pub(crate) const fn root_map_index(self) -> Option<usize> {
+        if self.root_map_index == Self::NO_ROOT_MAP {
+            None
+        } else {
+            Some(self.root_map_index as usize)
+        }
     }
 
     #[inline]
@@ -281,6 +294,10 @@ impl ExecutableFunction {
         &self.profile_rows
     }
 
+    pub(crate) fn root_map_index(&self, pc: u32) -> Option<usize> {
+        self.rows.get(pc as usize)?.root_map_index()
+    }
+
     #[must_use]
     pub const fn static_leaf_fuel(&self) -> Option<u64> {
         match self.static_leaf {
@@ -310,6 +327,8 @@ pub enum ExecutableBuildError {
     MissingHostImport { function: u32, pc: u32, import: u32 },
     JumpOutOfFunction { function: u32, pc: u32, target: u32 },
     RootMapOutOfFunction { function: u32, pc: u32 },
+    RootMapIndexOverflow { function: u32, pc: u32 },
+    RootMapPlanMismatch { function: u32, pc: u32 },
     FuelOverflow { function: u32, pc: u32 },
 }
 
@@ -339,6 +358,14 @@ impl std::fmt::Display for ExecutableBuildError {
             Self::RootMapOutOfFunction { function, pc } => write!(
                 formatter,
                 "function {function} carries a root map for out-of-range pc {pc}"
+            ),
+            Self::RootMapIndexOverflow { function, pc } => write!(
+                formatter,
+                "function {function} pc {pc} exceeds the dense root-map index range"
+            ),
+            Self::RootMapPlanMismatch { function, pc } => write!(
+                formatter,
+                "function {function} pc {pc} has inconsistent safepoint/root-map metadata"
             ),
             Self::FuelOverflow { function, pc } => write!(
                 formatter,
@@ -468,13 +495,27 @@ fn build_executable_function(
     let function = &bytecode.functions[function_index];
     let function_id = u32::try_from(function_index).unwrap_or(u32::MAX);
     let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
-    for root_map in &function.root_maps {
+    let mut root_map_indices = vec![ExecutableInstruction::NO_ROOT_MAP; function.code.len()];
+    for (root_index, root_map) in function.root_maps.iter().enumerate() {
         if root_map.pc >= code_len {
             return Err(ExecutableBuildError::RootMapOutOfFunction {
                 function: function_id,
                 pc: root_map.pc,
             });
         }
+        let root_index =
+            u16::try_from(root_index).map_err(|_| ExecutableBuildError::RootMapIndexOverflow {
+                function: function_id,
+                pc: root_map.pc,
+            })?;
+        let slot = &mut root_map_indices[root_map.pc as usize];
+        if *slot != ExecutableInstruction::NO_ROOT_MAP {
+            return Err(ExecutableBuildError::RootMapPlanMismatch {
+                function: function_id,
+                pc: root_map.pc,
+            });
+        }
+        *slot = root_index;
     }
     let mut rows = Vec::with_capacity(function.code.len());
     let mut profile_rows = Vec::with_capacity(function.code.len());
@@ -502,7 +543,7 @@ fn build_executable_function(
                 function,
                 function_id,
                 pc,
-                instruction,
+                root_map_indices[pc as usize],
                 costs,
             )?
             .with_profile_code(profile_code),
@@ -531,10 +572,11 @@ fn build_executable_row(
     function: &Function,
     function_id: u32,
     pc: u32,
-    instruction: Instruction,
+    root_map_index: u16,
     costs: &OpcodeCostTable,
 ) -> Result<ExecutableInstruction, ExecutableBuildError> {
     let bytecode = module.module();
+    let instruction = function.code[pc as usize];
     let code_len = u32::try_from(function.code.len()).unwrap_or(u32::MAX);
     match instruction {
         Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
@@ -579,6 +621,13 @@ fn build_executable_row(
         static_fuel
     };
     let safepoint = crate::interpreter::is_safepoint(instruction, pc);
+    if function_has_root_map(function, pc) != (root_map_index != ExecutableInstruction::NO_ROOT_MAP)
+    {
+        return Err(ExecutableBuildError::RootMapPlanMismatch {
+            function: function_id,
+            pc,
+        });
+    }
     let fuel_boundary = pc == 0
         || safepoint
         || function
@@ -601,7 +650,12 @@ fn build_executable_row(
             .into(),
         attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
         flags,
+        root_map_index,
     })
+}
+
+fn function_has_root_map(function: &Function, pc: u32) -> bool {
+    function.safepoints.binary_search(&pc).is_ok()
 }
 
 struct StaticLeafAnalysis {
@@ -1189,11 +1243,7 @@ fn update_counter() -> i32 {
                 function.code.iter().copied().zip(rows.rows()).enumerate()
             {
                 let pc = u32::try_from(pc).expect("test corpus pcs fit u32");
-                assert_eq!(
-                    row.safepoint(),
-                    is_safepoint(instruction, pc),
-                    "safepoint flag diverges at pc {pc}"
-                );
+                assert_row_safepoints(function, pc, instruction, row);
                 if row.dynamic_fuel() {
                     assert!(
                         dynamic_surface(instruction),
@@ -1266,6 +1316,24 @@ fn update_counter() -> i32 {
             }
         }
         assert_export_index(&module, &executable);
+    }
+
+    fn assert_row_safepoints(
+        function: &nexa_bytecode::Function,
+        pc: u32,
+        instruction: Instruction,
+        row: &super::ExecutableInstruction,
+    ) {
+        assert_eq!(
+            row.safepoint(),
+            is_safepoint(instruction, pc),
+            "safepoint flag diverges at pc {pc}"
+        );
+        assert_eq!(
+            row.root_map_index().is_some(),
+            super::function_has_root_map(function, pc),
+            "dense root-map index diverges at pc {pc}"
+        );
     }
 
     fn assert_call_frame(row: &super::ExecutableInstruction) {

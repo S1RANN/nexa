@@ -191,8 +191,32 @@ impl InterpreterContinuation {
                             .root_maps
                             .iter()
                             .find(|root_map| root_map.pc == pc)
-                            .map(|root_map| root_map.bitmap.clone())
+                            .map(|root_map| root_map.bitmap.as_slice())
                     })
+            })
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn checked_gc_roots_with_executable(
+        &self,
+        module: &VerifiedModule,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<Vec<GcRef>, InterpreterError> {
+        self.arena
+            .iter_gc_roots(|function, pc| {
+                let function_index = function as usize;
+                let root_index = executable
+                    .functions()
+                    .get(function_index)?
+                    .root_map_index(pc)?;
+                module
+                    .module()
+                    .functions
+                    .get(function_index)?
+                    .root_maps
+                    .get(root_index)
+                    .filter(|root_map| root_map.pc == pc)
+                    .map(|root_map| root_map.bitmap.as_slice())
             })
             .map_err(Into::into)
     }
