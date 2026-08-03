@@ -70,6 +70,9 @@ pub(crate) struct StaticLeafCertificate {
     pub buffer_copy: Option<StaticLeafBufferCopy>,
     pub buffer_get: Option<StaticLeafBufferGet>,
     pub buffer_work_fuel: u64,
+    /// Exact instruction count for the load-time-proven copy-then-get
+    /// buffer kernel. The fused executor preserves this logical charge.
+    pub buffer_kernel_instructions: Option<u8>,
     pub map_sets: u8,
     pub map_lookups: u8,
 }
@@ -604,7 +607,11 @@ impl StaticLeafAnalysis {
         Some(())
     }
 
-    const fn finish(self, fixed_fuel: u64) -> StaticLeafCertificate {
+    const fn finish(
+        self,
+        fixed_fuel: u64,
+        buffer_kernel_instructions: Option<u8>,
+    ) -> StaticLeafCertificate {
         StaticLeafCertificate {
             fixed_fuel,
             array_pushes: self.array_pushes,
@@ -612,6 +619,7 @@ impl StaticLeafAnalysis {
             buffer_copy: self.buffer_copy,
             buffer_get: self.buffer_get,
             buffer_work_fuel: self.buffer_work_fuel,
+            buffer_kernel_instructions,
             map_sets: self.map_sets,
             map_lookups: self.map_lookups,
         }
@@ -644,7 +652,47 @@ fn certify_static_leaf(
     let fixed_fuel = rows
         .iter()
         .try_fold(0_u64, |fuel, row| fuel.checked_add(row.attempt_fuel))?;
-    Some(analysis.finish(fixed_fuel))
+    Some(analysis.finish(fixed_fuel, certify_static_leaf_buffer_kernel(function)))
+}
+
+fn certify_static_leaf_buffer_kernel(function: &nexa_bytecode::Function) -> Option<u8> {
+    let mut buffer_result = [false; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+    let mut copied = false;
+    let mut loaded = false;
+    let mut returned = false;
+    for (pc, instruction) in function.code.iter().copied().enumerate() {
+        if returned {
+            return None;
+        }
+        match instruction {
+            Instruction::LoadI32 { dst, .. } => {
+                *buffer_result.get_mut(usize::from(dst))? = false;
+            }
+            Instruction::Move { dst, source } => {
+                *buffer_result.get_mut(usize::from(dst))? =
+                    *buffer_result.get(usize::from(source))?;
+            }
+            Instruction::BufferCopy { .. } if !copied && !loaded => {
+                copied = true;
+            }
+            Instruction::BufferGet { dst, .. } if copied && !loaded => {
+                *buffer_result.get_mut(usize::from(dst))? = true;
+                loaded = true;
+            }
+            Instruction::Return { source }
+                if loaded
+                    && *buffer_result.get(usize::from(source))?
+                    && pc + 1 == function.code.len() =>
+            {
+                returned = true;
+            }
+            _ => return None,
+        }
+    }
+    if !(copied && loaded && returned) {
+        return None;
+    }
+    u8::try_from(function.code.len()).ok()
 }
 
 const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {

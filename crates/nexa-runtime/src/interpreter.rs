@@ -594,11 +594,18 @@ const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
 
 pub struct CheckedInterpreter;
 
+#[derive(Clone, Copy)]
 enum StaticLeafStep {
     Next,
     Jump(usize),
     Return(RuntimeValue),
     Trap,
+}
+
+#[derive(Default)]
+struct PreparedStaticLeafBuffers {
+    copy: Option<crate::heap::PreparedBufferCopy>,
+    get: Option<crate::heap::PreparedBufferGet>,
 }
 
 #[inline]
@@ -609,6 +616,7 @@ fn execute_static_leaf_instruction(
     module: &VerifiedModule,
     heap: &mut Heap,
     executable: &crate::executable::ExecutableModule,
+    buffers: &PreparedStaticLeafBuffers,
 ) -> Result<StaticLeafStep, InterpreterError> {
     match instruction {
         instruction @ (Instruction::LoadI32 { .. }
@@ -647,7 +655,7 @@ fn execute_static_leaf_instruction(
             Ok(StaticLeafStep::Next)
         }
         instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
-            execute_static_leaf_buffer(instruction, registers, heap)?;
+            execute_static_leaf_buffer(instruction, registers, heap, buffers)?;
             Ok(StaticLeafStep::Next)
         }
         Instruction::Return { source } => Ok(StaticLeafStep::Return(
@@ -983,52 +991,84 @@ fn execute_static_leaf_buffer(
     instruction: Instruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
     heap: &mut Heap,
+    buffers: &PreparedStaticLeafBuffers,
 ) -> Result<(), InterpreterError> {
     match instruction {
-        Instruction::BufferCopy {
-            destination,
-            source,
-            source_start,
-            destination_start,
-            length,
-        } => {
-            let destination = crate::trusted::read_static_leaf(registers, destination);
-            let source = crate::trusted::read_static_leaf(registers, source);
-            let RuntimeValue::I32(source_start) =
-                crate::trusted::read_static_leaf(registers, source_start)
-            else {
-                return Err(InterpreterError::TypeMismatch);
-            };
-            let RuntimeValue::I32(destination_start) =
-                crate::trusted::read_static_leaf(registers, destination_start)
-            else {
-                return Err(InterpreterError::TypeMismatch);
-            };
-            let RuntimeValue::I32(length) = crate::trusted::read_static_leaf(registers, length)
-            else {
-                return Err(InterpreterError::TypeMismatch);
-            };
-            heap.buffer_copy(
-                destination,
-                source,
-                usize::try_from(source_start).map_err(|_| InterpreterError::TypeMismatch)?,
-                usize::try_from(destination_start).map_err(|_| InterpreterError::TypeMismatch)?,
-                usize::try_from(length).map_err(|_| InterpreterError::TypeMismatch)?,
-            )?;
+        Instruction::BufferCopy { .. } => {
+            let prepared = buffers.copy.ok_or(InterpreterError::TypeMismatch)?;
+            heap.execute_prepared_buffer_copy(prepared)?;
         }
-        Instruction::BufferGet { source, index, dst } => {
-            let buffer = crate::trusted::read_static_leaf(registers, source);
-            let RuntimeValue::I32(index) = crate::trusted::read_static_leaf(registers, index)
-            else {
-                return Err(InterpreterError::TypeMismatch);
-            };
-            let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
-            let value = heap.buffer_get(buffer, index)?;
+        Instruction::BufferGet { dst, .. } => {
+            let prepared = buffers.get.ok_or(InterpreterError::TypeMismatch)?;
+            let value = heap.execute_prepared_buffer_get(prepared)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
         _ => unreachable!("buffer leaf helper receives only buffer instructions"),
     }
     Ok(())
+}
+
+fn execute_prepared_buffer_kernel(
+    certificate: crate::executable::StaticLeafCertificate,
+    buffers: &PreparedStaticLeafBuffers,
+    mut fuel: FuelState,
+    fuel_used: u64,
+    heap: &mut Heap,
+) -> Result<StaticLeafOutcome, InterpreterError> {
+    let instructions = certificate
+        .buffer_kernel_instructions
+        .ok_or(InterpreterError::TypeMismatch)?;
+    heap.execute_prepared_buffer_copy(buffers.copy.ok_or(InterpreterError::TypeMismatch)?)?;
+    let value =
+        heap.execute_prepared_buffer_get(buffers.get.ok_or(InterpreterError::TypeMismatch)?)?;
+    fuel.slice_remaining = fuel
+        .slice_remaining
+        .checked_sub(fuel_used)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel.cumulative_used = fuel
+        .cumulative_used
+        .checked_add(fuel_used)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    Ok(StaticLeafOutcome {
+        result: Ok(Some(value)),
+        charge: ExecutionCharge {
+            instructions: u64::from(instructions),
+            fuel_used,
+        },
+        fuel,
+    })
+}
+
+fn finish_static_leaf(
+    step: StaticLeafStep,
+    module: &VerifiedModule,
+    function: u32,
+    pc: usize,
+    charge: ExecutionCharge,
+    mut fuel: FuelState,
+) -> Result<StaticLeafOutcome, InterpreterError> {
+    fuel.slice_remaining = fuel
+        .slice_remaining
+        .checked_sub(charge.fuel_used)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel.cumulative_used = fuel
+        .cumulative_used
+        .checked_add(charge.fuel_used)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let result = match step {
+        StaticLeafStep::Return(value) => Ok(Some(value)),
+        StaticLeafStep::Trap => Err(Box::new(Trap::from_static_leaf(
+            module,
+            function,
+            u32::try_from(pc).map_err(|_| InterpreterError::TypeMismatch)?,
+        ))),
+        StaticLeafStep::Next | StaticLeafStep::Jump(_) => unreachable!(),
+    };
+    Ok(StaticLeafOutcome {
+        result,
+        charge,
+        fuel,
+    })
 }
 
 fn resolved_class_field(
@@ -1150,34 +1190,34 @@ fn static_leaf_attempt_fuel(
     fuel_add(row.attempt_fuel, work)
 }
 
-fn static_leaf_buffers_valid(
+fn prepare_static_leaf_buffers(
     certificate: crate::executable::StaticLeafCertificate,
     registers: &crate::trusted::StaticLeafRegisters,
     heap: &Heap,
-) -> bool {
-    if let Some(check) = certificate.buffer_copy {
+) -> Option<PreparedStaticLeafBuffers> {
+    let copy = if let Some(check) = certificate.buffer_copy {
         let destination = crate::trusted::read_static_leaf(registers, check.destination);
         let source = crate::trusted::read_static_leaf(registers, check.source);
-        if heap
-            .validate_buffer_copy(
+        Some(
+            heap.prepare_buffer_copy(
                 destination,
                 source,
                 check.source_start,
                 check.destination_start,
                 check.length,
             )
-            .is_err()
-        {
-            return false;
-        }
-    }
-    if let Some(check) = certificate.buffer_get {
+            .ok()?,
+        )
+    } else {
+        None
+    };
+    let get = if let Some(check) = certificate.buffer_get {
         let buffer = crate::trusted::read_static_leaf(registers, check.source);
-        if !matches!(heap.buffer_len(buffer), Ok(length) if check.index < length) {
-            return false;
-        }
-    }
-    true
+        Some(heap.prepare_buffer_get(buffer, check.index).ok()?)
+    } else {
+        None
+    };
+    Some(PreparedStaticLeafBuffers { copy, get })
 }
 
 pub trait InterpreterHost {
@@ -1284,7 +1324,7 @@ impl CheckedInterpreter {
         module: &VerifiedModule,
         function: u32,
         arguments: &[RuntimeValue],
-        mut fuel: FuelState,
+        fuel: FuelState,
         costs: &OpcodeCostTable,
         heap: &mut Heap,
         executable: &crate::executable::ExecutableModule,
@@ -1324,9 +1364,10 @@ impl CheckedInterpreter {
         for (destination, argument) in (0_u16..).zip(arguments.iter().copied()) {
             crate::trusted::write_static_leaf(&mut registers, destination, argument);
         }
-        if !static_leaf_buffers_valid(certificate, &registers, heap) {
+        let Some(prepared_buffers) = prepare_static_leaf_buffers(certificate, &registers, heap)
+        else {
             return Ok(None);
-        }
+        };
         let Some(upper_fuel) = static_leaf_upper_fuel(certificate, heap)? else {
             return Ok(None);
         };
@@ -1335,6 +1376,16 @@ impl CheckedInterpreter {
         };
         if upper_fuel > fuel.slice_remaining || cumulative_after_upper > fuel.cumulative_limit {
             return Ok(None);
+        }
+        if certificate.buffer_kernel_instructions.is_some() {
+            return execute_prepared_buffer_kernel(
+                certificate,
+                &prepared_buffers,
+                fuel,
+                upper_fuel,
+                heap,
+            )
+            .map(Some);
         }
         let mut pc = 0_usize;
         let mut charge = ExecutionCharge::default();
@@ -1360,34 +1411,14 @@ impl CheckedInterpreter {
                 module,
                 heap,
                 executable,
+                &prepared_buffers,
             )?;
             match step {
                 StaticLeafStep::Next => pc += 1,
                 StaticLeafStep::Jump(target) => pc = target,
                 StaticLeafStep::Return(_) | StaticLeafStep::Trap => {
                     debug_assert!(charge.fuel_used <= upper_fuel);
-                    fuel.slice_remaining = fuel
-                        .slice_remaining
-                        .checked_sub(charge.fuel_used)
-                        .ok_or(InterpreterError::FuelCostOverflow)?;
-                    fuel.cumulative_used = fuel
-                        .cumulative_used
-                        .checked_add(charge.fuel_used)
-                        .ok_or(InterpreterError::FuelCostOverflow)?;
-                    let result = match step {
-                        StaticLeafStep::Return(value) => Ok(Some(value)),
-                        StaticLeafStep::Trap => Err(Box::new(Trap::from_static_leaf(
-                            module,
-                            function,
-                            u32::try_from(pc).map_err(|_| InterpreterError::TypeMismatch)?,
-                        ))),
-                        StaticLeafStep::Next | StaticLeafStep::Jump(_) => unreachable!(),
-                    };
-                    return Ok(Some(StaticLeafOutcome {
-                        result,
-                        charge,
-                        fuel,
-                    }));
+                    return finish_static_leaf(step, module, function, pc, charge, fuel).map(Some);
                 }
             }
         }
@@ -5531,6 +5562,131 @@ mod tests {
             .is_none(),
             "a same-shaped but separately verified code backing cannot reuse the certificate"
         );
+    }
+
+    fn make_buffer_leaf_heap(buffer_type: StableId) -> (Heap, [RuntimeValue; 2]) {
+        let mut heap = Heap::new_with_limits(16, 128, 16);
+        let destination = heap
+            .allocate_buffer(
+                buffer_type,
+                ValueType::I32,
+                &[
+                    RuntimeValue::I32(0),
+                    RuntimeValue::I32(0),
+                    RuntimeValue::I32(0),
+                ],
+            )
+            .expect("destination buffer");
+        let source = heap
+            .allocate_buffer(
+                buffer_type,
+                ValueType::I32,
+                &[
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3),
+                ],
+            )
+            .expect("source buffer");
+        (heap, [destination, source])
+    }
+
+    #[test]
+    fn static_leaf_prepares_buffer_headers_once_and_matches_full_execution() {
+        let source = r"
+fn copy(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
+    destination.copy(source, 0, 0, 3);
+    return destination.get(2);
+}
+";
+        let module = nexa_compiler::compile(source).expect("buffer leaf compiles");
+        let costs = OpcodeCostTable::canonical();
+        let executable = ExecutableModule::build(&module, costs).expect("buffer leaf executable");
+        assert!(
+            executable.functions()[0].static_leaf_fuel().is_some(),
+            "the fixture must exercise the certified leaf path"
+        );
+        assert!(
+            executable.functions()[0]
+                .static_leaf_certificate()
+                .is_some_and(|certificate| certificate.buffer_kernel_instructions == Some(7)),
+            "the exact copy-then-get shape must receive the fused-kernel certificate"
+        );
+        let buffer_type = module.module().buffer_types[0].type_id;
+
+        let limits = FrameLimits::default();
+        let (mut full_heap, full_arguments) = make_buffer_leaf_heap(buffer_type);
+        let continuation = CheckedInterpreter::start(
+            &module,
+            0,
+            &full_arguments,
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )
+        .expect("start full buffer path");
+        let full = CheckedInterpreter::poll_with_heap_and_executable(
+            &module,
+            continuation,
+            FuelState::new(256, 0, u64::MAX),
+            costs,
+            &mut full_heap,
+            &executable,
+        )
+        .expect("full buffer path");
+        let InterpreterOutcome::Returned {
+            value: full_value,
+            charge: full_charge,
+            fuel: full_fuel,
+            ..
+        } = full
+        else {
+            panic!("full buffer path must return");
+        };
+
+        let (mut leaf_heap, leaf_arguments) = make_buffer_leaf_heap(buffer_type);
+        let leaf = CheckedInterpreter::try_run_static_leaf(
+            &module,
+            0,
+            &leaf_arguments,
+            FuelState::new(256, 0, u64::MAX),
+            costs,
+            &mut leaf_heap,
+            &executable,
+        )
+        .expect("prepared buffer path executes")
+        .expect("buffer function remains certified");
+        assert_eq!(leaf.result.expect("buffer leaf returns"), full_value);
+        assert_eq!(leaf.charge, full_charge);
+        assert_eq!(leaf.fuel, full_fuel);
+        assert_eq!(leaf_heap.byte_inspection(), full_heap.byte_inspection());
+
+        let required_fuel = leaf.charge.fuel_used;
+        let (mut limited_heap, limited_arguments) = make_buffer_leaf_heap(buffer_type);
+        let before = limited_heap
+            .buffer_values(limited_arguments[0])
+            .expect("destination view")
+            .iter()
+            .collect::<Vec<_>>();
+        assert!(
+            CheckedInterpreter::try_run_static_leaf(
+                &module,
+                0,
+                &limited_arguments,
+                FuelState::new(required_fuel - 1, 0, u64::MAX),
+                costs,
+                &mut limited_heap,
+                &executable,
+            )
+            .expect("insufficient fuel falls back")
+            .is_none(),
+            "fused execution must not start without its exact fuel budget"
+        );
+        let after = limited_heap
+            .buffer_values(limited_arguments[0])
+            .expect("destination view")
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(after, before, "fuel fallback occurs before buffer mutation");
     }
 
     /// F2: the predecoded-row path and the recompute path must charge

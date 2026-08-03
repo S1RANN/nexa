@@ -1020,6 +1020,26 @@ struct BufferParts {
     range: CollectionRange,
 }
 
+/// A buffer copy whose handles, element layout, and logical bounds were
+/// resolved once before a certified leaf starts mutating the heap.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedBufferCopy {
+    destination: BufferParts,
+    source_absolute: usize,
+    destination_absolute: usize,
+    destination_start: usize,
+    length: usize,
+}
+
+/// A buffer read whose handle and logical index were resolved once during
+/// certified-leaf admission.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedBufferGet {
+    storage: CollectionStorage,
+    element_type: nexa_bytecode::ValueType,
+    absolute_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
@@ -2265,6 +2285,60 @@ impl Heap {
             index,
             length: view.len(),
         })
+    }
+
+    fn typed_collection_get_absolute(
+        &self,
+        storage: CollectionStorage,
+        element_type: nexa_bytecode::ValueType,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        macro_rules! scalar {
+            ($arena:ident, $constructor:expr) => {{
+                let values = &self.$arena.values;
+                values
+                    .get(index)
+                    .copied()
+                    .map($constructor)
+                    .ok_or(HeapError::IndexOutOfBounds {
+                        index,
+                        length: values.len(),
+                    })
+            }};
+        }
+        match storage {
+            CollectionStorage::I32 => scalar!(i32_collections, RuntimeValue::I32),
+            CollectionStorage::I64 => scalar!(i64_collections, RuntimeValue::I64),
+            CollectionStorage::F32 => scalar!(f32_collections, RuntimeValue::F32),
+            CollectionStorage::F64 => scalar!(f64_collections, RuntimeValue::F64),
+            CollectionStorage::Bool => {
+                scalar!(bool_collections, |value| RuntimeValue::Bool(value != 0))
+            }
+            CollectionStorage::Rune => scalar!(rune_collections, RuntimeValue::Rune),
+            CollectionStorage::String => scalar!(string_collections, |(reference, hash)| {
+                RuntimeValue::String { reference, hash }
+            }),
+            CollectionStorage::Ref => scalar!(ref_collections, RuntimeValue::Ref),
+            CollectionStorage::NamedRef => {
+                let nexa_bytecode::ValueType::Named(type_id) = element_type else {
+                    return Err(invalid_value_reference());
+                };
+                scalar!(ref_collections, |reference| RuntimeValue::NamedRef {
+                    reference,
+                    type_id,
+                })
+            }
+            CollectionStorage::Values => {
+                let values = &self.collections.values;
+                values
+                    .get(index)
+                    .copied()
+                    .ok_or(HeapError::IndexOutOfBounds {
+                        index,
+                        length: values.len(),
+                    })
+            }
+        }
     }
 
     pub(crate) fn typed_collection_set(
@@ -3937,6 +4011,41 @@ impl Heap {
         self.typed_collection_get(parts.storage, parts.element_type, parts.range, index)
     }
 
+    pub(crate) fn prepare_buffer_get(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<PreparedBufferGet, HeapError> {
+        let parts = self.buffer_parts(value)?;
+        if index >= parts.range.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.range.length,
+            });
+        }
+        let absolute_index = parts
+            .range
+            .start
+            .checked_add(index)
+            .ok_or_else(invalid_value_reference)?;
+        Ok(PreparedBufferGet {
+            storage: parts.storage,
+            element_type: parts.element_type,
+            absolute_index,
+        })
+    }
+
+    pub(crate) fn execute_prepared_buffer_get(
+        &self,
+        prepared: PreparedBufferGet,
+    ) -> Result<RuntimeValue, HeapError> {
+        self.typed_collection_get_absolute(
+            prepared.storage,
+            prepared.element_type,
+            prepared.absolute_index,
+        )
+    }
+
     pub fn buffer_set(
         &mut self,
         value: RuntimeValue,
@@ -4006,6 +4115,19 @@ impl Heap {
         destination_start: usize,
         length: usize,
     ) -> Result<(), HeapError> {
+        let prepared =
+            self.prepare_buffer_copy(destination, source, source_start, destination_start, length)?;
+        self.execute_prepared_buffer_copy(prepared)
+    }
+
+    pub(crate) fn prepare_buffer_copy(
+        &self,
+        destination: RuntimeValue,
+        source: RuntimeValue,
+        source_start: usize,
+        destination_start: usize,
+        length: usize,
+    ) -> Result<PreparedBufferCopy, HeapError> {
         let destination = self.buffer_parts(destination)?;
         let source = self.buffer_parts(source)?;
         let (source_end, destination_end) = validate_buffer_parts_copy(
@@ -4015,21 +4137,42 @@ impl Heap {
             destination_start,
             length,
         )?;
-        let source_absolute = source.range.start + source_start;
-        let destination_absolute = destination.range.start + destination_start;
-        let copied = source_end - source_start;
-        let element_type = destination.element_type;
-        let storage = destination.storage;
+        let source_absolute = source
+            .range
+            .start
+            .checked_add(source_start)
+            .ok_or_else(invalid_value_reference)?;
+        let destination_absolute = destination
+            .range
+            .start
+            .checked_add(destination_start)
+            .ok_or_else(invalid_value_reference)?;
+        debug_assert_eq!(source_end - source_start, length);
+        debug_assert_eq!(destination_end - destination_start, length);
+        Ok(PreparedBufferCopy {
+            destination,
+            source_absolute,
+            destination_absolute,
+            destination_start,
+            length,
+        })
+    }
+
+    pub(crate) fn execute_prepared_buffer_copy(
+        &mut self,
+        prepared: PreparedBufferCopy,
+    ) -> Result<(), HeapError> {
+        let storage = prepared.destination.storage;
         let element_bytes = storage.cell_size();
         self.counters.collection_relocation_bytes = self
             .counters
             .collection_relocation_bytes
-            .saturating_add((copied * element_bytes) as u64);
+            .saturating_add((prepared.length * element_bytes) as u64);
         macro_rules! copy_typed {
             ($arena:ident) => {
                 self.$arena.values.copy_within(
-                    source_absolute..source_absolute + copied,
-                    destination_absolute,
+                    prepared.source_absolute..prepared.source_absolute + prepared.length,
+                    prepared.destination_absolute,
                 )
             };
         }
@@ -4049,30 +4192,19 @@ impl Heap {
         // G1 barrier: every reference just published into the destination
         // extent is shaded; the gray queue tolerates duplicates.
         if self.gc_phase == GcPhase::Mark {
-            for offset in 0..(source_end - source_start) {
+            for offset in 0..prepared.length {
                 if let Some(value) = self
-                    .typed_collection_view(storage, element_type, destination.range)?
-                    .get(destination_start + offset)
+                    .typed_collection_view(
+                        storage,
+                        prepared.destination.element_type,
+                        prepared.destination.range,
+                    )?
+                    .get(prepared.destination_start + offset)
                 {
                     self.shade_on_write(value);
                 }
             }
         }
-        debug_assert_eq!(destination_end - destination_start, length);
-        Ok(())
-    }
-
-    pub(crate) fn validate_buffer_copy(
-        &self,
-        destination: RuntimeValue,
-        source: RuntimeValue,
-        source_start: usize,
-        destination_start: usize,
-        length: usize,
-    ) -> Result<(), HeapError> {
-        let destination = self.buffer_parts(destination)?;
-        let source = self.buffer_parts(source)?;
-        validate_buffer_parts_copy(destination, source, source_start, destination_start, length)?;
         Ok(())
     }
 
