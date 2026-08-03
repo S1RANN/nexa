@@ -88,6 +88,12 @@ pub struct PooledStringConstant {
     pub hash: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExecutableExport {
+    stable_id: StableId,
+    module_index: usize,
+}
+
 /// One predecoded metadata row parallel to verified bytecode.
 ///
 /// The 48-byte portable `Instruction` remains in the verifier-owned function
@@ -321,6 +327,7 @@ impl std::error::Error for ExecutableBuildError {}
 #[derive(Clone, Debug)]
 pub struct ExecutableModule {
     functions: Vec<ExecutableFunction>,
+    exports: Vec<ExecutableExport>,
     string_pool: Vec<PooledStringConstant>,
     string_pool_id: u64,
     cost_table_version: u32,
@@ -362,8 +369,19 @@ impl ExecutableModule {
                 costs,
             )?);
         }
+        let mut exports = bytecode
+            .exports
+            .iter()
+            .enumerate()
+            .map(|(module_index, export)| ExecutableExport {
+                stable_id: export.stable_id,
+                module_index,
+            })
+            .collect::<Vec<_>>();
+        exports.sort_unstable_by_key(|export| export.stable_id);
         Ok(Self {
             functions,
+            exports,
             string_pool,
             string_pool_id: NEXT_STRING_POOL_ID.fetch_add(1, Ordering::Relaxed),
             cost_table_version: costs.version,
@@ -373,6 +391,14 @@ impl ExecutableModule {
     #[must_use]
     pub fn functions(&self) -> &[ExecutableFunction] {
         &self.functions
+    }
+
+    #[inline]
+    pub(crate) fn export_index(&self, stable_id: StableId) -> Option<usize> {
+        self.exports
+            .binary_search_by_key(&stable_id, |export| export.stable_id)
+            .ok()
+            .map(|index| self.exports[index].module_index)
     }
 
     #[must_use]
@@ -1046,7 +1072,7 @@ mod tests {
         Signature, ValueType,
     };
     use nexa_core::StableId;
-    use nexa_verifier::{VerifierLimits, verify};
+    use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
     use super::{ExecutableBuildError, ExecutableModule, static_leaf_instruction_supported};
     use crate::interpreter::{OpcodeCostTable, is_safepoint};
@@ -1211,6 +1237,21 @@ fn update_counter() -> i32 {
                 _ => {}
             }
         }
+        assert_export_index(&module, &executable);
+    }
+
+    fn assert_export_index(module: &VerifiedModule, executable: &ExecutableModule) {
+        for (module_index, export) in module.module().exports.iter().enumerate() {
+            assert_eq!(
+                executable.export_index(export.stable_id),
+                Some(module_index),
+                "every script export resolves to its dense module slot"
+            );
+        }
+        assert_eq!(
+            executable.export_index(StableId::from_name("missing.executable.export")),
+            None
+        );
     }
 
     #[test]

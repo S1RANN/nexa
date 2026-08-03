@@ -2702,11 +2702,9 @@ impl RealmRuntime {
             return Err(RealmError::ModuleNotCallable);
         }
         let export = loaded
-            .verified
-            .module()
-            .exports
-            .iter()
-            .find(|export| export.stable_id == entrypoint.stable_id)
+            .executable
+            .export_index(entrypoint.stable_id)
+            .and_then(|index| loaded.verified.module().exports.get(index))
             .ok_or(RealmError::MissingTransactionalCellExport(
                 entrypoint.stable_id,
             ))?;
@@ -2808,11 +2806,9 @@ impl RealmRuntime {
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?;
         let export = loaded
-            .verified
-            .module()
-            .exports
-            .iter()
-            .find(|candidate| candidate.stable_id == stable_id)
+            .executable
+            .export_index(stable_id)
+            .and_then(|index| loaded.verified.module().exports.get(index))
             .ok_or(RealmError::MissingScriptExport(stable_id))?;
         let function = loaded
             .verified
@@ -2856,11 +2852,9 @@ impl RealmRuntime {
             .resolve(module.raw())
             .map_err(|error| crate::ScriptCallError::Runtime(format!("{error:?}")))?;
         let export = loaded
-            .verified
-            .module()
-            .exports
-            .iter()
-            .find(|candidate| candidate.stable_id == E::STABLE_ID)
+            .executable
+            .export_index(E::STABLE_ID)
+            .and_then(|index| loaded.verified.module().exports.get(index))
             .ok_or(crate::ScriptCallError::MissingExport {
                 name: E::NAME,
                 stable_id: E::STABLE_ID,
