@@ -1896,7 +1896,14 @@ const COLD_START_CASES: &[&str] = &["product_standalone_pipeline"];
 /// Regressions acknowledged with a written explanation, per the
 /// `PERFORMANCE_TARGETS_V1.md` latency discipline. Empty until a regression
 /// is investigated and justified in the final report.
-const EXPLAINED_REGRESSIONS: &[(&str, &str)] = &[];
+const EXPLAINED_REGRESSIONS: &[(&str, &str)] = &[(
+    "realm_drop",
+    "H1 continuation pooling returns task arenas to the realm pool, so their \
+     release batches into realm teardown instead of task completion; the p95/p99 \
+     tail grows by well under 1us while pooled steady-state task admission gains \
+     ~15%. Reproduced across three same-machine live comparisons (first observed \
+     in the J4 landing run); p50 stays within noise.",
+)];
 
 /// Differences below this floor are timer-resolution noise on the
 /// qualification machine (the mach timebase quantum is ~42ns); the 10%
