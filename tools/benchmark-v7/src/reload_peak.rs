@@ -62,6 +62,7 @@ struct Sample {
     shared_executable_payload_bytes: u64,
     layout_reuses: u64,
     module_abi_reuses: u64,
+    profile_metadata_reuses: u64,
     function_reuses: u64,
     string_pool_reuses: u64,
     host_plan_reuses: u64,
@@ -178,6 +179,7 @@ struct VmStorageSummary {
 struct ReuseSummary {
     layout_tables: u64,
     module_abis: u64,
+    profile_metadata: u64,
     unchanged_functions: u64,
     string_pools: u64,
     host_import_plans: u64,
@@ -218,6 +220,7 @@ pub(super) fn run(samples: usize, output: Option<&str>) -> Result<(), Box<dyn st
     let collection_bytes = max(|sample| sample.collection_bytes);
     let layout_reuses = max(|sample| sample.layout_reuses);
     let module_abi_reuses = max(|sample| sample.module_abi_reuses);
+    let profile_metadata_reuses = max(|sample| sample.profile_metadata_reuses);
     let function_reuses = max(|sample| sample.function_reuses);
     let string_pool_reuses = max(|sample| sample.string_pool_reuses);
     let host_plan_reuses = max(|sample| sample.host_plan_reuses);
@@ -327,6 +330,7 @@ pub(super) fn run(samples: usize, output: Option<&str>) -> Result<(), Box<dyn st
         reuse: ReuseSummary {
             layout_tables: layout_reuses,
             module_abis: module_abi_reuses,
+            profile_metadata: profile_metadata_reuses,
             unchanged_functions: function_reuses,
             string_pools: string_pool_reuses,
             host_import_plans: host_plan_reuses,
@@ -435,6 +439,7 @@ fn measure_one() -> Result<Sample, Box<dyn std::error::Error>> {
         shared_executable_payload_bytes: images.shared_executable_payload_bytes,
         layout_reuses: images.layout_reuses,
         module_abi_reuses: images.module_abi_reuses,
+        profile_metadata_reuses: images.profile_metadata_reuses,
         function_reuses: images.function_reuses,
         string_pool_reuses: images.string_pool_reuses,
         host_plan_reuses: host_plans.hits,

@@ -1604,7 +1604,7 @@ mod tests {
         assert_eq!(run.results[0].status, TestStatus::Error);
         assert_eq!(run.results[0].error, Some(TestError::FuelExhaustion));
         assert_eq!(run.results[0].instructions, 33);
-        // Bytecode v6 charges the caller's `Call` base plus its one-register
+        // Bytecode v7 charges the caller's `Call` base plus its one-register
         // callee-frame initialization (2 fuel) before entering `helper`.
         // The first `LoadBool` is then settled at the callee's entry
         // safepoint, so the exact committed charge is 3 fuel; the remaining

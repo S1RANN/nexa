@@ -1893,13 +1893,17 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         || report["samples"] != M5_RELOAD_PEAK_SAMPLES
         || report["status"] != "PASS"
         || report["build_profile"] != "release"
+        || report["protocol"]
+            != "one warmup plus bounded whole-lifetime samples in one isolated process"
+        || report["measurement_boundary"]
+            != "before compiling both candidates through committed reload while encoded artifacts, both execution images, migration staging, active incremental GC, and rooted VM storage overlap"
+        || report["started_at_unix_ms"]
+            .as_u64()
+            .is_none_or(|started| started == 0)
+        || !qualified_benchmark_toolchain(&report)
         || !qualified_benchmark_machine(&report)
         || !is_hex_digest(&report["benchmark_source_hash"], 32)
-        || ["p50_ns", "p95_ns", "p99_ns"].iter().any(|field| {
-            report["duration"][field]
-                .as_u64()
-                .is_none_or(|duration| duration == 0)
-        })
+        || !valid_p50_p95_p99(&report["duration"])
         || surfaces.len() != 7
         || surfaces.values().any(|value| value != true)
         || report["system_allocator"]["allocations_max"]
@@ -1911,12 +1915,7 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         || report["system_allocator"]["peak_outstanding_bytes_max"]
             .as_u64()
             .is_none_or(|bytes| bytes == 0)
-        || report["portable_artifacts"]["old_bytes"]
-            .as_u64()
-            .is_none_or(|bytes| bytes == 0)
-        || report["portable_artifacts"]["candidate_bytes"]
-            .as_u64()
-            .is_none_or(|bytes| bytes == 0)
+        || !valid_portable_artifact_overlap(&report["portable_artifacts"])
         || report["executable_images"]["entries"]
             .as_u64()
             .is_none_or(|entries| entries < 2)
@@ -1930,11 +1929,26 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         || report["migration_staging"]["object_peak"]
             .as_u64()
             .is_none_or(|peak| peak == 0)
+        || report["migration_staging"]["field_peak"]
+            .as_u64()
+            .is_none_or(|peak| peak == 0)
+        || report["migration_staging"]["forwarding_peak"]
+            .as_u64()
+            .is_none_or(|peak| peak == 0)
         || report["migration_staging"]["payload_byte_peak"]
             .as_u64()
             .is_none_or(|peak| peak == 0)
+        || report["migration_staging"]["gc_root_peak"]
+            .as_u64()
+            .is_none()
         || report["incremental_gc"]["active_before_reload"] != true
         || report["incremental_gc"]["active_after_reload"] != true
+        || report["incremental_gc"]["phase_before_reload"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || report["incremental_gc"]["phase_after_reload"]
+            .as_str()
+            .is_none_or(str::is_empty)
         || report["vm_storage"]["string_bytes"]
             .as_u64()
             .is_none_or(|bytes| bytes == 0)
@@ -1944,6 +1958,8 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         || report["reuse"]["layout_tables"]
             .as_u64()
             .is_none_or(|count| count == 0)
+        || report["reuse"]["module_abis"].as_u64().is_none()
+        || report["reuse"]["profile_metadata"].as_u64().is_none()
         || report["reuse"]["unchanged_functions"]
             .as_u64()
             .is_none_or(|count| count == 0)
@@ -1957,6 +1973,32 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         return None;
     }
     Some(report)
+}
+
+fn valid_p50_p95_p99(summary: &Value) -> bool {
+    let Some(p50) = summary["p50_ns"].as_u64() else {
+        return false;
+    };
+    let Some(p95) = summary["p95_ns"].as_u64() else {
+        return false;
+    };
+    let Some(p99) = summary["p99_ns"].as_u64() else {
+        return false;
+    };
+    p50 > 0 && p50 <= p95 && p95 <= p99
+}
+
+fn valid_portable_artifact_overlap(summary: &Value) -> bool {
+    let Some(old) = summary["old_bytes"].as_u64() else {
+        return false;
+    };
+    let Some(candidate) = summary["candidate_bytes"].as_u64() else {
+        return false;
+    };
+    let Some(simultaneous) = summary["simultaneous_bytes"].as_u64() else {
+        return false;
+    };
+    old > 0 && candidate > 0 && old.saturating_add(candidate) == simultaneous
 }
 
 /// M5 WP98: records every required cold-start surface independently.
@@ -2025,6 +2067,15 @@ fn cold_start_report_at(path: &Path, implementation_commit: &str) -> Option<Valu
         || report["warmup"] != 1
         || report["status"] != "PASS"
         || report["build_profile"] != "release"
+        || report["protocol"]
+            != "one isolated process; one unrecorded process warmup; every measured cold sample reconstructs the named boundary"
+        || report["started_at_unix_ms"]
+            .as_u64()
+            .is_none_or(|started| started == 0)
+        || report["measurement_boundaries"]
+            .as_object()
+            .is_none_or(|boundaries| boundaries.len() != M5_COLD_START_CASES.len())
+        || !qualified_benchmark_toolchain(&report)
         || !qualified_benchmark_machine(&report)
         || !is_hex_digest(&report["benchmark_source_hash"], 32)
     {
@@ -2032,10 +2083,33 @@ fn cold_start_report_at(path: &Path, implementation_commit: &str) -> Option<Valu
     }
     for case in cases {
         let name = case["case"].as_str()?;
-        if case["samples"] != M5_COLD_START_SAMPLES
-            || case["p50_ns"].as_u64().is_none_or(|value| value == 0)
-            || case["p95_ns"].as_u64().is_none_or(|value| value == 0)
-            || case["p99_ns"].as_u64().is_none_or(|value| value == 0)
+        let minimum = case["min_ns"].as_u64()?;
+        let p50 = case["p50_ns"].as_u64()?;
+        let p90 = case["p90_ns"].as_u64()?;
+        let p95 = case["p95_ns"].as_u64()?;
+        let p99 = case["p99_ns"].as_u64()?;
+        let maximum = case["max_ns"].as_u64()?;
+        if case["tier"].as_str().is_none_or(str::is_empty)
+            || case["samples"] != M5_COLD_START_SAMPLES
+            || case["throughput_ops_per_second"]
+                .as_u64()
+                .is_none_or(|throughput| throughput == 0)
+            || case["mean_ns"].as_u64().is_none_or(|mean| mean == 0)
+            || minimum == 0
+            || minimum > p50
+            || p50 > p90
+            || p90 > p95
+            || p95 > p99
+            || p99 > maximum
+            || [
+                "system_allocations",
+                "system_reallocations",
+                "system_allocated_bytes",
+                "system_reallocated_bytes",
+                "system_peak_outstanding_bytes",
+            ]
+            .into_iter()
+            .any(|field| case[field].as_u64().is_none())
             || report["measurement_boundaries"][name]
                 .as_str()
                 .is_none_or(str::is_empty)
@@ -2226,9 +2300,7 @@ fn formal_aggregate(report: Value, implementation_commit: &str) -> Option<Value>
             == "timed operation only; per-sample setup and result storage excluded"
         && is_hex_digest(&report["benchmark_source_hash"], 32)
         && is_hex_digest(&report["bytecode_hash"], 32)
-        && report["toolchain"]
-            .as_str()
-            .is_some_and(|toolchain| !toolchain.is_empty() && toolchain != "unknown")
+        && qualified_benchmark_toolchain(&report)
         && qualified_benchmark_machine(&report)
         && !cases.is_empty()
         && mandatory_cases
@@ -2242,6 +2314,12 @@ fn is_hex_digest(value: &Value, bytes: usize) -> bool {
         digest.len() == bytes.saturating_mul(2)
             && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+fn qualified_benchmark_toolchain(report: &Value) -> bool {
+    report["toolchain"]
+        .as_str()
+        .is_some_and(|toolchain| !toolchain.is_empty() && toolchain != "unknown")
 }
 
 fn qualified_benchmark_machine(report: &Value) -> bool {
