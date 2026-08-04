@@ -108,6 +108,21 @@ async_value().await
 }
 
 #[test]
+fn repl_preserves_state_across_one_hundred_mutation_cells() {
+    let fixture = Fixture::new();
+    let mut input = String::from("let mut total = 0;\n");
+    for _ in 0..100 {
+        input.push_str("total = total + 1;\n");
+    }
+    input.push_str("total\n:quit\n");
+
+    let output = fixture.repl(&[], &input);
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    assert!(has_output_line(&output, "100"), "{}", text(&output.stdout));
+}
+
+#[test]
 fn repl_inspection_and_maintenance_commands_use_the_compiled_session() {
     let fixture = Fixture::new();
     let output = fixture.repl(
