@@ -4849,24 +4849,24 @@ mod tests {
     fn unit_call_requires_a_bounded_dummy_return_slot() {
         let module = |caller_registers| {
             let mut module = ModuleBuilder::new();
-            let mut callee = FunctionBuilder::new(
+            let mut target_function = FunctionBuilder::new(
                 Signature {
                     parameters: Vec::new(),
                     result: None,
                 },
                 0,
             );
-            callee.emit(Instruction::ReturnVoid);
-            module.function(callee.finish().expect("Unit callee"));
+            target_function.emit(Instruction::ReturnVoid);
+            module.function(target_function.finish().expect("Unit callee"));
 
-            let mut caller = FunctionBuilder::new(
+            let mut invoker = FunctionBuilder::new(
                 Signature {
                     parameters: Vec::new(),
                     result: None,
                 },
                 caller_registers,
             );
-            caller
+            invoker
                 .emit(Instruction::Call {
                     function: 0,
                     args_base: 0,
@@ -4874,7 +4874,7 @@ mod tests {
                     dst: 0,
                 })
                 .emit(Instruction::ReturnVoid);
-            module.function(caller.finish().expect("Unit caller"));
+            module.function(invoker.finish().expect("Unit caller"));
             module.finish()
         };
 
