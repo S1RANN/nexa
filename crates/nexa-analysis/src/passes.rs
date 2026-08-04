@@ -961,7 +961,7 @@ impl TypedIrPass for MatchSpecialization {
     }
 
     fn run_function(&self, function: &mut TypedFunctionIr, context: &mut PassContext) {
-        let mut scopes = MatchScopes::default();
+        let mut scopes = MatchScopes::new(function);
         specialize_match_block(&mut function.body, &mut scopes, context);
     }
 }
@@ -969,17 +969,34 @@ impl TypedIrPass for MatchSpecialization {
 #[derive(Clone, Debug)]
 enum KnownTag {
     Literal(IrLiteral),
-    Enum(DefinitionId),
-    Builtin(BuiltinVariantIr),
-    Struct(DefinitionId),
+    Enum {
+        variant: DefinitionId,
+        payload: Option<Box<TypedExpressionIr>>,
+    },
+    Builtin {
+        variant: BuiltinVariantIr,
+        payload: Option<Box<TypedExpressionIr>>,
+    },
+    Struct {
+        definition: DefinitionId,
+        fields: Vec<(DefinitionId, TypedExpressionIr)>,
+    },
 }
 
 #[derive(Default)]
 struct MatchScopes {
     scopes: Vec<BTreeMap<DefinitionId, KnownTag>>,
+    immutable: BTreeSet<DefinitionId>,
 }
 
 impl MatchScopes {
+    fn new(function: &TypedFunctionIr) -> Self {
+        Self {
+            scopes: Vec::new(),
+            immutable: function.parameters.iter().copied().collect(),
+        }
+    }
+
     fn lookup(&self, definition: DefinitionId) -> Option<&KnownTag> {
         self.scopes
             .iter()
@@ -995,6 +1012,7 @@ impl MatchScopes {
     }
 
     fn invalidate(&mut self, definition: DefinitionId) {
+        self.immutable.remove(&definition);
         for scope in &mut self.scopes {
             scope.remove(&definition);
         }
@@ -1042,10 +1060,15 @@ fn specialize_match_block(
                 if let Some(value) = value {
                     specialize_match_expression(value, scopes, context);
                 }
-                if !*mutable
-                    && let Some(tag) = value.as_ref().and_then(|value| known_tag(value, scopes))
-                {
-                    scopes.bind(*definition, tag);
+                if !*mutable {
+                    scopes.immutable.insert(*definition);
+                    if let Some(tag) = value.as_ref().and_then(|value| {
+                        is_stable_match_value(value, scopes)
+                            .then(|| known_tag(value, scopes))
+                            .flatten()
+                    }) {
+                        scopes.bind(*definition, tag);
+                    }
                 }
             }
             TypedStatementIr::Assign { target, value } => {
@@ -1134,16 +1157,31 @@ fn specialize_match_expression(
     };
     *expression = replacement;
     context.rewrites = context.rewrites.saturating_add(1);
+    // The selected arm may contain another match over a binding introduced
+    // by the eliminated arm. Descend once more into the replacement so local
+    // tag knowledge survives nested match forms without another global pass.
+    specialize_match_expression(expression, scopes, context);
 }
 
 fn known_tag(expression: &TypedExpressionIr, scopes: &MatchScopes) -> Option<KnownTag> {
     match &expression.kind {
         TypedExpressionKind::Literal(literal) => Some(KnownTag::Literal(literal.clone())),
         TypedExpressionKind::EnumConstruct {
-            variant_definition, ..
-        } => Some(KnownTag::Enum(*variant_definition)),
-        TypedExpressionKind::BuiltinVariant { variant, .. } => Some(KnownTag::Builtin(*variant)),
-        TypedExpressionKind::Construct { definition, .. } => Some(KnownTag::Struct(*definition)),
+            variant_definition,
+            payload,
+            ..
+        } => Some(KnownTag::Enum {
+            variant: *variant_definition,
+            payload: payload.clone(),
+        }),
+        TypedExpressionKind::BuiltinVariant { variant, payload } => Some(KnownTag::Builtin {
+            variant: *variant,
+            payload: payload.clone(),
+        }),
+        TypedExpressionKind::Construct { definition, fields } => Some(KnownTag::Struct {
+            definition: *definition,
+            fields: fields.clone(),
+        }),
         TypedExpressionKind::Reference(definition) => scopes.lookup(*definition).cloned(),
         _ => None,
     }
@@ -1186,19 +1224,19 @@ fn known_match_value(
         }
         TypedExpressionKind::Reference(definition) => match scopes.lookup(*definition)? {
             KnownTag::Literal(literal) => KnownShape::Literal(literal.clone()),
-            KnownTag::Enum(variant) => KnownShape::Enum {
+            KnownTag::Enum { variant, payload } => KnownShape::Enum {
                 variant: *variant,
-                payload: None,
-                projectable: false,
+                payload: payload.clone(),
+                projectable: true,
             },
-            KnownTag::Builtin(variant) => KnownShape::Builtin {
+            KnownTag::Builtin { variant, payload } => KnownShape::Builtin {
                 variant: *variant,
-                payload: None,
-                projectable: false,
+                payload: payload.clone(),
+                projectable: true,
             },
-            KnownTag::Struct(definition) => KnownShape::Struct {
+            KnownTag::Struct { definition, fields } => KnownShape::Struct {
                 definition: *definition,
-                fields: None,
+                fields: Some(fields.clone()),
             },
         },
         _ => return None,
@@ -1462,12 +1500,46 @@ fn is_match_specialization_safe(expression: &TypedExpressionIr) -> bool {
     }
 }
 
+/// Stored payloads can be projected by substitution only when every value
+/// they read is immutable for the rest of the function. Mutable values are
+/// deliberately limited to tag-only specialization.
+fn is_stable_match_value(expression: &TypedExpressionIr, scopes: &MatchScopes) -> bool {
+    match &expression.kind {
+        TypedExpressionKind::Literal(_) => true,
+        TypedExpressionKind::Reference(definition) => scopes.immutable.contains(definition),
+        TypedExpressionKind::Unary { operand, .. } => is_stable_match_value(operand, scopes),
+        TypedExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            !matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder)
+                && expression.ty != IrType::String
+                && is_stable_match_value(left, scopes)
+                && is_stable_match_value(right, scopes)
+        }
+        TypedExpressionKind::Construct { fields, .. } => fields
+            .iter()
+            .all(|(_, value)| is_stable_match_value(value, scopes)),
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => payload
+            .as_deref()
+            .is_none_or(|payload| is_stable_match_value(payload, scopes)),
+        TypedExpressionKind::Tuple(values) => values
+            .iter()
+            .all(|value| is_stable_match_value(value, scopes)),
+        _ => false,
+    }
+}
+
 /// WP41 plus the IR half of WP42: removes provably dead pure work.
 ///
 /// An expression is deletable only when evaluating it can neither trap,
 /// allocate, call the host, nor touch any resource: division stays because
-/// of `DivideByZero`, constructors stay because heap admission can trap,
-/// calls stay entirely. Constant `if` conditions select their branch,
+/// of `DivideByZero`, Class/collection constructors stay because heap
+/// admission can trap, and calls stay entirely. Physical Struct/Enum/Tuple
+/// construction is pure and can disappear once unused. Constant `if`
+/// conditions select their branch,
 /// `while false` loops disappear, and statements after a terminator are
 /// unreachable and dropped. One bounded sweep, no fixpoint iteration.
 pub struct DeadCodeElimination;
@@ -2240,6 +2312,14 @@ fn is_pure_expression(expression: &TypedExpressionIr) -> bool {
                 && is_pure_expression(left)
                 && is_pure_expression(right)
         }
+        TypedExpressionKind::Construct { fields, .. } => {
+            fields.iter().all(|(_, value)| is_pure_expression(value))
+        }
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => {
+            payload.as_deref().is_none_or(is_pure_expression)
+        }
+        TypedExpressionKind::Tuple(values) => values.iter().all(is_pure_expression),
         _ => false,
     }
 }

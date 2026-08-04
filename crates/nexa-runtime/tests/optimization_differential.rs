@@ -7,6 +7,7 @@
 //! on it.
 
 use nexa_bytecode::Instruction;
+use nexa_core::SourceSpan;
 use nexa_runtime::{CheckedInterpreter, Heap, InterpreterOutcome, RuntimeValue, TrapKind};
 use nexa_verifier::VerifiedModule;
 
@@ -250,7 +251,24 @@ enum Observed {
     Trapped(TrapKind),
 }
 
-fn observe(module: &VerifiedModule, function: u32, arguments: &[RuntimeValue]) -> (Observed, u64) {
+#[derive(Debug, PartialEq)]
+struct TrapEvidence {
+    source_span: Option<SourceSpan>,
+    script_stack: Vec<(u32, Option<SourceSpan>)>,
+    host_boundary: Option<(u32, Option<SourceSpan>)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Observation {
+    outcome: Observed,
+    trap: Option<TrapEvidence>,
+}
+
+fn observe(
+    module: &VerifiedModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+) -> (Observation, u64) {
     let mut heap = Heap::new_with_limits(256, 16_384, 256);
     let outcome = CheckedInterpreter::run_with_heap(module, function, arguments, FUEL, &mut heap)
         .unwrap_or_else(|error| {
@@ -268,11 +286,33 @@ fn observe(module: &VerifiedModule, function: u32, arguments: &[RuntimeValue]) -
         "function {function} must not materialize a physical Enum"
     );
     match outcome {
-        InterpreterOutcome::Returned { value, charge, .. } => {
-            (Observed::Returned(value), charge.fuel_used)
-        }
+        InterpreterOutcome::Returned { value, charge, .. } => (
+            Observation {
+                outcome: Observed::Returned(value),
+                trap: None,
+            },
+            charge.fuel_used,
+        ),
         InterpreterOutcome::Trapped { trap, charge, .. } => {
-            (Observed::Trapped(trap.kind), charge.fuel_used)
+            let evidence = TrapEvidence {
+                source_span: trap.source_span,
+                script_stack: trap
+                    .script_call_stack
+                    .as_slice()
+                    .iter()
+                    .map(|frame| (frame.function, frame.source_span))
+                    .collect(),
+                host_boundary: trap
+                    .host_call_boundary
+                    .map(|boundary| (boundary.import, boundary.source_span)),
+            };
+            (
+                Observation {
+                    outcome: Observed::Trapped(trap.kind),
+                    trap: Some(evidence),
+                },
+                charge.fuel_used,
+            )
         }
         InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
             panic!("corpus never suspends or calls the host under test fuel")
@@ -294,7 +334,7 @@ fn assert_case(
          (optimized fuel {optimized_fuel}, reference fuel {reference_fuel})"
     );
     assert_eq!(
-        &optimized_outcome, expected,
+        &optimized_outcome.outcome, expected,
         "function {function} disagrees with the pinned corpus expectation"
     );
 }
@@ -428,9 +468,8 @@ fn reference_pipeline_actually_disables_the_optimizations() {
             .filter(|instruction| matches!(instruction, Instruction::StructNew { .. }))
             .count()
     };
-    // WP27/WP28 are representation semantics, not optional optimizations:
-    // both pipelines construct Struct/Enum values in physical register
-    // ranges and neither opcode denotes a heap materialization.
+    // WP27 Struct representation is shared by both pipelines: construction
+    // uses physical register ranges and never denotes a heap materialization.
     assert!(
         struct_constructions(&optimized, STRUCT_READ) > 0
             && struct_constructions(&reference, STRUCT_READ) > 0,
@@ -443,13 +482,17 @@ fn reference_pipeline_actually_disables_the_optimizations() {
             .filter(|instruction| matches!(instruction, Instruction::EnumNew { .. }))
             .count()
     };
-    assert!(
-        [ENUM_ROUND, ENUM_STATIC_QUIET, ENUM_ESCAPE]
-            .into_iter()
-            .all(|function| enum_constructions(&optimized, function) > 0
-                && enum_constructions(&reference, function) > 0),
-        "both pipelines retain physical Enum tag/payload construction"
-    );
+    for function in [ENUM_ROUND, ENUM_STATIC_QUIET, ENUM_ESCAPE] {
+        assert_eq!(
+            enum_constructions(&optimized, function),
+            0,
+            "WP43 removes a locally known Enum construction in function {function}"
+        );
+        assert!(
+            enum_constructions(&reference, function) > 0,
+            "reference function {function} retains physical Enum construction"
+        );
+    }
     // WP52 row storage is likewise a mandatory materialization boundary:
     // both pipelines push and read flattened physical rows.
     let push_rows = |module: &VerifiedModule, function: u32| {
