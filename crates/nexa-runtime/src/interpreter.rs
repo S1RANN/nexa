@@ -40,6 +40,14 @@ pub struct ExecutionCharge {
     pub fuel_used: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsyncResumeValue {
+    pub expected: Option<ValueType>,
+    pub result: AsyncResultType,
+    pub success: bool,
+    pub payload: RuntimeValue,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticLeafOutcome {
     pub result: Result<Option<RuntimeValue>, Box<Trap>>,
@@ -223,28 +231,25 @@ impl InterpreterContinuation {
         &mut self,
         module: &VerifiedModule,
         destination: u16,
-        expected: Option<ValueType>,
-        result: AsyncResultType,
-        success: bool,
-        payload: RuntimeValue,
+        resume: AsyncResumeValue,
         heap: Option<&Heap>,
     ) -> Result<(), InterpreterError> {
-        if expected != Some(ValueType::Named(result.result_type)) {
+        if resume.expected != Some(ValueType::Named(resume.result.result_type)) {
             return Err(InterpreterError::TypeMismatch);
         }
         let layout = module
             .layout_table()
-            .named_layout(result.result_type)
+            .named_layout(resume.result.result_type)
             .ok_or(InterpreterError::TypeMismatch)?;
         let enum_layout = layout
             .enum_layout
             .as_ref()
             .ok_or(InterpreterError::TypeMismatch)?;
-        let tag = u32::from(!success);
-        let payload_type = if success {
-            result.success
+        let tag = u32::from(!resume.success);
+        let payload_type = if resume.success {
+            resume.result.success
         } else {
-            result.error
+            resume.result.error
         };
         let variant = enum_layout
             .variants
@@ -266,7 +271,7 @@ impl InterpreterContinuation {
                 .get_mut(payload_start..payload_end)
                 .ok_or(InterpreterError::TypeMismatch)?,
             payload_type,
-            payload,
+            resume.payload,
             module.layout_table(),
             heap,
         )?;
@@ -1047,38 +1052,40 @@ fn execute_static_leaf_class(
             let value = heap.allocate_class(type_id, fields)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
-        Instruction::ClassGet { source, field, dst } => {
+        Instruction::ClassGet {
+            source,
+            field: _,
+            dst,
+        } => {
             let value = crate::trusted::read_static_leaf(registers, source);
-            let RuntimeValue::NamedRef { type_id, .. } = value else {
+            let RuntimeValue::NamedRef { .. } = value else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (_index, offset, slots, _owner_slots, _expected, _) =
-                resolved_class_field(module, type_id, field, row.resolved_nominal)?;
-            let field_values = heap.class_field_range(value, offset, slots)?;
+            let resolved = resolved_class_field(module, row.resolved_nominal)?;
+            let field_values = heap.class_field_range(value, resolved.offset, resolved.slots)?;
             crate::trusted::write_static_leaf_values(
                 registers,
                 dst,
-                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                u16::try_from(resolved.slots).map_err(|_| InterpreterError::TypeMismatch)?,
                 field_values.iter(),
             )?;
         }
         Instruction::ClassSet {
             source,
-            field,
+            field: _,
             value,
         } => {
             let object = crate::trusted::read_static_leaf(registers, source);
-            let RuntimeValue::NamedRef { type_id, .. } = object else {
+            let RuntimeValue::NamedRef { .. } = object else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (_index, offset, slots, _owner_slots, _expected, _) =
-                resolved_class_field(module, type_id, field, row.resolved_nominal)?;
+            let resolved = resolved_class_field(module, row.resolved_nominal)?;
             let replacement = crate::trusted::read_static_leaf_window(
                 registers,
                 value,
-                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                u16::try_from(resolved.slots).map_err(|_| InterpreterError::TypeMismatch)?,
             );
-            heap.set_class_field_range(object, offset, replacement)?;
+            heap.set_class_field_range(object, resolved.offset, replacement)?;
         }
         _ => unreachable!("class leaf helper receives only class instructions"),
     }
@@ -1467,41 +1474,41 @@ fn allocate_resolved_map(
     Ok(heap.allocate_physical_map(type_id, key_type, value_type, value_slots)?)
 }
 
+#[derive(Clone, Copy)]
+struct ResolvedClassField {
+    offset: usize,
+    slots: usize,
+    expected: ValueType,
+    state_index: Option<usize>,
+}
+
 fn resolved_class_field(
     module: &VerifiedModule,
-    type_id: StableId,
-    field: StableId,
     resolved: ExecutableNominalOperand,
-) -> Result<(usize, usize, usize, usize, ValueType, Option<usize>), InterpreterError> {
-    match resolved {
-        ExecutableNominalOperand::ClassField {
-            type_index,
-            index,
-            offset,
-            slots,
-            state_index,
-        } => {
-            let expected = module
-                .module()
-                .class_types
-                .get(usize::from(type_index))
-                .and_then(|class_type| class_type.fields.get(usize::from(index)))
-                .map(|field| field.ty)
-                .ok_or(InterpreterError::TypeMismatch)?;
-            Ok((
-                usize::from(index),
-                usize::from(offset),
-                usize::from(slots),
-                1,
-                expected,
-                (state_index != u16::MAX).then_some(usize::from(state_index)),
-            ))
-        }
-        _ => {
-            let _ = (module, type_id, field);
-            Err(InterpreterError::TypeMismatch)
-        }
-    }
+) -> Result<ResolvedClassField, InterpreterError> {
+    let ExecutableNominalOperand::ClassField {
+        type_index,
+        index,
+        offset,
+        slots,
+        state_index,
+    } = resolved
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    let expected = module
+        .module()
+        .class_types
+        .get(usize::from(type_index))
+        .and_then(|class_type| class_type.fields.get(usize::from(index)))
+        .map(|field| field.ty)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    Ok(ResolvedClassField {
+        offset: usize::from(offset),
+        slots: usize::from(slots),
+        expected,
+        state_index: (state_index != u16::MAX).then_some(usize::from(state_index)),
+    })
 }
 
 fn resolved_state_field(
@@ -2785,14 +2792,16 @@ impl CheckedInterpreter {
                 resolved_nominal = row.resolved_nominal;
                 instruction_cost = if row.dynamic_fuel() {
                     dynamic_instruction_fuel(
-                        module.module(),
-                        module.nominal_index_shape(),
                         instruction,
                         &continuation.arena,
                         heap.as_deref(),
-                        costs,
-                        resolved_nominal,
-                        Some(row.attempt_fuel),
+                        DynamicFuelPlan {
+                            module: module.module(),
+                            nominal_shape: module.nominal_index_shape(),
+                            costs,
+                            resolved: resolved_nominal,
+                            predecoded_base: Some(row.attempt_fuel),
+                        },
                     )?
                 } else {
                     row.attempt_fuel
@@ -2805,14 +2814,16 @@ impl CheckedInterpreter {
                 resolved_nominal = row.resolved_nominal;
                 instruction_cost = if row.dynamic_fuel() {
                     dynamic_instruction_fuel(
-                        module.module(),
-                        module.nominal_index_shape(),
                         instruction,
                         &continuation.arena,
                         heap.as_deref(),
-                        costs,
-                        resolved_nominal,
-                        Some(row.attempt_fuel),
+                        DynamicFuelPlan {
+                            module: module.module(),
+                            nominal_shape: module.nominal_index_shape(),
+                            costs,
+                            resolved: resolved_nominal,
+                            predecoded_base: Some(row.attempt_fuel),
+                        },
                     )?
                 } else {
                     row.attempt_fuel
@@ -3987,27 +3998,28 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (_index, offset, slots, _owner_slots, expected, state_index) =
-                        resolved_class_field(module, type_id, field, resolved_nominal)?;
+                    let resolved = resolved_class_field(module, resolved_nominal)?;
                     match value {
                         RuntimeValue::NamedRef { .. } => {
                             let field_values = heap
                                 .as_deref()
                                 .ok_or(InterpreterError::HeapUnavailable)?
-                                .class_field_range(value, offset, slots)?;
+                                .class_field_range(value, resolved.offset, resolved.slots)?;
                             continuation.arena.write_register_values(
                                 dst,
-                                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                                u16::try_from(resolved.slots)
+                                    .map_err(|_| InterpreterError::TypeMismatch)?,
                                 field_values.iter(),
                             )?;
                         }
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
-                            if slots != 1 {
+                            if resolved.slots != 1 {
                                 return Err(InterpreterError::TypeMismatch);
                             }
-                            let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
+                            let state_index =
+                                resolved.state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let field_value = state_registry.as_deref_mut().map_or_else(
                                 || {
                                     Err(RuntimeMessage::Static(
@@ -4020,12 +4032,12 @@ impl CheckedInterpreter {
                                         type_id,
                                         field,
                                         state_index,
-                                        expected,
+                                        resolved.expected,
                                     )
                                 },
                             );
                             let field_value = state_operation!(field_value);
-                            if runtime_value_type(field_value) != Some(expected) {
+                            if runtime_value_type(field_value) != Some(resolved.expected) {
                                 return Err(InterpreterError::TypeMismatch);
                             }
                             set_register(&mut continuation.arena, dst, field_value)?;
@@ -4045,30 +4057,31 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (_index, offset, slots, _owner_slots, expected, state_index) =
-                        resolved_class_field(module, type_id, field, resolved_nominal)?;
+                    let resolved = resolved_class_field(module, resolved_nominal)?;
                     match object {
                         RuntimeValue::NamedRef { .. } => {
                             let replacement = crate::trusted::read_register_window(
                                 &continuation.arena,
                                 value,
-                                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                                u16::try_from(resolved.slots)
+                                    .map_err(|_| InterpreterError::TypeMismatch)?,
                             )?;
                             heap.as_deref_mut()
                                 .ok_or(InterpreterError::HeapUnavailable)?
-                                .set_class_field_range(object, offset, replacement)?;
+                                .set_class_field_range(object, resolved.offset, replacement)?;
                         }
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
-                            if slots != 1 {
+                            if resolved.slots != 1 {
                                 return Err(InterpreterError::TypeMismatch);
                             }
                             let replacement = register(&continuation.arena, value)?;
-                            if runtime_value_type(replacement) != Some(expected) {
+                            if runtime_value_type(replacement) != Some(resolved.expected) {
                                 return Err(InterpreterError::TypeMismatch);
                             }
-                            let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
+                            let state_index =
+                                resolved.state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let update = state_registry.as_deref_mut().map_or_else(
                                 || {
                                     Err(RuntimeMessage::Static(
@@ -4081,7 +4094,7 @@ impl CheckedInterpreter {
                                         type_id,
                                         field,
                                         state_index,
-                                        expected,
+                                        resolved.expected,
                                         replacement,
                                     )
                                 },
@@ -5001,14 +5014,16 @@ fn instruction_attempt_fuel(
         return Ok(static_fuel);
     }
     dynamic_instruction_fuel(
-        module,
-        nominal_shape,
         instruction,
         arena,
         heap,
-        costs,
-        resolved,
-        None,
+        DynamicFuelPlan {
+            module,
+            nominal_shape,
+            costs,
+            resolved,
+            predecoded_base: None,
+        },
     )
 }
 
@@ -5097,17 +5112,29 @@ pub(crate) fn physical_instruction_work_fuel(
     Ok(Some(work))
 }
 
-#[allow(clippy::too_many_lines)]
-pub(crate) fn dynamic_instruction_fuel(
-    module: &nexa_bytecode::Module,
+#[derive(Clone, Copy)]
+struct DynamicFuelPlan<'a> {
+    module: &'a nexa_bytecode::Module,
     nominal_shape: nexa_verifier::NominalIndexShape,
+    costs: &'a OpcodeCostTable,
+    resolved: ExecutableNominalOperand,
+    predecoded_base: Option<u64>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn dynamic_instruction_fuel(
     instruction: Instruction,
     arena: &FrameArena,
     heap: Option<&Heap>,
-    costs: &OpcodeCostTable,
-    resolved: ExecutableNominalOperand,
-    predecoded_base: Option<u64>,
+    plan: DynamicFuelPlan<'_>,
 ) -> Result<u64, InterpreterError> {
+    let DynamicFuelPlan {
+        module,
+        nominal_shape,
+        costs,
+        resolved,
+        predecoded_base,
+    } = plan;
     let heap_required = || heap.ok_or(InterpreterError::HeapUnavailable);
     let base = predecoded_base.unwrap_or_else(|| costs.cost(instruction));
     let physical_work =
@@ -5936,8 +5963,12 @@ fn run_physical_standard_intrinsic(
                 return Err(InterpreterError::TypeMismatch);
             }
             let mut arguments = [RuntimeValue::Unit; 3];
-            for index in 0..usize::from(intrinsic.argument_count()) {
-                arguments[index] = argument(arena, index)?;
+            for (index, value) in arguments
+                .iter_mut()
+                .enumerate()
+                .take(usize::from(intrinsic.argument_count()))
+            {
+                *value = argument(arena, index)?;
             }
             match run_standard_intrinsic(
                 intrinsic,
@@ -7402,6 +7433,7 @@ mod tests {
     };
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn physical_abi_scatter_preserves_aggregate_and_following_scalar_parameters() {
         let source = r"
 struct Pair { first: i32, second: i32, }
@@ -8263,10 +8295,12 @@ fn work(x: i32) -> i32 {
             .write_resume_async_result(
                 &module,
                 0,
-                Some(ValueType::Named(result_type)),
-                async_result,
-                true,
-                RuntimeValue::Ref(reference),
+                super::AsyncResumeValue {
+                    expected: Some(ValueType::Named(result_type)),
+                    result: async_result,
+                    success: true,
+                    payload: RuntimeValue::Ref(reference),
+                },
                 Some(&heap),
             )
             .unwrap();
@@ -9284,6 +9318,7 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn standard_map_intrinsics_preserve_physical_struct_values() {
         let pair = StableId::from_name("test.Pair");
         let first = StableId::from_name("test.Pair.first");
@@ -9415,6 +9450,7 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn standard_array_intrinsics_preserve_physical_struct_values() {
         let pair = StableId::from_name("test.ArrayPair");
         let first = StableId::from_name("test.ArrayPair.first");

@@ -96,6 +96,10 @@ pub(crate) enum ExecutableNominalOperand {
 }
 
 impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
+    // Keeping the verifier-to-executable shape mapping in one exhaustive
+    // match makes newly added operand variants fail compilation until their
+    // compact representation is defined.
+    #[allow(clippy::too_many_lines)]
     fn from(resolved: ResolvedNominalOperand) -> Self {
         match resolved {
             ResolvedNominalOperand::None => Self::None,

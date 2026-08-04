@@ -4714,10 +4714,12 @@ impl RealmRuntime {
             continuation.write_resume_async_result(
                 &module,
                 destination,
-                expected_type,
-                result,
-                success,
-                value,
+                crate::interpreter::AsyncResumeValue {
+                    expected: expected_type,
+                    result,
+                    success,
+                    payload: value,
+                },
                 Some(&self.heap),
             )?;
         } else {
