@@ -60,6 +60,40 @@ fn allocations_during<T>(work: impl FnOnce() -> T) -> (u64, T) {
     (ALLOCATIONS.with(Cell::get) - before, value)
 }
 
+fn write_allocation_receipt(cases: [(&str, u64); 6]) {
+    let Some(path) = std::env::var_os("NEXA_M5_STEADY_STATE_RECEIPT") else {
+        return;
+    };
+    let implementation_commit = std::env::var("NEXA_M5_IMPLEMENTATION_COMMIT")
+        .expect("receipt generation requires the implementation commit");
+    let test_source_hash = std::env::var("NEXA_M5_STEADY_STATE_SOURCE_HASH")
+        .expect("receipt generation requires the test source hash");
+    let max_system_allocations = cases
+        .iter()
+        .map(|(_, allocations)| *allocations)
+        .max()
+        .unwrap_or(0);
+    let cases = cases
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let report = serde_json::json!({
+        "schema": 1,
+        "report": "Nexa M5 WP92 Steady-State Engine Allocation",
+        "implementation_commit": implementation_commit,
+        "test_source_hash": test_source_hash,
+        "cases": cases,
+        "max_system_allocations": max_system_allocations,
+        "status": if max_system_allocations == 0 { "PASS" } else { "FAIL" },
+    });
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create receipt directory");
+    }
+    let mut rendered = serde_json::to_vec_pretty(&report).expect("serialize allocation receipt");
+    rendered.push(b'\n');
+    std::fs::write(path, rendered).expect("write allocation receipt");
+}
+
 // --- Contract and entrypoint markers ----------------------------------------
 
 const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints {
@@ -416,6 +450,17 @@ fn steady_state_engine_paths_allocate_nothing() {
         per_tick_allocations, [0; 8],
         "a steady-state idle Engine tick must perform zero system allocations"
     );
+    write_allocation_receipt([
+        ("broadcast", dispatch_allocations),
+        ("projected_broadcast", projected_dispatch_allocations),
+        ("optional_broadcast", optional_dispatch_allocations),
+        ("owner_call", call_allocations),
+        ("optional_provider_call", provider_allocations),
+        (
+            "idle_tick",
+            per_tick_allocations.into_iter().max().unwrap_or(0),
+        ),
+    ]);
 }
 
 #[test]

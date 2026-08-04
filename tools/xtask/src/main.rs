@@ -2120,6 +2120,42 @@ fn cold_start_report_at(path: &Path, implementation_commit: &str) -> Option<Valu
     Some(report)
 }
 
+const STEADY_STATE_DISPATCH_CASES: [&str; 6] = [
+    "broadcast",
+    "projected_broadcast",
+    "optional_broadcast",
+    "owner_call",
+    "optional_provider_call",
+    "idle_tick",
+];
+
+fn steady_state_dispatch_source_hash() -> Result<String, DynError> {
+    let source =
+        fs::read(workspace_root().join("tools/benchmark-v7/tests/steady_state_allocation.rs"))?;
+    Ok(blake3::hash(&source).to_hex().to_string())
+}
+
+fn steady_state_dispatch_receipt_at(path: &Path, implementation_commit: &str) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    steady_state_dispatch_receipt(report, implementation_commit)
+}
+
+fn steady_state_dispatch_receipt(report: Value, implementation_commit: &str) -> Option<Value> {
+    let cases = report["cases"].as_object()?;
+    let source_hash = steady_state_dispatch_source_hash().ok()?;
+    (report["schema"] == 1
+        && report["report"] == "Nexa M5 WP92 Steady-State Engine Allocation"
+        && report["implementation_commit"].as_str() == Some(implementation_commit)
+        && report["test_source_hash"].as_str() == Some(source_hash.as_str())
+        && report["status"] == "PASS"
+        && report["max_system_allocations"].as_u64() == Some(0)
+        && cases.len() == STEADY_STATE_DISPATCH_CASES.len()
+        && STEADY_STATE_DISPATCH_CASES
+            .iter()
+            .all(|name| cases.get(*name).and_then(Value::as_u64) == Some(0)))
+    .then_some(report)
+}
+
 /// M5 stage-H gate: the WP89 immediate entrypoint settles with no Task,
 /// scheduler token, or tombstone, the H1 continuation pool feeds
 /// steady-state admissions, and the WP90/WP92 engine dispatch path is
@@ -2146,6 +2182,21 @@ fn test_runtime_fast_paths() -> Result<(), DynError> {
 /// execution, package routing survives enable/disable/reload ABA cycles, and
 /// every required steady-state Engine path is allocation-exact.
 fn test_host_engine_performance() -> Result<(), DynError> {
+    let root = workspace_root();
+    let receipt_path = root.join("target/nexa-artifacts/m5/steady-state-dispatch/report.json");
+    fs::create_dir_all(
+        receipt_path
+            .parent()
+            .ok_or("steady-state receipt has no parent")?,
+    )?;
+    if receipt_path.exists() {
+        fs::remove_file(&receipt_path)?;
+    }
+    let implementation_commit = git_output(&["rev-parse", "HEAD"])?;
+    let test_source_hash = steady_state_dispatch_source_hash()?;
+    let receipt_path_text = receipt_path
+        .to_str()
+        .ok_or("non-UTF-8 steady-state receipt path")?;
     cargo(&[
         "test",
         "-p",
@@ -2153,14 +2204,29 @@ fn test_host_engine_performance() -> Result<(), DynError> {
         "--test",
         "stable_host_dispatch",
     ])?;
-    cargo(&[
-        "test",
-        "-p",
-        "nexa-benchmark-v7",
-        "--test",
-        "steady_state_allocation",
-    ])?;
-    cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])
+    cargo_with_environment(
+        &[
+            "test",
+            "-p",
+            "nexa-benchmark-v7",
+            "--test",
+            "steady_state_allocation",
+        ],
+        &[
+            ("NEXA_M5_STEADY_STATE_RECEIPT", receipt_path_text),
+            ("NEXA_M5_IMPLEMENTATION_COMMIT", &implementation_commit),
+            ("NEXA_M5_STEADY_STATE_SOURCE_HASH", &test_source_hash),
+        ],
+    )?;
+    cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])?;
+    let receipt = steady_state_dispatch_receipt_at(&receipt_path, &implementation_commit)
+        .ok_or("WP92 steady-state dispatch receipt is stale, malformed, or nonzero")?;
+    println!(
+        "test-host-engine-performance: {} paths, max {} system allocations",
+        receipt["cases"].as_object().map_or(0, serde_json::Map::len),
+        receipt["max_system_allocations"]
+    );
+    Ok(())
 }
 
 /// M5 WP99 product gate. Every command below executes a real canonical
@@ -2551,6 +2617,16 @@ fn m5_final_report() -> Result<(), DynError> {
     let head = git_output(&["rev-parse", "HEAD"])?;
     let final_dir = root.join("target/nexa-artifacts/m5/final");
     fs::create_dir_all(&final_dir)?;
+    let steady_state_path = root.join("target/nexa-artifacts/m5/steady-state-dispatch/report.json");
+    let steady_state_dispatch =
+        if let Some(report) = steady_state_dispatch_receipt_at(&steady_state_path, &head) {
+            eprintln!("final report: reusing same-HEAD WP92 dispatch receipt");
+            report
+        } else {
+            test_host_engine_performance()?;
+            steady_state_dispatch_receipt_at(&steady_state_path, &head)
+                .ok_or("new WP92 dispatch receipt is not same-HEAD allocation evidence")?
+        };
     let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
     let reload_peak = if let Some(report) = reload_peak_report_at(&reload_peak_path, &head) {
         eprintln!("final report: reusing same-HEAD WP97 reload peak report");
@@ -2715,6 +2791,7 @@ fn m5_final_report() -> Result<(), DynError> {
         "aggregate": aggregate,
         "reload_peak": reload_peak,
         "cold_start": cold_start,
+        "steady_state_dispatch": steady_state_dispatch,
         "profiler": profile["profiler"],
         "decision": decision,
     });
@@ -3742,7 +3819,12 @@ fn finalize_m5() -> Result<(), DynError> {
     let gc_system_allocations = gc_case["max_system_allocations"]
         .as_u64()
         .ok_or("formal aggregate omitted GC system allocation count")?;
-    let steady_state_dispatch_system_allocations = 0_u64;
+    let steady_state_dispatch =
+        steady_state_dispatch_receipt(performance["steady_state_dispatch"].clone(), &head)
+            .ok_or("performance report omitted valid same-HEAD WP92 allocation evidence")?;
+    let steady_state_dispatch_system_allocations = steady_state_dispatch["max_system_allocations"]
+        .as_u64()
+        .ok_or("WP92 allocation receipt omitted its maximum")?;
     for bucket in [
         "product_cpu",
         "value_collection",
@@ -3791,6 +3873,7 @@ fn finalize_m5() -> Result<(), DynError> {
         || struct_gc_allocations != 0
         || enum_gc_allocations != 0
         || gc_system_allocations != 0
+        || steady_state_dispatch_system_allocations != 0
         || decision["schema"].as_u64() != Some(1)
         || decision["implementation_commit"] != head
         || performance["decision"] != decision
@@ -3836,9 +3919,8 @@ fn finalize_m5() -> Result<(), DynError> {
         "structGcAllocations": struct_gc_allocations,
         "enumGcAllocations": enum_gc_allocations,
         "gcSystemAllocations": gc_system_allocations,
-        // `test-host-engine-performance` immediately above measures this
-        // exact counter and fails before the report is reachable if nonzero.
         "steadyStateDispatchSystemAllocations": steady_state_dispatch_system_allocations,
+        "steadyStateDispatchReceipt": steady_state_dispatch,
         "unexplainedRegressions": unexplained_regressions,
         "semanticMismatches": [],
         "resourceLeaks": 0,
@@ -6089,6 +6171,32 @@ mod audit_tests {
             },
             "cases": cases,
         })
+    }
+
+    #[test]
+    fn steady_state_dispatch_receipt_requires_exact_zero_evidence() {
+        let mut report = serde_json::json!({
+            "schema": 1,
+            "report": "Nexa M5 WP92 Steady-State Engine Allocation",
+            "implementation_commit": "head",
+            "test_source_hash": super::steady_state_dispatch_source_hash()
+                .expect("test source hash"),
+            "cases": {
+                "broadcast": 0,
+                "projected_broadcast": 0,
+                "optional_broadcast": 0,
+                "owner_call": 0,
+                "optional_provider_call": 0,
+                "idle_tick": 0,
+            },
+            "max_system_allocations": 0,
+            "status": "PASS",
+        });
+        assert!(super::steady_state_dispatch_receipt(report.clone(), "head").is_some());
+        assert!(super::steady_state_dispatch_receipt(report.clone(), "other").is_none());
+
+        report["cases"]["owner_call"] = serde_json::Value::from(1);
+        assert!(super::steady_state_dispatch_receipt(report, "head").is_none());
     }
 
     #[test]
