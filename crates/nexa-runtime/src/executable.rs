@@ -851,7 +851,7 @@ fn build_executable_function(
     }
     let static_leaf = certify_static_leaf(function, &rows, nominal_shape);
     let constant_leaf =
-        static_leaf.and_then(|_| certify_static_leaf_constant_kernel(module, function));
+        static_leaf.and_then(|_| certify_static_leaf_constant_kernel(module, function, &rows));
     Ok(ExecutableFunction::new(
         function,
         abi,
@@ -1117,6 +1117,9 @@ impl StaticLeafAnalysis {
                 *self.i32_constant.get_mut(usize::from(dst))? = Some(value);
                 Some(())
             }
+            Instruction::CopyValue { dst, source, slots } => {
+                self.copy_value_range(source, dst, slots)
+            }
             Instruction::Add { dst, lhs, rhs } => {
                 let value = match (
                     *self.i32_constant.get(usize::from(lhs))?,
@@ -1129,12 +1132,33 @@ impl StaticLeafAnalysis {
                 *self.i32_constant.get_mut(usize::from(dst))? = value;
                 Some(())
             }
-            Instruction::LoadString { dst, .. }
+            Instruction::LoadI64 { dst, .. }
+            | Instruction::LoadString { dst, .. }
             | Instruction::StringByteLen { dst, .. }
             | Instruction::EnumNew { dst, .. }
             | Instruction::EnumTag { dst, .. }
             | Instruction::EnumPayload { dst, .. }
             | Instruction::CompareEq { dst, .. } => self.clear_destination(dst),
+            Instruction::StructNew {
+                fields_base,
+                fields_count,
+                dst,
+                ..
+            } => {
+                let ExecutableNominalOperand::StructLayout { slots } = resolved else {
+                    return None;
+                };
+                if slots != fields_count {
+                    return None;
+                }
+                self.copy_value_range(fields_base, dst, slots)
+            }
+            Instruction::StructGet { source, dst, .. } => {
+                let ExecutableNominalOperand::StructField { offset, slots, .. } = resolved else {
+                    return None;
+                };
+                self.copy_value_range(source.checked_add(offset)?, dst, slots)
+            }
             Instruction::Jump { .. } | Instruction::JumpIfFalse { .. } => {
                 self.saw_control_flow = true;
                 Some(())
@@ -1142,6 +1166,34 @@ impl StaticLeafAnalysis {
             Instruction::Return { .. } | Instruction::Trap => Some(()),
             _ => None,
         }
+    }
+
+    fn copy_value_range(&mut self, source: u16, destination: u16, slots: u16) -> Option<()> {
+        let source = usize::from(source);
+        let destination = usize::from(destination);
+        let slots = usize::from(slots);
+        let source_end = source.checked_add(slots)?;
+        let destination_end = destination.checked_add(slots)?;
+        self.local_class.get(source..source_end)?;
+        self.local_class.get(destination..destination_end)?;
+        self.local_array.get(source..source_end)?;
+        self.local_array.get(destination..destination_end)?;
+        self.i32_constant.get(source..source_end)?;
+        self.i32_constant.get(destination..destination_end)?;
+        self.buffer_value.get(source..source_end)?;
+        self.buffer_value.get(destination..destination_end)?;
+        self.local_map.get(source..source_end)?;
+        self.local_map.get(destination..destination_end)?;
+        self.local_class
+            .copy_within(source..source_end, destination);
+        self.local_array
+            .copy_within(source..source_end, destination);
+        self.i32_constant
+            .copy_within(source..source_end, destination);
+        self.buffer_value
+            .copy_within(source..source_end, destination);
+        self.local_map.copy_within(source..source_end, destination);
+        Some(())
     }
 
     fn observe_class(&mut self, instruction: Instruction) -> Option<()> {
@@ -1425,11 +1477,13 @@ enum StaticConstantValue {
 fn certify_static_leaf_constant_kernel(
     module: &VerifiedModule,
     function: &nexa_bytecode::Function,
+    rows: &[ExecutableInstruction],
 ) -> Option<StaticLeafConstantKernel> {
     let mut values = [StaticConstantValue::Unknown; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
     let mut effect = None;
     let mut result = None;
     for (pc, instruction) in function.code.iter().copied().enumerate() {
+        let row = rows.get(pc)?;
         match instruction {
             Instruction::LoadI32 { dst, value } => {
                 *values.get_mut(usize::from(dst))? = StaticConstantValue::I32(value);
@@ -1440,8 +1494,19 @@ fn certify_static_leaf_constant_kernel(
                 effect = Some(StaticLeafConstantEffect::LoadString { string });
                 *values.get_mut(usize::from(dst))? = StaticConstantValue::StringLength(length);
             }
+            Instruction::LoadI64 { dst, .. } => {
+                *values.get_mut(usize::from(dst))? = StaticConstantValue::Unknown;
+            }
             Instruction::Move { dst, source } => {
                 *values.get_mut(usize::from(dst))? = *values.get(usize::from(source))?;
+            }
+            instruction @ (Instruction::CopyValue { .. }
+            | Instruction::EnumNew { .. }
+            | Instruction::EnumTag { .. }
+            | Instruction::EnumPayload { .. }
+            | Instruction::StructNew { .. }
+            | Instruction::StructGet { .. }) => {
+                simulate_static_constant_aggregate(instruction, *row, &mut values)?;
             }
             Instruction::Add { dst, lhs, rhs } => {
                 let (StaticConstantValue::I32(lhs), StaticConstantValue::I32(rhs)) = (
@@ -1476,12 +1541,112 @@ fn certify_static_leaf_constant_kernel(
     })
 }
 
+fn simulate_static_constant_aggregate(
+    instruction: Instruction,
+    row: ExecutableInstruction,
+    values: &mut [StaticConstantValue; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+) -> Option<()> {
+    match instruction {
+        Instruction::CopyValue { dst, source, slots } => {
+            copy_static_constants(values, source, dst, slots)
+        }
+        Instruction::EnumNew { payload, dst, .. } => {
+            let ExecutableNominalOperand::EnumVariant {
+                tag,
+                payload_offset,
+                payload_slots,
+                owner_slots,
+            } = row.resolved_nominal
+            else {
+                return None;
+            };
+            let start = usize::from(dst);
+            let end = start.checked_add(usize::from(owner_slots))?;
+            values
+                .get_mut(start..end)?
+                .fill(StaticConstantValue::Unknown);
+            *values.get_mut(start)? = StaticConstantValue::I32(i32::try_from(tag).ok()?);
+            match (payload, payload_slots) {
+                (Some(payload), slots) if slots > 0 => {
+                    copy_static_constants(values, payload, dst.checked_add(payload_offset)?, slots)
+                }
+                (None, 0) => Some(()),
+                _ => None,
+            }
+        }
+        Instruction::EnumTag { source, dst } => {
+            let ExecutableNominalOperand::EnumLayout { .. } = row.resolved_nominal else {
+                return None;
+            };
+            *values.get_mut(usize::from(dst))? = *values.get(usize::from(source))?;
+            Some(())
+        }
+        Instruction::EnumPayload { source, dst, .. } => {
+            let ExecutableNominalOperand::EnumVariant {
+                payload_offset,
+                payload_slots,
+                ..
+            } = row.resolved_nominal
+            else {
+                return None;
+            };
+            copy_static_constants(
+                values,
+                source.checked_add(payload_offset)?,
+                dst,
+                payload_slots,
+            )
+        }
+        Instruction::StructNew {
+            fields_base,
+            fields_count,
+            dst,
+            ..
+        } => {
+            let ExecutableNominalOperand::StructLayout { slots } = row.resolved_nominal else {
+                return None;
+            };
+            if slots != fields_count {
+                return None;
+            }
+            copy_static_constants(values, fields_base, dst, slots)
+        }
+        Instruction::StructGet { source, dst, .. } => {
+            let ExecutableNominalOperand::StructField { offset, slots, .. } = row.resolved_nominal
+            else {
+                return None;
+            };
+            copy_static_constants(values, source.checked_add(offset)?, dst, slots)
+        }
+        _ => unreachable!("constant aggregate simulation has a closed instruction surface"),
+    }
+}
+
+fn copy_static_constants(
+    values: &mut [StaticConstantValue; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    source: u16,
+    destination: u16,
+    slots: u16,
+) -> Option<()> {
+    let source = usize::from(source);
+    let destination = usize::from(destination);
+    let slots = usize::from(slots);
+    let source_end = source.checked_add(slots)?;
+    let destination_end = destination.checked_add(slots)?;
+    values.get(source..source_end)?;
+    values.get(destination..destination_end)?;
+    values.copy_within(source..source_end, destination);
+    Some(())
+}
+
 const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {
     matches!(
         instruction,
         Instruction::LoadI32 { .. }
+            | Instruction::LoadI64 { .. }
             | Instruction::LoadString { .. }
             | Instruction::Move { .. }
+            | Instruction::CopyValue { .. }
             | Instruction::Add { .. }
             | Instruction::CompareEq { .. }
             | Instruction::Jump { .. }
@@ -1490,6 +1655,8 @@ const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {
             | Instruction::EnumNew { .. }
             | Instruction::EnumTag { .. }
             | Instruction::EnumPayload { .. }
+            | Instruction::StructNew { .. }
+            | Instruction::StructGet { .. }
             | Instruction::ClassNew { .. }
             | Instruction::ClassGet { .. }
             | Instruction::ClassSet { .. }

@@ -801,6 +801,7 @@ fn execute_static_leaf_instruction(
 ) -> Result<StaticLeafStep, InterpreterError> {
     match instruction {
         instruction @ (Instruction::LoadI32 { .. }
+        | Instruction::LoadI64 { .. }
         | Instruction::LoadString { .. }
         | Instruction::Move { .. }
         | Instruction::Add { .. }
@@ -813,6 +814,12 @@ fn execute_static_leaf_instruction(
         instruction @ (Instruction::EnumNew { .. }
         | Instruction::EnumTag { .. }
         | Instruction::EnumPayload { .. }) => execute_static_leaf_enum(instruction, row, registers),
+        instruction @ (Instruction::CopyValue { .. }
+        | Instruction::StructNew { .. }
+        | Instruction::StructGet { .. }) => {
+            execute_static_leaf_aggregate(instruction, row, registers)?;
+            Ok(StaticLeafStep::Next)
+        }
         instruction @ (Instruction::ClassNew { .. }
         | Instruction::ClassGet { .. }
         | Instruction::ClassSet { .. }) => {
@@ -862,6 +869,9 @@ fn execute_static_leaf_value(
         Instruction::LoadI32 { dst, value } => {
             crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(value));
         }
+        Instruction::LoadI64 { dst, value } => {
+            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I64(value));
+        }
         Instruction::LoadString { dst, string } => {
             let value = load_static_leaf_string(module, heap, executable, string)?;
             crate::trusted::write_static_leaf(registers, dst, value);
@@ -895,6 +905,48 @@ fn execute_static_leaf_value(
         _ => unreachable!("value leaf helper receives only value instructions"),
     }
     Ok(StaticLeafStep::Next)
+}
+
+fn execute_static_leaf_aggregate(
+    instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+) -> Result<(), InterpreterError> {
+    match instruction {
+        Instruction::CopyValue { dst, source, slots } => {
+            crate::trusted::copy_static_leaf_range(registers, source, dst, slots);
+        }
+        Instruction::StructNew {
+            fields_base,
+            fields_count,
+            dst,
+            ..
+        } => {
+            let ExecutableNominalOperand::StructLayout { slots } = row.resolved_nominal else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            if slots != fields_count {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            crate::trusted::copy_static_leaf_range(registers, fields_base, dst, slots);
+        }
+        Instruction::StructGet { source, dst, .. } => {
+            let ExecutableNominalOperand::StructField { offset, slots, .. } = row.resolved_nominal
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            crate::trusted::copy_static_leaf_range(
+                registers,
+                source
+                    .checked_add(offset)
+                    .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?,
+                dst,
+                slots,
+            );
+        }
+        _ => unreachable!("aggregate leaf helper receives only physical aggregate instructions"),
+    }
+    Ok(())
 }
 
 fn load_static_leaf_string(
@@ -1591,18 +1643,20 @@ fn static_leaf_upper_fuel(
             certificate.buffer_work_fuel,
         )?,
     )?;
-    let initial_ranges = fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?;
-    for push in 0..certificate.array_pushes {
-        // A splitting claim and the following release can each add at most
-        // one free range. Pretend every prior push grew so this remains an
-        // upper bound for any allocator shape the certified local array sees.
-        let ranges = initial_ranges
-            .checked_add(u64::from(push).saturating_mul(2))
-            .ok_or(InterpreterError::FuelCostOverflow)?;
-        upper = fuel_add(
-            upper,
-            collection_arena_metadata_shape_fuel(ranges, true, true)?,
-        )?;
+    if certificate.array_pushes != 0 {
+        let initial_ranges = fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?;
+        for push in 0..certificate.array_pushes {
+            // A splitting claim and the following release can each add at most
+            // one free range. Pretend every prior push grew so this remains an
+            // upper bound for any allocator shape the certified local array sees.
+            let ranges = initial_ranges
+                .checked_add(u64::from(push).saturating_mul(2))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            upper = fuel_add(
+                upper,
+                collection_arena_metadata_shape_fuel(ranges, true, true)?,
+            )?;
+        }
     }
     let map_attempts = u64::from(certificate.map_sets)
         .checked_mul(2)
@@ -1624,6 +1678,37 @@ fn static_leaf_upper_fuel(
         )?;
     }
     Ok(Some(upper))
+}
+
+#[cold]
+#[inline(never)]
+fn write_static_leaf_materialized_argument(
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    destination: u16,
+    slots: u16,
+    expected: ValueType,
+    value: RuntimeValue,
+    module: &VerifiedModule,
+    heap: &Heap,
+) -> Result<(), InterpreterError> {
+    let slots = usize::from(slots);
+    if slots > crate::trusted::STATIC_LEAF_REGISTER_CAPACITY {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let mut physical = [RuntimeValue::Unit; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+    flatten_materialized_value(
+        &mut physical[..slots],
+        expected,
+        value,
+        module.layout_table(),
+        Some(heap),
+    )?;
+    crate::trusted::write_static_leaf_values(
+        registers,
+        destination,
+        u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+        physical[..slots].iter().copied(),
+    )
 }
 
 fn static_leaf_attempt_fuel(
@@ -2025,35 +2110,7 @@ impl CheckedInterpreter {
             return Ok(None);
         }
         validate_arguments(arguments, &function_meta.signature.parameters)?;
-        let mut registers = crate::trusted::new_static_leaf_registers();
-        let mut packed_arguments =
-            [RuntimeValue::Unit; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
         let abi = executable_function.abi();
-        if usize::from(abi.parameter_slots) > packed_arguments.len() {
-            return Ok(None);
-        }
-        for (argument, parameter) in arguments.iter().copied().zip(&abi.parameters) {
-            let start = usize::from(parameter.slot_offset);
-            let end = start + usize::from(parameter.slot_count);
-            flatten_materialized_value(
-                &mut packed_arguments[start..end],
-                parameter.logical_type,
-                argument,
-                module.layout_table(),
-                Some(heap),
-            )?;
-        }
-        for destination in 0..abi.parameter_slots {
-            crate::trusted::write_static_leaf(
-                &mut registers,
-                destination,
-                packed_arguments[usize::from(destination)],
-            );
-        }
-        let Some(prepared_buffers) = prepare_static_leaf_buffers(certificate, &registers, heap)
-        else {
-            return Ok(None);
-        };
         let Some(upper_fuel) = static_leaf_upper_fuel(certificate, heap)? else {
             return Ok(None);
         };
@@ -2091,6 +2148,47 @@ impl CheckedInterpreter {
                     *profile_row,
                 );
             }
+        };
+        if abi.parameter_slots == 0
+            && let Some(kernel) = executable_function.static_leaf_constant_kernel()
+        {
+            record_prefix(usize::from(kernel.instructions));
+            return execute_static_leaf_constant_kernel(
+                kernel, module, executable, fuel, upper_fuel, heap,
+            )
+            .map(Some);
+        }
+        let mut registers = crate::trusted::new_static_leaf_registers();
+        for (argument, parameter) in arguments.iter().copied().zip(&abi.parameters) {
+            if parameter.slot_count == 1
+                && !matches!(
+                    parameter.logical_type,
+                    ValueType::Named(type_id)
+                        if module.layout_table().named_layout(type_id).is_some_and(|layout| {
+                            matches!(
+                                layout.equality_strategy,
+                                nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                                    | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+                            )
+                        })
+                )
+            {
+                crate::trusted::write_static_leaf(&mut registers, parameter.slot_offset, argument);
+            } else {
+                write_static_leaf_materialized_argument(
+                    &mut registers,
+                    parameter.slot_offset,
+                    parameter.slot_count,
+                    parameter.logical_type,
+                    argument,
+                    module,
+                    heap,
+                )?;
+            }
+        }
+        let Some(prepared_buffers) = prepare_static_leaf_buffers(certificate, &registers, heap)
+        else {
+            return Ok(None);
         };
         if let Some(instructions) = certificate.buffer_kernel_instructions {
             record_prefix(usize::from(instructions));
@@ -5115,6 +5213,15 @@ pub(crate) fn physical_instruction_work_fuel(
     resolved: ExecutableNominalOperand,
 ) -> Result<Option<u64>, InterpreterError> {
     let work = match instruction {
+        Instruction::StructGet { .. } => {
+            let ExecutableNominalOperand::StructField { slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
+                value_visit_fuel(u64::from(slots), 1)?,
+            )?
+        }
         Instruction::EnumNew { .. } => {
             let ExecutableNominalOperand::EnumVariant {
                 payload_slots,
@@ -5258,15 +5365,6 @@ fn dynamic_instruction_fuel(
         } => string_build_attempt_fuel(arena, heap_required()?, parts_base, parts_count)?,
         Instruction::Return { .. } | Instruction::ReturnVoid | Instruction::CleanupReturn => {
             return_defer_attempt_fuel(module, instruction, arena)?
-        }
-        Instruction::StructGet { .. } => {
-            let ExecutableNominalOperand::StructField { slots, .. } = resolved else {
-                return Err(InterpreterError::TypeMismatch);
-            };
-            fuel_add(
-                nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
-                value_visit_fuel(u64::from(slots), 1)?,
-            )?
         }
         Instruction::StructWith { .. } => {
             let ExecutableNominalOperand::StructField {
@@ -7969,19 +8067,32 @@ fn work() -> i32 {
         )
         .expect("constant kernel executes")
         .expect("constant function is certified");
-        assert_eq!(leaf.result.expect("constant kernel returns"), full_value);
-        assert_eq!(leaf.charge, full_charge);
-        assert_eq!(leaf.fuel, full_fuel);
-        assert_eq!(leaf_heap.byte_inspection(), full_heap.byte_inspection());
+        assert_eq!(
+            leaf.result.expect("constant kernel returns"),
+            full_value,
+            "function {function} result"
+        );
+        assert_eq!(leaf.charge, full_charge, "function {function} charge");
+        assert_eq!(leaf.fuel, full_fuel, "function {function} fuel");
+        assert_eq!(
+            leaf_heap.byte_inspection(),
+            full_heap.byte_inspection(),
+            "function {function} heap"
+        );
     }
 
     #[test]
     fn static_leaf_constant_kernel_and_physical_enum_path_match_full_execution() {
         let source = r#"
 class Cell { mut value: i32, next: Option<Cell>, }
+struct Row { value: i32, wide: i64, label: string, }
 fn string_constant() -> i32 {
     let text: string = "kernel";
     return text.byte_len();
+}
+fn struct_constant() -> i32 {
+    let row: Row = Row { value: 7, wide: 9, label: "row" };
+    return row.value;
 }
 fn class_constant() -> i32 {
     let cell: Cell = new Cell { value: 7, next: Option::None };
@@ -8006,21 +8117,21 @@ fn arithmetic_constant() -> i32 {
         );
         assert!(
             executable.functions()[1]
-                .static_leaf_certificate()
-                .is_some()
-        );
-        assert!(
-            executable.functions()[1]
                 .static_leaf_constant_kernel()
-                .is_none(),
-            "physical Enum/Class mutation stays on the general certified leaf path"
+                .is_some()
         );
         assert!(
             executable.functions()[2]
                 .static_leaf_constant_kernel()
+                .is_some(),
+            "scalar-replaced Enum/Class work must be load-time partially evaluated"
+        );
+        assert!(
+            executable.functions()[3]
+                .static_leaf_constant_kernel()
                 .is_some()
         );
-        for function in 0..3 {
+        for function in 0..4 {
             assert_constant_leaf_parity(
                 &module,
                 &executable,
