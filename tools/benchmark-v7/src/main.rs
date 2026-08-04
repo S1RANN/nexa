@@ -177,6 +177,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[derive(Clone, Copy, Debug, Default)]
 struct Observation {
     result: Option<RuntimeValue>,
+    semantic_digest: Option<u64>,
     fuel: u64,
     instructions: u64,
     heap_slots: u64,
@@ -184,6 +185,12 @@ struct Observation {
     vm: Option<nexa_runtime::VmAllocationCounters>,
     gc: Option<GcObservation>,
     resources: PeakResources,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedOutcome {
+    Runtime(RuntimeValue),
+    SemanticDigest(u64),
 }
 
 /// Per-sample incremental GC evidence (stage G).
@@ -666,9 +673,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if processes > 1 {
         return run_multi_process(&arguments, processes, samples);
     }
-    if profiler_enabled {
-        nexa_runtime::profiler::enable();
-    }
     let run_returned_case: RunReturned = if profiler_control {
         run_returned_without_profiler
     } else {
@@ -686,6 +690,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that computes the wrong product answer is never allowed to emit a
     // performance receipt.
     verify_product_results(&language, &language_rows)?;
+    verify_result_values(&language, &language_rows, run_returned_case);
+    if profiler_enabled {
+        // Correctness preflights are deliberately excluded from profiler
+        // evidence just as they are excluded from timed samples.
+        nexa_runtime::profiler::enable();
+    }
     // Stage H: one pooled continuation arena serves every steady-state case;
     // cold-start cases pass a fresh empty pool on purpose.
     let mut continuation_pool: Option<nexa_runtime::FrameArena> = None;
@@ -1106,15 +1116,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_realm.load_module(fast.clone(), HOST, fast.module().state_schema_fingerprint)?;
     let snapshot_scope = snapshot_realm.create_scope(None)?;
     let snapshot_task = call(&mut snapshot_realm, snapshot_module, snapshot_scope, 1)?;
-    let snapshot = snapshot_realm.create_typed_snapshot(
-        snapshot_task,
-        nexa_runtime::EncodedSnapshot::copy_i32_slice(
-            StableId::from_name("BenchSnapshot"),
-            StableId::from_name("BenchSnapshot::snapshot-schema"),
-            &[1_i32, 2, 3, 4],
-        )
-        .expect("benchmark snapshot encoding is fixed"),
-    )?;
+    let encoded_snapshot = nexa_runtime::EncodedSnapshot::copy_i32_slice(
+        StableId::from_name("BenchSnapshot"),
+        StableId::from_name("BenchSnapshot::snapshot-schema"),
+        &[1_i32, 2, 3, 4],
+    )
+    .expect("benchmark snapshot encoding is fixed");
+    let expected_snapshot_payload = Arc::clone(&encoded_snapshot.payload);
+    let expected_snapshot_layout = encoded_snapshot.layout;
+    let snapshot = snapshot_realm.create_typed_snapshot(snapshot_task, encoded_snapshot)?;
+    assert_eq!(
+        snapshot_realm.snapshot_payload(snapshot)?,
+        expected_snapshot_payload.as_ref(),
+        "snapshot benchmark must retain the exact encoded payload"
+    );
+    assert_eq!(
+        snapshot_realm.snapshot_layout(snapshot)?,
+        expected_snapshot_layout,
+        "snapshot benchmark must retain the exact typed layout"
+    );
     cases.push(bench(
         "snapshot_access",
         "micro",
@@ -1156,10 +1176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let async_module = async_realm.load_module(async_verified, HOST, async_schema)?;
     let async_scope = async_realm.create_scope(None)?;
     let async_instructions = 3;
-    cases.push(bench(
+    cases.push(bench_checked(
         "async_admission",
         "subsystem",
         samples,
+        RuntimeValue::I32(7),
         || (),
         |()| {
             let vm_before = async_realm.vm_allocation_counters();
@@ -1182,8 +1203,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             async_realm
                 .tick(TickBudget::default())
                 .expect("async completion tick");
+            let completed = match &async_realm
+                .terminal_record(task)
+                .expect("async benchmark task has a terminal record")
+                .reason
+            {
+                nexa_runtime::TaskTerminalReason::Completed(value) => *value,
+                reason => panic!("async benchmark terminated incorrectly: {reason:?}"),
+            };
             Observation {
-                result: None,
+                result: completed,
+                semantic_digest: None,
                 fuel: async_instructions,
                 instructions: async_instructions,
                 heap_slots: async_realm.resource_ledger().heap_objects,
@@ -1198,10 +1228,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     close_host(&async_host)?;
 
     let migration = migration_inputs()?;
-    cases.push(bench(
+    let migration_hash = verified_migration_hash(&migration);
+    cases.push(bench_digest_checked(
         "migration",
         "subsystem",
         samples,
+        migration_hash,
         || (),
         |()| {
             let result = run_migrate_check(
@@ -1214,6 +1246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             black_box(result.final_state_hash);
             Observation {
                 result: None,
+                semantic_digest: Some(result.final_state_hash),
                 fuel: result.usage.fuel_used,
                 instructions: result.usage.fuel_used,
                 heap_slots: result.usage.object_peak as u64,
@@ -1255,6 +1288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             resources.merge(PeakResources::from_ledger(after));
             Observation {
                 result: None,
+                semantic_digest: None,
                 fuel: 1,
                 instructions: 1,
                 heap_slots: after.heap_objects,
@@ -1302,7 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_heap_objects: 1_024,
         ..RealmConfig::default()
     }));
-    cases.push(bench(
+    let gc_case = bench(
         "gc_incremental_step",
         "micro",
         samples,
@@ -1345,7 +1379,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Observation::default()
             }
         },
-    ));
+    );
+    assert!(
+        gc_case.gc.cycles.is_some_and(|cycles| cycles > 0),
+        "incremental GC benchmark must complete at least one cycle"
+    );
+    assert!(
+        gc_case
+            .gc
+            .objects_reclaimed
+            .is_some_and(|objects| objects > 0),
+        "incremental GC benchmark must reclaim its churn objects"
+    );
+    assert!(
+        gc_case.gc.bytes_reclaimed.is_some_and(|bytes| bytes > 0),
+        "incremental GC benchmark must reclaim payload bytes"
+    );
+    cases.push(gc_case);
     drop(gc_realm);
 
     let report = BenchmarkReport {
@@ -2143,6 +2193,89 @@ fn verify_product_results(
     }))
 }
 
+fn verify_result_values(
+    language: &VerifiedModule,
+    rows: &ExecutableModule,
+    run_returned_case: RunReturned,
+) {
+    let mut heap = Heap::new_with_limits(64, 4_096, 64);
+    let mut pool = None;
+    let ok = run_returned_case(
+        language,
+        rows,
+        1,
+        &[RuntimeValue::I32(7)],
+        &mut heap,
+        256,
+        &mut pool,
+    )
+    .result
+    .expect("Result::Ok benchmark returns a value");
+    let (ok_type, ok_variant, ok_tag, ok_payload) =
+        heap.enum_parts(ok).expect("Result::Ok is materialized");
+    let ValueType::Named(result_type) = language.module().functions[1]
+        .signature
+        .result
+        .expect("Result::Ok function has a result")
+    else {
+        panic!("Result::Ok benchmark must return a named Result type");
+    };
+    let result_metadata = language
+        .module()
+        .enum_types
+        .iter()
+        .find(|candidate| candidate.type_id == result_type)
+        .expect("Result benchmark metadata exists");
+    let ok_metadata = result_metadata
+        .variants
+        .iter()
+        .find(|variant| variant.tag == 0)
+        .expect("Result::Ok metadata exists");
+    let err_metadata = result_metadata
+        .variants
+        .iter()
+        .find(|variant| variant.tag == 1)
+        .expect("Result::Err metadata exists");
+    assert_eq!(ok_type, result_type);
+    assert_eq!(ok_variant, ok_metadata.stable_id);
+    assert_eq!(ok_tag, ok_metadata.tag);
+    assert_eq!(ok_payload, Some(RuntimeValue::I32(7)));
+
+    let err = run_returned_case(language, rows, 2, &[], &mut heap, 256, &mut pool)
+        .result
+        .expect("Result::Err benchmark returns a value");
+    let (err_type, err_variant, err_tag, err_payload) =
+        heap.enum_parts(err).expect("Result::Err is materialized");
+    assert_eq!(err_type, result_type);
+    assert_eq!(err_variant, err_metadata.stable_id);
+    assert_eq!(err_tag, err_metadata.tag);
+    let error = err_payload.expect("Result::Err carries BenchError");
+    let (error_type, error_variant, error_tag, error_payload) = heap
+        .enum_parts(error)
+        .expect("BenchError::Failed is materialized");
+    let ValueType::Named(bench_error) = err_metadata
+        .payload_type
+        .expect("Result::Err metadata carries BenchError")
+    else {
+        panic!("Result::Err benchmark must carry a named BenchError type");
+    };
+    let error_metadata = language
+        .module()
+        .enum_types
+        .iter()
+        .find(|candidate| candidate.type_id == bench_error)
+        .expect("BenchError metadata exists");
+    let failed_metadata = error_metadata
+        .variants
+        .iter()
+        .find(|variant| variant.tag == 0)
+        .expect("BenchError::Failed metadata exists");
+    assert_eq!(error_type, bench_error);
+    assert_eq!(error_variant, failed_metadata.stable_id);
+    assert_eq!(error_tag, failed_metadata.tag);
+    assert_eq!(error_payload, None);
+}
+
 /// K20 diagnostic: isolates the certified leaf executor from the pooled
 /// continuation path in one process. Each pair alternates order and creates
 /// its fresh heap before timing, so clock drift and setup cannot masquerade
@@ -2555,6 +2688,7 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
     resources.merge(second.resources);
     Observation {
         result: None,
+        semantic_digest: None,
         fuel: first.fuel.saturating_add(second.fuel),
         instructions: first.instructions.saturating_add(second.instructions),
         heap_slots: u64::try_from(heap_slots).unwrap_or(u64::MAX),
@@ -2867,6 +3001,7 @@ struct BenchStateIds {
     ty: StableId,
     value_field: StableId,
     legacy_field: StableId,
+    total_field: StableId,
 }
 
 fn bench_state_ids(old: &VerifiedModule, new: &VerifiedModule) -> BenchStateIds {
@@ -2902,7 +3037,74 @@ fn bench_state_ids(old: &VerifiedModule, new: &VerifiedModule) -> BenchStateIds 
             .find(|field| !retained(field))
             .expect("removed benchmark legacy field")
             .stable_id,
+        total_field: new_state
+            .fields
+            .iter()
+            .find(|field| {
+                !old_state
+                    .fields
+                    .iter()
+                    .any(|candidate| candidate.stable_id == field.stable_id)
+            })
+            .expect("added benchmark total field")
+            .stable_id,
     }
+}
+
+fn verified_migration_hash(inputs: &MigrationInputs) -> u64 {
+    let result = run_migrate_check(
+        &inputs.old_bytes,
+        &inputs.new_bytes,
+        &inputs.fixture_bytes,
+        MigrateCheckConfig {
+            dump_state: true,
+            diff_state: true,
+            ..MigrateCheckConfig::default()
+        },
+    )
+    .expect("benchmark migration correctness preflight");
+    let state_ids = bench_state_ids(&inputs.old_module, &inputs.new_module);
+    assert_eq!(result.final_object_count, 1);
+    assert_eq!(result.usage.objects_read, 2);
+    assert_eq!(result.usage.objects_created, 1);
+    assert_eq!(result.usage.fields_written, 2);
+    assert_eq!(result.usage.replaced, 1);
+    assert_eq!(result.usage.generation_changes, 1);
+    let output = result
+        .output_state
+        .as_ref()
+        .expect("migration preflight requests output state");
+    assert_eq!(output.stateful_domain, 1);
+    let [object] = output.objects.as_slice() else {
+        panic!("migration benchmark must publish exactly one state object");
+    };
+    assert_eq!(object.stable_id, StableId::from_name("bench").0);
+    assert_eq!(object.type_id, state_ids.ty.0);
+    assert_eq!(object.generation, 2);
+    assert_eq!(object.fields.len(), 2);
+    let field = |stable_id: StableId| {
+        object
+            .fields
+            .iter()
+            .find(|field| field.stable_id == stable_id.0)
+            .unwrap_or_else(|| panic!("migration output omitted field {stable_id}"))
+    };
+    assert_eq!(
+        field(state_ids.value_field).value,
+        StateFixtureValue::I32 { value: 7 }
+    );
+    assert_eq!(
+        field(state_ids.total_field).value,
+        StateFixtureValue::I32 { value: 1 }
+    );
+    assert!(
+        object
+            .fields
+            .iter()
+            .all(|field| field.stable_id != state_ids.legacy_field.0),
+        "removed migration field must not survive"
+    );
+    result.final_state_hash
 }
 
 struct PreparedReload {
@@ -2961,7 +3163,26 @@ fn bench_checked<T>(
         tier,
         samples,
         WARMUP.min(samples),
-        Some(expected),
+        Some(ExpectedOutcome::Runtime(expected)),
+        prepare,
+        operation,
+    )
+}
+
+fn bench_digest_checked<T>(
+    name: &'static str,
+    tier: &'static str,
+    samples: usize,
+    expected: u64,
+    prepare: impl FnMut() -> T,
+    operation: impl FnMut(T) -> Observation,
+) -> CaseStats {
+    bench_with_warmup_expected(
+        name,
+        tier,
+        samples,
+        WARMUP.min(samples),
+        Some(ExpectedOutcome::SemanticDigest(expected)),
         prepare,
         operation,
     )
@@ -2983,14 +3204,19 @@ fn bench_with_warmup_expected<T>(
     tier: &'static str,
     samples: usize,
     warmup: usize,
-    expected: Option<RuntimeValue>,
+    expected: Option<ExpectedOutcome>,
     mut prepare: impl FnMut() -> T,
     mut operation: impl FnMut(T) -> Observation,
 ) -> CaseStats {
     for _ in 0..warmup {
         let input = prepare();
         let observation = black_box(operation(input));
-        assert_benchmark_result(name, expected, observation.result);
+        assert_benchmark_result(
+            name,
+            expected,
+            observation.result,
+            observation.semantic_digest,
+        );
     }
     let mut durations = Vec::with_capacity(samples);
     let mut allocation_totals = AllocationDelta::default();
@@ -3008,7 +3234,12 @@ fn bench_with_warmup_expected<T>(
         let observation = black_box(operation(input));
         let elapsed = started.elapsed();
         // The result check is intentionally outside the timed boundary.
-        assert_benchmark_result(name, expected, observation.result);
+        assert_benchmark_result(
+            name,
+            expected,
+            observation.result,
+            observation.semantic_digest,
+        );
         allocation_totals.accumulate(region.end());
         durations.push(elapsed);
         fuel = fuel.saturating_add(observation.fuel);
@@ -3095,15 +3326,22 @@ fn bench_with_warmup_expected<T>(
 
 fn assert_benchmark_result(
     name: &str,
-    expected: Option<RuntimeValue>,
-    actual: Option<RuntimeValue>,
+    expected: Option<ExpectedOutcome>,
+    actual_result: Option<RuntimeValue>,
+    actual_digest: Option<u64>,
 ) {
-    if let Some(expected) = expected {
-        assert_eq!(
-            actual,
+    match expected {
+        Some(ExpectedOutcome::Runtime(expected)) => assert_eq!(
+            actual_result,
             Some(expected),
             "Benchmark v7 case {name} returned the wrong value"
-        );
+        ),
+        Some(ExpectedOutcome::SemanticDigest(expected)) => assert_eq!(
+            actual_digest,
+            Some(expected),
+            "Benchmark v7 case {name} returned the wrong semantic digest"
+        ),
+        None => {}
     }
 }
 
