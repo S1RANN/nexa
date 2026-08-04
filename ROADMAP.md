@@ -26,7 +26,7 @@ Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
-Nexa M5 Deep Performance Optimization = IN PROGRESS
+Nexa M5 Deep Performance Optimization = COMPLETE
 Nexa Language v2 = COMPLETE
 NIDL v2 = COMPLETE
 Structured Codegen v2 = COMPLETE
@@ -208,18 +208,25 @@ tagged commit.
 ## After M4R1
 
 ```text
-M5 Deep Performance Optimization = IN PROGRESS
-M6 LLVM JIT = NOT STARTED
+M5 Deep Performance Optimization = COMPLETE
+M6 LLVM JIT = DEFER
 M7 Full Semantic LSP = NOT STARTED
 M8 DAP = NOT STARTED
 ```
 
-M5 optimizes value representation, the interpreter, collections, GC, and
-Task/Host boundaries behind frozen observable semantics, in two gated
-stages (M5a representation and interpreter, M5b GC and product corpus).
-Its normative scope, protocol, targets, and JIT decision rules live under
-`baseline/performance/`. M5 ends with a data-backed `GO`/`DEFER` decision
-for M6 LLVM JIT.
+M5 completed its two gated stages: M5a froze ValueLayout, Typed IR,
+typed collections, and ExecutableModule; M5b completed incremental GC,
+Task/Host/Engine fast paths, caches, the product corpus, and final performance
+qualification. The formal same-machine comparison met all four targets with
+no unexplained p95/p99 regression. Its normative evidence and decision rules
+live under `baseline/performance/`.
+
+M6 LLVM JIT is **DEFER**, not rejected. Warm V8 still leads all three
+comparable pure-computation workloads by more than 1.5x, but M5 has no
+per-workload CPU sample proving interpreter execution is at least 40% in two
+products and no LLVM prototype proving compilation-cost amortization within a
+frozen call/frame budget. A future JIT proposal must establish both before it
+can change this decision.
 
 M4R1 does not include user generics, traits or interfaces, closures,
 inheritance, dynamic dispatch, operator overloading, macros, reflection,

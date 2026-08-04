@@ -34,13 +34,13 @@ Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
-Nexa M5 Deep Performance Optimization = IN PROGRESS
-Performance Measurement Authority v1 = IN PROGRESS
-Value Layout v1 = IN PROGRESS
-ExecutableModule v1 = IN PROGRESS
-Incremental GC v1 = IN PROGRESS
-Runtime Fast Paths v1 = IN PROGRESS
-M6 LLVM JIT = NOT STARTED
+Nexa M5 Deep Performance Optimization = COMPLETE
+Performance Measurement Authority v1 = COMPLETE
+Value Layout v1 = COMPLETE
+ExecutableModule v1 = COMPLETE
+Incremental GC v1 = COMPLETE
+Runtime Fast Paths v1 = COMPLETE
+M6 LLVM JIT = DEFER
 Nexa Language v2 = COMPLETE
 NIDL v2 = COMPLETE
 Structured Codegen v2 = COMPLETE
@@ -91,6 +91,16 @@ M4R1 completion is enforced by `cargo xtask finalize-m4-r1`; the clean tagged
 report is written to
 `target/nexa-artifacts/m4r1-finalize/final-report.json`, and the publication
 authority is the annotated `language-scale-m4-complete-r1` tag.
+
+M5 completion is enforced by `cargo xtask finalize-m5` from the clean,
+published `performance-m5-complete` annotated tag. The finalizer reruns the
+workspace and historical gates, live same-machine baseline comparison,
+profiler overhead, product corpus, V8 parity, and structural zero-allocation
+checks. Its terminal report is written to
+`target/nexa-artifacts/m5-finalize/final-report.json`. The data-backed M6 LLVM
+JIT decision is **DEFER**: M5 met every frozen performance target, but neither
+per-workload CPU sampling nor a bounded LLVM compilation-cost prototype proves
+the remaining JIT GO conditions.
 
 See [Source Modules](docs/MODULES.md),
 [Local Libraries](docs/LOCAL_LIBRARIES.md),

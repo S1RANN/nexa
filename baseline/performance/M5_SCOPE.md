@@ -2,7 +2,7 @@
 
 Version: **1.0.0**
 
-Status: **IN PROGRESS**
+Status: **COMPLETE**
 
 M5 is the deep performance optimization milestone. It optimizes value
 representation, the interpreter, collections, GC, Task/Host boundaries, and
@@ -64,3 +64,23 @@ If an optimization conflicts with verifier safety, precise roots, write
 barriers, fuel, resource ceilings, failure atomicity, reload rollback,
 diagnostic locations, or deterministic results, the optimization is removed
 rather than the condition weakened.
+
+## Completion evidence
+
+M5 completed both staged slices under the frozen Benchmark v7 protocol. The
+qualification run used 7 independent processes with 1,000 samples per case
+and a live rebuild of `performance-m5-baseline` on the same Apple M4 Pro
+machine. It met all four geometric-mean targets and reported no unexplained
+p95/p99 regression:
+
+```text
+Product CPU corpus          2.397x  (target 1.50x)
+Value/collection corpus     2.444x  (target 2.00x)
+Host/Task/Engine corpus     1.485x  (target 1.30x)
+Cold-start corpus           1.650x  (target 1.20x)
+```
+
+The terminal tagged-HEAD authority is
+`target/nexa-artifacts/m5-finalize/final-report.json`; raw benchmark receipts
+remain uncommitted under `target/nexa-artifacts/m5/`. The resulting M6 LLVM
+JIT decision is `DEFER`, as documented in `JIT_DECISION_V1.md`.
