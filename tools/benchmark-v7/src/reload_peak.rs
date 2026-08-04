@@ -85,9 +85,13 @@ struct ReloadPeakReport {
     benchmark_source_hash: String,
     toolchain: String,
     os: &'static str,
+    os_version: String,
     arch: &'static str,
+    machine_model: String,
     cpu_model: String,
     logical_cpu_count: usize,
+    power_source: String,
+    thermal_policy: String,
     build_profile: &'static str,
     samples: usize,
     started_at_unix_ms: u128,
@@ -263,9 +267,13 @@ pub(super) fn run(samples: usize, output: Option<&str>) -> Result<(), Box<dyn st
         benchmark_source_hash: super::benchmark_source_hash(),
         toolchain: super::rustc_version(),
         os: std::env::consts::OS,
+        os_version: super::os_version(),
         arch: std::env::consts::ARCH,
+        machine_model: super::machine_model(),
         cpu_model: super::cpu_model(),
         logical_cpu_count: std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        power_source: super::power_source(),
+        thermal_policy: super::thermal_policy(),
         build_profile: if cfg!(debug_assertions) {
             "debug"
         } else {

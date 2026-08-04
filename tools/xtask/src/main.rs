@@ -1532,13 +1532,25 @@ fn test_profiler_overhead() -> Result<(), DynError> {
     let control: Value = serde_json::from_slice(&fs::read(&control_path)?)?;
     let disabled: Value = serde_json::from_slice(&fs::read(&disabled_path)?)?;
     let enabled: Value = serde_json::from_slice(&fs::read(&enabled_path)?)?;
-    for (name, report) in [
-        ("control", &control),
-        ("disabled", &disabled),
-        ("enabled", &enabled),
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    for (name, report, profiler_enabled, profiler_mode) in [
+        ("control", &control, false, "compiled-out-control"),
+        ("disabled", &disabled, false, "disabled"),
+        ("enabled", &enabled, true, "enabled"),
     ] {
-        if report["process_count"].as_u64()
-            != Some(u64::try_from(PROCESSES).expect("formal process count fits u64"))
+        if report["schema"].as_u64() != Some(2)
+            || report["benchmark_version"].as_u64() != Some(7)
+            || report["status"] != "PASS"
+            || report["implementation_commit"].as_str() != Some(head.as_str())
+            || report["build_profile"] != "release"
+            || report["profiler_enabled"] != profiler_enabled
+            || report["profiler_mode"] != profiler_mode
+            || report["warmup_per_process"].as_u64() != Some(100)
+            || !is_hex_digest(&report["benchmark_source_hash"], 32)
+            || !is_hex_digest(&report["bytecode_hash"], 32)
+            || !qualified_benchmark_machine(report)
+            || report["process_count"].as_u64()
+                != Some(u64::try_from(PROCESSES).expect("formal process count fits u64"))
             || report["samples_per_process"].as_u64()
                 != Some(u64::try_from(SAMPLES).expect("formal sample count fits u64"))
         {
@@ -1548,11 +1560,41 @@ fn test_profiler_overhead() -> Result<(), DynError> {
     for field in [
         "implementation_commit",
         "benchmark_source_hash",
+        "bytecode_hash",
         "benchmark_version",
+        "toolchain",
+        "os",
+        "os_version",
+        "arch",
+        "machine_model",
+        "cpu_model",
+        "logical_cpu_count",
+        "power_source",
+        "thermal_policy",
+        "build_profile",
+        "allocation_scope",
     ] {
         if control[field] != disabled[field] || control[field] != enabled[field] {
             return Err(format!("profiler A/B reports disagree on {field}").into());
         }
+    }
+    let case_inventory = |report: &Value| -> Option<Vec<(String, String)>> {
+        report["cases"]
+            .as_array()?
+            .iter()
+            .map(|case| {
+                Some((
+                    case["case"].as_str()?.to_owned(),
+                    case["tier"].as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    };
+    if case_inventory(&control).is_none()
+        || case_inventory(&control) != case_inventory(&disabled)
+        || case_inventory(&control) != case_inventory(&enabled)
+    {
+        return Err("profiler A/B reports disagree on the benchmark case inventory".into());
     }
 
     let p50 = |report: &Value, name: &str| -> Option<u64> {
@@ -1851,9 +1893,8 @@ fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Val
         || report["samples"] != M5_RELOAD_PEAK_SAMPLES
         || report["status"] != "PASS"
         || report["build_profile"] != "release"
-        || report["benchmark_source_hash"]
-            .as_str()
-            .is_none_or(|hash| hash.len() != 64)
+        || !qualified_benchmark_machine(&report)
+        || !is_hex_digest(&report["benchmark_source_hash"], 32)
         || ["p50_ns", "p95_ns", "p99_ns"].iter().any(|field| {
             report["duration"][field]
                 .as_u64()
@@ -1983,9 +2024,9 @@ fn cold_start_report_at(path: &Path, implementation_commit: &str) -> Option<Valu
         || report["samples"] != M5_COLD_START_SAMPLES
         || report["warmup"] != 1
         || report["status"] != "PASS"
-        || report["benchmark_source_hash"]
-            .as_str()
-            .is_none_or(|hash| hash.len() != 64)
+        || report["build_profile"] != "release"
+        || !qualified_benchmark_machine(&report)
+        || !is_hex_digest(&report["benchmark_source_hash"], 32)
     {
         return None;
     }
@@ -2139,31 +2180,167 @@ fn m5_product_corpus() -> Result<(), DynError> {
 /// defer; the report never disguises an unfinished GO condition as pending.
 fn formal_aggregate_at(path: &Path, implementation_commit: &str) -> Option<Value> {
     let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (report["implementation_commit"].as_str() == Some(implementation_commit)
+    formal_aggregate(report, implementation_commit)
+}
+
+fn formal_aggregate(report: Value, implementation_commit: &str) -> Option<Value> {
+    let cases = report["cases"].as_array()?;
+    let mut names = BTreeSet::new();
+    for case in cases {
+        let name = case["case"].as_str().filter(|name| !name.is_empty())?;
+        if !names.insert(name) || case["tier"].as_str().is_none_or(str::is_empty) {
+            return None;
+        }
+        let p50 = case["median_p50_ns"].as_u64()?;
+        let p95 = case["median_p95_ns"].as_u64()?;
+        let p99 = case["median_p99_ns"].as_u64()?;
+        if p50 == 0
+            || p50 > p95
+            || p95 > p99
+            || case["median_throughput_ops_per_second"]
+                .as_u64()
+                .is_none_or(|throughput| throughput == 0)
+            || case["max_system_allocations"].as_u64().is_none()
+            || case["max_system_allocated_bytes"].as_u64().is_none()
+        {
+            return None;
+        }
+    }
+    let mandatory_cases = VALUE_COLLECTION_CASES
+        .iter()
+        .chain(PRODUCT_CPU_CASES)
+        .chain(HOST_TASK_ENGINE_CASES)
+        .chain(COLD_START_CASES);
+    (report["schema"].as_u64() == Some(2)
+        && report["implementation_commit"].as_str() == Some(implementation_commit)
         && report["benchmark_version"].as_u64() == Some(7)
+        && report["protocol"] == "median across process medians; each process independently warmed"
+        && report["status"] == "PASS"
         && report["process_count"].as_u64() == Some(7)
         && report["samples_per_process"].as_u64() == Some(1_000)
-        && report["cases"]
-            .as_array()
-            .is_some_and(|cases| !cases.is_empty()))
+        && report["warmup_per_process"].as_u64() == Some(100)
+        && report["build_profile"] == "release"
+        && report["profiler_enabled"] == false
+        && report["profiler_mode"] == "disabled"
+        && report["allocation_scope"]
+            == "timed operation only; per-sample setup and result storage excluded"
+        && is_hex_digest(&report["benchmark_source_hash"], 32)
+        && is_hex_digest(&report["bytecode_hash"], 32)
+        && report["toolchain"]
+            .as_str()
+            .is_some_and(|toolchain| !toolchain.is_empty() && toolchain != "unknown")
+        && qualified_benchmark_machine(&report)
+        && !cases.is_empty()
+        && mandatory_cases
+            .into_iter()
+            .all(|name| names.contains(*name)))
     .then_some(report)
 }
 
+fn is_hex_digest(value: &Value, bytes: usize) -> bool {
+    value.as_str().is_some_and(|digest| {
+        digest.len() == bytes.saturating_mul(2)
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn qualified_benchmark_machine(report: &Value) -> bool {
+    [
+        "arch",
+        "os",
+        "os_version",
+        "machine_model",
+        "cpu_model",
+        "power_source",
+        "thermal_policy",
+    ]
+    .into_iter()
+    .all(|field| {
+        report[field]
+            .as_str()
+            .is_some_and(|value| !value.is_empty() && value != "unknown")
+    }) && report["logical_cpu_count"]
+        .as_u64()
+        .is_some_and(|count| count > 0)
+}
+
 fn same_benchmark_machine(left: &Value, right: &Value) -> bool {
-    ["arch", "os", "cpu_model", "logical_cpu_count"]
+    qualified_benchmark_machine(left)
+        && qualified_benchmark_machine(right)
+        && [
+            "arch",
+            "os",
+            "os_version",
+            "machine_model",
+            "cpu_model",
+            "logical_cpu_count",
+            "power_source",
+            "thermal_policy",
+        ]
         .into_iter()
         .all(|field| left[field] == right[field])
 }
 
 fn formal_profile_at(path: &Path, implementation_commit: &str, aggregate: &Value) -> Option<Value> {
     let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (report["implementation_commit"].as_str() == Some(implementation_commit)
+    let cases = report["cases"].as_array()?;
+    let aggregate_cases = aggregate["cases"].as_array()?;
+    let case_names = cases
+        .iter()
+        .map(|case| case["case"].as_str())
+        .collect::<Option<Vec<_>>>()?;
+    let aggregate_names = aggregate_cases
+        .iter()
+        .map(|case| case["case"].as_str())
+        .collect::<Option<Vec<_>>>()?;
+    let profiler = &report["profiler"];
+    (report["schema"].as_u64() == Some(1)
+        && report["implementation_commit"].as_str() == Some(implementation_commit)
         && report["benchmark_version"].as_u64() == Some(7)
         && report["samples"].as_u64() == Some(200)
+        && report["warmup"].as_u64() == Some(100)
+        && report["process_index"].as_u64() == Some(0)
+        && report["build_profile"] == "release"
         && report["profiler_enabled"].as_bool() == Some(true)
-        && report["profiler"]["total_opcode_executions"]
+        && report["profiler_mode"] == "enabled"
+        && report["benchmark_source_hash"] == aggregate["benchmark_source_hash"]
+        && report["bytecode_hash"] == aggregate["bytecode_hash"]
+        && report["toolchain"] == aggregate["toolchain"]
+        && is_hex_digest(&report["benchmark_source_hash"], 32)
+        && is_hex_digest(&report["bytecode_hash"], 32)
+        && profiler["schema"].as_u64() == Some(1)
+        && profiler["total_opcode_executions"]
             .as_u64()
             .is_some_and(|executions| executions > 0)
+        && profiler["function_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        && profiler["top_opcodes"]
+            .as_array()
+            .is_some_and(|opcodes| !opcodes.is_empty())
+        && [
+            "dropped_modules",
+            "dropped_functions",
+            "dropped_sites",
+            "dropped_host_calls",
+        ]
+        .into_iter()
+        .all(|field| profiler[field].as_u64().is_some())
+        && profiler["gc"].is_object()
+        && profiler["tasks"].is_object()
+        && case_names == aggregate_names
+        && cases.iter().all(|case| {
+            let p50 = case["p50_ns"].as_u64();
+            let p95 = case["p95_ns"].as_u64();
+            let p99 = case["p99_ns"].as_u64();
+            case["samples"].as_u64() == Some(200)
+                && case["throughput_ops_per_second"]
+                    .as_u64()
+                    .is_some_and(|throughput| throughput > 0)
+                && p50.is_some_and(|value| value > 0)
+                && p50.zip(p95).is_some_and(|(p50, p95)| p50 <= p95)
+                && p95.zip(p99).is_some_and(|(p95, p99)| p95 <= p99)
+        })
         && same_benchmark_machine(&report, aggregate))
     .then_some(report)
 }
@@ -2220,6 +2397,14 @@ fn m5_final_report() -> Result<(), DynError> {
         formal_aggregate_at(&aggregate_path, &head)
             .ok_or("new M5 aggregate is not a same-HEAD formal 7x1000 report")?
     };
+    if !same_benchmark_machine(&reload_peak, &aggregate)
+        || !same_benchmark_machine(&cold_start, &aggregate)
+    {
+        return Err(
+            "WP97/WP98 and the formal hot aggregate were measured under different machine qualifications"
+                .into(),
+        );
+    }
     let profile = if let Some(report) = formal_profile_at(&profile_path, &head, &aggregate) {
         eprintln!("final report: reusing same-HEAD 1x200 profile");
         report
@@ -2347,6 +2532,16 @@ fn m5_final_report() -> Result<(), DynError> {
         markdown,
         "M6 LLVM JIT decision: **{jit_decision}** (failed GO conditions: {rendered_blockers}).\n",
     )?;
+    writeln!(
+        markdown,
+        "Qualification: {} / {} / {} logical CPUs; {}; {}; {}.\n",
+        aggregate["machine_model"].as_str().unwrap_or("?"),
+        aggregate["cpu_model"].as_str().unwrap_or("?"),
+        aggregate["logical_cpu_count"],
+        aggregate["os_version"].as_str().unwrap_or("?"),
+        aggregate["power_source"].as_str().unwrap_or("?"),
+        aggregate["thermal_policy"].as_str().unwrap_or("?"),
+    )?;
     markdown
         .push_str("| case | tier | p50 (ns) | p99 (ns) | max allocs |\n|---|---|---|---|---|\n");
     if let Some(cases) = aggregate["cases"].as_array() {
@@ -2420,9 +2615,78 @@ fn v8_gap_condition(final_dir: &Path, aggregate: &Value) -> Value {
             "note": "v8-comparison.json was produced at a different commit; rerun cargo xtask m5-v8-comparison",
         });
     }
-    let satisfied = comparison["c4_v8_gap_satisfied"].as_bool() == Some(true);
+    let Some(workloads) = comparison["workloads"].as_array() else {
+        return serde_json::json!({
+            "status": "malformed",
+            "note": "v8-comparison.json omitted its workload evidence",
+        });
+    };
+    let workload_names = workloads
+        .iter()
+        .map(|workload| workload["case"].as_str())
+        .collect::<Option<Vec<_>>>();
+    let computed_leads = workloads
+        .iter()
+        .filter_map(|workload| {
+            Some((
+                workload["nexa_median_p50_ns"].as_u64()?,
+                workload["v8_median_p50_ns"].as_u64()?,
+            ))
+        })
+        .filter(|&(nexa_p50, v8_p50)| v8_lead_at_least_1_5x(nexa_p50, v8_p50))
+        .count();
+    let declared_leads = comparison["workloads_with_v8_lead_at_least_1_5x"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok());
+    let satisfied = comparison["c4_v8_gap_satisfied"].as_bool();
+    let malformed = comparison["schema"].as_u64() != Some(1)
+        || comparison["protocol"]
+            != "7 processes x 1000 samples per side; median across process medians; per-process warmup"
+        || comparison["result_parity"]
+            != "all workloads returned identical results in both runtimes"
+        || comparison["processes"].as_u64() != Some(7)
+        || comparison["samples_per_process"].as_u64() != Some(1_000)
+        || comparison["warmup_per_process"].as_u64() != Some(100)
+        || !is_hex_digest(&comparison["harness_source_hash"], 32)
+        || comparison["node_version"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || comparison["v8_version"].as_str().is_none_or(str::is_empty)
+        || !same_benchmark_machine(&comparison["qualification_machine"], aggregate)
+        || workload_names.as_deref() != Some(PRODUCT_CPU_CASES)
+        || workloads.iter().enumerate().any(|(index, workload)| {
+            let Some(&(expected_case, expected_result)) = PRODUCT_CPU_RESULTS.get(index) else {
+                return true;
+            };
+            let Some(nexa_p50) = workload["nexa_median_p50_ns"].as_u64() else {
+                return true;
+            };
+            let Some(v8_p50) = workload["v8_median_p50_ns"].as_u64() else {
+                return true;
+            };
+            let Some(reported_ratio) = workload["v8_lead_ratio"].as_f64() else {
+                return true;
+            };
+            let expected_ratio = rounded_v8_lead_ratio(nexa_p50, v8_p50);
+            workload["case"].as_str() != Some(expected_case)
+                || workload["result"].as_i64() != Some(expected_result)
+                || nexa_p50 == 0
+                || v8_p50 == 0
+                || !reported_ratio.is_finite()
+                || (reported_ratio - expected_ratio).abs() > f64::EPSILON
+                || workload["v8_lead_at_least_1_5x"].as_bool()
+                    != Some(v8_lead_at_least_1_5x(nexa_p50, v8_p50))
+        })
+        || declared_leads != Some(computed_leads)
+        || satisfied != Some(computed_leads >= 3);
+    if malformed {
+        return serde_json::json!({
+            "status": "malformed",
+            "note": "v8-comparison.json failed its protocol, machine, inventory, parity, or ratio checks",
+        });
+    }
     serde_json::json!({
-        "status": if satisfied { "satisfied" } else { "not-satisfied" },
+        "status": if satisfied == Some(true) { "satisfied" } else { "not-satisfied" },
         "note": "warm V8 versus the Nexa interpreter over the comparable pure-computation product workloads",
         "node_version": comparison["node_version"],
         "v8_version": comparison["v8_version"],
@@ -2506,6 +2770,54 @@ fn m5_v8_comparison() -> Result<(), DynError> {
         );
         v8_reports.push(report);
     }
+    let first_v8 = v8_reports.first().ok_or("V8 harness produced no reports")?;
+    let mut v8_process_indices = BTreeSet::new();
+    for (report_number, report) in v8_reports.iter().enumerate() {
+        let cases = report["cases"]
+            .as_array()
+            .ok_or_else(|| format!("V8 report {report_number} omitted cases"))?;
+        let names = cases
+            .iter()
+            .map(|case| case["case"].as_str())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("V8 report {report_number} has an unnamed case"))?;
+        let process_index = report["process_index"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|index| *index < V8_COMPARISON_PROCESSES)
+            .ok_or_else(|| format!("V8 report {report_number} has an invalid process index"))?;
+        if report["schema"].as_u64() != Some(1)
+            || report["harness"] != "benchmark-v7-v8-comparison"
+            || report["node_version"].as_str() != Some(node_version.as_str())
+            || report["v8_version"] != first_v8["v8_version"]
+            || report["harness_source_hash"] != first_v8["harness_source_hash"]
+            || !is_hex_digest(&report["harness_source_hash"], 32)
+            || report["samples"].as_u64()
+                != Some(u64::try_from(V8_COMPARISON_SAMPLES).expect("sample count fits u64"))
+            || report["warmup"].as_u64() != Some(100)
+            || names != PRODUCT_CPU_CASES
+            || !v8_process_indices.insert(process_index)
+        {
+            return Err(format!(
+                "V8 report {report_number} is not a unique formal Benchmark v7 process receipt"
+            )
+            .into());
+        }
+        for case in cases {
+            let p50 = case["p50_ns"].as_u64();
+            let p95 = case["p95_ns"].as_u64();
+            let p99 = case["p99_ns"].as_u64();
+            if case["samples"].as_u64()
+                != Some(u64::try_from(V8_COMPARISON_SAMPLES).expect("sample count fits u64"))
+                || p50.is_none_or(|value| value == 0)
+                || p50.zip(p95).is_none_or(|(p50, p95)| p50 > p95)
+                || p95.zip(p99).is_none_or(|(p95, p99)| p95 > p99)
+                || case["result"].as_i64().is_none()
+            {
+                return Err(format!("V8 report {report_number} has malformed case timings").into());
+            }
+        }
+    }
     let v8_version = v8_reports[0]["v8_version"]
         .as_str()
         .ok_or("v8 harness report omitted its V8 version")?
@@ -2541,14 +2853,16 @@ fn m5_v8_comparison() -> Result<(), DynError> {
     let mut workloads = Vec::new();
     let mut leads = 0_usize;
     let mut parity_failures = Vec::new();
-    for workload in [
-        "product_data_sweep",
-        "product_combat_tick",
-        "product_grid_score",
-    ] {
+    for &(workload, pinned_result) in &PRODUCT_CPU_RESULTS {
         let expected = nexa_results[workload]
             .as_i64()
             .ok_or_else(|| format!("--verify-products omitted {workload}"))?;
+        if expected != pinned_result {
+            return Err(format!(
+                "{workload} returned {expected}, but the frozen product result is {pinned_result}"
+            )
+            .into());
+        }
         let mut v8_p50s = Vec::with_capacity(v8_reports.len());
         for report in &v8_reports {
             let case = report["cases"]
@@ -2574,8 +2888,8 @@ fn m5_v8_comparison() -> Result<(), DynError> {
             .and_then(|cases| cases.iter().find(|case| case["case"] == workload))
             .and_then(|case| case["median_p50_ns"].as_u64())
             .ok_or_else(|| format!("nexa aggregate omitted {workload}"))?;
-        let lead = nexa_p50 as f64 / v8_p50.max(1) as f64;
-        if lead >= 1.5 {
+        let lead_at_least_1_5x = v8_lead_at_least_1_5x(nexa_p50, v8_p50);
+        if lead_at_least_1_5x {
             leads += 1;
         }
         workloads.push(serde_json::json!({
@@ -2583,7 +2897,8 @@ fn m5_v8_comparison() -> Result<(), DynError> {
             "result": expected,
             "nexa_median_p50_ns": nexa_p50,
             "v8_median_p50_ns": v8_p50,
-            "v8_lead_ratio": (lead * 100.0).round() / 100.0,
+            "v8_lead_ratio": rounded_v8_lead_ratio(nexa_p50, v8_p50),
+            "v8_lead_at_least_1_5x": lead_at_least_1_5x,
         }));
     }
     if !parity_failures.is_empty() {
@@ -2600,8 +2915,22 @@ fn m5_v8_comparison() -> Result<(), DynError> {
         "discipline": "warm V8 JIT-compiled code measured against the Nexa interpreter (JIT_DECISION_V1.md)",
         "node_version": node_version,
         "v8_version": v8_version,
+        "harness_source_hash": first_v8["harness_source_hash"],
+        "processes": V8_COMPARISON_PROCESSES,
+        "samples_per_process": V8_COMPARISON_SAMPLES,
+        "warmup_per_process": 100,
         "nexa_implementation_commit": aggregate["implementation_commit"],
         "nexa_aggregate": aggregate_provenance,
+        "qualification_machine": {
+            "os": aggregate["os"],
+            "os_version": aggregate["os_version"],
+            "arch": aggregate["arch"],
+            "machine_model": aggregate["machine_model"],
+            "cpu_model": aggregate["cpu_model"],
+            "logical_cpu_count": aggregate["logical_cpu_count"],
+            "power_source": aggregate["power_source"],
+            "thermal_policy": aggregate["thermal_policy"],
+        },
         "result_parity": "all workloads returned identical results in both runtimes",
         "workloads": workloads,
         "workloads_with_v8_lead_at_least_1_5x": leads,
@@ -2632,6 +2961,25 @@ const PRODUCT_CPU_CASES: &[&str] = &[
     "product_combat_tick",
     "product_grid_score",
 ];
+const PRODUCT_CPU_RESULTS: [(&str, i64); 3] = [
+    ("product_data_sweep", 32_640),
+    ("product_combat_tick", 633),
+    ("product_grid_score", 157_992),
+];
+const BASELINE_PRODUCT_CPU_CASES: &[&str] = &["product_data_sweep"];
+
+fn v8_lead_at_least_1_5x(nexa_p50: u64, v8_p50: u64) -> bool {
+    v8_p50 > 0 && u128::from(nexa_p50) * 2 >= u128::from(v8_p50) * 3
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    // Nanosecond medians remain far below the f64 exact-integer boundary.
+)]
+fn rounded_v8_lead_ratio(nexa_p50: u64, v8_p50: u64) -> f64 {
+    let ratio = nexa_p50 as f64 / v8_p50.max(1) as f64;
+    (ratio * 100.0).round() / 100.0
+}
 /// WP16 covers the current hot interpreter corpus, including cases added
 /// after the frozen M5 baseline bucket.
 const PROFILER_HOT_CASES: &[&str] = &[
@@ -2652,6 +3000,62 @@ const HOST_TASK_ENGINE_CASES: &[&str] = &[
     "realm_drop",
 ];
 const COLD_START_CASES: &[&str] = &["product_standalone_pipeline"];
+
+/// Validates the immutable baseline harness's schema-1 aggregate after the
+/// current xtask process has synchronously produced and qualified it. The
+/// baseline predates the schema-2 provenance envelope, so only fields that
+/// its frozen harness actually measured are accepted before the same-process
+/// qualification stamp is checked.
+fn formal_baseline_aggregate(
+    report: Value,
+    implementation_commit: &str,
+    machine_authority: &Value,
+) -> Option<Value> {
+    let cases = report["cases"].as_array()?;
+    let mut names = BTreeSet::new();
+    for case in cases {
+        let name = case["case"].as_str().filter(|name| !name.is_empty())?;
+        if !names.insert(name) || case["tier"].as_str().is_none_or(str::is_empty) {
+            return None;
+        }
+        let p50 = case["median_p50_ns"].as_u64()?;
+        let p95 = case["median_p95_ns"].as_u64()?;
+        let p99 = case["median_p99_ns"].as_u64()?;
+        if p50 == 0
+            || p50 > p95
+            || p95 > p99
+            || case["median_throughput_ops_per_second"]
+                .as_u64()
+                .is_none_or(|throughput| throughput == 0)
+            || case["max_system_allocations"].as_u64().is_none()
+            || case["max_system_allocated_bytes"].as_u64().is_none()
+        {
+            return None;
+        }
+    }
+    let mandatory_cases = VALUE_COLLECTION_CASES
+        .iter()
+        .chain(BASELINE_PRODUCT_CPU_CASES)
+        .chain(HOST_TASK_ENGINE_CASES)
+        .chain(COLD_START_CASES);
+    (report["schema"].as_u64() == Some(1)
+        && report["benchmark_version"].as_u64() == Some(7)
+        && report["protocol"]
+            == "median across process medians; each process independently warmed"
+        && report["implementation_commit"].as_str() == Some(implementation_commit)
+        && report["process_count"].as_u64() == Some(7)
+        && report["samples_per_process"].as_u64() == Some(1_000)
+        && report["build_profile"] == "release"
+        && report["status"] == "PASS"
+        && report["machine_identity_provenance"]
+            == "bound by the same xtask process to its live HEAD receipt while synchronously running the baseline worktree"
+        && is_hex_digest(&report["benchmark_source_hash"], 32)
+        && same_benchmark_machine(&report, machine_authority)
+        && mandatory_cases
+            .into_iter()
+            .all(|name| names.contains(*name)))
+    .then_some(report)
+}
 
 /// Regressions acknowledged with a written explanation, per the
 /// `PERFORMANCE_TARGETS_V1.md` latency discipline. Empty until a regression
@@ -2677,14 +3081,21 @@ const REGRESSION_NOISE_FLOOR_NS: u128 = 100;
 /// inside a temporary worktree (never a saved report from another
 /// session); its live artifact is reused only while pinned to the
 /// immutable tag commit. The command fails on unexplained shared-case
-/// p95/p99 regressions beyond 10%; throughput-target achievement is
-/// recorded for finalize-m5 to enforce.
+/// p95/p99 regressions beyond 10% or on a missed frozen throughput target.
+fn m5_performance_regression() -> Result<(), DynError> {
+    m5_performance_regression_with_live_head(None)
+}
+
+/// `live_head` is accepted only from the finalizer's immediately preceding
+/// profiler-disabled 7x1000 run. Standalone invocations pass `None` and
+/// always measure HEAD again, so a saved JSON file can never masquerade as
+/// the live side of the required baseline comparison.
 #[allow(
     clippy::too_many_lines,
     // Ratio reporting only; the f64 mantissa bound is irrelevant here.
     clippy::cast_precision_loss
 )]
-fn m5_performance_regression() -> Result<(), DynError> {
+fn m5_performance_regression_with_live_head(live_head: Option<Value>) -> Result<(), DynError> {
     let root = workspace_root();
     let regression_dir = root.join("target/nexa-artifacts/m5/regression");
     fs::create_dir_all(&regression_dir)?;
@@ -2694,15 +3105,14 @@ fn m5_performance_regression() -> Result<(), DynError> {
     let baseline_commit = git_output(&["rev-parse", "performance-m5-baseline^{}"])?;
     let head_commit = git_output(&["rev-parse", "HEAD"])?;
 
-    // HEAD side: a same-commit formal receipt generated earlier in this gate
-    // sequence is byte-for-byte the same measurement authority. Reuse it
-    // instead of paying for a second or third 7x1000 run.
+    // HEAD is always live: either this command measures it here, or the
+    // finalizer passes the profiler-disabled aggregate it just generated in
+    // the same call stack under the identical protocol.
     let head_path = regression_dir.join("head-7x1000.json");
-    let final_aggregate_path = root.join("target/nexa-artifacts/m5/final/aggregate-7x1000.json");
-    let head = if let Some(report) = formal_aggregate_at(&final_aggregate_path, &head_commit)
-        .or_else(|| formal_aggregate_at(&head_path, &head_commit))
-    {
-        eprintln!("regression: reusing same-HEAD formal aggregate");
+    let head = if let Some(report) = live_head {
+        let report = formal_aggregate(report, &head_commit)
+            .ok_or("finalizer supplied a malformed live HEAD aggregate")?;
+        eprintln!("regression: using the finalizer's immediately preceding live HEAD aggregate");
         fs::write(
             &head_path,
             format!("{}\n", serde_json::to_string_pretty(&report)?),
@@ -2726,29 +3136,27 @@ fn m5_performance_regression() -> Result<(), DynError> {
         formal_aggregate_at(&head_path, &head_commit)
             .ok_or("new HEAD benchmark is not a formal 7x1000 report")?
     };
+    let final_aggregate_path = root.join("target/nexa-artifacts/m5/final/aggregate-7x1000.json");
+    fs::create_dir_all(
+        final_aggregate_path
+            .parent()
+            .ok_or("formal aggregate path has no parent")?,
+    )?;
+    fs::write(
+        &final_aggregate_path,
+        format!("{}\n", serde_json::to_string_pretty(&head)?),
+    )?;
 
-    // Baseline side: reuse this machine's live artifact only while it is
-    // pinned to the immutable tag commit under the formal protocol and its
-    // machine identity matches the HEAD authority.
+    // Baseline is never reused. The immutable tag's own harness runs now in
+    // a detached temporary worktree, then its schema-1 aggregate is
+    // qualified by this same process and validated before comparison.
     let baseline_path = regression_dir.join("baseline-live-7x1000.json");
-    let existing: Option<Value> = fs::read(&baseline_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let baseline = match existing {
-        Some(report)
-            if report["implementation_commit"].as_str() == Some(baseline_commit.as_str())
-                && report["process_count"].as_u64() == Some(7)
-                && report["samples_per_process"].as_u64() == Some(1_000)
-                && same_benchmark_machine(&report, &head) =>
-        {
-            eprintln!("baseline: reusing the live run pinned to {baseline_commit}");
-            report
-        }
-        _ => generate_baseline_live(&root, &baseline_path)?,
-    };
-    if !same_benchmark_machine(&baseline, &head) {
-        return Err("live baseline and HEAD reports came from different machines".into());
-    }
+    let baseline = formal_baseline_aggregate(
+        generate_baseline_live(&root, &baseline_path, &head)?,
+        &baseline_commit,
+        &head,
+    )
+    .ok_or("new baseline benchmark is not a live qualified 7x1000 report")?;
 
     let case_map = |report: &Value| -> BTreeMap<String, (u128, u128, u128)> {
         report["cases"]
@@ -2830,22 +3238,63 @@ fn m5_performance_regression() -> Result<(), DynError> {
                 .collect::<Vec<_>>(),
         })
     };
+    let buckets = serde_json::json!({
+        "product_cpu": bucket(PRODUCT_CPU_CASES, 1.50),
+        "value_collection": bucket(VALUE_COLLECTION_CASES, 2.00),
+        "host_task_engine": bucket(HOST_TASK_ENGINE_CASES, 1.30),
+        "cold_start": bucket(COLD_START_CASES, 1.20),
+    });
+    let targets_met = [
+        "product_cpu",
+        "value_collection",
+        "host_task_engine",
+        "cold_start",
+    ]
+    .into_iter()
+    .all(|bucket| buckets[bucket]["met"] == true);
+    let passed = regressions.is_empty() && targets_met;
     let comparison = serde_json::json!({
         "schema": 1,
         "protocol": "live baseline worktree vs HEAD; 7 processes x 1000 samples each side; median across process medians",
         "baseline_tag": "performance-m5-baseline",
         "baseline_commit": baseline_commit,
         "head_commit": head_commit,
-        "buckets": {
-            "product_cpu": bucket(PRODUCT_CPU_CASES, 1.50),
-            "value_collection": bucket(VALUE_COLLECTION_CASES, 2.00),
-            "host_task_engine": bucket(HOST_TASK_ENGINE_CASES, 1.30),
-            "cold_start": bucket(COLD_START_CASES, 1.20),
+        "head_authority": {
+            "schema": head["schema"],
+            "benchmark_source_hash": head["benchmark_source_hash"],
+            "bytecode_hash": head["bytecode_hash"],
+            "toolchain": head["toolchain"],
+            "build_profile": head["build_profile"],
+            "allocation_scope": head["allocation_scope"],
+            "os": head["os"],
+            "os_version": head["os_version"],
+            "arch": head["arch"],
+            "machine_model": head["machine_model"],
+            "cpu_model": head["cpu_model"],
+            "logical_cpu_count": head["logical_cpu_count"],
+            "power_source": head["power_source"],
+            "thermal_policy": head["thermal_policy"],
         },
+        "baseline_authority": {
+            "schema": baseline["schema"],
+            "benchmark_source_hash": baseline["benchmark_source_hash"],
+            "build_profile": baseline["build_profile"],
+            "os": baseline["os"],
+            "os_version": baseline["os_version"],
+            "arch": baseline["arch"],
+            "machine_model": baseline["machine_model"],
+            "cpu_model": baseline["cpu_model"],
+            "logical_cpu_count": baseline["logical_cpu_count"],
+            "power_source": baseline["power_source"],
+            "thermal_policy": baseline["thermal_policy"],
+            "machine_identity_provenance": baseline["machine_identity_provenance"],
+        },
+        "buckets": buckets,
         "cases_without_baseline": new_cases,
         "regressions": regressions,
         "explained_regressions": explained,
         "noise_floor_ns": u64::try_from(REGRESSION_NOISE_FLOOR_NS).unwrap_or(u64::MAX),
+        "status": if passed { "PASS" } else { "FAIL" },
     });
     fs::write(
         regression_dir.join("comparison.json"),
@@ -2857,6 +3306,9 @@ fn m5_performance_regression() -> Result<(), DynError> {
         .is_some_and(|entries| !entries.is_empty())
     {
         return Err("unexplained p95/p99 regressions beyond 10% on shared mandatory cases".into());
+    }
+    if comparison["status"] != "PASS" {
+        return Err("one or more M5 throughput buckets missed the frozen target".into());
     }
     Ok(())
 }
@@ -3046,8 +3498,12 @@ fn finalize_m5() -> Result<(), DynError> {
     m4r1::test_entrypoints()?;
     m4r1::m4r1_scale_stress()?;
     test_profiler_overhead()?;
+    let live_head_path =
+        root.join("target/nexa-artifacts/m5/profiler-overhead/disabled-7x1000.json");
+    let live_head = formal_aggregate_at(&live_head_path, &head)
+        .ok_or("profiler gate did not leave a valid live profiler-disabled HEAD aggregate")?;
+    m5_performance_regression_with_live_head(Some(live_head))?;
     m5_v8_comparison()?;
-    m5_performance_regression()?;
     m5_final_report()?;
     repo_audit()?;
 
@@ -3086,10 +3542,20 @@ fn finalize_m5() -> Result<(), DynError> {
     let unexplained_regressions = comparison["regressions"]
         .as_array()
         .ok_or("comparison regressions is not an array")?;
-    if comparison["head_commit"] != head
+    if comparison["schema"].as_u64() != Some(1)
+        || comparison["status"] != "PASS"
+        || comparison["head_commit"] != head
+        || comparison["head_authority"]["schema"].as_u64() != Some(2)
+        || comparison["head_authority"]["build_profile"] != "release"
+        || !is_hex_digest(&comparison["head_authority"]["benchmark_source_hash"], 32)
+        || !is_hex_digest(&comparison["head_authority"]["bytecode_hash"], 32)
         || !unexplained_regressions.is_empty()
+        || profiler["schema"].as_u64() != Some(1)
         || profiler["implementation_commit"] != head
         || profiler["status"] != "PASS"
+        || profiler["processes"].as_u64() != Some(7)
+        || profiler["samples_per_process"].as_u64() != Some(1_000)
+        || product["schema"].as_u64() != Some(1)
         || product["implementation_commit"] != head
         || product["status"] != "PASS"
         || reload_peak["implementation_commit"] != head
@@ -3099,9 +3565,18 @@ fn finalize_m5() -> Result<(), DynError> {
         || cold_start["implementation_commit"] != head
         || performance["cold_start"]["implementation_commit"] != head
         || performance["cold_start"]["status"] != "PASS"
+        || performance["schema"].as_u64() != Some(1)
         || performance["aggregate"]["implementation_commit"] != head
         || performance["aggregate"]["benchmark_version"] != 7
+        || performance["aggregate"]["schema"] != 2
+        || performance["aggregate"]["status"] != "PASS"
+        || performance["aggregate"]["build_profile"] != "release"
+        || performance["aggregate"]["process_count"] != 7
+        || performance["aggregate"]["samples_per_process"] != 1_000
+        || performance["aggregate"]["warmup_per_process"] != 100
+        || decision["schema"].as_u64() != Some(1)
         || decision["implementation_commit"] != head
+        || performance["decision"] != decision
         || !matches!(decision["decision"].as_str(), Some("GO" | "DEFER"))
     {
         return Err("one or more M5 machine receipts are stale, malformed, or failing".into());
@@ -3186,7 +3661,11 @@ fn finalize_m5() -> Result<(), DynError> {
 /// into a temporary worktree and its own frozen harness runs the formal
 /// protocol there. The worktree is removed afterwards; only the report
 /// survives.
-fn generate_baseline_live(root: &Path, baseline_path: &Path) -> Result<Value, DynError> {
+fn generate_baseline_live(
+    root: &Path,
+    baseline_path: &Path,
+    machine_authority: &Value,
+) -> Result<Value, DynError> {
     let worktree = root.join("target/nexa-worktrees/m5-baseline");
     let worktree_str = worktree.to_str().ok_or("non-UTF-8 worktree path")?;
     // Pre-clean any stale worktree from an interrupted run.
@@ -3246,7 +3725,32 @@ fn generate_baseline_live(root: &Path, baseline_path: &Path) -> Result<Value, Dy
             String::from_utf8_lossy(&removed.stderr)
         );
     }
-    Ok(serde_json::from_slice(&fs::read(baseline_path)?)?)
+    if !qualified_benchmark_machine(machine_authority) {
+        return Err("HEAD benchmark omitted its qualified machine identity".into());
+    }
+    let mut report: Value = serde_json::from_slice(&fs::read(baseline_path)?)?;
+    for field in [
+        "arch",
+        "os",
+        "os_version",
+        "machine_model",
+        "cpu_model",
+        "logical_cpu_count",
+        "power_source",
+        "thermal_policy",
+    ] {
+        report[field] = machine_authority[field].clone();
+    }
+    report["build_profile"] = Value::from("release");
+    report["status"] = Value::from("PASS");
+    report["machine_identity_provenance"] = Value::from(
+        "bound by the same xtask process to its live HEAD receipt while synchronously running the baseline worktree",
+    );
+    fs::write(
+        baseline_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    Ok(report)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5201,7 +5705,113 @@ fn low_level_event_violations(root: &Path, tracked: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod audit_tests {
+    use std::collections::BTreeSet;
     use std::fs;
+
+    fn formal_aggregate_fixture(commit: &str) -> serde_json::Value {
+        let names = super::VALUE_COLLECTION_CASES
+            .iter()
+            .chain(super::PRODUCT_CPU_CASES)
+            .chain(super::HOST_TASK_ENGINE_CASES)
+            .chain(super::COLD_START_CASES)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let cases = names
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "case": name,
+                    "tier": "product",
+                    "median_throughput_ops_per_second": 10_000,
+                    "median_p50_ns": 100,
+                    "median_p95_ns": 120,
+                    "median_p99_ns": 140,
+                    "max_system_allocations": 0,
+                    "max_system_allocated_bytes": 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": 2,
+            "benchmark_version": 7,
+            "protocol": "median across process medians; each process independently warmed",
+            "status": "PASS",
+            "implementation_commit": commit,
+            "benchmark_source_hash": "11".repeat(32),
+            "bytecode_hash": "22".repeat(32),
+            "toolchain": "rustc qualification",
+            "os": "macos",
+            "os_version": "15.0",
+            "arch": "aarch64",
+            "machine_model": "Mac16,7",
+            "cpu_model": "qualification-cpu",
+            "logical_cpu_count": 10,
+            "power_source": "AC Power",
+            "thermal_policy": "qualification-policy",
+            "build_profile": "release",
+            "profiler_enabled": false,
+            "profiler_mode": "disabled",
+            "allocation_scope": "timed operation only; per-sample setup and result storage excluded",
+            "process_count": 7,
+            "samples_per_process": 1_000,
+            "warmup_per_process": 100,
+            "cases": cases,
+        })
+    }
+
+    fn formal_profile_fixture(aggregate: &serde_json::Value) -> serde_json::Value {
+        let cases = aggregate["cases"]
+            .as_array()
+            .expect("aggregate cases")
+            .iter()
+            .map(|case| {
+                serde_json::json!({
+                    "case": case["case"],
+                    "tier": case["tier"],
+                    "samples": 200,
+                    "throughput_ops_per_second": 10_000,
+                    "p50_ns": 100,
+                    "p95_ns": 120,
+                    "p99_ns": 140,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": 1,
+            "benchmark_version": 7,
+            "implementation_commit": aggregate["implementation_commit"],
+            "benchmark_source_hash": aggregate["benchmark_source_hash"],
+            "bytecode_hash": aggregate["bytecode_hash"],
+            "toolchain": aggregate["toolchain"],
+            "os": aggregate["os"],
+            "os_version": aggregate["os_version"],
+            "arch": aggregate["arch"],
+            "machine_model": aggregate["machine_model"],
+            "cpu_model": aggregate["cpu_model"],
+            "logical_cpu_count": aggregate["logical_cpu_count"],
+            "power_source": aggregate["power_source"],
+            "thermal_policy": aggregate["thermal_policy"],
+            "build_profile": "release",
+            "samples": 200,
+            "warmup": 100,
+            "process_index": 0,
+            "profiler_enabled": true,
+            "profiler_mode": "enabled",
+            "profiler": {
+                "schema": 1,
+                "total_opcode_executions": 1_000,
+                "function_count": 4,
+                "dropped_modules": 0,
+                "dropped_functions": 0,
+                "dropped_sites": 0,
+                "dropped_host_calls": 0,
+                "top_opcodes": [["add_i32", 1_000]],
+                "gc": {},
+                "tasks": {},
+            },
+            "cases": cases,
+        })
+    }
 
     #[test]
     fn m3r1_audit_tracks_the_build_fingerprint_lifecycle_names() {
@@ -5220,13 +5830,7 @@ mod audit_tests {
             "nexa-m5-formal-aggregate-{}.json",
             std::process::id()
         ));
-        let mut report = serde_json::json!({
-            "implementation_commit": "head",
-            "benchmark_version": 7,
-            "process_count": 7,
-            "samples_per_process": 1_000,
-            "cases": [{"case": "product"}],
-        });
+        let mut report = formal_aggregate_fixture("head");
         fs::write(
             &path,
             serde_json::to_vec(&report).expect("fixture serializes"),
@@ -5246,16 +5850,144 @@ mod audit_tests {
     }
 
     #[test]
+    fn live_baseline_requires_full_case_and_same_process_machine_authority() {
+        let machine = formal_aggregate_fixture("head");
+        let mut baseline = formal_aggregate_fixture("baseline");
+        baseline["schema"] = serde_json::Value::from(1);
+        baseline["machine_identity_provenance"] = serde_json::Value::from(
+            "bound by the same xtask process to its live HEAD receipt while synchronously running the baseline worktree",
+        );
+        assert!(super::formal_baseline_aggregate(baseline.clone(), "baseline", &machine).is_some());
+
+        baseline["cases"][0]["median_p50_ns"] = serde_json::Value::from(0);
+        assert!(super::formal_baseline_aggregate(baseline, "baseline", &machine).is_none());
+    }
+
+    #[test]
     fn benchmark_reuse_requires_the_same_machine_identity() {
         let left = serde_json::json!({
             "arch": "aarch64",
             "os": "macos",
+            "os_version": "15.0",
+            "machine_model": "Mac16,7",
             "cpu_model": "qualification-cpu",
             "logical_cpu_count": 10,
+            "power_source": "AC Power",
+            "thermal_policy": "qualification-policy",
         });
         let mut right = left.clone();
         assert!(super::same_benchmark_machine(&left, &right));
         right["cpu_model"] = serde_json::Value::from("different-cpu");
         assert!(!super::same_benchmark_machine(&left, &right));
+        assert!(!super::same_benchmark_machine(
+            &serde_json::json!({}),
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn formal_profile_reuse_requires_release_and_exact_aggregate_authority() {
+        let aggregate = formal_aggregate_fixture("head");
+        let path = std::env::temp_dir().join(format!(
+            "nexa-m5-formal-profile-{}.json",
+            std::process::id()
+        ));
+        let mut profile = formal_profile_fixture(&aggregate);
+        fs::write(
+            &path,
+            serde_json::to_vec(&profile).expect("profile serializes"),
+        )
+        .expect("profile writes");
+        assert!(super::formal_profile_at(&path, "head", &aggregate).is_some());
+
+        profile["build_profile"] = serde_json::Value::from("debug");
+        fs::write(
+            &path,
+            serde_json::to_vec(&profile).expect("profile serializes"),
+        )
+        .expect("profile rewrites");
+        assert!(super::formal_profile_at(&path, "head", &aggregate).is_none());
+        fs::remove_file(path).expect("fixture cleans up");
+    }
+
+    #[test]
+    fn v8_decision_reuse_requires_exact_protocol_and_machine_authority() {
+        let aggregate = formal_aggregate_fixture("head");
+        let directory =
+            std::env::temp_dir().join(format!("nexa-m5-v8-condition-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("fixture directory");
+        let qualification_machine = serde_json::json!({
+            "os": aggregate["os"],
+            "os_version": aggregate["os_version"],
+            "arch": aggregate["arch"],
+            "machine_model": aggregate["machine_model"],
+            "cpu_model": aggregate["cpu_model"],
+            "logical_cpu_count": aggregate["logical_cpu_count"],
+            "power_source": aggregate["power_source"],
+            "thermal_policy": aggregate["thermal_policy"],
+        });
+        let workloads = super::PRODUCT_CPU_RESULTS
+            .iter()
+            .map(|(name, result)| {
+                serde_json::json!({
+                    "case": name,
+                    "result": result,
+                    "nexa_median_p50_ns": 200,
+                    "v8_median_p50_ns": 100,
+                    "v8_lead_ratio": 2.0,
+                    "v8_lead_at_least_1_5x": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut comparison = serde_json::json!({
+            "schema": 1,
+            "protocol": "7 processes x 1000 samples per side; median across process medians; per-process warmup",
+            "node_version": "v24.0.0",
+            "v8_version": "13.0",
+            "harness_source_hash": "33".repeat(32),
+            "processes": 7,
+            "samples_per_process": 1_000,
+            "warmup_per_process": 100,
+            "nexa_implementation_commit": "head",
+            "qualification_machine": qualification_machine,
+            "result_parity": "all workloads returned identical results in both runtimes",
+            "workloads": workloads,
+            "workloads_with_v8_lead_at_least_1_5x": 3,
+            "c4_v8_gap_satisfied": true,
+        });
+        let path = directory.join("v8-comparison.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&comparison).expect("comparison serializes"),
+        )
+        .expect("comparison writes");
+        assert_eq!(
+            super::v8_gap_condition(&directory, &aggregate)["status"],
+            "satisfied"
+        );
+
+        comparison["workloads"][0]["v8_lead_at_least_1_5x"] = serde_json::Value::from(false);
+        fs::write(
+            &path,
+            serde_json::to_vec(&comparison).expect("comparison serializes"),
+        )
+        .expect("comparison rewrites");
+        assert_eq!(
+            super::v8_gap_condition(&directory, &aggregate)["status"],
+            "malformed"
+        );
+        comparison["workloads"][0]["v8_lead_at_least_1_5x"] = serde_json::Value::from(true);
+
+        comparison["qualification_machine"]["cpu_model"] = serde_json::Value::from("different-cpu");
+        fs::write(
+            &path,
+            serde_json::to_vec(&comparison).expect("comparison serializes"),
+        )
+        .expect("comparison rewrites");
+        assert_eq!(
+            super::v8_gap_condition(&directory, &aggregate)["status"],
+            "malformed"
+        );
+        fs::remove_dir_all(directory).expect("fixture cleans up");
     }
 }

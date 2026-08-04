@@ -1,4 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -343,9 +344,13 @@ struct BenchmarkReport {
     bytecode_hash: String,
     toolchain: String,
     os: &'static str,
+    os_version: String,
     arch: &'static str,
+    machine_model: String,
     cpu_model: String,
     logical_cpu_count: usize,
+    power_source: String,
+    thermal_policy: String,
     build_profile: &'static str,
     samples: usize,
     warmup: usize,
@@ -545,10 +550,26 @@ struct AggregateReport {
     schema: u32,
     benchmark_version: u32,
     protocol: &'static str,
+    status: &'static str,
     process_count: usize,
     samples_per_process: usize,
+    warmup_per_process: usize,
     implementation_commit: String,
     benchmark_source_hash: String,
+    bytecode_hash: String,
+    toolchain: String,
+    os: String,
+    os_version: String,
+    arch: String,
+    machine_model: String,
+    cpu_model: String,
+    logical_cpu_count: usize,
+    power_source: String,
+    thermal_policy: String,
+    build_profile: String,
+    profiler_enabled: bool,
+    profiler_mode: String,
+    allocation_scope: String,
     cases: Vec<AggregateCase>,
 }
 
@@ -1307,16 +1328,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytecode_hash,
         toolchain: rustc_version(),
         os: std::env::consts::OS,
+        os_version: os_version(),
         arch: std::env::consts::ARCH,
+        machine_model: machine_model(),
         cpu_model: cpu_model(),
         logical_cpu_count: std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        power_source: power_source(),
+        thermal_policy: thermal_policy(),
         build_profile: if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         },
         samples,
-        warmup: WARMUP,
+        warmup: WARMUP.min(samples),
         process_index,
         started_at_unix_ms,
         profiler_enabled,
@@ -1395,8 +1420,152 @@ fn aggregate_reports(
     processes: usize,
     samples: usize,
 ) -> Result<AggregateReport, Box<dyn std::error::Error>> {
+    if processes == 0 || samples == 0 || reports.len() != processes {
+        return Err(format!(
+            "aggregate expected {processes} non-empty process reports with {samples} samples, got {}",
+            reports.len()
+        )
+        .into());
+    }
     let first = reports.first().ok_or("no benchmark process reports")?;
     let first_cases = first["cases"].as_array().ok_or("report has no cases")?;
+    if first_cases.is_empty() {
+        return Err("benchmark report has an empty case inventory".into());
+    }
+    let invariant_fields = [
+        "implementation_commit",
+        "benchmark_source_hash",
+        "bytecode_hash",
+        "toolchain",
+        "os",
+        "os_version",
+        "arch",
+        "machine_model",
+        "cpu_model",
+        "logical_cpu_count",
+        "power_source",
+        "thermal_policy",
+        "build_profile",
+        "profiler_enabled",
+        "profiler_mode",
+        "allocation_scope",
+    ];
+    let expected_warmup = u64::try_from(WARMUP.min(samples)).unwrap_or(u64::MAX);
+    let mut process_indices = BTreeSet::new();
+    for (report_number, report) in reports.iter().enumerate() {
+        if report["schema"].as_u64() != Some(1)
+            || report["benchmark_version"].as_u64() != Some(7)
+            || report["samples"].as_u64() != Some(u64::try_from(samples).unwrap_or(u64::MAX))
+            || report["warmup"].as_u64() != Some(expected_warmup)
+        {
+            return Err(format!(
+                "benchmark process report {report_number} has the wrong schema, version, samples, or warmup"
+            )
+            .into());
+        }
+        for field in invariant_fields {
+            if report[field] != first[field] {
+                return Err(format!(
+                    "benchmark process report {report_number} disagrees on {field}"
+                )
+                .into());
+            }
+        }
+        let process_index = report["process_index"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|index| *index < processes)
+            .ok_or_else(|| {
+                format!("benchmark process report {report_number} has an invalid process_index")
+            })?;
+        if !process_indices.insert(process_index) {
+            return Err(format!("duplicate benchmark process_index {process_index}").into());
+        }
+        let report_cases = report["cases"]
+            .as_array()
+            .ok_or_else(|| format!("benchmark process report {report_number} has no cases"))?;
+        if report_cases.len() != first_cases.len() {
+            return Err(
+                format!("benchmark process report {report_number} changed the case count").into(),
+            );
+        }
+        for (case_index, (expected, actual)) in first_cases.iter().zip(report_cases).enumerate() {
+            if actual["case"] != expected["case"] || actual["tier"] != expected["tier"] {
+                return Err(format!(
+                    "benchmark process report {report_number} changed case {case_index} identity or tier"
+                )
+                .into());
+            }
+            if actual["case"].as_str().is_none_or(str::is_empty)
+                || actual["tier"].as_str().is_none_or(str::is_empty)
+                || actual["samples"].as_u64() != Some(u64::try_from(samples).unwrap_or(u64::MAX))
+            {
+                return Err(format!(
+                    "benchmark process report {report_number} has invalid case {case_index} metadata"
+                )
+                .into());
+            }
+            let numeric = |field: &str| {
+                actual[field].as_u64().map(u128::from).or_else(|| {
+                    actual[field]
+                        .as_number()
+                        .and_then(serde_json::Number::as_u128)
+                })
+            };
+            let throughput = numeric("throughput_ops_per_second");
+            let p50 = numeric("p50_ns");
+            let p95 = numeric("p95_ns");
+            let p99 = numeric("p99_ns");
+            if throughput.is_none_or(|value| value == 0)
+                || p50.is_none_or(|value| value == 0)
+                || p95.is_none_or(|value| value == 0)
+                || p99.is_none_or(|value| value == 0)
+                || p50.zip(p95).is_none_or(|(p50, p95)| p50 > p95)
+                || p95.zip(p99).is_none_or(|(p95, p99)| p95 > p99)
+                || numeric("system_allocations").is_none()
+                || numeric("system_allocated_bytes").is_none()
+            {
+                return Err(format!(
+                    "benchmark process report {report_number} has invalid case {case_index} measurements"
+                )
+                .into());
+            }
+        }
+    }
+    for (field, expected_length) in [("benchmark_source_hash", 64), ("bytecode_hash", 64)] {
+        if first[field]
+            .as_str()
+            .is_none_or(|value| value.len() != expected_length)
+        {
+            return Err(format!("benchmark process report has an invalid {field}").into());
+        }
+    }
+    for field in [
+        "implementation_commit",
+        "toolchain",
+        "os",
+        "os_version",
+        "arch",
+        "machine_model",
+        "cpu_model",
+        "power_source",
+        "thermal_policy",
+        "build_profile",
+        "profiler_mode",
+        "allocation_scope",
+    ] {
+        if first[field].as_str().is_none_or(str::is_empty) {
+            return Err(format!("benchmark process report has an empty {field}").into());
+        }
+    }
+    if first["logical_cpu_count"]
+        .as_u64()
+        .is_none_or(|count| count == 0)
+        || first["profiler_enabled"].as_bool().is_none()
+    {
+        return Err("benchmark process report has invalid machine/profiler metadata".into());
+    }
+
     let mut cases = Vec::with_capacity(first_cases.len());
     for (case_index, case) in first_cases.iter().enumerate() {
         let name = case["case"].as_str().ok_or("case has no name")?.to_owned();
@@ -1438,26 +1607,174 @@ fn aggregate_reports(
         });
     }
     Ok(AggregateReport {
-        schema: 1,
+        schema: 2,
         benchmark_version: 7,
         protocol: "median across process medians; each process independently warmed",
+        status: "PASS",
         process_count: processes,
         samples_per_process: samples,
-        implementation_commit: git_commit(),
-        benchmark_source_hash: benchmark_source_hash(),
+        warmup_per_process: WARMUP.min(samples),
+        implementation_commit: first["implementation_commit"]
+            .as_str()
+            .expect("validated implementation commit")
+            .to_owned(),
+        benchmark_source_hash: first["benchmark_source_hash"]
+            .as_str()
+            .expect("validated benchmark source hash")
+            .to_owned(),
+        bytecode_hash: first["bytecode_hash"]
+            .as_str()
+            .expect("validated bytecode hash")
+            .to_owned(),
+        toolchain: first["toolchain"]
+            .as_str()
+            .expect("validated toolchain")
+            .to_owned(),
+        os: first["os"].as_str().expect("validated OS").to_owned(),
+        os_version: first["os_version"]
+            .as_str()
+            .expect("validated OS version")
+            .to_owned(),
+        arch: first["arch"].as_str().expect("validated arch").to_owned(),
+        machine_model: first["machine_model"]
+            .as_str()
+            .expect("validated machine model")
+            .to_owned(),
+        cpu_model: first["cpu_model"]
+            .as_str()
+            .expect("validated CPU model")
+            .to_owned(),
+        logical_cpu_count: first["logical_cpu_count"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("validated logical CPU count"),
+        power_source: first["power_source"]
+            .as_str()
+            .expect("validated power source")
+            .to_owned(),
+        thermal_policy: first["thermal_policy"]
+            .as_str()
+            .expect("validated thermal policy")
+            .to_owned(),
+        build_profile: first["build_profile"]
+            .as_str()
+            .expect("validated build profile")
+            .to_owned(),
+        profiler_enabled: first["profiler_enabled"]
+            .as_bool()
+            .expect("validated profiler flag"),
+        profiler_mode: first["profiler_mode"]
+            .as_str()
+            .expect("validated profiler mode")
+            .to_owned(),
+        allocation_scope: first["allocation_scope"]
+            .as_str()
+            .expect("validated allocation scope")
+            .to_owned(),
         cases,
     })
+}
+
+#[cfg(test)]
+mod aggregate_report_tests {
+    use serde_json::{Value, json};
+
+    use super::aggregate_reports;
+
+    fn report(process_index: usize) -> Value {
+        json!({
+            "schema": 1,
+            "benchmark_version": 7,
+            "implementation_commit": "0123456789012345678901234567890123456789",
+            "benchmark_source_hash": "11".repeat(32),
+            "bytecode_hash": "22".repeat(32),
+            "toolchain": "rustc qualification",
+            "os": "macos",
+            "os_version": "15.0",
+            "arch": "aarch64",
+            "machine_model": "Mac16,7",
+            "cpu_model": "qualification-cpu",
+            "logical_cpu_count": 10,
+            "power_source": "AC Power",
+            "thermal_policy": "qualification-policy",
+            "build_profile": "release",
+            "samples": 1_000,
+            "warmup": 100,
+            "process_index": process_index,
+            "profiler_enabled": false,
+            "profiler_mode": "disabled",
+            "allocation_scope": "timed operation only; per-sample setup and result storage excluded",
+            "cases": [{
+                "case": "qualified_case",
+                "tier": "product",
+                "samples": 1_000,
+                "throughput_ops_per_second": 10_000,
+                "p50_ns": 100,
+                "p95_ns": 120,
+                "p99_ns": 140,
+                "system_allocations": 0,
+                "system_allocated_bytes": 0,
+            }],
+        })
+    }
+
+    #[test]
+    fn aggregate_retains_and_validates_process_qualification_metadata() {
+        let reports = [report(0), report(1)];
+        let aggregate = aggregate_reports(&reports, 2, 1_000).expect("reports aggregate");
+        assert_eq!(aggregate.schema, 2);
+        assert_eq!(aggregate.status, "PASS");
+        assert_eq!(aggregate.build_profile, "release");
+        assert_eq!(aggregate.machine_model, "Mac16,7");
+        assert_eq!(aggregate.cpu_model, "qualification-cpu");
+        assert_eq!(aggregate.logical_cpu_count, 10);
+        assert_eq!(
+            aggregate.allocation_scope,
+            "timed operation only; per-sample setup and result storage excluded"
+        );
+        assert_eq!(aggregate.cases.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_rejects_machine_case_and_process_identity_drift() {
+        let first = report(0);
+
+        let mut machine_drift = report(1);
+        machine_drift["cpu_model"] = Value::from("different-cpu");
+        assert!(aggregate_reports(&[first.clone(), machine_drift], 2, 1_000).is_err());
+
+        let mut case_drift = report(1);
+        case_drift["cases"][0]["case"] = Value::from("different_case");
+        assert!(aggregate_reports(&[first.clone(), case_drift], 2, 1_000).is_err());
+
+        assert!(aggregate_reports(&[first.clone(), report(0)], 2, 1_000).is_err());
+        assert!(aggregate_reports(&[first], 2, 1_000).is_err());
+    }
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|output| !output.is_empty())
+}
+
+fn normalize_multiline(value: String) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn cpu_model() -> String {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
             .unwrap_or_else(|| "unknown".into())
     }
     #[cfg(target_os = "linux")]
@@ -1470,6 +1787,108 @@ fn cpu_model() -> String {
                     .and_then(|line| line.split(':').nth(1))
                     .map(|name| name.trim().to_owned())
             })
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".into()
+    }
+}
+
+fn machine_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sysctl", &["-n", "hw.model"]).unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/sys/class/dmi/id/product_name")
+            .ok()
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".into()
+    }
+}
+
+fn os_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("sw_vers", &[])
+            .map(normalize_multiline)
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|release| {
+                release
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+                    .map(|value| value.trim_matches('"').to_owned())
+            })
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".into()
+    }
+}
+
+fn power_source() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("pmset", &["-g", "batt"])
+            .and_then(|output| output.lines().next().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let directory = std::path::Path::new("/sys/class/power_supply");
+        let mut found_mains = false;
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
+                if kind.trim() != "Mains" {
+                    continue;
+                }
+                found_mains = true;
+                let online =
+                    std::fs::read_to_string(entry.path().join("online")).unwrap_or_default();
+                if online.trim() == "1" {
+                    return "AC Power".into();
+                }
+            }
+        }
+        if found_mains {
+            "Battery Power".into()
+        } else {
+            "unknown".into()
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".into()
+    }
+}
+
+fn thermal_policy() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        command_output("pmset", &["-g", "custom"])
+            .map(normalize_multiline)
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+            .ok()
+            .map(|policy| policy.trim().to_owned())
+            .filter(|policy| !policy.is_empty())
             .unwrap_or_else(|| "unknown".into())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

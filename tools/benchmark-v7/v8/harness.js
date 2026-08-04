@@ -15,6 +15,9 @@
 // comparison (JIT_DECISION_V1.md).
 "use strict";
 
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+
 // Pinned expected results; the xtask driver additionally cross-checks
 // them against the Nexa side via `nexa-benchmark-v7 --verify-products`.
 const EXPECTED = {
@@ -172,6 +175,10 @@ function main() {
   const report = {
     schema: 1,
     harness: "benchmark-v7-v8-comparison",
+    harness_source_hash: crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(__filename))
+      .digest("hex"),
     node_version: process.version,
     v8_version: process.versions.v8,
     process_index: processIndex,

@@ -1,6 +1,6 @@
 # Benchmark Protocol v1
 
-Version: **1.0.0**
+Version: **1.0.1**
 
 Benchmark v7 (`tools/benchmark-v7`) is the only performance measurement
 authority for M5. Benchmark v6 remains in the tree, frozen, until every v7
@@ -35,6 +35,19 @@ configuration recorded in each report: machine model, CPU model, logical CPU
 count, OS version, power source, and thermal policy. Reports from other
 machines are exploratory and cannot satisfy gates. CI is not part of M5
 completion evidence.
+
+Per-process Benchmark v7 reports use schema 1. The current multi-process
+aggregate uses schema 2 so it retains those qualification fields, the exact
+toolchain, build profile, bytecode hash, profiler mode, process count, sample
+count, warmup count, and validated case inventory instead of discarding child
+provenance. This is an evidence-envelope correction only; it does not change
+the frozen timing, warmup, corpus, or median-of-medians protocol.
+
+The immutable baseline tag predates that aggregate envelope and emits schema
+1. It is accepted only when the finalizer has synchronously rebuilt and run
+the tag in a temporary worktree and bound it to the immediately preceding
+live HEAD qualification from that same finalizer call. Prerecorded baseline
+aggregates are never accepted.
 
 ## Baseline discipline
 
