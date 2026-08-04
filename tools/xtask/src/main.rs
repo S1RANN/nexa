@@ -419,9 +419,12 @@ fn main() -> Result<(), DynError> {
         "test-source-cache" => test_source_cache(),
         "test-artifact-cache" => test_artifact_cache(),
         "test-runtime-fast-paths" => test_runtime_fast_paths(),
+        "test-host-engine-performance" => test_host_engine_performance(),
+        "m5-product-corpus" => m5_product_corpus(),
         "m5-final-report" => m5_final_report(),
         "m5-v8-comparison" => m5_v8_comparison(),
         "m5-performance-regression" => m5_performance_regression(),
+        "finalize-m5" => finalize_m5(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -455,8 +458,9 @@ fn main() -> Result<(), DynError> {
                  test-profiler-overhead|test-value-layout|test-typed-collections|\
                  test-ir-optimizations|test-optimization-differential|\
                  test-executable-parity|test-executable-module|test-gc-v1|test-source-cache|\
-                 test-artifact-cache|test-runtime-fast-paths|m5-final-report|\
-                 m5-v8-comparison|m5-performance-regression"
+                 test-artifact-cache|test-runtime-fast-paths|test-host-engine-performance|\
+                 m5-product-corpus|m5-final-report|m5-v8-comparison|\
+                 m5-performance-regression|finalize-m5"
             );
             Err("unknown xtask command".into())
         }
@@ -533,13 +537,16 @@ fn check() -> Result<(), DynError> {
 fn check_m5_gates() -> Result<(), DynError> {
     test_performance_counters()?;
     test_value_layout()?;
+    test_typed_collections()?;
     test_ir_optimizations()?;
     test_optimization_differential()?;
-    test_executable_parity()?;
+    test_executable_module()?;
     test_gc_v1()?;
     test_source_cache()?;
     test_artifact_cache()?;
     test_runtime_fast_paths()?;
+    test_host_engine_performance()?;
+    m5_product_corpus()?;
     cargo(&[
         "run",
         "--release",
@@ -1793,11 +1800,116 @@ fn test_runtime_fast_paths() -> Result<(), DynError> {
     ])
 }
 
+/// M5 WP83-WP92 gate: Host imports and typed script exports resolve before
+/// execution, package routing survives enable/disable/reload ABA cycles, and
+/// every required steady-state Engine path is allocation-exact.
+fn test_host_engine_performance() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "stable_host_dispatch",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-benchmark-v7",
+        "--test",
+        "steady_state_allocation",
+    ])?;
+    cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])
+}
+
+/// M5 WP99 product gate. Every command below executes a real canonical
+/// package/build/runtime path; the receipt is written only after the entire
+/// corpus succeeds and is pinned to the current implementation commit.
+fn m5_product_corpus() -> Result<(), DynError> {
+    let root = workspace_root();
+    cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])?;
+    test_snake()?;
+    snake_headless("stress")?;
+    cargo(&["run", "-p", "combat-runtime"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "collection_string_stress",
+    ])?;
+    cargo(&["test", "-p", "nexa-cli", "--test", "standalone"])?;
+    cargo(&["test", "-p", "nexa-cli", "--test", "repl"])?;
+
+    let verification_stdout = captured_stdout(
+        Command::new("cargo")
+            .args([
+                "run",
+                "--release",
+                "--quiet",
+                "-p",
+                "nexa-benchmark-v7",
+                "--",
+                "--verify-products",
+            ])
+            .current_dir(&root),
+        "nexa-benchmark-v7 --verify-products",
+    )?;
+    let product_results: Value = serde_json::from_str(&verification_stdout)?;
+    for workload in [
+        "product_combat_tick",
+        "product_data_sweep",
+        "product_grid_score",
+    ] {
+        if !product_results[workload].is_number() {
+            return Err(format!("product verification omitted numeric result {workload}").into());
+        }
+    }
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let report = serde_json::json!({
+        "schema": 1,
+        "milestone": "Nexa M5 Product Corpus",
+        "implementation_commit": head,
+        "snake": {
+            "canonical_package_tests": "PASS",
+            "headless_stress": "PASS",
+            "engine_package_scales": [0, 9, 20, 50],
+            "enable_disable_reload": "PASS",
+            "required_and_optional_dispatch": "PASS",
+        },
+        "combat": {
+            "canonical_package_pipeline": "PASS",
+            "deep_calls_struct_enum_class_async_resources_migration_reload": "PASS",
+        },
+        "data_intensive": {
+            "ten_thousand_struct_rows": "PASS",
+            "typed_array_map_gc_string_state": "PASS",
+            "verified_results": product_results,
+        },
+        "standalone": {
+            "single_file_package_async_trap": "PASS",
+        },
+        "repl": {
+            "one_hundred_cells": "PASS",
+            "failed_cell_rollback": "PASS",
+            "async_cell_and_resource_recovery": "PASS",
+        },
+        "status": "PASS",
+    });
+    let output = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+    fs::create_dir_all(output.parent().ok_or("product report has no parent")?)?;
+    fs::write(
+        &output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 /// M5 stage-J: produces the decision artifacts named by
-/// `JIT_DECISION_V1.md` - the formal 7x1000 performance report plus the
-/// JIT decision state. The decision stays `PENDING` until every GO
-/// condition has an input: the V8 comparison requires a qualified V8
-/// environment, and the frozen-surface condition requires M5a finalize.
+/// `JIT_DECISION_V1.md` - the formal 7x1000 performance report plus one
+/// terminal `GO` or `DEFER` decision. Missing evidence is itself a reason to
+/// defer; the report never disguises an unfinished GO condition as pending.
 #[allow(
     clippy::too_many_lines,
     // Percent displays only; the mantissa bound is irrelevant here.
@@ -1863,10 +1975,16 @@ fn m5_final_report() -> Result<(), DynError> {
     let gc_step_p50 = case("gc_incremental_step")
         .and_then(|case| case["median_p50_ns"].as_u64())
         .unwrap_or(0);
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let surfaces_frozen = git_output(&["cat-file", "-t", "performance-m5-complete"])
+        .is_ok_and(|kind| kind == "tag")
+        && git_output(&["rev-parse", "performance-m5-complete^{}"])
+            .is_ok_and(|target| target == head)
+        && git_output(&["status", "--porcelain"]).is_ok_and(|status| status.is_empty());
     let conditions = serde_json::json!({
         "c1_interpreter_dominance": {
-            "status": "evidence-supported",
-            "note": "opcode dispatch dominates the product corpus; OS-level CPU sampling confirmation remains open",
+            "status": "not-proven",
+            "note": "opcode counts show interpreter concentration, but the required per-workload CPU sampling proof is not yet available",
             "top5_opcode_share_percent": if total_opcodes == 0 { 0.0 } else { 100.0 * top_share as f64 / total_opcodes as f64 },
             "total_opcode_executions": total_opcodes,
             "product_workloads": product_cases,
@@ -1883,27 +2001,36 @@ fn m5_final_report() -> Result<(), DynError> {
         },
         "c4_v8_gap": v8_gap_condition(&final_dir, &aggregate),
         "c5_llvm_amortization": {
-            "status": "pending",
-            "note": "depends on the c4 workload mapping and an LLVM cost prototype",
+            "status": "not-proven",
+            "note": "no frozen LLVM compilation-cost prototype proves amortization within a call-count or frame-count budget",
         },
         "c6_frozen_surfaces": {
-            "status": "pending",
-            "note": "ExecutableModule schema and ValueLayout may still change until M5a finalize",
+            "status": if surfaces_frozen { "satisfied" } else { "not-frozen" },
+            "note": if surfaces_frozen {
+                "ValueLayout, ExecutableModule, safepoints, root maps, and Host ABI are frozen by the annotated M5 completion tag"
+            } else {
+                "the annotated performance-m5-complete tag does not yet freeze the current clean HEAD"
+            },
         },
     });
-    let mut blockers = Vec::new();
-    if !matches!(
-        conditions["c4_v8_gap"]["status"].as_str(),
-        Some("satisfied" | "not-satisfied")
-    ) {
-        blockers.push("v8-comparison-environment");
-    }
-    blockers.push("m5a-finalize-freeze");
-    let rendered_blockers = blockers.join(", ");
+    let failed_go_conditions = conditions
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, condition)| {
+            (condition["status"] != "satisfied").then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
+    let jit_decision = if failed_go_conditions.is_empty() {
+        "GO"
+    } else {
+        "DEFER"
+    };
+    let rendered_blockers = failed_go_conditions.join(", ");
     let decision = serde_json::json!({
         "schema": 1,
-        "decision": "PENDING",
-        "blockers": blockers,
+        "decision": jit_decision,
+        "failed_go_conditions": failed_go_conditions,
         "conditions": conditions,
         "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
         "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
@@ -1926,7 +2053,7 @@ fn m5_final_report() -> Result<(), DynError> {
     let mut markdown = String::from("# M5 Performance Report (generated)\n\n");
     writeln!(
         markdown,
-        "Decision state: **PENDING** (blockers: {rendered_blockers}).\n",
+        "M6 LLVM JIT decision: **{jit_decision}** (failed GO conditions: {rendered_blockers}).\n",
     )?;
     markdown
         .push_str("| case | tier | p50 (ns) | p99 (ns) | max allocs |\n|---|---|---|---|---|\n");
@@ -1953,7 +2080,7 @@ fn m5_final_report() -> Result<(), DynError> {
         },
     )?;
     fs::write(final_dir.join("performance-report.md"), markdown)?;
-    println!("m5-final-report: PENDING decision written to target/nexa-artifacts/m5/final/");
+    println!("m5-final-report: {jit_decision} decision written to target/nexa-artifacts/m5/final/");
     Ok(())
 }
 
@@ -2400,6 +2527,308 @@ fn m5_performance_regression() -> Result<(), DynError> {
     {
         return Err("unexplained p95/p99 regressions beyond 10% on shared mandatory cases".into());
     }
+    Ok(())
+}
+
+/// M5 terminal gate. It is intentionally runnable only from the published,
+/// clean, annotated completion checkout; all expensive correctness and
+/// performance evidence is then regenerated or validated at that exact HEAD.
+#[allow(clippy::too_many_lines)]
+fn finalize_m5() -> Result<(), DynError> {
+    const HISTORICAL_TAGS: [(&str, &str, &str); 11] = [
+        (
+            "gate1-v2.9-stop",
+            "1217d4dfdb323a6442717b18385dfcb6fb74d499",
+            "8552064ec01b3191467633717de7b77c97cb24f1",
+        ),
+        (
+            "internal-pivot-m1-complete",
+            "772fe1a6faa66b9377e4339fd6f3f02452671fe5",
+            "a44ec778f2733e1e1cc9e122823190ff131c9c70",
+        ),
+        (
+            "internal-pivot-m1-complete-r1",
+            "ff67117903df6996a1a94f19fed61fde57b17386",
+            "049b7b52891d4731af1793ab0a755f79130a03dd",
+        ),
+        (
+            "embed-snake-m2-complete",
+            "d3ae62fab3c3d40a5741853c8a7332ecffcfa676",
+            "aef12a0f92a1efe8c0f0497c3cb6147cb86f0c7e",
+        ),
+        (
+            "developer-loop-m3-complete",
+            "058e3c5638997735cc1faa55f6d9cf8496141dea",
+            "621612f49c4180989711df3ca80021fd21ad9277",
+        ),
+        (
+            "developer-loop-m3-complete-r1",
+            "a7e809ad42036d9286cf8d78f7ba126e3964e05c",
+            "b53ce21f98db7387b37cca0572fbbf920ab53d61",
+        ),
+        (
+            "developer-loop-m3-complete-r2",
+            "8077ff2b5c99f2c3a145d95d04d42b0b81a76e8a",
+            "71c3a3ead70533f013928b6d1c434e1870f49b24",
+        ),
+        (
+            "developer-loop-m3-complete-r3",
+            "cc05c461c0db2b7ba2310536071d136807563cfd",
+            "9d31064536b5c201ffdb064fb6af8837e87edbb5",
+        ),
+        (
+            "language-scale-m4-complete",
+            "ccb2284ad4a949d0d32978c4258599263dfd74b9",
+            "dffdede878e88845e21d6f1733f75d57839e81da",
+        ),
+        (
+            "language-scale-m4-complete-r1",
+            "e23f95204aac67ea2c4669cbe893831077a6d8a0",
+            "5de5027b5ebe4b2adbe1cec9e8dd5b9b25b9b8ba",
+        ),
+        (
+            "performance-m5-baseline",
+            "ca6eecec77bdecf6f717d3c3e85aae5a2298541c",
+            "24e87e0a7df07281d2205b1ed88162c7e6617231",
+        ),
+    ];
+
+    let root = workspace_root();
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let branch = git_output(&["branch", "--show-current"])?;
+    let worktree_status = git_output(&["status", "--porcelain"])?;
+    if branch != "main" || !worktree_status.is_empty() {
+        return Err(format!(
+            "finalize-m5 requires a clean attached main checkout; branch={branch:?}, \
+             status={worktree_status:?}"
+        )
+        .into());
+    }
+    let completion_tag_type = git_output(&["cat-file", "-t", "performance-m5-complete"])?;
+    let completion_tag_object = git_output(&["rev-parse", "performance-m5-complete"])?;
+    let completion_tag_target = git_output(&["rev-parse", "performance-m5-complete^{}"])?;
+    if completion_tag_type != "tag" || completion_tag_target != head {
+        return Err("performance-m5-complete must be an annotated tag targeting HEAD".into());
+    }
+
+    let mut remote_references = vec![
+        "refs/heads/main".to_owned(),
+        "refs/heads/codex/performance-m5".to_owned(),
+        "refs/tags/performance-m5-complete".to_owned(),
+        "refs/tags/performance-m5-complete^{}".to_owned(),
+    ];
+    for (name, _, _) in HISTORICAL_TAGS {
+        remote_references.push(format!("refs/tags/{name}"));
+        remote_references.push(format!("refs/tags/{name}^{{}}"));
+    }
+    let mut remote_command = Command::new("git");
+    remote_command.args(["ls-remote", "origin"]);
+    remote_command.args(&remote_references);
+    remote_command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&root);
+    let remote_output = captured_stdout(&mut remote_command, "git ls-remote origin")?;
+    let remote = remote_output
+        .lines()
+        .filter_map(|line| {
+            let (object, reference) = line.split_once('\t')?;
+            Some((reference.to_owned(), object.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for reference in ["refs/heads/main", "refs/heads/codex/performance-m5"] {
+        if remote.get(reference).map(String::as_str) != Some(head.as_str()) {
+            return Err(format!("remote {reference} does not target final HEAD {head}").into());
+        }
+    }
+    if remote
+        .get("refs/tags/performance-m5-complete")
+        .map(String::as_str)
+        != Some(completion_tag_object.as_str())
+        || remote
+            .get("refs/tags/performance-m5-complete^{}")
+            .map(String::as_str)
+            != Some(head.as_str())
+    {
+        return Err(
+            "remote performance-m5-complete tag differs from the local annotated tag".into(),
+        );
+    }
+    let mut historical_tags = Vec::with_capacity(HISTORICAL_TAGS.len());
+    for (name, expected_object, expected_target) in HISTORICAL_TAGS {
+        let object_type = git_output(&["cat-file", "-t", name])?;
+        let object = git_output(&["rev-parse", name])?;
+        let target = git_output(&["rev-parse", &format!("{name}^{{}}")])?;
+        let remote_object = remote
+            .get(&format!("refs/tags/{name}"))
+            .cloned()
+            .unwrap_or_else(|| "missing".into());
+        let remote_target = remote
+            .get(&format!("refs/tags/{name}^{{}}"))
+            .cloned()
+            .unwrap_or_else(|| "missing".into());
+        if object_type != "tag"
+            || object != expected_object
+            || target != expected_target
+            || remote_object != expected_object
+            || remote_target != expected_target
+        {
+            return Err(format!(
+                "historical annotated tag {name} changed locally or remotely: \
+                 type={object_type}, object={object}, target={target}, \
+                 remote_object={remote_object}, remote_target={remote_target}"
+            )
+            .into());
+        }
+        historical_tags.push(serde_json::json!({
+            "name": name,
+            "object": object,
+            "target": target,
+            "status": "PASS",
+        }));
+    }
+
+    cargo(&["fmt", "--all", "--", "--check"])?;
+    cargo(&["check", "--workspace", "--all-targets"])?;
+    cargo(&[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    cargo(&["test", "--workspace", "--all-targets"])?;
+    cargo(&["test", "--doc", "--workspace"])?;
+
+    check()?;
+    m4r1::test_language_v2()?;
+    m4r1::test_object_model_v2()?;
+    m4r1::test_async_v2()?;
+    m4r1::test_nidl_v2()?;
+    m4r1::test_structured_codegen()?;
+    m4r1::test_standalone()?;
+    m4r1::test_repl()?;
+    m4r1::test_entrypoints()?;
+    m4r1::m4r1_scale_stress()?;
+    test_profiler_overhead()?;
+    m5_v8_comparison()?;
+    m5_performance_regression()?;
+    m5_final_report()?;
+    repo_audit()?;
+
+    let comparison_path = root.join("target/nexa-artifacts/m5/regression/comparison.json");
+    let profiler_path = root.join("target/nexa-artifacts/m5/profiler-overhead/formal-7x1000.json");
+    let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+    let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
+    let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
+    let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
+    let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
+    let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
+    let decision: Value = serde_json::from_slice(&fs::read(&decision_path)?)?;
+    let performance: Value = serde_json::from_slice(&fs::read(&performance_path)?)?;
+
+    let geomean = |bucket: &str| -> Result<f64, DynError> {
+        comparison["buckets"][bucket]["geomean"]
+            .as_f64()
+            .ok_or_else(|| format!("comparison omitted numeric {bucket} geomean").into())
+    };
+    for bucket in [
+        "product_cpu",
+        "value_collection",
+        "host_task_engine",
+        "cold_start",
+    ] {
+        if comparison["buckets"][bucket]["met"] != true {
+            return Err(format!("M5 performance bucket {bucket} did not meet its target").into());
+        }
+    }
+    let unexplained_regressions = comparison["regressions"]
+        .as_array()
+        .ok_or("comparison regressions is not an array")?;
+    if comparison["head_commit"] != head
+        || !unexplained_regressions.is_empty()
+        || profiler["implementation_commit"] != head
+        || profiler["status"] != "PASS"
+        || product["implementation_commit"] != head
+        || product["status"] != "PASS"
+        || performance["aggregate"]["implementation_commit"] != head
+        || performance["aggregate"]["benchmark_version"] != 7
+        || decision["implementation_commit"] != head
+        || !matches!(decision["decision"].as_str(), Some("GO" | "DEFER"))
+    {
+        return Err("one or more M5 machine receipts are stale, malformed, or failing".into());
+    }
+    let jit_decision = decision["decision"]
+        .as_str()
+        .ok_or("JIT decision is not a string")?;
+    let decision_document =
+        fs::read_to_string(root.join("baseline/performance/JIT_DECISION_V1.md"))?;
+    if !decision_document.contains(&format!("Status: **{jit_decision}**"))
+        || !decision_document.contains(&format!("M6 LLVM JIT = {jit_decision}"))
+    {
+        return Err("JIT_DECISION_V1.md does not match the terminal machine decision".into());
+    }
+    for status_document in ["README.md", "ROADMAP.md"] {
+        if !fs::read_to_string(root.join(status_document))?
+            .contains("Nexa M5 Deep Performance Optimization = COMPLETE")
+        {
+            return Err(format!("{status_document} does not mark M5 COMPLETE").into());
+        }
+    }
+    if !git_output(&["status", "--porcelain"])?.is_empty()
+        || git_output(&["rev-parse", "HEAD"])? != head
+    {
+        return Err("checkout changed or became dirty while finalizing M5".into());
+    }
+
+    let report = serde_json::json!({
+        "schema": 1,
+        "milestone": "Nexa M5 Deep Performance Optimization",
+        "baselineTag": "performance-m5-baseline",
+        "baselineCommit": comparison["baseline_commit"],
+        "implementationCommit": head,
+        "productGeomeanSpeedup": geomean("product_cpu")?,
+        "valueCollectionGeomeanSpeedup": geomean("value_collection")?,
+        "hostTaskEngineGeomeanSpeedup": geomean("host_task_engine")?,
+        "coldStartGeomeanSpeedup": geomean("cold_start")?,
+        "structGcAllocations": 0,
+        "enumGcAllocations": 0,
+        "gcSystemAllocations": 0,
+        "steadyStateDispatchSystemAllocations": 0,
+        "unexplainedRegressions": unexplained_regressions,
+        "semanticMismatches": [],
+        "resourceLeaks": 0,
+        "jitDecision": jit_decision,
+        "workspace": {
+            "fmt": "PASS",
+            "check": "PASS",
+            "clippy": "PASS",
+            "test": "PASS",
+            "doc": "PASS",
+        },
+        "historicalTags": historical_tags,
+        "completionTag": {
+            "type": completion_tag_type,
+            "object": completion_tag_object,
+            "target": completion_tag_target,
+        },
+        "remotePublication": {
+            "main": remote["refs/heads/main"],
+            "milestoneBranch": remote["refs/heads/codex/performance-m5"],
+            "completionTagObject": remote["refs/tags/performance-m5-complete"],
+            "completionTagTarget": remote["refs/tags/performance-m5-complete^{}"],
+        },
+        "status": "PASS",
+    });
+    let output = root.join("target/nexa-artifacts/m5-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M5 final report has no parent")?)?;
+    let temporary = output.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    fs::rename(&temporary, &output)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

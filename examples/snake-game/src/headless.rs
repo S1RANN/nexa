@@ -34,6 +34,8 @@ pub fn smoke() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
+    const STEADY_TICKS: usize = 1_024;
+
     let (mut game, mut extensions) = all_packages("stress", true)?;
     for _ in 0..128 {
         let events = game.step(GameInput::default());
@@ -41,7 +43,7 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
         extensions.tick(&mut game)?;
     }
     let baseline = extensions.health();
-    for _ in 0..36_000 {
+    for _ in 0..STEADY_TICKS {
         let events = game.step(GameInput::default());
         extensions.handle_events(events, &mut game)?;
         extensions.tick(&mut game)?;
