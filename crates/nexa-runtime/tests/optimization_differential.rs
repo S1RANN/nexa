@@ -6,6 +6,8 @@
 //! totals are exempt, so this gate records fuel divergence but never asserts
 //! on it.
 
+use std::fmt::Write;
+
 use nexa_bytecode::Instruction;
 use nexa_core::SourceSpan;
 use nexa_runtime::{CheckedInterpreter, Heap, InterpreterOutcome, RuntimeValue, TrapKind};
@@ -337,6 +339,128 @@ fn assert_case(
         &optimized_outcome.outcome, expected,
         "function {function} disagrees with the pinned corpus expectation"
     );
+}
+
+const GENERATED_LAYOUT_CASES: usize = 48;
+
+fn next_seeded(state: &mut u64) -> u32 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    u32::try_from(value & u64::from(u32::MAX)).expect("masked seed fits u32")
+}
+
+/// WP36 generated-program authority. One fixed seed produces a reproducible
+/// mix of nested Struct, Enum, Option, update-construction, and Class-bearing
+/// layouts. All functions are compiled together so this adds one optimized
+/// and one reference compilation rather than one compiler invocation per
+/// generated case.
+fn generated_layout_corpus() -> String {
+    let mut source = String::from(
+        "struct GeneratedPair { left: i32, right: i32, }\n\
+         class GeneratedNode { mut value: i32, }\n\
+         struct GeneratedHolder { node: GeneratedNode, bias: i32, }\n\
+         enum GeneratedValue { Empty, Pair(GeneratedPair), Scalar(i32), }\n",
+    );
+    let mut seed = 0x4e45_5841_5f4d_355fu64;
+    for index in 0..GENERATED_LAYOUT_CASES {
+        let left = i32::try_from(next_seeded(&mut seed) % 17).unwrap_or(0) - 8;
+        let right = i32::try_from(next_seeded(&mut seed) % 19).unwrap_or(0) - 9;
+        let factor = i32::try_from(next_seeded(&mut seed) % 5).unwrap_or(0) + 1;
+        let mode = next_seeded(&mut seed) % 6;
+        writeln!(source, "fn generated_{index:03}(x: i32) -> i32 {{")
+            .expect("writing to String is infallible");
+        match mode {
+            0 => writeln!(
+                source,
+                "  let pair: GeneratedPair = GeneratedPair {{ left: x + {left}, right: x + {right} }};\n\
+                 return pair.left * {factor} + pair.right;\n\
+                 }}"
+            ),
+            1 => writeln!(
+                source,
+                "  let pair: GeneratedPair = GeneratedPair {{ left: x + {left}, right: x + {right} }};\n\
+                 let value: GeneratedValue = GeneratedValue::Pair(pair);\n\
+                 return match value {{\n\
+                   GeneratedValue::Empty => {right},\n\
+                   GeneratedValue::Scalar(item) => item,\n\
+                   GeneratedValue::Pair(item) => item.left + item.right * {factor},\n\
+                 }};\n\
+                 }}"
+            ),
+            2 => writeln!(
+                source,
+                "  let value: GeneratedValue = GeneratedValue::Scalar(x + {left});\n\
+                 return match value {{\n\
+                   GeneratedValue::Empty => {right},\n\
+                   GeneratedValue::Pair(item) => item.left,\n\
+                   GeneratedValue::Scalar(item) => item * {factor},\n\
+                 }};\n\
+                 }}"
+            ),
+            3 => writeln!(
+                source,
+                "  let original: GeneratedPair = GeneratedPair {{ left: x + {left}, right: x + {right} }};\n\
+                 let updated: GeneratedPair = GeneratedPair {{ left: x * {factor}, ..original }};\n\
+                 return updated.left + updated.right;\n\
+                 }}"
+            ),
+            4 => writeln!(
+                source,
+                "  let node: GeneratedNode = new GeneratedNode {{ value: x + {left} }};\n\
+                 let holder: GeneratedHolder = GeneratedHolder {{ node: node, bias: {right} }};\n\
+                 return holder.node.value * {factor} + holder.bias;\n\
+                 }}"
+            ),
+            _ => writeln!(
+                source,
+                "  let pair: GeneratedPair = GeneratedPair {{ left: x + {left}, right: x + {right} }};\n\
+                 let value: Option<GeneratedPair> = Option::Some(pair);\n\
+                 return match value {{\n\
+                   Option::Some(item) => item.left * {factor} + item.right,\n\
+                   Option::None => {right},\n\
+                 }};\n\
+                 }}"
+            ),
+        }
+        .expect("writing to String is infallible");
+    }
+    source
+}
+
+#[test]
+fn seeded_generated_layout_programs_match_the_reference_pipeline() {
+    let source = generated_layout_corpus();
+    let optimized = nexa_compiler::compile(&source).expect("generated optimized corpus compiles");
+    let reference =
+        nexa_compiler::compile_reference(&source).expect("generated reference corpus compiles");
+    assert_eq!(optimized.module().functions.len(), GENERATED_LAYOUT_CASES);
+    assert_eq!(reference.module().functions.len(), GENERATED_LAYOUT_CASES);
+
+    let mut seed = 0x5750_3336_5f4d_355fu64;
+    for function in 0..GENERATED_LAYOUT_CASES {
+        let generated = next_seeded(&mut seed).cast_signed();
+        for input in [-31, -1, 0, 19, generated] {
+            let arguments = [RuntimeValue::I32(input)];
+            let (optimized_outcome, optimized_fuel) = observe(
+                &optimized,
+                u32::try_from(function).expect("generated function index fits u32"),
+                &arguments,
+            );
+            let (reference_outcome, reference_fuel) = observe(
+                &reference,
+                u32::try_from(function).expect("generated function index fits u32"),
+                &arguments,
+            );
+            assert_eq!(
+                optimized_outcome, reference_outcome,
+                "generated function {function} diverges for input {input} \
+                 (optimized fuel {optimized_fuel}, reference fuel {reference_fuel})"
+            );
+        }
+    }
 }
 
 #[test]
