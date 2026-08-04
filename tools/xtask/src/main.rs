@@ -532,6 +532,17 @@ fn check() -> Result<(), DynError> {
     check_m5_gates()
 }
 
+/// Runs the stacked milestone gates after the caller has already completed
+/// the full workspace fmt/check/clippy/test/doc sequence at this exact HEAD.
+/// This is the terminal-finalizer path and prevents a second full workspace
+/// compilation/test sweep.
+fn check_after_workspace() -> Result<(), DynError> {
+    check_through_m3_after_workspace()?;
+    m4::run_m4_gates().ensure_passed()?;
+    m4r1::record_regression_pass()?;
+    check_m5_gates()
+}
+
 /// M5 stage-A/B/C/D gates landed so far; the finalize-m5 protocol adds the
 /// multi-process benchmark comparison on top of these.
 fn check_m5_gates() -> Result<(), DynError> {
@@ -539,7 +550,6 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_value_layout()?;
     test_typed_collections()?;
     test_ir_optimizations()?;
-    test_optimization_differential()?;
     test_executable_module()?;
     test_gc_v1()?;
     test_source_cache()?;
@@ -561,7 +571,14 @@ fn check_m5_gates() -> Result<(), DynError> {
 }
 
 fn check_through_m3() -> Result<(), DynError> {
-    let summary = run_check_summary();
+    check_through_m3_with_summary(run_check_summary())
+}
+
+fn check_through_m3_after_workspace() -> Result<(), DynError> {
+    check_through_m3_with_summary(run_check_summary_after_workspace())
+}
+
+fn check_through_m3_with_summary(summary: CheckSummary) -> Result<(), DynError> {
     println!("{summary:#?}");
     if !summary.passed() {
         return Err("one or more independently executed M1 check gates failed".into());
@@ -1661,9 +1678,12 @@ fn test_typed_collections() -> Result<(), DynError> {
     ])
 }
 
-/// M5 WP37/WP38 gate: Typed IR pass manager and constant folding.
+/// M5 WP37-WP46 gate: validated local passes, match specialization,
+/// bounded package inlining, materialization decisions, and source-preserving
+/// optimized/reference differential evidence.
 fn test_ir_optimizations() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-analysis", "--lib", "passes"])
+    cargo(&["test", "-p", "nexa-analysis", "--lib", "passes"])?;
+    test_optimization_differential()
 }
 
 /// M5 WP36 gate: optimized versus reference pipeline over the differential
@@ -1910,6 +1930,37 @@ fn m5_product_corpus() -> Result<(), DynError> {
 /// `JIT_DECISION_V1.md` - the formal 7x1000 performance report plus one
 /// terminal `GO` or `DEFER` decision. Missing evidence is itself a reason to
 /// defer; the report never disguises an unfinished GO condition as pending.
+fn formal_aggregate_at(path: &Path, implementation_commit: &str) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (report["implementation_commit"].as_str() == Some(implementation_commit)
+        && report["benchmark_version"].as_u64() == Some(7)
+        && report["process_count"].as_u64() == Some(7)
+        && report["samples_per_process"].as_u64() == Some(1_000)
+        && report["cases"]
+            .as_array()
+            .is_some_and(|cases| !cases.is_empty()))
+    .then_some(report)
+}
+
+fn same_benchmark_machine(left: &Value, right: &Value) -> bool {
+    ["arch", "os", "cpu_model", "logical_cpu_count"]
+        .into_iter()
+        .all(|field| left[field] == right[field])
+}
+
+fn formal_profile_at(path: &Path, implementation_commit: &str, aggregate: &Value) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (report["implementation_commit"].as_str() == Some(implementation_commit)
+        && report["benchmark_version"].as_u64() == Some(7)
+        && report["samples"].as_u64() == Some(200)
+        && report["profiler_enabled"].as_bool() == Some(true)
+        && report["profiler"]["total_opcode_executions"]
+            .as_u64()
+            .is_some_and(|executions| executions > 0)
+        && same_benchmark_machine(&report, aggregate))
+    .then_some(report)
+}
+
 #[allow(
     clippy::too_many_lines,
     // Percent displays only; the mantissa bound is irrelevant here.
@@ -1918,39 +1969,52 @@ fn m5_product_corpus() -> Result<(), DynError> {
 fn m5_final_report() -> Result<(), DynError> {
     use std::fmt::Write as _;
     let root = workspace_root();
+    let head = git_output(&["rev-parse", "HEAD"])?;
     let final_dir = root.join("target/nexa-artifacts/m5/final");
     fs::create_dir_all(&final_dir)?;
     let aggregate_path = final_dir.join("aggregate-7x1000.json");
     let profile_path = final_dir.join("profile-1x200.json");
-    cargo(&[
-        "run",
-        "--release",
-        "--quiet",
-        "-p",
-        "nexa-benchmark-v7",
-        "--",
-        "--samples",
-        "1000",
-        "--processes",
-        "7",
-        "--output",
-        aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
-    ])?;
-    cargo(&[
-        "run",
-        "--release",
-        "--quiet",
-        "-p",
-        "nexa-benchmark-v7",
-        "--",
-        "--samples",
-        "200",
-        "--profile",
-        "--output",
-        profile_path.to_str().ok_or("non-UTF-8 artifact path")?,
-    ])?;
-    let aggregate: Value = serde_json::from_slice(&fs::read(&aggregate_path)?)?;
-    let profile: Value = serde_json::from_slice(&fs::read(&profile_path)?)?;
+    let aggregate = if let Some(report) = formal_aggregate_at(&aggregate_path, &head) {
+        eprintln!("final report: reusing same-HEAD formal aggregate");
+        report
+    } else {
+        cargo(&[
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "nexa-benchmark-v7",
+            "--",
+            "--samples",
+            "1000",
+            "--processes",
+            "7",
+            "--output",
+            aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
+        ])?;
+        formal_aggregate_at(&aggregate_path, &head)
+            .ok_or("new M5 aggregate is not a same-HEAD formal 7x1000 report")?
+    };
+    let profile = if let Some(report) = formal_profile_at(&profile_path, &head, &aggregate) {
+        eprintln!("final report: reusing same-HEAD 1x200 profile");
+        report
+    } else {
+        cargo(&[
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "nexa-benchmark-v7",
+            "--",
+            "--samples",
+            "200",
+            "--profile",
+            "--output",
+            profile_path.to_str().ok_or("non-UTF-8 artifact path")?,
+        ])?;
+        formal_profile_at(&profile_path, &head, &aggregate)
+            .ok_or("new M5 profile is not a same-machine, same-HEAD 1x200 report")?
+    };
     let profiler = &profile["profiler"];
     let total_opcodes = profiler["total_opcode_executions"].as_u64().unwrap_or(0);
     let top_share = profiler["top_opcodes"].as_array().map_or(0, |entries| {
@@ -1975,7 +2039,6 @@ fn m5_final_report() -> Result<(), DynError> {
     let gc_step_p50 = case("gc_incremental_step")
         .and_then(|case| case["median_p50_ns"].as_u64())
         .unwrap_or(0);
-    let head = git_output(&["rev-parse", "HEAD"])?;
     let surfaces_frozen = git_output(&["cat-file", "-t", "performance-m5-complete"])
         .is_ok_and(|kind| kind == "tag")
         && git_output(&["rev-parse", "performance-m5-complete^{}"])
@@ -2198,14 +2261,10 @@ fn m5_v8_comparison() -> Result<(), DynError> {
     // commit; otherwise regenerate it through the measurement authority.
     let head = git_output(&["rev-parse", "HEAD"])?;
     let aggregate_path = final_dir.join("aggregate-7x1000.json");
-    let existing: Option<Value> = fs::read(&aggregate_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let (aggregate, aggregate_provenance) = match existing {
-        Some(aggregate) if aggregate["implementation_commit"].as_str() == Some(head.as_str()) => {
-            (aggregate, "reused: produced at this commit")
-        }
-        _ => {
+    let (aggregate, aggregate_provenance) =
+        if let Some(aggregate) = formal_aggregate_at(&aggregate_path, &head) {
+            (aggregate, "reused: same-HEAD formal 7x1000 receipt")
+        } else {
             cargo(&[
                 "run",
                 "--release",
@@ -2220,12 +2279,10 @@ fn m5_v8_comparison() -> Result<(), DynError> {
                 "--output",
                 aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
             ])?;
-            (
-                serde_json::from_slice(&fs::read(&aggregate_path)?)?,
-                "generated by this run",
-            )
-        }
-    };
+            let aggregate = formal_aggregate_at(&aggregate_path, &head)
+                .ok_or("V8 comparison generated a non-formal Nexa aggregate")?;
+            (aggregate, "generated by this run")
+        };
 
     let mut workloads = Vec::new();
     let mut leads = 0_usize;
@@ -2383,8 +2440,42 @@ fn m5_performance_regression() -> Result<(), DynError> {
     let baseline_commit = git_output(&["rev-parse", "performance-m5-baseline^{}"])?;
     let head_commit = git_output(&["rev-parse", "HEAD"])?;
 
+    // HEAD side: a same-commit formal receipt generated earlier in this gate
+    // sequence is byte-for-byte the same measurement authority. Reuse it
+    // instead of paying for a second or third 7x1000 run.
+    let head_path = regression_dir.join("head-7x1000.json");
+    let final_aggregate_path = root.join("target/nexa-artifacts/m5/final/aggregate-7x1000.json");
+    let head = if let Some(report) = formal_aggregate_at(&final_aggregate_path, &head_commit)
+        .or_else(|| formal_aggregate_at(&head_path, &head_commit))
+    {
+        eprintln!("regression: reusing same-HEAD formal aggregate");
+        fs::write(
+            &head_path,
+            format!("{}\n", serde_json::to_string_pretty(&report)?),
+        )?;
+        report
+    } else {
+        cargo(&[
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "nexa-benchmark-v7",
+            "--",
+            "--samples",
+            "1000",
+            "--processes",
+            "7",
+            "--output",
+            head_path.to_str().ok_or("non-UTF-8 artifact path")?,
+        ])?;
+        formal_aggregate_at(&head_path, &head_commit)
+            .ok_or("new HEAD benchmark is not a formal 7x1000 report")?
+    };
+
     // Baseline side: reuse this machine's live artifact only while it is
-    // pinned to the immutable tag commit under the formal protocol.
+    // pinned to the immutable tag commit under the formal protocol and its
+    // machine identity matches the HEAD authority.
     let baseline_path = regression_dir.join("baseline-live-7x1000.json");
     let existing: Option<Value> = fs::read(&baseline_path)
         .ok()
@@ -2393,31 +2484,17 @@ fn m5_performance_regression() -> Result<(), DynError> {
         Some(report)
             if report["implementation_commit"].as_str() == Some(baseline_commit.as_str())
                 && report["process_count"].as_u64() == Some(7)
-                && report["samples_per_process"].as_u64() == Some(1_000) =>
+                && report["samples_per_process"].as_u64() == Some(1_000)
+                && same_benchmark_machine(&report, &head) =>
         {
             eprintln!("baseline: reusing the live run pinned to {baseline_commit}");
             report
         }
         _ => generate_baseline_live(&root, &baseline_path)?,
     };
-
-    // HEAD side: always fresh under the same protocol.
-    let head_path = regression_dir.join("head-7x1000.json");
-    cargo(&[
-        "run",
-        "--release",
-        "--quiet",
-        "-p",
-        "nexa-benchmark-v7",
-        "--",
-        "--samples",
-        "1000",
-        "--processes",
-        "7",
-        "--output",
-        head_path.to_str().ok_or("non-UTF-8 artifact path")?,
-    ])?;
-    let head: Value = serde_json::from_slice(&fs::read(&head_path)?)?;
+    if !same_benchmark_machine(&baseline, &head) {
+        return Err("live baseline and HEAD reports came from different machines".into());
+    }
 
     let case_map = |report: &Value| -> BTreeMap<String, (u128, u128, u128)> {
         report["cases"]
@@ -2699,8 +2776,12 @@ fn finalize_m5() -> Result<(), DynError> {
     ])?;
     cargo(&["test", "--workspace", "--all-targets"])?;
     cargo(&["test", "--doc", "--workspace"])?;
+    cargo_with_environment(
+        &["doc", "--workspace", "--no-deps"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
+    )?;
 
-    check()?;
+    check_after_workspace()?;
     m4r1::test_language_v2()?;
     m4r1::test_object_model_v2()?;
     m4r1::test_async_v2()?;
@@ -3909,8 +3990,17 @@ fn finalize_m2() -> Result<(), DynError> {
 }
 
 fn run_check_summary() -> CheckSummary {
+    let workspace = workspace_check().is_ok();
+    run_check_summary_with_workspace(workspace)
+}
+
+fn run_check_summary_after_workspace() -> CheckSummary {
+    run_check_summary_with_workspace(true)
+}
+
+fn run_check_summary_with_workspace(workspace_check: bool) -> CheckSummary {
     CheckSummary {
-        workspace_check: workspace_check().is_ok(),
+        workspace_check,
         repo_audit: repo_audit().is_ok(),
         binding_test: test_binding().is_ok(),
         task_test: test_task().is_ok(),
@@ -4842,6 +4932,8 @@ fn low_level_event_violations(root: &Path, tracked: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod audit_tests {
+    use std::fs;
+
     #[test]
     fn m3r1_audit_tracks_the_build_fingerprint_lifecycle_names() {
         super::m3r1_audit().expect("the current Engine must satisfy the M3R1 lifecycle audit");
@@ -4851,5 +4943,50 @@ mod audit_tests {
     fn m3r3_audit_tracks_the_build_fingerprint_freshness_names() {
         super::m3r3_product_audit()
             .expect("the current Engine must satisfy the M3R3 freshness audit");
+    }
+
+    #[test]
+    fn formal_aggregate_reuse_is_commit_and_protocol_exact() {
+        let path = std::env::temp_dir().join(format!(
+            "nexa-m5-formal-aggregate-{}.json",
+            std::process::id()
+        ));
+        let mut report = serde_json::json!({
+            "implementation_commit": "head",
+            "benchmark_version": 7,
+            "process_count": 7,
+            "samples_per_process": 1_000,
+            "cases": [{"case": "product"}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&report).expect("fixture serializes"),
+        )
+        .expect("fixture writes");
+        assert!(super::formal_aggregate_at(&path, "head").is_some());
+        assert!(super::formal_aggregate_at(&path, "other").is_none());
+
+        report["samples_per_process"] = serde_json::Value::from(999);
+        fs::write(
+            &path,
+            serde_json::to_vec(&report).expect("fixture serializes"),
+        )
+        .expect("fixture rewrites");
+        assert!(super::formal_aggregate_at(&path, "head").is_none());
+        fs::remove_file(path).expect("fixture cleans up");
+    }
+
+    #[test]
+    fn benchmark_reuse_requires_the_same_machine_identity() {
+        let left = serde_json::json!({
+            "arch": "aarch64",
+            "os": "macos",
+            "cpu_model": "qualification-cpu",
+            "logical_cpu_count": 10,
+        });
+        let mut right = left.clone();
+        assert!(super::same_benchmark_machine(&left, &right));
+        right["cpu_model"] = serde_json::Value::from("different-cpu");
+        assert!(!super::same_benchmark_machine(&left, &right));
     }
 }
