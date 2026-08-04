@@ -1177,7 +1177,7 @@ fn execute_static_leaf_map(
             if key_slots != 1 {
                 return Err(InterpreterError::TypeMismatch);
             }
-            let value = heap.allocate_physical_map(type_id, key, value, value_slots)?;
+            let value = allocate_resolved_map(heap, module, type_id, key, value, value_slots)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
         Instruction::MapSet { source, key, value } => {
@@ -1222,7 +1222,7 @@ fn execute_static_leaf_map(
                     registers,
                     payload,
                     value_slots,
-                    value.iter().copied(),
+                    value.iter(),
                 )?;
             }
         }
@@ -1443,6 +1443,28 @@ fn resolved_map_value(
             )
         })
         .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn allocate_resolved_map(
+    heap: &mut Heap,
+    module: &VerifiedModule,
+    type_id: StableId,
+    key_type: ValueType,
+    value_type: ValueType,
+    value_slots: u16,
+) -> Result<RuntimeValue, InterpreterError> {
+    if let ValueType::Named(named_id) = value_type
+        && let Some(layout) = module.layout_table().named_layout(named_id)
+    {
+        return Ok(heap.allocate_physical_map_with_layout(
+            type_id,
+            key_type,
+            value_type,
+            value_slots,
+            layout,
+        )?);
+    }
+    Ok(heap.allocate_physical_map(type_id, key_type, value_type, value_slots)?)
 }
 
 fn resolved_class_field(
@@ -4358,10 +4380,15 @@ impl CheckedInterpreter {
                     if key_slots != 1 {
                         return Err(InterpreterError::TypeMismatch);
                     }
-                    let value = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?
-                        .allocate_physical_map(type_id, key, value, value_slots)?;
+                    let value = allocate_resolved_map(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?,
+                        module,
+                        type_id,
+                        key,
+                        value,
+                        value_slots,
+                    )?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }

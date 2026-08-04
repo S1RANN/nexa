@@ -28,6 +28,7 @@ pub struct VmMap {
     key_type: nexa_bytecode::ValueType,
     value_type: nexa_bytecode::ValueType,
     value_slots: u16,
+    value_storage: CollectionStorage,
     slots: CollectionRange,
     values: CollectionRange,
     length: usize,
@@ -41,6 +42,7 @@ impl VmMap {
         &self,
         arena: &MapSlotArena,
         values: &CollectionArena,
+        scalar_values: &ScalarArenaSet,
         visit: &mut impl FnMut(GcRef),
     ) {
         let mut trace_table = |slots: CollectionRange, value_range: CollectionRange| {
@@ -53,13 +55,15 @@ impl VmMap {
                 }
                 let row = map_value_row(value_range, self.value_slots, index)
                     .expect("map value table matches its slot capacity");
-                for reference in values
-                    .values(row)
-                    .expect("map value table remains live with its slots")
-                    .iter()
-                    .copied()
-                    .filter_map(value_reference)
-                {
+                let row = typed_collection_view_from_arenas(
+                    values,
+                    scalar_values,
+                    self.value_storage,
+                    self.value_type,
+                    row,
+                )
+                .expect("map value table remains live with its slots");
+                for reference in row.iter().filter_map(value_reference) {
                     visit(reference);
                 }
             }
@@ -95,7 +99,7 @@ impl VmMap {
                 self.values
                     .length
                     .saturating_add(rehash_values)
-                    .saturating_mul(size_of::<RuntimeValue>()),
+                    .saturating_mul(self.value_storage.cell_size()),
             )
     }
 }
@@ -106,10 +110,13 @@ pub(crate) struct MapEntries<'a> {
     old: &'a [Option<MapEntry>],
     new: &'a [Option<MapEntry>],
     values: &'a CollectionArena,
+    scalar_values: &'a ScalarArenaSet,
     current_values: CollectionRange,
     old_values: CollectionRange,
     new_values: CollectionRange,
+    value_type: nexa_bytecode::ValueType,
     value_slots: u16,
+    value_storage: CollectionStorage,
     phase: u8,
     index: usize,
     remaining: usize,
@@ -145,10 +152,16 @@ impl Iterator for MapEntries<'_> {
                 };
                 let row = map_value_row(values, self.value_slots, self.index - 1)
                     .expect("scalar Host map table has a matching value row");
-                let value = self
-                    .values
-                    .values(row)
-                    .expect("scalar Host map entry has a live value extent")[0];
+                let value = typed_collection_view_from_arenas(
+                    self.values,
+                    self.scalar_values,
+                    self.value_storage,
+                    self.value_type,
+                    row,
+                )
+                .expect("scalar Host map entry has a live value extent")
+                .get(0)
+                .expect("scalar Host map entry has one physical value");
                 return Some((entry.key, value));
             }
         }
@@ -739,6 +752,61 @@ impl CollectionStorage {
     }
 }
 
+const fn default_map_value_storage(
+    value_type: nexa_bytecode::ValueType,
+    value_slots: u16,
+) -> CollectionStorage {
+    if value_slots != 1 {
+        return CollectionStorage::Values;
+    }
+    match value_type {
+        nexa_bytecode::ValueType::Named(_) => CollectionStorage::Values,
+        other => CollectionStorage::for_type(other),
+    }
+}
+
+fn map_value_storage_for_layout(
+    value_type: nexa_bytecode::ValueType,
+    layout: &nexa_bytecode::layout::ValueLayout,
+) -> CollectionStorage {
+    use nexa_bytecode::layout::{CopyStrategy, PhysicalSlotKind};
+
+    if layout.physical_slots != 1 {
+        return CollectionStorage::Values;
+    }
+    let nexa_bytecode::ValueType::Named(_) = value_type else {
+        return CollectionStorage::for_type(value_type);
+    };
+
+    if layout.copy_strategy == CopyStrategy::ReferenceShare
+        && layout.slot_kinds.as_slice() == [PhysicalSlotKind::GcReference]
+    {
+        return CollectionStorage::NamedRef;
+    }
+    if layout
+        .enum_layout
+        .as_ref()
+        .is_some_and(|enum_layout| enum_layout.payload_slots == 0)
+    {
+        return CollectionStorage::I32;
+    }
+
+    // A one-slot flattened struct can share the exact scalar arena of its
+    // physical field. Named reference fields stay wide because reconstructing
+    // them requires the nested field's type id, not the wrapper's type id.
+    let Some(field) = layout
+        .field_offsets
+        .iter()
+        .find(|field| field.offset == 0 && field.slots == 1)
+    else {
+        return CollectionStorage::Values;
+    };
+    match field.logical_type {
+        nexa_bytecode::ValueType::Named(_) => CollectionStorage::Values,
+        other => CollectionStorage::for_type(other),
+    }
+}
+
 fn collection_storage_for_values(
     element_type: nexa_bytecode::ValueType,
     values: &[RuntimeValue],
@@ -905,6 +973,37 @@ pub enum CollectionView<'a> {
         values: &'a [GcRef],
         type_id: StableId,
     },
+}
+
+fn typed_collection_view_from_arenas<'a>(
+    values: &'a CollectionArena,
+    scalar_values: &'a ScalarArenaSet,
+    storage: CollectionStorage,
+    element_type: nexa_bytecode::ValueType,
+    range: CollectionRange,
+) -> Result<CollectionView<'a>, HeapError> {
+    match storage {
+        CollectionStorage::Values => Ok(CollectionView::Values(values.values(range)?)),
+        CollectionStorage::I32 => Ok(CollectionView::I32(scalar_values.i32().values(range)?)),
+        CollectionStorage::I64 => Ok(CollectionView::I64(scalar_values.i64().values(range)?)),
+        CollectionStorage::F32 => Ok(CollectionView::F32(scalar_values.f32().values(range)?)),
+        CollectionStorage::F64 => Ok(CollectionView::F64(scalar_values.f64().values(range)?)),
+        CollectionStorage::Bool => Ok(CollectionView::Bool(scalar_values.bools().values(range)?)),
+        CollectionStorage::Rune => Ok(CollectionView::Rune(scalar_values.runes().values(range)?)),
+        CollectionStorage::String => Ok(CollectionView::String(
+            scalar_values.strings().values(range)?,
+        )),
+        CollectionStorage::Ref => Ok(CollectionView::Ref(scalar_values.refs().values(range)?)),
+        CollectionStorage::NamedRef => {
+            let nexa_bytecode::ValueType::Named(type_id) = element_type else {
+                return Err(invalid_value_reference());
+            };
+            Ok(CollectionView::NamedRef {
+                values: scalar_values.refs().values(range)?,
+                type_id,
+            })
+        }
+    }
 }
 
 impl<'a> CollectionView<'a> {
@@ -2073,9 +2172,9 @@ impl Heap {
                 released = released.saturating_add(
                     u64::try_from(values.length)
                         .unwrap_or(u64::MAX)
-                        .saturating_mul(size_of::<RuntimeValue>() as u64),
+                        .saturating_mul(map.value_storage.cell_size() as u64),
                 );
-                self.release_typed_collection(CollectionStorage::Values, values);
+                self.release_typed_collection(map.value_storage, values);
             }
         }
         released
@@ -2422,44 +2521,13 @@ impl Heap {
         element_type: nexa_bytecode::ValueType,
         range: CollectionRange,
     ) -> Result<CollectionView<'_>, HeapError> {
-        match storage {
-            CollectionStorage::Values => {
-                Ok(CollectionView::Values(self.collections.values(range)?))
-            }
-            CollectionStorage::I32 => Ok(CollectionView::I32(
-                self.scalar_collections.i32().values(range)?,
-            )),
-            CollectionStorage::I64 => Ok(CollectionView::I64(
-                self.scalar_collections.i64().values(range)?,
-            )),
-            CollectionStorage::F32 => Ok(CollectionView::F32(
-                self.scalar_collections.f32().values(range)?,
-            )),
-            CollectionStorage::F64 => Ok(CollectionView::F64(
-                self.scalar_collections.f64().values(range)?,
-            )),
-            CollectionStorage::Bool => Ok(CollectionView::Bool(
-                self.scalar_collections.bools().values(range)?,
-            )),
-            CollectionStorage::Rune => Ok(CollectionView::Rune(
-                self.scalar_collections.runes().values(range)?,
-            )),
-            CollectionStorage::String => Ok(CollectionView::String(
-                self.scalar_collections.strings().values(range)?,
-            )),
-            CollectionStorage::Ref => Ok(CollectionView::Ref(
-                self.scalar_collections.refs().values(range)?,
-            )),
-            CollectionStorage::NamedRef => {
-                let nexa_bytecode::ValueType::Named(type_id) = element_type else {
-                    return Err(invalid_value_reference());
-                };
-                Ok(CollectionView::NamedRef {
-                    values: self.scalar_collections.refs().values(range)?,
-                    type_id,
-                })
-            }
-        }
+        typed_collection_view_from_arenas(
+            &self.collections,
+            &self.scalar_collections,
+            storage,
+            element_type,
+            range,
+        )
     }
 
     fn field_view(
@@ -2642,53 +2710,14 @@ impl Heap {
         source: std::ops::Range<usize>,
         destination: usize,
     ) -> Result<(), HeapError> {
-        match storage {
-            CollectionStorage::I32 => self
-                .scalar_collections
-                .i32_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::I64 => self
-                .scalar_collections
-                .i64_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::F32 => self
-                .scalar_collections
-                .f32_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::F64 => self
-                .scalar_collections
-                .f64_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::Bool => self
-                .scalar_collections
-                .bools_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::Rune => self
-                .scalar_collections
-                .runes_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::String => self
-                .scalar_collections
-                .strings_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::Ref | CollectionStorage::NamedRef => self
-                .scalar_collections
-                .refs_mut()
-                .values_mut(range)?
-                .copy_within(source, destination),
-            CollectionStorage::Values => self
-                .collections
-                .values_mut(range)?
-                .copy_within(source, destination),
-        }
-        Ok(())
+        typed_collection_copy_within_arenas(
+            &mut self.collections,
+            &mut self.scalar_collections,
+            storage,
+            range,
+            source,
+            destination,
+        )
     }
 
     fn typed_collection_clear(
@@ -2697,45 +2726,13 @@ impl Heap {
         range: CollectionRange,
         cells: std::ops::Range<usize>,
     ) -> Result<(), HeapError> {
-        match storage {
-            CollectionStorage::I32 => {
-                self.scalar_collections.i32_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::I64 => {
-                self.scalar_collections.i64_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::F32 => {
-                self.scalar_collections.f32_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::F64 => {
-                self.scalar_collections.f64_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::Bool => {
-                self.scalar_collections.bools_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::Rune => {
-                self.scalar_collections.runes_mut().values_mut(range)?[cells].fill(0);
-            }
-            CollectionStorage::String => {
-                self.scalar_collections.strings_mut().values_mut(range)?[cells].fill((
-                    GcRef {
-                        index: u32::MAX,
-                        generation: u32::MAX,
-                    },
-                    0,
-                ));
-            }
-            CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                self.scalar_collections.refs_mut().values_mut(range)?[cells].fill(GcRef {
-                    index: u32::MAX,
-                    generation: u32::MAX,
-                });
-            }
-            CollectionStorage::Values => {
-                self.collections.values_mut(range)?[cells].fill(RuntimeValue::Unit);
-            }
-        }
-        Ok(())
+        typed_collection_clear_in_arenas(
+            &mut self.collections,
+            &mut self.scalar_collections,
+            storage,
+            range,
+            cells,
+        )
     }
 
     #[must_use]
@@ -4963,10 +4960,52 @@ impl Heap {
         value_type: nexa_bytecode::ValueType,
         value_slots: u16,
     ) -> Result<RuntimeValue, HeapError> {
+        let value_storage = default_map_value_storage(value_type, value_slots);
+        self.allocate_physical_map_with_storage(
+            type_id,
+            key_type,
+            value_type,
+            value_slots,
+            value_storage,
+        )
+    }
+
+    pub(crate) fn allocate_physical_map_with_layout(
+        &mut self,
+        type_id: StableId,
+        key_type: nexa_bytecode::ValueType,
+        value_type: nexa_bytecode::ValueType,
+        value_slots: u16,
+        value_layout: &nexa_bytecode::layout::ValueLayout,
+    ) -> Result<RuntimeValue, HeapError> {
+        if value_layout.logical_type != value_type
+            || value_layout.physical_slots != value_slots
+            || value_layout.slot_kinds.len() != usize::from(value_slots)
+        {
+            return Err(invalid_value_reference());
+        }
+        let value_storage = map_value_storage_for_layout(value_type, value_layout);
+        self.allocate_physical_map_with_storage(
+            type_id,
+            key_type,
+            value_type,
+            value_slots,
+            value_storage,
+        )
+    }
+
+    fn allocate_physical_map_with_storage(
+        &mut self,
+        type_id: StableId,
+        key_type: nexa_bytecode::ValueType,
+        value_type: nexa_bytecode::ValueType,
+        value_slots: u16,
+        value_storage: CollectionStorage,
+    ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::map_type(key_type, value_type) {
             return Err(invalid_value_reference());
         }
-        if value_slots == 0 {
+        if value_slots == 0 || (value_storage.is_compact() && value_slots != 1) {
             return Err(invalid_value_reference());
         }
         let initial_capacity = self.empty_map_capacity();
@@ -4975,12 +5014,12 @@ impl Heap {
             .ok_or(HeapError::CapacityExhausted)?;
         let payload_bytes = (initial_capacity as u64)
             .saturating_mul(size_of::<Option<MapEntry>>() as u64)
-            .saturating_add((value_cells as u64).saturating_mul(size_of::<RuntimeValue>() as u64));
+            .saturating_add((value_cells as u64).saturating_mul(value_storage.cell_size() as u64));
         self.ensure_new_object_headroom(payload_bytes, true)?;
         self.ensure_collection_headroom(payload_bytes)?;
         let mut reservation = self.preflight(1)?;
         let slots = self.map_slots.claim(initial_capacity)?;
-        let values = match self.claim_typed_collection(CollectionStorage::Values, value_cells) {
+        let values = match self.claim_typed_collection(value_storage, value_cells) {
             Ok(values) => values,
             Err(error) => {
                 self.map_slots.release(slots);
@@ -4992,6 +5031,7 @@ impl Heap {
             key_type,
             value_type,
             value_slots,
+            value_storage,
             slots,
             values,
             length: 0,
@@ -5051,10 +5091,13 @@ impl Heap {
             old,
             new,
             values: &self.collections,
+            scalar_values: &self.scalar_collections,
             current_values: map.values,
             old_values,
             new_values,
+            value_type: map.value_type,
             value_slots: map.value_slots,
+            value_storage: map.value_storage,
             phase: 0,
             index: 0,
             remaining: map.length,
@@ -5165,7 +5208,9 @@ impl Heap {
         if destination.len() != value.len() {
             return Err(invalid_value_reference());
         }
-        destination.copy_from_slice(value);
+        for (destination, value) in destination.iter_mut().zip(value.iter()) {
+            *destination = value;
+        }
         Ok(true)
     }
 
@@ -5173,14 +5218,18 @@ impl Heap {
         &self,
         value: RuntimeValue,
         key: RuntimeValue,
-    ) -> Result<Option<&[RuntimeValue]>, HeapError> {
+    ) -> Result<Option<CollectionView<'_>>, HeapError> {
         let hash = self.runtime_value_hash(key)?;
         let map = self.map(value)?;
         let Some(location) = self.find_map_entry(map, key, hash)? else {
             return Ok(None);
         };
         let range = map_entry_value_range(map, location)?;
-        Ok(Some(self.collections.values(range)?))
+        Ok(Some(self.typed_collection_view(
+            map.value_storage,
+            map.value_type,
+            range,
+        )?))
     }
 
     pub fn map_contains(&self, value: RuntimeValue, key: RuntimeValue) -> Result<bool, HeapError> {
@@ -5196,6 +5245,74 @@ impl Heap {
         replacement: RuntimeValue,
     ) -> Result<MapSetOutcome, HeapError> {
         self.map_set_value_range(value, key, std::slice::from_ref(&replacement))
+    }
+
+    fn write_map_value_range(
+        &mut self,
+        storage: CollectionStorage,
+        value_type: nexa_bytecode::ValueType,
+        range: CollectionRange,
+        replacement: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        if replacement.len() != range.length {
+            return Err(invalid_value_reference());
+        }
+        if storage == CollectionStorage::Values {
+            self.collections
+                .values_mut(range)?
+                .copy_from_slice(replacement);
+            return Ok(());
+        }
+        if replacement.len() != 1 {
+            return Err(invalid_value_reference());
+        }
+        self.typed_collection_set(storage, value_type, range, 0, replacement[0])
+    }
+
+    fn begin_map_rehash(&mut self, storage: usize, new_capacity: usize) -> Result<(), HeapError> {
+        let map = self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists");
+        let value_cells = new_capacity
+            .checked_mul(usize::from(map.value_slots))
+            .ok_or(HeapError::CapacityExhausted)?;
+        let value_storage = map.value_storage;
+        let entry_bytes = size_of::<Option<MapEntry>>() as u64;
+        let new_bytes = (new_capacity as u64)
+            .saturating_mul(entry_bytes)
+            .saturating_add((value_cells as u64).saturating_mul(value_storage.cell_size() as u64));
+        self.ensure_payload_headroom(new_bytes)?;
+        self.ensure_collection_headroom(new_bytes)?;
+
+        let new_slots = self.map_slots.claim(new_capacity)?;
+        let new_values = match self.claim_typed_collection(value_storage, value_cells) {
+            Ok(values) => values,
+            Err(error) => {
+                self.map_slots.release(new_slots);
+                return Err(error);
+            }
+        };
+        self.charge_collection_payload(new_bytes);
+        self.counters.map_slot_allocations = self
+            .counters
+            .map_slot_allocations
+            .saturating_add(new_capacity as u64);
+
+        let map = self.maps[storage]
+            .as_mut()
+            .expect("validated map storage exists");
+        let old_slots = map.slots;
+        let old_values = map.values;
+        map.slots = CollectionRange::default();
+        map.values = CollectionRange::default();
+        map.rehash = Some(MapRehash {
+            old_slots,
+            new_slots,
+            old_values,
+            new_values,
+            cursor: 0,
+        });
+        Ok(())
     }
 
     pub(crate) fn map_set_value_range(
@@ -5234,15 +5351,20 @@ impl Heap {
             .rehash
             .is_some()
         {
+            let value_storage = self.maps[storage]
+                .as_ref()
+                .expect("validated map storage exists")
+                .value_storage;
             let released = progress_map_rehash(
                 self.maps[storage]
                     .as_mut()
                     .expect("validated map storage exists"),
                 &mut self.map_slots,
                 &mut self.collections,
+                &mut self.scalar_collections,
             )?;
             if let Some((old_values, released_bytes)) = released {
-                self.release_typed_collection(CollectionStorage::Values, old_values);
+                self.release_typed_collection(value_storage, old_values);
                 // G6: rehash completion released the old slot/value table.
                 self.release_collection_payload(released_bytes);
             }
@@ -5261,9 +5383,9 @@ impl Heap {
                 .as_ref()
                 .expect("validated map storage exists");
             let value_range = map_entry_value_range(map, location)?;
-            self.collections
-                .values_mut(value_range)?
-                .copy_from_slice(replacement);
+            let value_storage = map.value_storage;
+            let value_type = map.value_type;
+            self.write_map_value_range(value_storage, value_type, value_range, replacement)?;
             return Ok(MapSetOutcome::Complete);
         }
 
@@ -5281,57 +5403,10 @@ impl Heap {
             let new_capacity =
                 next_map_capacity(map, self.max_collection_length).expect("map needs rehash");
             if new_capacity > old_capacity {
-                let entry_bytes = size_of::<Option<MapEntry>>() as u64;
-                let value_cells = new_capacity
-                    .checked_mul(usize::from(map.value_slots))
-                    .ok_or(HeapError::CapacityExhausted)?;
                 // G6 admission and charge: the new slot vector joins the
                 // map's footprint with its companion value rows. Both old
                 // extents are released when the bounded rehash completes.
-                let new_bytes = (new_capacity as u64)
-                    .saturating_mul(entry_bytes)
-                    .saturating_add(
-                        (value_cells as u64).saturating_mul(size_of::<RuntimeValue>() as u64),
-                    );
-                self.ensure_payload_headroom(new_bytes)?;
-                self.ensure_collection_headroom(new_bytes)?;
-                let new_slots = self.map_slots.claim(new_capacity)?;
-                let new_values =
-                    match self.claim_typed_collection(CollectionStorage::Values, value_cells) {
-                        Ok(values) => values,
-                        Err(error) => {
-                            self.map_slots.release(new_slots);
-                            return Err(error);
-                        }
-                    };
-                self.charge_collection_payload(
-                    u64::try_from(new_slots.length)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(entry_bytes)
-                        .saturating_add(
-                            u64::try_from(new_values.length)
-                                .unwrap_or(u64::MAX)
-                                .saturating_mul(size_of::<RuntimeValue>() as u64),
-                        ),
-                );
-                self.counters.map_slot_allocations = self
-                    .counters
-                    .map_slot_allocations
-                    .saturating_add(new_capacity as u64);
-                let map = self.maps[storage]
-                    .as_mut()
-                    .expect("validated map storage exists");
-                let old_slots = map.slots;
-                let old_values = map.values;
-                map.slots = CollectionRange::default();
-                map.values = CollectionRange::default();
-                map.rehash = Some(MapRehash {
-                    old_slots,
-                    new_slots,
-                    old_values,
-                    new_values,
-                    cursor: 0,
-                });
+                self.begin_map_rehash(storage, new_capacity)?;
                 return Ok(MapSetOutcome::RehashPending);
             }
         }
@@ -5344,12 +5419,12 @@ impl Heap {
         let range = map.slots;
         let values = map.values;
         let value_slots = map.value_slots;
+        let value_storage = map.value_storage;
+        let value_type = map.value_type;
         let index = insert_map_entry(self.map_slots.slots_mut(range), entry)?;
         let value_range =
             map_value_row(values, value_slots, index).ok_or_else(invalid_value_reference)?;
-        self.collections
-            .values_mut(value_range)?
-            .copy_from_slice(replacement);
+        self.write_map_value_range(value_storage, value_type, value_range, replacement)?;
         self.maps[storage]
             .as_mut()
             .expect("validated map storage exists")
@@ -5392,27 +5467,32 @@ impl Heap {
         let range = map_location_range(map, location);
         let values = map_location_values(map, location);
         let value_slots = map.value_slots;
+        let value_storage = map.value_storage;
+        let value_type = map.value_type;
         let value_range = map_entry_value_range(map, location)?;
-        destination.copy_from_slice(self.collections.values(value_range)?);
+        let view = self.typed_collection_view(value_storage, value_type, value_range)?;
+        for (destination, value) in destination.iter_mut().zip(view.iter()) {
+            *destination = value;
+        }
         match location {
             MapLocation::RehashOld(_) => {
                 self.map_slots.slots_mut(range)[map_location_index(location)]
                     .take()
                     .expect("located map entry exists");
-                self.collections
-                    .values_mut(value_range)?
-                    .fill(RuntimeValue::Unit);
+                self.typed_collection_clear(value_storage, value_range, 0..value_range.length)?;
             }
             MapLocation::Current(_) | MapLocation::RehashNew(_) => {
                 remove_probed_entry_with_values(
                     self.map_slots.slots_mut(range),
                     &mut self.collections,
+                    &mut self.scalar_collections,
+                    value_storage,
                     values,
                     value_slots,
                     map_location_index(location),
                 );
             }
-        };
+        }
         self.maps[storage]
             .as_mut()
             .expect("validated map storage exists")
@@ -5431,8 +5511,8 @@ impl Heap {
             // sides and lets the next insertion choose a fresh capacity.
             self.map_slots.release(rehash.old_slots);
             self.map_slots.release(rehash.new_slots);
-            self.release_typed_collection(CollectionStorage::Values, rehash.old_values);
-            self.release_typed_collection(CollectionStorage::Values, rehash.new_values);
+            self.release_typed_collection(snapshot.value_storage, rehash.old_values);
+            self.release_typed_collection(snapshot.value_storage, rehash.new_values);
             let bytes = (rehash
                 .old_slots
                 .length
@@ -5443,7 +5523,7 @@ impl Heap {
                         .old_values
                         .length
                         .saturating_add(rehash.new_values.length) as u64)
-                        .saturating_mul(size_of::<RuntimeValue>() as u64),
+                        .saturating_mul(snapshot.value_storage.cell_size() as u64),
                 );
             let map = self.maps[storage]
                 .as_mut()
@@ -5455,9 +5535,11 @@ impl Heap {
             self.release_collection_payload(bytes);
         } else {
             self.map_slots.slots_mut(snapshot.slots).fill(None);
-            self.collections
-                .values_mut(snapshot.values)?
-                .fill(RuntimeValue::Unit);
+            self.typed_collection_clear(
+                snapshot.value_storage,
+                snapshot.values,
+                0..snapshot.values.length,
+            )?;
             self.maps[storage]
                 .as_mut()
                 .expect("validated map storage exists")
@@ -6425,11 +6507,16 @@ impl Heap {
                         .and_then(Option::as_ref)
                         .ok_or(HeapError::InvalidReference(reference))?;
                     let slots = &mut self.slots;
-                    map.trace_references(&self.map_slots, &self.collections, &mut |child| {
-                        if Self::enqueue_gray(slots, queue, child) {
-                            grayed += 1;
-                        }
-                    });
+                    map.trace_references(
+                        &self.map_slots,
+                        &self.collections,
+                        &self.scalar_collections,
+                        &mut |child| {
+                            if Self::enqueue_gray(slots, queue, child) {
+                                grayed += 1;
+                            }
+                        },
+                    );
                 }
                 _ => {
                     // The object is briefly taken out of its slot so the
@@ -6717,6 +6804,128 @@ fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<u
     Err(HeapError::CapacityExhausted)
 }
 
+fn typed_collection_copy_within_arenas(
+    values: &mut CollectionArena,
+    scalar_values: &mut ScalarArenaSet,
+    storage: CollectionStorage,
+    range: CollectionRange,
+    source: std::ops::Range<usize>,
+    destination: usize,
+) -> Result<(), HeapError> {
+    match storage {
+        CollectionStorage::I32 => scalar_values
+            .i32_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::I64 => scalar_values
+            .i64_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::F32 => scalar_values
+            .f32_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::F64 => scalar_values
+            .f64_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::Bool => scalar_values
+            .bools_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::Rune => scalar_values
+            .runes_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::String => scalar_values
+            .strings_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::Ref | CollectionStorage::NamedRef => scalar_values
+            .refs_mut()
+            .values_mut(range)?
+            .copy_within(source, destination),
+        CollectionStorage::Values => values.values_mut(range)?.copy_within(source, destination),
+    }
+    Ok(())
+}
+
+fn typed_collection_copy_absolute(
+    values: &mut CollectionArena,
+    scalar_values: &mut ScalarArenaSet,
+    storage: CollectionStorage,
+    source: std::ops::Range<usize>,
+    destination: usize,
+) -> Result<(), HeapError> {
+    let length = source.end.saturating_sub(source.start);
+    let start = source.start.min(destination);
+    let end = source.end.max(
+        destination
+            .checked_add(length)
+            .ok_or(HeapError::CapacityExhausted)?,
+    );
+    let encompassing = CollectionRange {
+        start,
+        length: end.checked_sub(start).ok_or(HeapError::CapacityExhausted)?,
+    };
+    typed_collection_copy_within_arenas(
+        values,
+        scalar_values,
+        storage,
+        encompassing,
+        source.start - start..source.end - start,
+        destination - start,
+    )
+}
+
+fn typed_collection_clear_in_arenas(
+    values: &mut CollectionArena,
+    scalar_values: &mut ScalarArenaSet,
+    storage: CollectionStorage,
+    range: CollectionRange,
+    cells: std::ops::Range<usize>,
+) -> Result<(), HeapError> {
+    match storage {
+        CollectionStorage::I32 => {
+            scalar_values.i32_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::I64 => {
+            scalar_values.i64_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::F32 => {
+            scalar_values.f32_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::F64 => {
+            scalar_values.f64_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::Bool => {
+            scalar_values.bools_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::Rune => {
+            scalar_values.runes_mut().values_mut(range)?[cells].fill(0);
+        }
+        CollectionStorage::String => {
+            scalar_values.strings_mut().values_mut(range)?[cells].fill((
+                GcRef {
+                    index: u32::MAX,
+                    generation: u32::MAX,
+                },
+                0,
+            ));
+        }
+        CollectionStorage::Ref | CollectionStorage::NamedRef => {
+            scalar_values.refs_mut().values_mut(range)?[cells].fill(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            });
+        }
+        CollectionStorage::Values => {
+            values.values_mut(range)?[cells].fill(RuntimeValue::Unit);
+        }
+    }
+    Ok(())
+}
+
 fn map_value_row(
     values: CollectionRange,
     value_slots: u16,
@@ -6765,6 +6974,7 @@ fn progress_map_rehash(
     map: &mut VmMap,
     arena: &mut MapSlotArena,
     values: &mut CollectionArena,
+    scalar_values: &mut ScalarArenaSet,
 ) -> Result<Option<(CollectionRange, u64)>, HeapError> {
     const REHASH_CHUNK: usize = 8;
     let rehash = map.rehash.as_mut().expect("rehash state checked by caller");
@@ -6779,10 +6989,21 @@ fn progress_map_rehash(
                 .ok_or_else(invalid_value_reference)?;
             let destination = map_value_row(rehash.new_values, map.value_slots, destination)
                 .ok_or_else(invalid_value_reference)?;
-            values
-                .values
-                .copy_within(source.start..source.end(), destination.start);
-            values.values[source.start..source.end()].fill(RuntimeValue::Unit);
+            typed_collection_copy_absolute(
+                values,
+                scalar_values,
+                map.value_storage,
+                source.start..source.end(),
+                destination.start,
+            )?;
+            let source_length = source.length;
+            typed_collection_clear_in_arenas(
+                values,
+                scalar_values,
+                map.value_storage,
+                source,
+                0..source_length,
+            )?;
         }
     }
     rehash.cursor = end;
@@ -6794,7 +7015,7 @@ fn progress_map_rehash(
         let released = (old_slots.length as u64)
             .saturating_mul(size_of::<Option<MapEntry>>() as u64)
             .saturating_add(
-                (old_values.length as u64).saturating_mul(size_of::<RuntimeValue>() as u64),
+                (old_values.length as u64).saturating_mul(map.value_storage.cell_size() as u64),
             );
         arena.release(old_slots);
         map.slots = new_slots;
@@ -6846,6 +7067,8 @@ fn remove_probed_entry(slots: &mut [Option<MapEntry>], index: usize) -> MapEntry
 fn remove_probed_entry_with_values(
     slots: &mut [Option<MapEntry>],
     values: &mut CollectionArena,
+    scalar_values: &mut ScalarArenaSet,
+    storage: CollectionStorage,
     value_table: CollectionRange,
     value_slots: u16,
     index: usize,
@@ -6855,13 +7078,20 @@ fn remove_probed_entry_with_values(
             .expect("map slot source has a companion value row");
         let destination = map_value_row(value_table, value_slots, destination)
             .expect("map slot destination has a companion value row");
-        values
-            .values
-            .copy_within(source.start..source.end(), destination.start);
+        typed_collection_copy_absolute(
+            values,
+            scalar_values,
+            storage,
+            source.start..source.end(),
+            destination.start,
+        )
+        .expect("map companion value rows share a live typed arena");
     });
     let hole = map_value_row(value_table, value_slots, hole)
         .expect("map deletion hole has a companion value row");
-    values.values[hole.start..hole.end()].fill(RuntimeValue::Unit);
+    let hole_length = hole.length;
+    typed_collection_clear_in_arenas(values, scalar_values, storage, hole, 0..hole_length)
+        .expect("map deletion hole remains inside its typed arena");
     removed
 }
 
@@ -6915,8 +7145,8 @@ mod tests {
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, StableId};
 
     use super::{
-        CollectionView, GcBudget, GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object,
-        fnv_content_hash, insert_map_entry, remove_probed_entry,
+        CollectionStorage, CollectionView, GcBudget, GcRoots, Heap, HeapError, MapEntry,
+        MapSetOutcome, Object, fnv_content_hash, insert_map_entry, remove_probed_entry,
     };
     use crate::{RuntimeFailurePoint, RuntimeValue};
 
@@ -7017,6 +7247,194 @@ mod tests {
             );
         }
         assert_eq!(heap.map_len(map).unwrap(), 64);
+    }
+
+    #[test]
+    fn scalar_map_values_use_exact_width_companion_storage() {
+        let mut heap = Heap::new_with_limits(32, usize::MAX, 64);
+        let map_type = nexa_bytecode::map_type(
+            nexa_bytecode::ValueType::I32,
+            nexa_bytecode::ValueType::Bool,
+        );
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::Bool,
+            )
+            .unwrap();
+
+        let storage = heap.map_storage_index(map).unwrap();
+        let header = heap.maps[storage].as_ref().unwrap();
+        assert_eq!(header.value_storage, CollectionStorage::Bool);
+        assert_eq!(heap.live_collection_bytes(), header.storage_bytes() as u64);
+        assert_eq!(
+            header.values.length * header.value_storage.cell_size(),
+            header.slots.length,
+            "bool companions occupy one byte per map slot"
+        );
+
+        for key in 0..20 {
+            while heap
+                .map_set(
+                    map,
+                    RuntimeValue::I32(key),
+                    RuntimeValue::Bool(key % 2 == 0),
+                )
+                .unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        }
+        for key in 0..20 {
+            assert_eq!(
+                heap.map_get(map, RuntimeValue::I32(key)).unwrap(),
+                Some(RuntimeValue::Bool(key % 2 == 0))
+            );
+        }
+        for key in (0..20).step_by(3) {
+            assert_eq!(
+                heap.map_remove(map, RuntimeValue::I32(key)).unwrap(),
+                Some(RuntimeValue::Bool(key % 2 == 0))
+            );
+        }
+
+        let header = heap.maps[storage].as_ref().unwrap();
+        assert_eq!(header.value_storage, CollectionStorage::Bool);
+        assert_eq!(
+            heap.live_collection_bytes(),
+            header.storage_bytes() as u64,
+            "rehash completion keeps exact compact G6 accounting"
+        );
+    }
+
+    #[test]
+    fn compact_string_map_values_are_precisely_traced_across_rehash() {
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let map_type = nexa_bytecode::map_type(
+            nexa_bytecode::ValueType::I32,
+            nexa_bytecode::ValueType::String,
+        );
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::String,
+            )
+            .unwrap();
+        let RuntimeValue::NamedRef {
+            reference: map_root,
+            ..
+        } = map
+        else {
+            panic!("map allocation returns a named reference");
+        };
+        let mut strings = Vec::new();
+        for key in 0..20 {
+            let text = format!("value-{key}");
+            let reference = heap.allocate_string(&text).unwrap();
+            strings.push(reference);
+            let value = RuntimeValue::String {
+                reference,
+                hash: heap.string_hash(reference).unwrap(),
+            };
+            while heap.map_set(map, RuntimeValue::I32(key), value).unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        }
+        let storage = heap.map_storage_index(map).unwrap();
+        assert_eq!(
+            heap.maps[storage].as_ref().unwrap().value_storage,
+            CollectionStorage::String
+        );
+
+        let roots = GcRoots {
+            running_frames: vec![map_root],
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().live, 21);
+        for reference in &strings {
+            assert!(heap.resolve(*reference).is_ok());
+        }
+
+        let removed = strings[7];
+        assert!(
+            heap.map_remove(map, RuntimeValue::I32(7))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(heap.collect(&roots).unwrap().reclaimed, 1);
+        assert!(heap.resolve(removed).is_err());
+        for (index, reference) in strings.iter().copied().enumerate() {
+            if index != 7 {
+                assert!(heap.resolve(reference).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn verified_named_reference_map_values_use_compact_reference_storage() {
+        let class_type = StableId::from_name("test.CompactMapClass");
+        let mut module = nexa_bytecode::ModuleBuilder::new();
+        module.metadata(
+            StableId::from_name("test.compact-map-host"),
+            nexa_bytecode::StateSchema::default().fingerprint(),
+        );
+        module.class_type(nexa_bytecode::ClassType {
+            type_id: class_type,
+            fields: Vec::new(),
+        });
+        let module = module.finish();
+        let layout = nexa_bytecode::layout::LayoutTable::for_module(&module)
+            .unwrap()
+            .layout_of(nexa_bytecode::ValueType::Named(class_type))
+            .unwrap();
+
+        let mut heap = Heap::new_with_limits(16, usize::MAX, 32);
+        let map_type = nexa_bytecode::map_type(
+            nexa_bytecode::ValueType::I32,
+            nexa_bytecode::ValueType::Named(class_type),
+        );
+        let map = heap
+            .allocate_physical_map_with_layout(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::Named(class_type),
+                1,
+                &layout,
+            )
+            .unwrap();
+        let class = heap.allocate_class(class_type, &[]).unwrap();
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(1), class),
+            Ok(MapSetOutcome::Complete)
+        );
+        assert_eq!(heap.map_get(map, RuntimeValue::I32(1)), Ok(Some(class)));
+
+        let storage = heap.map_storage_index(map).unwrap();
+        assert_eq!(
+            heap.maps[storage].as_ref().unwrap().value_storage,
+            CollectionStorage::NamedRef
+        );
+        let RuntimeValue::NamedRef {
+            reference: map_root,
+            ..
+        } = map
+        else {
+            panic!("map allocation returns a named reference");
+        };
+        let RuntimeValue::NamedRef {
+            reference: class_reference,
+            ..
+        } = class
+        else {
+            panic!("class allocation returns a named reference");
+        };
+        let roots = GcRoots {
+            running_frames: vec![map_root],
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().live, 2);
+        assert!(heap.resolve(class_reference).is_ok());
     }
 
     #[test]
