@@ -7062,6 +7062,7 @@ mod tests {
             .unwrap_or_else(|| panic!("missing frozen spec for {}", intrinsic.canonical_name()))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn intrinsic_module(spec: &FrozenIntrinsicSpec, effect: FunctionEffect) -> Module {
         let parameters = spec.arguments.clone();
         let result = spec.result;
