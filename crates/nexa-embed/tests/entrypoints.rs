@@ -9,7 +9,8 @@ use nexa::prelude::{
 };
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CapabilitySet, EngineError, HostContract, MemoryPackage,
-    MemorySource, NexaEngine, PackageId, PackagePolicy, PackageRuntimeLimits, SourceId, TrustLevel,
+    MemorySource, NexaEngine, PackageId, PackagePolicy, PackageRuntimeLimits, PackageStatus,
+    SourceId, TrustLevel,
 };
 
 const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints {
@@ -131,12 +132,12 @@ fn contract() -> HostContract {
     })
 }
 
-fn policy() -> PackagePolicy {
+fn policy(max_packages: usize) -> PackagePolicy {
     PackagePolicy {
         trust: TrustLevel::Trusted,
         capability_ceiling: CapabilitySet::default(),
         allowed_activation: ActivationSet::new([ActivationPolicy::DefaultEnabled]),
-        max_packages: 8,
+        max_packages,
         runtime_limits: PackageRuntimeLimits::default(),
         allow_entitlement: false,
     }
@@ -162,10 +163,10 @@ fn package(id: &str, source: &str) -> MemoryPackage {
         .source(format!("src/{}.nexa", id.replace('.', "/")), source)
 }
 
-fn source(packages: impl IntoIterator<Item = MemoryPackage>) -> MemorySource {
+fn source(packages: impl IntoIterator<Item = MemoryPackage>, max_packages: usize) -> MemorySource {
     let mut source = MemorySource::new(
         SourceId::new("snake-entrypoints").expect("Source ID"),
-        policy(),
+        policy(max_packages),
     );
     for package in packages {
         source = source.package(package);
@@ -173,17 +174,80 @@ fn source(packages: impl IntoIterator<Item = MemoryPackage>) -> MemorySource {
     source
 }
 
-fn engine(packages: impl IntoIterator<Item = MemoryPackage>) -> NexaEngine {
+fn engine_with_limit(
+    packages: impl IntoIterator<Item = MemoryPackage>,
+    max_packages: usize,
+) -> NexaEngine {
     let contract = contract();
     let contract_runtime_id = contract.contract_runtime_id();
     NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
             Box::new(EmptyRegistry(contract_runtime_id)) as Box<dyn HostRegistry>
         })
-        .package_source(source(packages))
+        .package_source(source(packages, max_packages))
         .require_export::<OnEvent>()
         .build()
         .expect("typed entrypoint Engine")
+}
+
+fn engine(packages: impl IntoIterator<Item = MemoryPackage>) -> NexaEngine {
+    engine_with_limit(packages, 8)
+}
+
+fn broadcast_count(engine: &mut NexaEngine, expected: usize) {
+    let results = engine.dispatch::<OnEvent>(&10);
+    assert_eq!(results.len(), expected);
+    assert!(results.into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn snake_dispatch_scales_through_50_packages_and_zero() {
+    let package_ids = (0..50)
+        .map(|index| PackageId::new(format!("snake.scale{index:02}")).expect("scale Package ID"))
+        .collect::<Vec<_>>();
+    let packages = package_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            package(
+                id.as_str(),
+                &format!("pub fn on_event(value: i32) -> i32 {{ return value + {index}; }}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut engine = engine_with_limit(packages, package_ids.len());
+
+    engine.discover().expect("discover 50 Snake packages");
+    engine.enable_defaults().expect("enable 50 Snake packages");
+    broadcast_count(&mut engine, 50);
+
+    for id in &package_ids[20..] {
+        engine.disable(id).expect("disable package above 20");
+    }
+    broadcast_count(&mut engine, 20);
+
+    for id in &package_ids[9..20] {
+        engine.disable(id).expect("disable package above 9");
+    }
+    broadcast_count(&mut engine, 9);
+
+    for id in &package_ids[..9] {
+        engine.disable(id).expect("disable remaining package");
+    }
+    broadcast_count(&mut engine, 0);
+    assert!(
+        engine
+            .inspection()
+            .packages
+            .iter()
+            .all(|package| package.status == PackageStatus::Disabled)
+    );
+
+    let reloaded = &package_ids[49];
+    engine.enable(reloaded).expect("re-enable one package");
+    broadcast_count(&mut engine, 1);
+    engine.reload(reloaded).expect("reload enabled package");
+    broadcast_count(&mut engine, 1);
 }
 
 #[test]
