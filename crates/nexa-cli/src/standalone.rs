@@ -58,19 +58,13 @@ impl nexa::ScriptExport for StandaloneMain {
 
     const STABLE_ID: nexa::StableId = nexa::STANDALONE_MAIN_STABLE_ID;
     const NAME: &'static str = "main";
-
-    fn signature() -> nexa::prelude::Signature {
-        nexa::prelude::Signature {
-            parameters: vec![nexa::prelude::ValueType::Named(
-                nexa::prelude::ArrayType::new(nexa::prelude::ValueType::String).type_id,
-            )],
-            result: Some(nexa::prelude::ValueType::I32),
-        }
-    }
-
-    fn effect() -> nexa::prelude::FunctionEffect {
-        nexa::prelude::FunctionEffect::Task
-    }
+    const SIGNATURE: nexa::ScriptSignature = nexa::ScriptSignature::new(
+        &[nexa::prelude::ValueType::Named(
+            nexa::prelude::ArrayType::new(nexa::prelude::ValueType::String).type_id,
+        )],
+        Some(nexa::prelude::ValueType::I32),
+    );
+    const EFFECT: nexa::prelude::FunctionEffect = nexa::prelude::FunctionEffect::Task;
 
     fn argument_requirements(
         arguments: &Self::Args,
@@ -93,17 +87,14 @@ impl nexa::ScriptExport for StandaloneMain {
     fn encode_args(
         writer: &mut nexa::ScriptCallWriter<'_>,
         arguments: &Self::Args,
-    ) -> Result<Vec<nexa::prelude::RuntimeValue>, nexa::ScriptCallError> {
-        let values = arguments
-            .iter()
-            .map(|argument| writer.write_string(argument.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+    ) -> Result<nexa::ScriptArguments, nexa::ScriptCallError> {
         let array = nexa::prelude::ArrayType::new(nexa::prelude::ValueType::String);
-        let mut builder = writer.begin_array(array.type_id, array.element, values.len())?;
-        for value in values {
+        let mut builder = writer.begin_array(array.type_id, array.element, arguments.len())?;
+        for argument in arguments {
+            let value = writer.write_string(argument.clone())?;
             writer.push_array_value(&mut builder, value)?;
         }
-        Ok(vec![writer.finish_array(builder)?])
+        nexa::ScriptArguments::try_from_array([writer.finish_array(builder)?])
     }
 
     fn decode_output(

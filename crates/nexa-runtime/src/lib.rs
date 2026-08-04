@@ -72,14 +72,15 @@ pub use host::{
     HostFunctionAuthority, HostFunctionSlot, HostMapEntryRef, HostMapRef, HostOptionRef,
     HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostRequestState,
     HostResultRef, HostReturnRequirements, HostReturnTransaction, HostStr, HostStructRef, HostTrap,
-    HostValueRef, MAX_HOST_RETURN_FIELDS, MustCompletePolicy, PendingHostRequest,
-    RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
-    ReleaseRecord, RequestTerminalRecord, ResolvedHostFunction, ResourceContext,
+    HostValueRef, MAX_HOST_RETURN_FIELDS, MAX_SCRIPT_ARGUMENTS, MustCompletePolicy,
+    PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError,
+    ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResolvedHostFunction, ResourceContext,
     ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
     RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
-    RuntimeResources, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, SnapshotHandle, SnapshotLayout, TaskResourceSet, TypedSnapshotRef,
-    contract_runtime_id_from_fingerprint, invoke_host_boundary, validate_host_completion,
+    RuntimeResources, ScriptArgumentRequirements, ScriptArguments, ScriptCallError,
+    ScriptCallWriter, ScriptExport, ScriptOutputReader, ScriptSignature, SnapshotHandle,
+    SnapshotLayout, TaskResourceSet, TypedSnapshotRef, contract_runtime_id_from_fingerprint,
+    invoke_host_boundary, validate_host_completion,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

@@ -765,8 +765,8 @@ impl StateHandleType {
 }
 
 #[must_use]
-pub fn array_type(element: ValueType) -> StableId {
-    parameterized_type_id("Array", &[element])
+pub const fn array_type(element: ValueType) -> StableId {
+    nexa_core::canonical_array_type_id(canonical_value_type(element))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -777,7 +777,7 @@ pub struct ArrayType {
 
 impl ArrayType {
     #[must_use]
-    pub fn new(element: ValueType) -> Self {
+    pub const fn new(element: ValueType) -> Self {
         Self {
             type_id: array_type(element),
             element,

@@ -274,6 +274,18 @@ pub(crate) struct PackageDevelopment {
     pub recent_metrics: VecDeque<crate::PackageMetric>,
 }
 
+pub(crate) const PACKAGE_METRIC_HISTORY_CAPACITY: usize = 32;
+
+impl PackageDevelopment {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            recent_metrics: VecDeque::with_capacity(PACKAGE_METRIC_HISTORY_CAPACITY),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReadyCandidate {
     pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,

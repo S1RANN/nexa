@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 use nexa::prelude::{
     FunctionEffect, HostCallOutcome, HostFunctionSlot, HostRegistry, HostTrap,
     ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
-    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, Signature, StableId, ValueType,
+    ScriptArgumentRequirements, ScriptArguments, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, ScriptSignature, StableId, ValueType,
 };
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CapabilitySet, EngineError, HostContract, MemoryPackage,
@@ -33,17 +33,9 @@ macro_rules! i32_entrypoint {
 
             const STABLE_ID: StableId = StableId($stable_id);
             const NAME: &'static str = $name;
-
-            fn signature() -> Signature {
-                Signature {
-                    parameters: vec![ValueType::I32],
-                    result: Some(ValueType::I32),
-                }
-            }
-
-            fn effect() -> FunctionEffect {
-                FunctionEffect::Ordinary
-            }
+            const SIGNATURE: ScriptSignature =
+                ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+            const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
 
             fn argument_requirements(
                 _: &Self::Args,
@@ -54,8 +46,8 @@ macro_rules! i32_entrypoint {
             fn encode_args(
                 _: &mut ScriptCallWriter<'_>,
                 args: &Self::Args,
-            ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-                Ok(vec![RuntimeValue::I32(*args)])
+            ) -> Result<ScriptArguments, ScriptCallError> {
+                ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
             }
 
             fn decode_output(
@@ -347,7 +339,7 @@ fn snake_packages_use_required_broadcast_and_typed_optional_routing() {
     );
     assert_eq!(
         spawn.optional_entrypoint_signatures[0].signature,
-        ChooseFoodSpawn::signature()
+        ChooseFoodSpawn::SIGNATURE.into_owned()
     );
     assert_eq!(
         spawn.optional_entrypoint_signatures[0].effect,

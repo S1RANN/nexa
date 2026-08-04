@@ -11,7 +11,8 @@ use nexa_bytecode::{
 use nexa_core::StableId;
 use nexa_runtime::{
     MustCompletePolicy, RealmConfig, RealmRuntime, RuntimeValue, ScriptArgumentRequirements,
-    ScriptCallError, ScriptCallWriter, ScriptExport, ScriptOutputReader,
+    ScriptArguments, ScriptCallError, ScriptCallWriter, ScriptExport, ScriptOutputReader,
+    ScriptSignature,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -28,17 +29,9 @@ impl ScriptExport for ImmediateAdd {
 
     const STABLE_ID: StableId = IMMEDIATE_EXPORT;
     const NAME: &'static str = "immediate_add";
-
-    fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        }
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Immediate
-    }
+    const SIGNATURE: ScriptSignature =
+        ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+    const EFFECT: FunctionEffect = FunctionEffect::Immediate;
 
     fn argument_requirements(
         _: &Self::Args,
@@ -49,8 +42,8 @@ impl ScriptExport for ImmediateAdd {
     fn encode_args(
         _: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I32(*args)])
+    ) -> Result<ScriptArguments, ScriptCallError> {
+        ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
     }
 
     fn decode_output(
@@ -72,17 +65,9 @@ impl ScriptExport for ImmediateTrap {
 
     const STABLE_ID: StableId = TRAP_EXPORT;
     const NAME: &'static str = "immediate_trap";
-
-    fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        }
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Immediate
-    }
+    const SIGNATURE: ScriptSignature =
+        ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+    const EFFECT: FunctionEffect = FunctionEffect::Immediate;
 
     fn argument_requirements(
         _: &Self::Args,
@@ -93,8 +78,8 @@ impl ScriptExport for ImmediateTrap {
     fn encode_args(
         _: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I32(*args)])
+    ) -> Result<ScriptArguments, ScriptCallError> {
+        ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
     }
 
     fn decode_output(
@@ -116,17 +101,9 @@ impl ScriptExport for TaskAdd {
 
     const STABLE_ID: StableId = TASK_EXPORT;
     const NAME: &'static str = "task_add";
-
-    fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        }
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Task
-    }
+    const SIGNATURE: ScriptSignature =
+        ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+    const EFFECT: FunctionEffect = FunctionEffect::Task;
 
     fn argument_requirements(
         _: &Self::Args,
@@ -137,8 +114,8 @@ impl ScriptExport for TaskAdd {
     fn encode_args(
         _: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I32(*args)])
+    ) -> Result<ScriptArguments, ScriptCallError> {
+        ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
     }
 
     fn decode_output(

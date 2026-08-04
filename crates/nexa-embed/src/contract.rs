@@ -14,8 +14,8 @@ impl ExportRequirement {
         Self {
             name: E::NAME.to_owned(),
             stable_id: E::STABLE_ID,
-            signature: E::signature(),
-            effect: E::effect(),
+            signature: E::SIGNATURE.into_owned(),
+            effect: E::EFFECT,
         }
     }
 }

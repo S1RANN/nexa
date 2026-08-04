@@ -3345,17 +3345,12 @@ fn generate_nexa_marker(
             const STABLE_ID: nexa_runtime::StableId =
                 nexa_runtime::StableId(#stable_id);
             const NAME: &'static str = #name;
-
-            fn signature() -> nexa_runtime::Signature {
-                nexa_runtime::Signature {
-                    parameters: vec![#(#parameter_types),*],
-                    result: #result_signature,
-                }
-            }
-
-            fn effect() -> nexa_runtime::FunctionEffect {
-                #effect
-            }
+            const SIGNATURE: nexa_runtime::ScriptSignature =
+                nexa_runtime::ScriptSignature::new(
+                    &[#(#parameter_types),*],
+                    #result_signature,
+                );
+            const EFFECT: nexa_runtime::FunctionEffect = #effect;
 
             fn argument_requirements(
                 args: &Self::Args,
@@ -3375,12 +3370,12 @@ fn generate_nexa_marker(
                 writer: &mut nexa_runtime::ScriptCallWriter<'_>,
                 args: &Self::Args,
             ) -> ::std::result::Result<
-                ::std::vec::Vec<nexa_runtime::RuntimeValue>,
+                nexa_runtime::ScriptArguments,
                 nexa_runtime::ScriptCallError,
             > {
                 let _ = writer;
                 let _ = args;
-                ::std::result::Result::Ok(::std::vec![#(#encoded_args),*])
+                nexa_runtime::ScriptArguments::try_from_array([#(#encoded_args),*])
             }
 
             fn decode_output(

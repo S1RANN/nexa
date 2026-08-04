@@ -91,6 +91,9 @@ use development::DevelopmentWorker;
 use diagnostic::BoundedDiagnosticLog;
 use package::{PackageRecord, PackageRuntime};
 
+pub type PackageCallResult<T> = Result<PackageOutput<T>, EngineError>;
+pub type DispatchSlice<'a, T> = Result<&'a [PackageCallResult<T>], DispatchCapacityError>;
+
 #[derive(Clone, Debug)]
 pub struct PackageContext {
     pub package_id: PackageId,
@@ -99,6 +102,15 @@ pub struct PackageContext {
     pub capabilities: CapabilitySet,
     pub data_namespace: String,
     pub version: PackageVersion,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PackageDispatchContext<'a> {
+    pub id: &'a PackageId,
+    pub source_id: &'a SourceId,
+    pub trust: TrustLevel,
+    pub capabilities: &'a CapabilitySet,
+    pub priority: i32,
 }
 
 pub trait HostRegistryFactory {
@@ -368,7 +380,7 @@ impl NexaEngine {
                     runtime: None,
                     last_diagnostic: None,
                     last_known_good: None,
-                    development: development::PackageDevelopment::default(),
+                    development: development::PackageDevelopment::new(),
                     awaiting_job: None,
                     handler_calls_this_tick: 0,
                     handler_instructions_this_tick: 0,
@@ -1599,7 +1611,7 @@ impl NexaEngine {
             runtime: None,
             last_diagnostic: None,
             last_known_good: None,
-            development: development::PackageDevelopment::default(),
+            development: development::PackageDevelopment::new(),
             awaiting_job: None,
             handler_calls_this_tick: 0,
             handler_instructions_this_tick: 0,
@@ -2860,7 +2872,7 @@ impl NexaEngine {
         };
         self.package_entrypoint(index, E::STABLE_ID)
             .is_some_and(|(signature, effect)| {
-                signature == E::signature() && effect_satisfies_declaration(effect, E::effect())
+                E::SIGNATURE.matches(signature) && effect_satisfies_declaration(effect, E::EFFECT)
             })
     }
 
@@ -2878,7 +2890,7 @@ impl NexaEngine {
             Err(error) => return Some(Err(error)),
         };
         let (signature, effect) = self.package_entrypoint(index, E::STABLE_ID)?;
-        if signature != E::signature() || !effect_satisfies_declaration(effect, E::effect()) {
+        if !E::SIGNATURE.matches(signature) || !effect_satisfies_declaration(effect, E::EFFECT) {
             return Some(Err(EngineError::ExportSignature(
                 id.clone(),
                 E::NAME.to_owned(),
@@ -2900,8 +2912,8 @@ impl NexaEngine {
                 record.lifecycle.status() == PackageStatus::Enabled
                     && self.package_entrypoint(*index, E::STABLE_ID).is_some_and(
                         |(signature, effect)| {
-                            signature == E::signature()
-                                && effect_satisfies_declaration(effect, E::effect())
+                            E::SIGNATURE.matches(signature)
+                                && effect_satisfies_declaration(effect, E::EFFECT)
                         },
                     )
             })
@@ -2924,7 +2936,7 @@ impl NexaEngine {
         &self,
         index: usize,
         stable_id: nexa::StableId,
-    ) -> Option<(nexa_runtime::Signature, nexa_runtime::FunctionEffect)> {
+    ) -> Option<(&nexa_runtime::Signature, nexa_runtime::FunctionEffect)> {
         let record = &self.packages[index];
         let artifact = record
             .runtime
@@ -2945,7 +2957,7 @@ impl NexaEngine {
             .module()
             .functions
             .get(usize::try_from(entrypoint.function).ok()?)?;
-        Some((entrypoint.signature.clone(), function.effect))
+        Some((&entrypoint.signature, function.effect))
     }
 
     fn call_index<E: nexa_runtime::ScriptExport>(
@@ -2972,7 +2984,7 @@ impl NexaEngine {
         // WP89: exports whose module function is `@immediate` skip the
         // Task/scheduler/tombstone lifecycle entirely (the realm settles
         // them in one predecoded poll). Routing keys off the module's
-        // verified effect - not `E::effect()` - because a module may
+        // verified effect - not `E::EFFECT` - because a module may
         // strengthen an Ordinary declaration to `@immediate` and every
         // Ordinary caller must still benefit. All other effects keep the
         // metered Task path.
@@ -3043,37 +3055,82 @@ impl NexaEngine {
     pub fn dispatch<E: nexa_runtime::ScriptExport>(
         &mut self,
         args: &E::Args,
-    ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
-        self.refresh_dispatch_plan();
-        // The plan is moved out for the duration of the calls (call_index
-        // needs `&mut self`) and restored afterwards; steady-state
-        // dispatches therefore allocate nothing beyond the output vector.
-        let plan = std::mem::take(&mut self.dispatch_plan);
-        let outputs = plan
-            .iter()
-            .map(|&index| self.call_index::<E>(index, args))
-            .collect();
-        self.dispatch_plan = plan;
+    ) -> Vec<PackageCallResult<E::Output>> {
+        let mut outputs = Vec::with_capacity(self.packages.len());
+        self.dispatch_into::<E>(args, &mut outputs)
+            .expect("a package-sized dispatch buffer has sufficient capacity");
         outputs
+    }
+
+    /// Broadcasts into caller-owned storage without allocating after the
+    /// buffer has been sized for the enabled package bound.
+    ///
+    /// The capacity check happens before any handler executes, so a
+    /// real-time caller never receives a partial broadcast.
+    pub fn dispatch_into<'a, E: nexa_runtime::ScriptExport>(
+        &mut self,
+        args: &E::Args,
+        outputs: &'a mut Vec<PackageCallResult<E::Output>>,
+    ) -> DispatchSlice<'a, E::Output> {
+        self.refresh_dispatch_plan();
+        let required = self.dispatch_plan.len();
+        let capacity = outputs.capacity();
+        outputs.clear();
+        if capacity < required {
+            return Err(DispatchCapacityError { required, capacity });
+        }
+        // The plan is moved out for the duration of the calls because
+        // `call_index` needs `&mut self`; both plan and output storage are
+        // retained for the next steady-state broadcast.
+        let plan = std::mem::take(&mut self.dispatch_plan);
+        for &index in &plan {
+            outputs.push(self.call_index::<E>(index, args));
+        }
+        self.dispatch_plan = plan;
+        Ok(outputs)
     }
 
     /// Deterministically dispatches while allowing package-specific immutable
     /// arguments, such as a projection of that package's typed state.
     pub fn dispatch_with<E: nexa_runtime::ScriptExport>(
         &mut self,
-        mut args: impl FnMut(&PackageInfo) -> E::Args,
-    ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
-        self.refresh_dispatch_plan();
-        let plan = std::mem::take(&mut self.dispatch_plan);
-        let outputs = plan
-            .iter()
-            .map(|&index| {
-                let package = self.packages[index].info();
-                self.call_index::<E>(index, &args(&package))
-            })
-            .collect();
-        self.dispatch_plan = plan;
+        args: impl FnMut(PackageDispatchContext<'_>) -> E::Args,
+    ) -> Vec<PackageCallResult<E::Output>> {
+        let mut outputs = Vec::with_capacity(self.packages.len());
+        self.dispatch_with_into::<E>(args, &mut outputs)
+            .expect("a package-sized dispatch buffer has sufficient capacity");
         outputs
+    }
+
+    /// Package-specific variant of [`Self::dispatch_into`].
+    pub fn dispatch_with_into<'a, E: nexa_runtime::ScriptExport>(
+        &mut self,
+        mut args: impl FnMut(PackageDispatchContext<'_>) -> E::Args,
+        outputs: &'a mut Vec<PackageCallResult<E::Output>>,
+    ) -> DispatchSlice<'a, E::Output> {
+        self.refresh_dispatch_plan();
+        let required = self.dispatch_plan.len();
+        let capacity = outputs.capacity();
+        outputs.clear();
+        if capacity < required {
+            return Err(DispatchCapacityError { required, capacity });
+        }
+        let plan = std::mem::take(&mut self.dispatch_plan);
+        for &index in &plan {
+            let call_args = {
+                let record = &self.packages[index];
+                args(PackageDispatchContext {
+                    id: &record.candidate.manifest.id,
+                    source_id: &record.source_id,
+                    trust: record.policy.trust,
+                    capabilities: &record.effective.capabilities,
+                    priority: record.effective.priority,
+                })
+            };
+            outputs.push(self.call_index::<E>(index, &call_args));
+        }
+        self.dispatch_plan = plan;
+        Ok(outputs)
     }
 
     /// WP90: rebuilds the broadcast plan only when the revalidation scan
@@ -3259,7 +3316,9 @@ impl NexaEngine {
                 .map_or_else(nexa_runtime::RuntimeResourceLedger::default, |runtime| {
                     runtime.realm.resource_ledger()
                 });
-            while record.development.recent_metrics.len() >= 32 {
+            while record.development.recent_metrics.len()
+                >= development::PACKAGE_METRIC_HISTORY_CAPACITY
+            {
                 record.development.recent_metrics.pop_front();
             }
             record.development.recent_metrics.push_back(PackageMetric {
@@ -3803,6 +3862,24 @@ pub enum EngineError {
     DiscoveryAlreadyCompleted,
     Shutdown(String),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchCapacityError {
+    pub required: usize,
+    pub capacity: usize,
+}
+
+impl fmt::Display for DispatchCapacityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "dispatch buffer capacity {} is below required bound {}",
+            self.capacity, self.required
+        )
+    }
+}
+
+impl std::error::Error for DispatchCapacityError {}
 
 impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

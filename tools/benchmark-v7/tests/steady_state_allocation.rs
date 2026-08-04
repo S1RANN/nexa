@@ -1,14 +1,8 @@
 //! M5 stage-H gate (WP90/WP92): steady-state engine dispatch is
-//! allocation-exact. After warmup, the engine and runtime infrastructure
-//! allocate nothing per broadcast - no plan rebuild, no identity or
-//! capability-set clones, no task lifecycle, no continuation storage -
-//! leaving only the caller-visible outputs vector plus, per called
-//! package, the two vectors the `ScriptExport` trait contract itself
-//! returns by value (`encode_args` argument registers and the
-//! `signature()` used by the realm's per-call safety re-validation).
-//! The WP90 dispatch plan is reused across broadcasts - its revalidation
-//! scan allocates nothing - while lifecycle changes still rebuild it
-//! correctly.
+//! allocation-exact. Generated signatures and argument blocks are static
+//! or inline, and the caller reuses a bounded output buffer. After warmup,
+//! broadcasts, provider/owner calls, and idle ticks perform zero system
+//! allocations while lifecycle changes still rebuild the cached plan.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -17,8 +11,8 @@ use std::sync::OnceLock;
 use nexa::prelude::{
     FunctionEffect, HostCallOutcome, HostFunctionSlot, HostRegistry, HostTrap,
     ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
-    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, Signature, StableId, ValueType,
+    ScriptArgumentRequirements, ScriptArguments, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, ScriptSignature, StableId, ValueType,
 };
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CapabilitySet, HostContract, MemoryPackage, MemorySource,
@@ -88,17 +82,9 @@ macro_rules! i32_entrypoint {
 
             const STABLE_ID: StableId = StableId($stable_id);
             const NAME: &'static str = $name;
-
-            fn signature() -> Signature {
-                Signature {
-                    parameters: vec![ValueType::I32],
-                    result: Some(ValueType::I32),
-                }
-            }
-
-            fn effect() -> FunctionEffect {
-                FunctionEffect::$effect
-            }
+            const SIGNATURE: ScriptSignature =
+                ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+            const EFFECT: FunctionEffect = FunctionEffect::$effect;
 
             fn argument_requirements(
                 _: &Self::Args,
@@ -109,8 +95,8 @@ macro_rules! i32_entrypoint {
             fn encode_args(
                 _: &mut ScriptCallWriter<'_>,
                 args: &Self::Args,
-            ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-                Ok(vec![RuntimeValue::I32(*args)])
+            ) -> Result<ScriptArguments, ScriptCallError> {
+                ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
             }
 
             fn decode_output(
@@ -128,11 +114,17 @@ macro_rules! i32_entrypoint {
 
 // NIDL v2 declaration identities for the validated `SnakeEntrypoints`
 // Contract; `contract()` re-derives and asserts them from the parsed NIDL.
-// Both markers declare Ordinary - exactly what generated bindings produce
+// The markers declare Ordinary - exactly what generated bindings produce
 // for a sync contract function. The packages strengthen
 // `calculate_food_effect` to `@immediate`, so the engine's module-effect
 // routing (WP89) must send it down the task-free path on its own.
 i32_entrypoint!(OnEvent, "on_event", 0xefff_24e2_9dbd_2cb4, Ordinary);
+i32_entrypoint!(
+    ChooseFoodSpawn,
+    "choose_food_spawn",
+    0x0418_ea07_84bf_08cf,
+    Ordinary
+);
 i32_entrypoint!(
     CalculateFoodEffect,
     "calculate_food_effect",
@@ -222,6 +214,8 @@ fn package(id: &str, offset: i32) -> MemoryPackage {
     let source = format!(
         "pub fn on_event(value: i32) -> i32 {{ return value + {offset}; }}\n\
          @immediate\n\
+         pub fn choose_food_spawn(value: i32) -> i32 {{ return value + 10 + {offset}; }}\n\
+         @immediate\n\
          pub fn calculate_food_effect(value: i32) -> i32 {{ return value * 2 + {offset}; }}\n"
     );
     MemoryPackage::new(id.replace('.', "-"), manifest(id))
@@ -275,7 +269,7 @@ fn broadcast_values(engine: &mut NexaEngine, args: i32) -> Vec<(String, i32)> {
 }
 
 #[test]
-fn steady_state_dispatch_allocates_only_the_visible_vectors() {
+fn steady_state_engine_paths_allocate_nothing() {
     let mut engine = engine([
         package("pkg.alpha", 1),
         package("pkg.beta", 2),
@@ -293,49 +287,109 @@ fn steady_state_dispatch_allocates_only_the_visible_vectors() {
         ]
     );
 
-    // Warmup: fill the WP90 plan, the H1 continuation pools, and every
-    // lazy one-time initialization on the call path.
+    let mut outputs = Vec::with_capacity(3);
+    let mut undersized = Vec::with_capacity(2);
+    let capacity_error = engine
+        .dispatch_into::<CalculateFoodEffect>(&0, &mut undersized)
+        .expect_err("undersized dispatch buffer must fail before calling handlers");
+    assert_eq!(capacity_error.required, 3);
+    assert_eq!(capacity_error.capacity, 2);
+    assert!(undersized.is_empty());
+
+    // Warmup: fill the WP90 plan, the H1 continuation pools, fixed output
+    // storage, tick metrics, and every lazy one-time initialization.
     for round in 0..4 {
-        let outputs = engine.dispatch::<CalculateFoodEffect>(&round);
+        let outputs = engine
+            .dispatch_into::<CalculateFoodEffect>(&round, &mut outputs)
+            .expect("bounded dispatch output");
         assert_eq!(outputs.len(), 3);
     }
     let alpha = PackageId::new("pkg.alpha").expect("package id");
     engine
         .call::<CalculateFoodEffect>(&alpha, &5)
         .expect("warm single call");
+    engine
+        .call_optional::<ChooseFoodSpawn>(&alpha, &5)
+        .expect("provider implements choose_food_spawn")
+        .expect("warm provider call");
+    for _ in 0..4 {
+        engine.tick().expect("warm idle Engine tick");
+    }
 
-    // WP92 gate: per broadcast, exactly one outputs vector plus the two
-    // per-package trait-contract vectors (argument registers + the
-    // signature the realm re-validates against) - nothing else. Plan
-    // rebuilds, identity clones, capability sets, pooled continuations,
-    // and the task-free immediate path (WP89) all stay allocation-free.
-    const TRAIT_CONTRACT_VECTORS_PER_CALL: u64 = 2;
+    // WP92 hard gate: the reusable output storage, static signatures,
+    // fixed argument blocks, cached plan, shared identities/capabilities,
+    // and task-free immediate path allocate nothing.
     let rounds = 8_u64;
     let (dispatch_allocations, _) = allocations_during(|| {
         for round in 0..rounds {
             #[allow(clippy::cast_possible_truncation)]
-            let outputs = engine.dispatch::<CalculateFoodEffect>(&(round as i32));
-            assert_eq!(outputs.len(), 3);
-            for output in outputs {
-                output.expect("steady-state immediate call");
+            let current = engine
+                .dispatch_into::<CalculateFoodEffect>(&(round as i32), &mut outputs)
+                .expect("bounded dispatch output");
+            assert_eq!(current.len(), 3);
+            for output in current {
+                assert!(output.is_ok(), "steady-state immediate call");
             }
         }
     });
     assert_eq!(
-        dispatch_allocations,
-        rounds * (1 + 3 * TRAIT_CONTRACT_VECTORS_PER_CALL),
-        "steady-state dispatch must allocate exactly the outputs vector plus \
-         the per-package trait-contract vectors"
+        dispatch_allocations, 0,
+        "steady-state dispatch must perform zero system allocations"
     );
 
-    // A steady-state single call allocates only its two trait-contract
-    // vectors; the engine and the task-free immediate path add nothing.
+    let (projected_dispatch_allocations, _) = allocations_during(|| {
+        for _ in 0..rounds {
+            let current = engine
+                .dispatch_with_into::<CalculateFoodEffect>(
+                    |package| i32::from(package.id.as_str() == "pkg.alpha"),
+                    &mut outputs,
+                )
+                .expect("bounded projected dispatch output");
+            assert_eq!(current.len(), 3);
+            assert!(current.iter().all(Result::is_ok));
+        }
+    });
+    assert_eq!(
+        projected_dispatch_allocations, 0,
+        "package-projected dispatch must perform zero system allocations"
+    );
+
     let (call_allocations, called) =
         allocations_during(|| engine.call::<CalculateFoodEffect>(&alpha, &7));
     assert_eq!(called.expect("steady-state single call").value, 15);
     assert_eq!(
-        call_allocations, TRAIT_CONTRACT_VECTORS_PER_CALL,
-        "a steady-state immediate call must allocate exactly its trait-contract vectors"
+        call_allocations, 0,
+        "a steady-state owner call must perform zero system allocations"
+    );
+
+    let (provider_allocations, provided) =
+        allocations_during(|| engine.call_optional::<ChooseFoodSpawn>(&alpha, &7));
+    assert_eq!(
+        provided
+            .expect("provider implements choose_food_spawn")
+            .expect("steady-state provider call")
+            .value,
+        18
+    );
+    assert_eq!(
+        provider_allocations, 0,
+        "a steady-state optional provider call must perform zero system allocations"
+    );
+
+    let mut per_tick_allocations = [0_u64; 8];
+    for allocation_count in &mut per_tick_allocations {
+        let (allocations, report) =
+            allocations_during(|| engine.tick().expect("steady-state idle Engine tick"));
+        *allocation_count = allocations;
+        assert!(report.development_events.is_empty());
+        assert!(report.diagnostics.is_empty());
+        assert!(report.reloads.is_empty());
+        assert!(report.faulted_packages.is_empty());
+        assert_eq!(report.released_resources, 0);
+    }
+    assert_eq!(
+        per_tick_allocations, [0; 8],
+        "a steady-state idle Engine tick must perform zero system allocations"
     );
 }
 

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use nexa::prelude::{
     FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry,
-    HostTrap, ResolvedHostFunction, ResourceContext, RuntimeValue, Signature, StableId, ValueType,
+    HostTrap, ResolvedHostFunction, ResourceContext, RuntimeValue, ScriptArguments,
+    ScriptSignature, StableId, ValueType,
 };
 use nexa::{
     RuntimeHostArgs, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
@@ -319,17 +320,9 @@ impl ScriptExport for Run {
 
     const STABLE_ID: StableId = RUN_ID;
     const NAME: &'static str = "run";
-
-    fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        }
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Ordinary
-    }
+    const SIGNATURE: ScriptSignature =
+        ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+    const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
 
     fn argument_requirements(
         _: &Self::Args,
@@ -340,8 +333,8 @@ impl ScriptExport for Run {
     fn encode_args(
         _: &mut ScriptCallWriter<'_>,
         value: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I32(*value)])
+    ) -> Result<ScriptArguments, ScriptCallError> {
+        ScriptArguments::try_from_array([RuntimeValue::I32(*value)])
     }
 
     fn decode_output(
@@ -363,14 +356,8 @@ impl ScriptExport for ResourceProbe {
 
     const STABLE_ID: StableId = RESOURCE_PROBE_ID;
     const NAME: &'static str = "resource_probe";
-
-    fn signature() -> Signature {
-        Run::signature()
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Task
-    }
+    const SIGNATURE: ScriptSignature = Run::SIGNATURE;
+    const EFFECT: FunctionEffect = FunctionEffect::Task;
 
     fn argument_requirements(
         args: &Self::Args,
@@ -381,7 +368,7 @@ impl ScriptExport for ResourceProbe {
     fn encode_args(
         writer: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+    ) -> Result<ScriptArguments, ScriptCallError> {
         Run::encode_args(writer, args)
     }
 

@@ -99,7 +99,7 @@ fn generated_tokens_are_parsed_formatted_and_parsed_again() {
         "pub struct OnEventArgs",
         "pub type OnEventOutput",
         "const NAME: &'static str = \"on_event\"",
-        "fn effect() -> nexa_runtime::FunctionEffect",
+        "const EFFECT: nexa_runtime::FunctionEffect",
         "nexa_runtime::FunctionEffect::Ordinary",
         "nexa_runtime::FunctionEffect::Task",
     ] {

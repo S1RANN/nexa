@@ -2960,10 +2960,10 @@ impl RealmRuntime {
                 name: E::NAME,
                 stable_id: E::STABLE_ID,
             })?;
-        if export.signature != E::signature() {
+        if !E::SIGNATURE.matches(&export.signature) {
             return Err(crate::ScriptCallError::SignatureMismatch { name: E::NAME });
         }
-        if !export_effect_satisfies(export.effect, E::effect()) {
+        if !export_effect_satisfies(export.effect, E::EFFECT) {
             return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
         }
         let function = loaded
@@ -3000,10 +3000,11 @@ impl RealmRuntime {
                 .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
             let values = E::encode_args(&mut writer, args)?;
             writer
-                .commit_arguments(values)
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?
+                .commit_arguments()
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+            values
         };
-        self.spawn_task_inner(module, function, &values, config)
+        self.spawn_task_inner(module, function, values.as_slice(), config)
             .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))
     }
 
@@ -3098,8 +3099,9 @@ impl RealmRuntime {
                 .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
             let values = E::encode_args(&mut writer, args)?;
             writer
-                .commit_arguments(values)
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?
+                .commit_arguments()
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+            values
         };
         let loaded = self
             .modules
@@ -3111,7 +3113,7 @@ impl RealmRuntime {
         if let Some(outcome) = crate::CheckedInterpreter::try_run_static_leaf(
             &verified,
             function,
-            &values,
+            values.as_slice(),
             FuelState::new(policy.fuel, 0, policy.cumulative_budget),
             &self.cost_table,
             &mut self.heap,
@@ -3134,7 +3136,7 @@ impl RealmRuntime {
         let continuation = crate::InterpreterContinuation::new_with_storage_and_heap(
             &verified,
             function,
-            &values,
+            values.as_slice(),
             limits.frames,
             reservation,
             storage,

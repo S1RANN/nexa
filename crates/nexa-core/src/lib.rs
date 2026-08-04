@@ -439,8 +439,63 @@ pub enum CanonicalValueType {
 /// framing is centralized here so analysis, compiler, bytecode metadata, and
 /// state-layout fingerprinting cannot disagree about nested structural types.
 #[must_use]
-pub fn canonical_parameterized_type_id(name: &str, arguments: &[CanonicalValueType]) -> StableId {
-    canonical_parameterized_type_id_iter(name, arguments.iter().copied())
+pub const fn canonical_parameterized_type_id(
+    name: &str,
+    arguments: &[CanonicalValueType],
+) -> StableId {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let mut hash = append_parameterized_bytes(OFFSET, name.as_bytes());
+    hash = append_parameterized_bytes(hash, b"<");
+    let mut index = 0;
+    while index < arguments.len() {
+        if index != 0 {
+            hash = append_parameterized_bytes(hash, b",");
+        }
+        hash = append_parameterized_value(hash, arguments[index]);
+        index += 1;
+    }
+    hash = append_parameterized_bytes(hash, b">");
+    StableId(hash)
+}
+
+const fn append_parameterized_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(PRIME);
+        index += 1;
+    }
+    hash
+}
+
+const fn append_parameterized_value(mut hash: u64, argument: CanonicalValueType) -> u64 {
+    match argument {
+        CanonicalValueType::I32 => append_parameterized_bytes(hash, b"i32"),
+        CanonicalValueType::I64 => append_parameterized_bytes(hash, b"i64"),
+        CanonicalValueType::F32 => append_parameterized_bytes(hash, b"f32"),
+        CanonicalValueType::F64 => append_parameterized_bytes(hash, b"f64"),
+        CanonicalValueType::Bool => append_parameterized_bytes(hash, b"bool"),
+        CanonicalValueType::Rune => append_parameterized_bytes(hash, b"rune"),
+        CanonicalValueType::String => append_parameterized_bytes(hash, b"string"),
+        CanonicalValueType::Ref => append_parameterized_bytes(hash, b"ref"),
+        CanonicalValueType::Named(id) => {
+            hash = append_parameterized_bytes(hash, b"named:");
+            let mut nibbles = 16;
+            while nibbles != 0 {
+                nibbles -= 1;
+                let nibble = ((id.0 >> (nibbles * 4)) & 0xf) as u8;
+                let digit = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + nibble - 10
+                };
+                hash = append_parameterized_bytes(hash, &[digit]);
+            }
+            hash
+        }
+    }
 }
 
 /// Derives a structural runtime ABI identity without materializing an
@@ -496,12 +551,12 @@ pub fn canonical_parameterized_type_id_iter(
 }
 
 #[must_use]
-pub fn canonical_option_type_id(payload: CanonicalValueType) -> StableId {
+pub const fn canonical_option_type_id(payload: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("Option", &[payload])
 }
 
 #[must_use]
-pub fn canonical_result_type_id(
+pub const fn canonical_result_type_id(
     success: CanonicalValueType,
     error: CanonicalValueType,
 ) -> StableId {
@@ -509,37 +564,37 @@ pub fn canonical_result_type_id(
 }
 
 #[must_use]
-pub fn canonical_array_type_id(element: CanonicalValueType) -> StableId {
+pub const fn canonical_array_type_id(element: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("Array", &[element])
 }
 
 #[must_use]
-pub fn canonical_map_type_id(key: CanonicalValueType, value: CanonicalValueType) -> StableId {
+pub const fn canonical_map_type_id(key: CanonicalValueType, value: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("Map", &[key, value])
 }
 
 #[must_use]
-pub fn canonical_tuple_type_id(elements: &[CanonicalValueType]) -> StableId {
+pub const fn canonical_tuple_type_id(elements: &[CanonicalValueType]) -> StableId {
     canonical_parameterized_type_id("Tuple", elements)
 }
 
 #[must_use]
-pub fn canonical_buffer_type_id(element: CanonicalValueType) -> StableId {
+pub const fn canonical_buffer_type_id(element: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("Buffer", &[element])
 }
 
 #[must_use]
-pub fn canonical_snapshot_type_id(content_type: StableId) -> StableId {
+pub const fn canonical_snapshot_type_id(content_type: StableId) -> StableId {
     canonical_parameterized_type_id("Snapshot", &[CanonicalValueType::Named(content_type)])
 }
 
 #[must_use]
-pub fn canonical_resource_token_type_id(content_type: StableId) -> StableId {
+pub const fn canonical_resource_token_type_id(content_type: StableId) -> StableId {
     canonical_parameterized_type_id("Token", &[CanonicalValueType::Named(content_type)])
 }
 
 #[must_use]
-pub fn canonical_state_handle_type_id(target: CanonicalValueType) -> StableId {
+pub const fn canonical_state_handle_type_id(target: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("StateHandle", &[target])
 }
 
@@ -825,7 +880,8 @@ mod tests {
     use super::{
         BuildFingerprint, CanonicalStateField, CanonicalStateSchema, CanonicalStateType,
         CanonicalSymbolIdentity, CanonicalValueType, FileId, FingerprintBuilder, RawHandle,
-        SourceSpan, StableId, StableSymbolRegistry, SymbolKind, machine_event_id,
+        SourceSpan, StableId, StableSymbolRegistry, SymbolKind, canonical_array_type_id,
+        canonical_parameterized_type_id, canonical_parameterized_type_id_iter, machine_event_id,
         machine_invariant_hash, machine_state_id,
     };
 
@@ -985,6 +1041,26 @@ mod tests {
                 ty: CanonicalValueType::I64,
                 ..field_a
             }])
+        );
+    }
+
+    #[test]
+    fn const_parameterized_type_ids_match_the_streaming_derivation() {
+        const ARRAY_STRING: StableId = canonical_array_type_id(CanonicalValueType::String);
+        const ARGUMENTS: [CanonicalValueType; 3] = [
+            CanonicalValueType::I32,
+            CanonicalValueType::String,
+            CanonicalValueType::Named(StableId(0x0123_4567_89ab_cdef)),
+        ];
+        const COMPOSITE: StableId = canonical_parameterized_type_id("Composite", &ARGUMENTS);
+
+        assert_eq!(
+            ARRAY_STRING,
+            canonical_parameterized_type_id_iter("Array", [CanonicalValueType::String],)
+        );
+        assert_eq!(
+            COMPOSITE,
+            canonical_parameterized_type_id_iter("Composite", ARGUMENTS)
         );
     }
 }

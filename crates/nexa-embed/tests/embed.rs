@@ -14,8 +14,8 @@ use nexa_embed::{
 use nexa_runtime::{
     FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostFunctionSlot, HostRegistry,
     HostTrap, ResolvedHostFunction, ResourceContext, RuntimeHostArgs, RuntimeValue,
-    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, Signature, StableId, ValueType,
+    ScriptArgumentRequirements, ScriptArguments, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, ScriptSignature, StableId, ValueType,
 };
 
 const IDL_SOURCE: &str = "contract TestHost {
@@ -188,17 +188,9 @@ impl ScriptExport for Run {
 
     const STABLE_ID: StableId = RUN_ID;
     const NAME: &'static str = "run";
-
-    fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        }
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Ordinary
-    }
+    const SIGNATURE: ScriptSignature =
+        ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
+    const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
 
     fn argument_requirements(
         _: &Self::Args,
@@ -209,8 +201,8 @@ impl ScriptExport for Run {
     fn encode_args(
         _: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I32(*args)])
+    ) -> Result<ScriptArguments, ScriptCallError> {
+        ScriptArguments::try_from_array([RuntimeValue::I32(*args)])
     }
 
     fn decode_output(
@@ -232,14 +224,8 @@ impl ScriptExport for MeterRun {
 
     const STABLE_ID: StableId = METER_RUN_ID;
     const NAME: &'static str = "run";
-
-    fn signature() -> Signature {
-        Run::signature()
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Ordinary
-    }
+    const SIGNATURE: ScriptSignature = Run::SIGNATURE;
+    const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
 
     fn argument_requirements(
         args: &Self::Args,
@@ -250,7 +236,7 @@ impl ScriptExport for MeterRun {
     fn encode_args(
         writer: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+    ) -> Result<ScriptArguments, ScriptCallError> {
         Run::encode_args(writer, args)
     }
 
@@ -270,14 +256,8 @@ impl ScriptExport for TaskRun {
 
     const STABLE_ID: StableId = RUN_ID;
     const NAME: &'static str = "run";
-
-    fn signature() -> Signature {
-        Run::signature()
-    }
-
-    fn effect() -> FunctionEffect {
-        FunctionEffect::Task
-    }
+    const SIGNATURE: ScriptSignature = Run::SIGNATURE;
+    const EFFECT: FunctionEffect = FunctionEffect::Task;
 
     fn argument_requirements(
         args: &Self::Args,
@@ -288,7 +268,7 @@ impl ScriptExport for TaskRun {
     fn encode_args(
         writer: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+    ) -> Result<ScriptArguments, ScriptCallError> {
         Run::encode_args(writer, args)
     }
 

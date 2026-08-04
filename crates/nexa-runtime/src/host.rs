@@ -2362,12 +2362,9 @@ impl<'a> HostReturnTransaction<'a> {
         Ok(value)
     }
 
-    pub fn commit_arguments(
-        mut self,
-        values: Vec<crate::RuntimeValue>,
-    ) -> Result<Vec<crate::RuntimeValue>, HostTrap> {
+    pub fn commit_arguments(mut self) -> Result<(), HostTrap> {
         self.finish()?;
-        Ok(values)
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), HostTrap> {
@@ -2750,6 +2747,85 @@ pub const fn contract_runtime_id_from_fingerprint(fingerprint: [u8; 32]) -> Stab
 pub type ScriptArgumentRequirements = HostReturnRequirements;
 pub type ScriptCallWriter<'a> = HostReturnTransaction<'a>;
 
+pub const MAX_SCRIPT_ARGUMENTS: usize = MAX_HOST_ARGUMENTS;
+
+/// Allocation-free encoded arguments for a generated script export.
+///
+/// NIDL caps Host and script boundaries at [`MAX_SCRIPT_ARGUMENTS`]. Keeping
+/// the values inline makes the common scalar call path independent of the
+/// system allocator while still allowing the writer to stage heap-backed
+/// strings and collections transactionally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptArguments {
+    values: [crate::RuntimeValue; MAX_SCRIPT_ARGUMENTS],
+    len: u8,
+}
+
+impl ScriptArguments {
+    pub fn try_from_array<const N: usize>(
+        values: [crate::RuntimeValue; N],
+    ) -> Result<Self, ScriptCallError> {
+        if N > MAX_SCRIPT_ARGUMENTS {
+            return Err(ScriptCallError::ArgumentEncoding);
+        }
+        let mut encoded = [crate::RuntimeValue::Unit; MAX_SCRIPT_ARGUMENTS];
+        encoded[..N].copy_from_slice(&values);
+        Ok(Self {
+            values: encoded,
+            len: u8::try_from(N).map_err(|_| ScriptCallError::ArgumentEncoding)?,
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[crate::RuntimeValue] {
+        &self.values[..usize::from(self.len)]
+    }
+}
+
+/// Compile-time script-export ABI metadata.
+///
+/// Generated bindings store parameter layouts in static memory. Hot calls
+/// compare this borrowed descriptor with the verified module instead of
+/// rebuilding an owned `Signature` and allocating its parameter vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptSignature {
+    parameters: &'static [nexa_bytecode::ValueType],
+    result: Option<nexa_bytecode::ValueType>,
+}
+
+impl ScriptSignature {
+    #[must_use]
+    pub const fn new(
+        parameters: &'static [nexa_bytecode::ValueType],
+        result: Option<nexa_bytecode::ValueType>,
+    ) -> Self {
+        Self { parameters, result }
+    }
+
+    #[must_use]
+    pub const fn parameters(self) -> &'static [nexa_bytecode::ValueType] {
+        self.parameters
+    }
+
+    #[must_use]
+    pub const fn result(self) -> Option<nexa_bytecode::ValueType> {
+        self.result
+    }
+
+    #[must_use]
+    pub fn matches(self, signature: &nexa_bytecode::Signature) -> bool {
+        self.parameters == signature.parameters && self.result == signature.result
+    }
+
+    #[must_use]
+    pub fn into_owned(self) -> nexa_bytecode::Signature {
+        nexa_bytecode::Signature {
+            parameters: self.parameters.to_vec(),
+            result: self.result,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ScriptOutputReader<'a> {
     heap: &'a crate::Heap,
@@ -2809,10 +2885,8 @@ pub trait ScriptExport {
 
     const STABLE_ID: StableId;
     const NAME: &'static str;
-
-    fn signature() -> nexa_bytecode::Signature;
-
-    fn effect() -> nexa_bytecode::FunctionEffect;
+    const SIGNATURE: ScriptSignature;
+    const EFFECT: nexa_bytecode::FunctionEffect;
 
     fn argument_requirements(
         args: &Self::Args,
@@ -2821,7 +2895,7 @@ pub trait ScriptExport {
     fn encode_args(
         writer: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
-    ) -> Result<Vec<crate::RuntimeValue>, ScriptCallError>;
+    ) -> Result<ScriptArguments, ScriptCallError>;
 
     fn decode_output(
         reader: &ScriptOutputReader<'_>,
