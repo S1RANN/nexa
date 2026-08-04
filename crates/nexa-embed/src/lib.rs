@@ -160,6 +160,8 @@ pub struct NexaEngine {
     diagnostics: BoundedDiagnosticLog,
     required_exports: Vec<ExportRequirement>,
     declared_entrypoints: Vec<EntrypointSignature>,
+    declared_entrypoint_slots: BTreeMap<nexa::StableId, usize>,
+    optional_dispatch_plans: Vec<Vec<usize>>,
     persisted: BTreeMap<PackageId, bool>,
     development: DevelopmentConfig,
     development_coordinator: nexa_analysis::DevelopmentCoordinator,
@@ -244,6 +246,19 @@ impl NexaEngine {
                     .cloned()
             })
             .collect();
+        let declared_entrypoint_slots = declared_entrypoints
+            .iter()
+            .enumerate()
+            .map(|(slot, entrypoint)| (entrypoint.stable_id, slot))
+            .collect::<BTreeMap<_, _>>();
+        if declared_entrypoint_slots.len() != declared_entrypoints.len() {
+            return Err(EngineError::Contract(
+                "NIDL contract contains duplicate entrypoint identities".into(),
+            ));
+        }
+        let optional_dispatch_plans = (0..declared_entrypoints.len())
+            .map(|_| Vec::new())
+            .collect();
         let (host_contract_source_identity, host_contract_source) =
             if let Some((identity, text)) = builder.host_contract_source {
                 nexa::HostContractInput::with_source(&idl, identity.clone(), text.clone())
@@ -295,6 +310,8 @@ impl NexaEngine {
             diagnostics: BoundedDiagnosticLog::default(),
             required_exports,
             declared_entrypoints,
+            declared_entrypoint_slots,
+            optional_dispatch_plans,
             persisted,
             development: builder.development,
             development_coordinator,
@@ -692,11 +709,23 @@ impl NexaEngine {
         let root_scope = realm
             .create_scope(None)
             .map_err(|error| EngineError::Load(manifest.id.clone(), error.to_string()))?;
+        let entrypoint_exports = self
+            .declared_entrypoints
+            .iter()
+            .map(|declared| {
+                artifact
+                    .module()
+                    .exports
+                    .iter()
+                    .position(|export| export.stable_id == declared.stable_id)
+            })
+            .collect();
         Ok(PackageRuntime {
             realm,
             module,
             root_scope,
             artifact,
+            entrypoint_exports,
         })
     }
 
@@ -2903,33 +2932,99 @@ impl NexaEngine {
     pub fn dispatch_optional<E: nexa_runtime::ScriptExport>(
         &mut self,
         args: &E::Args,
-    ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
-        let mut indexes = self
+    ) -> Vec<PackageCallResult<E::Output>> {
+        let mut outputs = Vec::with_capacity(self.packages.len());
+        self.dispatch_optional_into::<E>(args, &mut outputs)
+            .expect("a package-sized optional dispatch buffer has sufficient capacity");
+        outputs
+    }
+
+    /// Allocation-free steady-state Optional broadcast using the
+    /// contract-slot-indexed per-entrypoint plan.
+    pub fn dispatch_optional_into<'a, E: nexa_runtime::ScriptExport>(
+        &mut self,
+        args: &E::Args,
+        outputs: &'a mut Vec<PackageCallResult<E::Output>>,
+    ) -> DispatchSlice<'a, E::Output> {
+        outputs.clear();
+        let Some(&slot) = self.declared_entrypoint_slots.get(&E::STABLE_ID) else {
+            return Ok(outputs);
+        };
+        let mut plan = std::mem::take(&mut self.optional_dispatch_plans[slot]);
+        if !self.optional_dispatch_plan_is_current::<E>(&plan) {
+            plan.clear();
+            for index in 0..self.packages.len() {
+                if self.package_matches_optional_export::<E>(index) {
+                    plan.push(index);
+                }
+            }
+            let packages = &self.packages;
+            plan.sort_by(|&left, &right| {
+                let left = &packages[left];
+                let right = &packages[right];
+                right
+                    .effective
+                    .priority
+                    .cmp(&left.effective.priority)
+                    .then_with(|| left.candidate.manifest.id.cmp(&right.candidate.manifest.id))
+            });
+        }
+        let required = plan.len();
+        let capacity = outputs.capacity();
+        if capacity < required {
+            self.optional_dispatch_plans[slot] = plan;
+            return Err(DispatchCapacityError { required, capacity });
+        }
+        for &index in &plan {
+            outputs.push(self.call_index::<E>(index, args));
+        }
+        self.optional_dispatch_plans[slot] = plan;
+        Ok(outputs)
+    }
+
+    fn package_matches_optional_export<E: nexa_runtime::ScriptExport>(&self, index: usize) -> bool {
+        self.packages
+            .get(index)
+            .is_some_and(|record| record.lifecycle.status() == PackageStatus::Enabled)
+            && self
+                .package_entrypoint(index, E::STABLE_ID)
+                .is_some_and(|(signature, effect)| {
+                    E::SIGNATURE.matches(signature)
+                        && effect_satisfies_declaration(effect, E::EFFECT)
+                })
+    }
+
+    fn optional_dispatch_plan_is_current<E: nexa_runtime::ScriptExport>(
+        &self,
+        plan: &[usize],
+    ) -> bool {
+        if self
             .packages
             .iter()
             .enumerate()
-            .filter(|(index, record)| {
-                record.lifecycle.status() == PackageStatus::Enabled
-                    && self.package_entrypoint(*index, E::STABLE_ID).is_some_and(
-                        |(signature, effect)| {
-                            E::SIGNATURE.matches(signature)
-                                && effect_satisfies_declaration(effect, E::EFFECT)
-                        },
-                    )
-            })
-            .map(|(index, record)| {
-                (
-                    index,
-                    record.effective.priority,
-                    record.candidate.manifest.id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        indexes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
-        indexes
-            .into_iter()
-            .map(|(index, _, _)| self.call_index::<E>(index, args))
-            .collect()
+            .filter(|(index, _)| self.package_matches_optional_export::<E>(*index))
+            .count()
+            != plan.len()
+        {
+            return false;
+        }
+        let mut previous: Option<&PackageRecord> = None;
+        for &index in plan {
+            if !self.package_matches_optional_export::<E>(index) {
+                return false;
+            }
+            let record = &self.packages[index];
+            if let Some(previous) = previous {
+                let ordered = previous.effective.priority > record.effective.priority
+                    || (previous.effective.priority == record.effective.priority
+                        && previous.candidate.manifest.id < record.candidate.manifest.id);
+                if !ordered {
+                    return false;
+                }
+            }
+            previous = Some(record);
+        }
+        true
     }
 
     fn package_entrypoint(
@@ -2938,21 +3033,22 @@ impl NexaEngine {
         stable_id: nexa::StableId,
     ) -> Option<(&nexa_runtime::Signature, nexa_runtime::FunctionEffect)> {
         let record = &self.packages[index];
-        let artifact = record
-            .runtime
-            .as_ref()
-            .map(|runtime| &runtime.artifact)
-            .or_else(|| {
-                record
-                    .last_known_good
-                    .as_ref()
-                    .map(|known_good| &known_good.artifact)
-            })?;
-        let entrypoint = artifact
-            .module()
-            .exports
-            .iter()
-            .find(|entrypoint| entrypoint.stable_id == stable_id)?;
+        let slot = *self.declared_entrypoint_slots.get(&stable_id)?;
+        let (artifact, export_index) = if let Some(runtime) = &record.runtime {
+            (
+                &runtime.artifact,
+                *runtime.entrypoint_exports.get(slot)?.as_ref()?,
+            )
+        } else {
+            let artifact = &record.last_known_good.as_ref()?.artifact;
+            let export_index = artifact
+                .module()
+                .exports
+                .iter()
+                .position(|entrypoint| entrypoint.stable_id == stable_id)?;
+            (artifact, export_index)
+        };
+        let entrypoint = artifact.module().exports.get(export_index)?;
         let function = artifact
             .module()
             .functions

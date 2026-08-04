@@ -13,6 +13,9 @@ pub(crate) struct PackageRuntime {
     pub module: nexa::prelude::ModuleHandle,
     pub root_scope: nexa::prelude::ScopeHandle,
     pub artifact: crate::CompiledPackageArtifact,
+    /// Contract-slot-indexed portable export indexes, resolved once when
+    /// the package is admitted.
+    pub entrypoint_exports: Vec<Option<usize>>,
 }
 
 pub(crate) struct PackageRecord {

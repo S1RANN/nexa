@@ -312,6 +312,14 @@ fn steady_state_engine_paths_allocate_nothing() {
         .call_optional::<ChooseFoodSpawn>(&alpha, &5)
         .expect("provider implements choose_food_spawn")
         .expect("warm provider call");
+    let mut optional_outputs = Vec::with_capacity(3);
+    assert_eq!(
+        engine
+            .dispatch_optional_into::<ChooseFoodSpawn>(&5, &mut optional_outputs)
+            .expect("bounded Optional dispatch output")
+            .len(),
+        3
+    );
     for _ in 0..4 {
         engine.tick().expect("warm idle Engine tick");
     }
@@ -352,6 +360,20 @@ fn steady_state_engine_paths_allocate_nothing() {
     assert_eq!(
         projected_dispatch_allocations, 0,
         "package-projected dispatch must perform zero system allocations"
+    );
+
+    let (optional_dispatch_allocations, _) = allocations_during(|| {
+        for _ in 0..rounds {
+            let current = engine
+                .dispatch_optional_into::<ChooseFoodSpawn>(&7, &mut optional_outputs)
+                .expect("bounded Optional dispatch output");
+            assert_eq!(current.len(), 3);
+            assert!(current.iter().all(Result::is_ok));
+        }
+    });
+    assert_eq!(
+        optional_dispatch_allocations, 0,
+        "Optional broadcast must perform zero system allocations"
     );
 
     let (call_allocations, called) =
@@ -401,9 +423,17 @@ fn dispatch_plan_follows_lifecycle_changes() {
         package("pkg.gamma", 3),
     ]);
     let beta = PackageId::new("pkg.beta").expect("package id");
+    let mut optional_outputs = Vec::with_capacity(3);
 
     // Warm plan with all three packages.
     assert_eq!(broadcast_values(&mut engine, 1).len(), 3);
+    assert_eq!(
+        engine
+            .dispatch_optional_into::<ChooseFoodSpawn>(&1, &mut optional_outputs)
+            .expect("warm Optional dispatch plan")
+            .len(),
+        3
+    );
 
     // Disabling a package must invalidate the cached plan: the O(n)
     // revalidation scan sees the population change and rebuilds.
@@ -411,6 +441,13 @@ fn dispatch_plan_follows_lifecycle_changes() {
     assert_eq!(
         broadcast_values(&mut engine, 1),
         vec![("pkg.alpha".to_string(), 3), ("pkg.gamma".to_string(), 5),]
+    );
+    assert_eq!(
+        engine
+            .dispatch_optional_into::<ChooseFoodSpawn>(&1, &mut optional_outputs)
+            .expect("Optional plan after disable")
+            .len(),
+        2
     );
 
     // Re-enabling restores the full deterministic broadcast order.
@@ -422,5 +459,12 @@ fn dispatch_plan_follows_lifecycle_changes() {
             ("pkg.beta".to_string(), 4),
             ("pkg.gamma".to_string(), 5),
         ]
+    );
+    assert_eq!(
+        engine
+            .dispatch_optional_into::<ChooseFoodSpawn>(&1, &mut optional_outputs)
+            .expect("Optional plan after re-enable")
+            .len(),
+        3
     );
 }
