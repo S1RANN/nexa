@@ -369,18 +369,24 @@ fn canonical_object_model_source_executes_through_verified_bytecode() {
             && allocation.site.function_stable_id.0 != 0
             && allocation.site.source_span.is_some()
     }));
-    assert!(profile.allocations.iter().any(|allocation| matches!(
-        allocation.site.kind,
-        nexa::AllocationKind::StructMaterialization
-    )));
+    assert!(
+        !profile.allocations.iter().any(|allocation| matches!(
+            allocation.site.kind,
+            nexa::AllocationKind::StructMaterialization
+        )),
+        "verified Struct values must remain in physical slots without heap materialization"
+    );
     assert!(
         profile
             .allocations
             .iter()
             .any(|allocation| matches!(allocation.site.kind, nexa::AllocationKind::Class))
     );
-    assert!(profile.allocations.iter().any(|allocation| matches!(
-        allocation.site.kind,
-        nexa::AllocationKind::EnumMaterialization
-    )));
+    assert!(
+        !profile.allocations.iter().any(|allocation| matches!(
+            allocation.site.kind,
+            nexa::AllocationKind::EnumMaterialization
+        )),
+        "verified Enum values must remain in physical slots without heap materialization"
+    );
 }
