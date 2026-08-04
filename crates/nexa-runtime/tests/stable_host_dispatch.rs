@@ -97,67 +97,144 @@ impl HostRegistry for SingleAuthorityRegistry {
     }
 }
 
-fn verified_import_module(import: HostImport) -> VerifiedModule {
-    let parameter_count =
-        u16::try_from(import.parameters.len()).expect("test Host signature fits u16");
-    let destination = parameter_count;
+fn add_fixture_enum_types(
+    module: &mut ModuleBuilder,
+    import: &HostImport,
+    extra_enum_types: &[nexa_bytecode::EnumType],
+) {
+    for enumeration in extra_enum_types {
+        module.enum_type(enumeration.clone());
+    }
+    if let Some(async_result) = import.async_result {
+        let result = nexa_bytecode::result_type(async_result.success, async_result.error);
+        assert_eq!(result.type_id, async_result.result_type);
+        if !extra_enum_types
+            .iter()
+            .any(|enumeration| enumeration.type_id == result.type_id)
+        {
+            module.enum_type(result);
+        }
+    }
+}
+
+fn verified_import_module_with_enums(
+    import: HostImport,
+    extra_enum_types: &[nexa_bytecode::EnumType],
+) -> VerifiedModule {
+    let schema = nexa_bytecode::StateSchema::default().fingerprint();
+    let mut layout_module = ModuleBuilder::new();
+    layout_module.metadata(HOST_CONTRACT_ID, schema);
+    add_fixture_enum_types(&mut layout_module, &import, extra_enum_types);
+    let layouts = nexa_bytecode::layout::LayoutTable::for_module(&layout_module.finish())
+        .expect("forged Host fixture types have valid layouts");
+    let parameter_slots = import.parameters.iter().copied().fold(0_u16, |slots, ty| {
+        slots
+            .checked_add(
+                layouts
+                    .physical_slots(ty)
+                    .expect("Host parameter type has a physical layout"),
+            )
+            .expect("test Host parameters fit the physical frame")
+    });
+    let result_layout = import.result.map(|ty| {
+        layouts
+            .layout_of(ty)
+            .expect("Host result has a physical layout")
+    });
+    let result_slots = result_layout
+        .as_ref()
+        .map_or(0, |layout| layout.physical_slots);
+    let registers = parameter_slots
+        .checked_add(result_slots)
+        .expect("test Host result fits the physical frame");
+    let destination = parameter_slots;
     let mut entrypoint = FunctionBuilder::new(
         Signature {
             parameters: import.parameters.clone(),
             result: import.result,
         },
-        destination + 1,
+        registers,
     );
     entrypoint
-        .effect(FunctionEffect::Task)
-        .emit(Instruction::HostCall {
-            import: 0,
-            args_base: 0,
-            args_count: parameter_count,
-            dst: destination,
-        })
-        .emit(Instruction::Return {
+        .parameter_slots(parameter_slots)
+        .effect(FunctionEffect::Task);
+    let mut parameter_offset = 0_u16;
+    let mut before_call = vec![false; usize::from(registers)];
+    for ty in import.parameters.iter().copied() {
+        let layout = layouts
+            .layout_of(ty)
+            .expect("Host parameter has a physical layout");
+        for (offset, root) in layout.gc_bitmap.iter().copied().enumerate() {
+            before_call[usize::from(parameter_offset) + offset] = root;
+        }
+        parameter_offset += layout.physical_slots;
+    }
+    for (register, root) in before_call.iter().copied().enumerate() {
+        if root {
+            entrypoint
+                .set_root(u16::try_from(register).expect("test register fits u16"))
+                .expect("parameter GC root lies in the physical frame");
+        }
+    }
+    entrypoint.emit(Instruction::HostCall {
+        import: 0,
+        args_base: 0,
+        args_count: parameter_slots,
+        dst: destination,
+    });
+    if import.result.is_some() {
+        entrypoint.emit(Instruction::Return {
             source: destination,
         });
-    let mut entrypoint = entrypoint.finish().expect("forged Host import entrypoint");
-    if import.result.is_some_and(ValueType::is_reference) {
-        entrypoint.root_bitmap[usize::from(destination)] = true;
-        let mut before_call = vec![false; usize::from(destination + 1)];
-        for (index, parameter) in import.parameters.iter().enumerate() {
-            before_call[index] = parameter.is_reference();
-        }
-        let mut before_return = before_call.clone();
-        before_return[usize::from(destination)] = true;
-        entrypoint.safepoints = vec![0, 1];
-        entrypoint.root_maps = vec![
-            RootMap {
-                pc: 0,
-                bitmap: before_call,
-            },
-            RootMap {
-                pc: 1,
-                bitmap: before_return,
-            },
-        ];
+    } else {
+        entrypoint.emit(Instruction::ReturnVoid);
     }
+    let mut entrypoint = entrypoint.finish().expect("forged Host import entrypoint");
+    let mut before_return = before_call.clone();
+    if let Some(result_layout) = &result_layout {
+        for (offset, root) in result_layout.gc_bitmap.iter().copied().enumerate() {
+            let register = usize::from(destination) + offset;
+            before_return[register] = root;
+            entrypoint.root_bitmap[register] |= root;
+        }
+    }
+    entrypoint.safepoints = vec![0, 1];
+    entrypoint.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: before_call,
+        },
+        RootMap {
+            pc: 1,
+            bitmap: before_return,
+        },
+    ];
 
-    let schema = nexa_bytecode::StateSchema::default().fingerprint();
     let mut module = ModuleBuilder::new();
     module.metadata(HOST_CONTRACT_ID, schema);
-    if let Some(async_result) = import.async_result {
-        let result = nexa_bytecode::result_type(async_result.success, async_result.error);
-        assert_eq!(result.type_id, async_result.result_type);
-        module.enum_type(result);
-    }
+    add_fixture_enum_types(&mut module, &import, extra_enum_types);
     module.host_import(import);
     module.function(entrypoint);
     verify(module.finish(), VerifierLimits::default()).expect("verified forged Host import module")
+}
+
+fn verified_import_module(import: HostImport) -> VerifiedModule {
+    verified_import_module_with_enums(import, &[])
 }
 
 fn assert_authority_mismatch(
     authority: HostFunctionAuthority,
     import: HostImport,
     field: HostFunctionAuthorityField,
+) {
+    assert_authority_mismatch_with_enums(authority, import, field, &[]);
+}
+
+fn assert_authority_mismatch_with_enums(
+    authority: HostFunctionAuthority,
+    import: HostImport,
+    field: HostFunctionAuthorityField,
+    extra_enum_types: &[nexa_bytecode::EnumType],
 ) {
     let stable_id = authority.stable_id();
     let schema = nexa_bytecode::StateSchema::default().fingerprint();
@@ -168,7 +245,11 @@ fn assert_authority_mismatch(
     )
     .expect("hosted Realm");
     assert_eq!(
-        realm.load_module(verified_import_module(import), HOST_CONTRACT_ID, schema),
+        realm.load_module(
+            verified_import_module_with_enums(import, extra_enum_types),
+            HOST_CONTRACT_ID,
+            schema
+        ),
         Err(RealmError::HostFunctionAuthorityMismatch { stable_id, field })
     );
 }
@@ -430,7 +511,7 @@ fn realm_rejects_host_import_with_forged_mode() {
         Some(async_result),
         &[],
     );
-    assert_authority_mismatch(
+    assert_authority_mismatch_with_enums(
         authority,
         HostImport {
             stable_id,
@@ -443,6 +524,7 @@ fn realm_rejects_host_import_with_forged_mode() {
             async_result: None,
         },
         HostFunctionAuthorityField::Mode,
+        &[result],
     );
 }
 
