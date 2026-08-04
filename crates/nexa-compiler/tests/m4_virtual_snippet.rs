@@ -413,7 +413,7 @@ fn add(left: i32, right: i32) -> i32 {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn unit_runtime_values_are_materialized_after_effects_and_inside_containers() {
+fn unit_runtime_values_preserve_return_parameter_container_and_async_semantics() {
     let compiled = compile_typed_evidence_package(
         r"
 fn noop() -> unit {}
@@ -458,8 +458,6 @@ async fn await_unit() -> i32 {
             .unwrap_or_else(|| panic!("missing debug metadata for `{name}`"))
             .function_index
     };
-    let noop = function_index("noop");
-    let consume = function_index("consume");
     let via_return = function_index("via_return");
     let via_parameter = function_index("via_parameter");
     let option_unit = function_index("option_unit");
@@ -469,41 +467,10 @@ async fn await_unit() -> i32 {
     let via_return_code = &compiled.module.functions
         [usize::try_from(via_return).expect("function index fits usize")]
     .code;
-    assert!(
-        via_return_code.windows(2).any(|instructions| matches!(
-            instructions,
-            [
-                Instruction::Call { function, .. },
-                Instruction::LoadI32 { value: 0, .. }
-            ] if *function == noop
-        )),
-        "a Unit call must materialize its sentinel only after the call completes"
-    );
     assert_eq!(
         via_return_code.last(),
         Some(&Instruction::ReturnVoid),
         "returning a Unit expression must execute it and return without a bytecode result"
-    );
-
-    let via_parameter_code = &compiled.module.functions
-        [usize::try_from(via_parameter).expect("function index fits usize")]
-    .code;
-    assert!(
-        via_parameter_code.windows(3).any(|instructions| matches!(
-            instructions,
-            [
-                Instruction::Call {
-                    function: called_noop,
-                    ..
-                },
-                Instruction::LoadI32 { value: 0, .. },
-                Instruction::Call {
-                    function: called_consume,
-                    ..
-                }
-            ] if *called_noop == noop && *called_consume == consume
-        )),
-        "the Unit sentinel must be initialized before it is passed to another call"
     );
 
     let verified = nexa_verifier::verify(compiled.module, nexa_verifier::VerifierLimits::default())
@@ -1895,7 +1862,7 @@ async fn parent(value: i32) -> i32 {
 }
 
 #[test]
-fn multi_payload_enum_patterns_unpack_the_analyzer_tuple_payload() {
+fn multi_payload_enum_patterns_preserve_dynamic_tuple_payload_without_materialization() {
     let verified = nexa_compiler::compile(
         r"
 enum Pair {
@@ -1903,8 +1870,8 @@ enum Pair {
     Both(i32, i32),
 }
 
-fn sum() -> i32 {
-    let pair = Pair::Both(20, 22);
+fn sum(first: i32, second: i32) -> i32 {
+    let pair = Pair::Both(first, second);
     return match pair {
         Pair::Empty => 0,
         Pair::Both(left, right) => left + right,
@@ -1913,18 +1880,15 @@ fn sum() -> i32 {
 ",
     )
     .expect("multi-payload Enum construction and matching must reach typed codegen");
-    assert!(
-        verified.module().functions[0]
-            .code
-            .iter()
-            .filter(|instruction| matches!(instruction, Instruction::StructGet { .. }))
-            .count()
-            >= 2,
-        "the tuple payload is unpacked through its two stable tuple fields"
-    );
     let mut heap = Heap::new(16);
-    let result = CheckedInterpreter::run_with_heap(&verified, 0, &[], 1_000, &mut heap)
-        .expect("sum executes");
+    let result = CheckedInterpreter::run_with_heap(
+        &verified,
+        0,
+        &[RuntimeValue::I32(20), RuntimeValue::I32(22)],
+        1_000,
+        &mut heap,
+    )
+    .expect("sum executes");
     assert!(matches!(
         result,
         InterpreterOutcome::Returned {
@@ -1932,4 +1896,7 @@ fn sum() -> i32 {
             ..
         }
     ));
+    let counters = heap.vm_allocation_counters();
+    assert_eq!(counters.struct_materializations, 0);
+    assert_eq!(counters.enum_materializations, 0);
 }
