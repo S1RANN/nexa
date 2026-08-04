@@ -420,6 +420,7 @@ fn main() -> Result<(), DynError> {
         "test-artifact-cache" => test_artifact_cache(),
         "test-runtime-fast-paths" => test_runtime_fast_paths(),
         "test-host-engine-performance" => test_host_engine_performance(),
+        "m5-cold-start-report" => m5_cold_start_report(),
         "m5-product-corpus" => m5_product_corpus(),
         "m5-final-report" => m5_final_report(),
         "m5-v8-comparison" => m5_v8_comparison(),
@@ -459,7 +460,7 @@ fn main() -> Result<(), DynError> {
                  test-ir-optimizations|test-optimization-differential|\
                  test-executable-parity|test-executable-module|test-gc-v1|test-source-cache|\
                  test-artifact-cache|test-runtime-fast-paths|test-host-engine-performance|\
-                 m5-product-corpus|m5-final-report|m5-v8-comparison|\
+                 m5-cold-start-report|m5-product-corpus|m5-final-report|m5-v8-comparison|\
                  m5-performance-regression|finalize-m5"
             );
             Err("unknown xtask command".into())
@@ -556,6 +557,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_artifact_cache()?;
     test_runtime_fast_paths()?;
     test_host_engine_performance()?;
+    m5_cold_start_report()?;
     m5_product_corpus()?;
     cargo(&[
         "run",
@@ -1798,6 +1800,93 @@ fn test_artifact_cache() -> Result<(), DynError> {
     ])
 }
 
+/// M5 WP98: records every required cold-start surface independently.
+///
+/// This intentionally uses a bounded one-process protocol instead of adding
+/// eight expensive initialization cases to the frozen 7x1000 hot comparison.
+/// Benchmark v7 remains the timing authority and the terminal report retains
+/// the exact same-HEAD receipt.
+const M5_COLD_START_SAMPLES: usize = 15;
+const M5_COLD_START_CASES: [&str; 8] = [
+    "standalone_single_file",
+    "standalone_package",
+    "engine_first_discover_enable",
+    "artifact_cache_warm",
+    "artifact_cache_cold",
+    "repl_first_cell",
+    "repl_subsequent_cell",
+    "reload",
+];
+
+fn m5_cold_start_report() -> Result<(), DynError> {
+    let root = workspace_root();
+    let output = root.join("target/nexa-artifacts/m5/cold-start/report.json");
+    fs::create_dir_all(output.parent().ok_or("cold-start report has no parent")?)?;
+    let samples = M5_COLD_START_SAMPLES.to_string();
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--cold-start-report",
+        "--samples",
+        &samples,
+        "--output",
+        output.to_str().ok_or("non-UTF-8 cold-start report path")?,
+    ])?;
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let report = cold_start_report_at(&output, &head)
+        .ok_or("WP98 cold-start report is stale, incomplete, or malformed")?;
+    let cases = report["cases"]
+        .as_array()
+        .ok_or("WP98 report cases is not an array")?;
+    println!(
+        "m5-cold-start-report: {} isolated cases x {M5_COLD_START_SAMPLES} samples",
+        cases.len()
+    );
+    Ok(())
+}
+
+fn cold_start_report_at(path: &Path, implementation_commit: &str) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let cases = report["cases"].as_array()?;
+    let actual = cases
+        .iter()
+        .map(|case| case["case"].as_str())
+        .collect::<Option<Vec<_>>>()?;
+    if actual != M5_COLD_START_CASES
+        || report["schema"] != 1
+        || report["benchmark_version"] != 7
+        || report["report"] != "Nexa M5 WP98 Cold Start"
+        || report["implementation_commit"].as_str() != Some(implementation_commit)
+        || report["samples"] != M5_COLD_START_SAMPLES
+        || report["warmup"] != 1
+        || report["status"] != "PASS"
+        || report["benchmark_source_hash"]
+            .as_str()
+            .is_none_or(|hash| hash.len() != 64)
+    {
+        return None;
+    }
+    for case in cases {
+        let name = case["case"].as_str()?;
+        if case["samples"] != M5_COLD_START_SAMPLES
+            || case["p50_ns"].as_u64().is_none_or(|value| value == 0)
+            || case["p95_ns"].as_u64().is_none_or(|value| value == 0)
+            || case["p99_ns"].as_u64().is_none_or(|value| value == 0)
+            || report["measurement_boundaries"][name]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+    }
+    Some(report)
+}
+
 /// M5 stage-H gate: the WP89 immediate entrypoint settles with no Task,
 /// scheduler token, or tombstone, the H1 continuation pool feeds
 /// steady-state admissions, and the WP90/WP92 engine dispatch path is
@@ -1972,6 +2061,15 @@ fn m5_final_report() -> Result<(), DynError> {
     let head = git_output(&["rev-parse", "HEAD"])?;
     let final_dir = root.join("target/nexa-artifacts/m5/final");
     fs::create_dir_all(&final_dir)?;
+    let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
+    let cold_start = if let Some(report) = cold_start_report_at(&cold_start_path, &head) {
+        eprintln!("final report: reusing same-HEAD WP98 cold-start report");
+        report
+    } else {
+        m5_cold_start_report()?;
+        cold_start_report_at(&cold_start_path, &head)
+            .ok_or("new WP98 cold-start report is not a same-HEAD Benchmark v7 receipt")?
+    };
     let aggregate_path = final_dir.join("aggregate-7x1000.json");
     let profile_path = final_dir.join("profile-1x200.json");
     let aggregate = if let Some(report) = formal_aggregate_at(&aggregate_path, &head) {
@@ -2097,6 +2195,7 @@ fn m5_final_report() -> Result<(), DynError> {
         "conditions": conditions,
         "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
         "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
+        "cold_start_artifact": "target/nexa-artifacts/m5/cold-start/report.json",
         "implementation_commit": aggregate["implementation_commit"],
     });
     fs::write(
@@ -2106,6 +2205,7 @@ fn m5_final_report() -> Result<(), DynError> {
     let report = serde_json::json!({
         "schema": 1,
         "aggregate": aggregate,
+        "cold_start": cold_start,
         "profiler": profile["profiler"],
         "decision": decision,
     });
@@ -2130,6 +2230,20 @@ fn m5_final_report() -> Result<(), DynError> {
                 case["median_p50_ns"],
                 case["median_p99_ns"],
                 case["max_system_allocations"],
+            )?;
+        }
+    }
+    markdown.push_str(
+        "\nWP98 cold-start cases are recorded separately with one isolated process and 15 samples:\n\n",
+    );
+    if let Some(cases) = report["cold_start"]["cases"].as_array() {
+        for case in cases {
+            writeln!(
+                markdown,
+                "- {}: p50 {} ns, p99 {} ns",
+                case["case"].as_str().unwrap_or("?"),
+                case["p50_ns"],
+                case["p99_ns"],
             )?;
         }
     }
@@ -2800,11 +2914,14 @@ fn finalize_m5() -> Result<(), DynError> {
     let comparison_path = root.join("target/nexa-artifacts/m5/regression/comparison.json");
     let profiler_path = root.join("target/nexa-artifacts/m5/profiler-overhead/formal-7x1000.json");
     let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+    let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
     let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
     let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
     let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
     let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
     let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
+    let cold_start = cold_start_report_at(&cold_start_path, &head)
+        .ok_or("WP98 cold-start receipt is stale or malformed")?;
     let decision: Value = serde_json::from_slice(&fs::read(&decision_path)?)?;
     let performance: Value = serde_json::from_slice(&fs::read(&performance_path)?)?;
 
@@ -2832,6 +2949,9 @@ fn finalize_m5() -> Result<(), DynError> {
         || profiler["status"] != "PASS"
         || product["implementation_commit"] != head
         || product["status"] != "PASS"
+        || cold_start["implementation_commit"] != head
+        || performance["cold_start"]["implementation_commit"] != head
+        || performance["cold_start"]["status"] != "PASS"
         || performance["aggregate"]["implementation_commit"] != head
         || performance["aggregate"]["benchmark_version"] != 7
         || decision["implementation_commit"] != head
@@ -2872,6 +2992,7 @@ fn finalize_m5() -> Result<(), DynError> {
         "valueCollectionGeomeanSpeedup": geomean("value_collection")?,
         "hostTaskEngineGeomeanSpeedup": geomean("host_task_engine")?,
         "coldStartGeomeanSpeedup": geomean("cold_start")?,
+        "coldStartScenarios": cold_start["cases"],
         "structGcAllocations": 0,
         "enumGcAllocations": 0,
         "gcSystemAllocations": 0,

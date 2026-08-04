@@ -6,18 +6,17 @@ publish = false
 
 [dependencies]
 blake3 = { workspace = true }
+nexa = { path = "../../crates/nexa" }
+nexa-analysis = { path = "../../crates/nexa-analysis" }
 nexa-bytecode = { path = "../../crates/nexa-bytecode" }
 nexa-compiler = { path = "../../crates/nexa-compiler" }
 nexa-core = { path = "../../crates/nexa-core" }
+nexa-embed = { path = "../../crates/nexa-embed" }
 nexa-migrate = { path = "../../crates/nexa-migrate" }
 nexa-runtime = { path = "../../crates/nexa-runtime", features = ["profiler-overhead-control"] }
 nexa-verifier = { path = "../../crates/nexa-verifier" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-nexa = { path = "../../crates/nexa" }
-nexa-embed = { path = "../../crates/nexa-embed" }
 
 [lints.rust]
 unsafe_code = "allow"

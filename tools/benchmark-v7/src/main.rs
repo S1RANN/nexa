@@ -24,8 +24,11 @@ use nexa_runtime::{
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
 
+mod cold_start;
+
 const DEFAULT_SAMPLES: usize = 1_000;
 const SMOKE_SAMPLES: usize = 20;
+const COLD_START_SAMPLES: usize = 15;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
 const BENCH_TASK_EXPORT: StableId = StableId(0x4245_4e43_4854_4153);
@@ -579,10 +582,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let smoke = arguments.iter().any(|argument| argument == "--smoke");
+    let cold_start_report = arguments
+        .iter()
+        .any(|argument| argument == "--cold-start-report");
     let samples = argument_value(&arguments, "--samples")
         .map(str::parse)
         .transpose()?
-        .unwrap_or(if smoke {
+        .unwrap_or(if cold_start_report {
+            COLD_START_SAMPLES
+        } else if smoke {
             SMOKE_SAMPLES
         } else {
             DEFAULT_SAMPLES
@@ -598,6 +606,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(str::parse)
         .transpose()?
         .unwrap_or(1_usize);
+    if cold_start_report {
+        if processes != 1 {
+            return Err("the WP98 cold-start report uses one isolated process".into());
+        }
+        return cold_start::run(samples, argument_value(&arguments, "--output"));
+    }
     let profiler_enabled = arguments.iter().any(|argument| argument == "--profile");
     let profiler_control = arguments
         .iter()
@@ -1276,7 +1290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema: 1,
         benchmark_version: 7,
         implementation_commit: git_commit(),
-        benchmark_source_hash: blake3::hash(include_bytes!("main.rs")).to_hex().to_string(),
+        benchmark_source_hash: benchmark_source_hash(),
         bytecode_hash,
         toolchain: rustc_version(),
         os: std::env::consts::OS,
@@ -1417,7 +1431,7 @@ fn aggregate_reports(
         process_count: processes,
         samples_per_process: samples,
         implementation_commit: git_commit(),
-        benchmark_source_hash: blake3::hash(include_bytes!("main.rs")).to_hex().to_string(),
+        benchmark_source_hash: benchmark_source_hash(),
         cases,
     })
 }
@@ -2431,10 +2445,21 @@ fn bench<T>(
     name: &'static str,
     tier: &'static str,
     samples: usize,
+    prepare: impl FnMut() -> T,
+    operation: impl FnMut(T) -> Observation,
+) -> CaseStats {
+    bench_with_warmup(name, tier, samples, WARMUP.min(samples), prepare, operation)
+}
+
+fn bench_with_warmup<T>(
+    name: &'static str,
+    tier: &'static str,
+    samples: usize,
+    warmup: usize,
     mut prepare: impl FnMut() -> T,
     mut operation: impl FnMut(T) -> Observation,
 ) -> CaseStats {
-    for _ in 0..WARMUP.min(samples) {
+    for _ in 0..warmup {
         let input = prepare();
         black_box(operation(input));
     }
@@ -2556,6 +2581,15 @@ fn git_commit() -> String {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn benchmark_source_hash() -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nexa-benchmark-v7\0main.rs\0");
+    hasher.update(include_bytes!("main.rs"));
+    hasher.update(b"\0cold_start.rs\0");
+    hasher.update(include_bytes!("cold_start.rs"));
+    hasher.finalize().to_hex().to_string()
 }
 
 fn rustc_version() -> String {
