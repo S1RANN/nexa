@@ -1086,6 +1086,94 @@ fn planned_payload_slots(payload: &PlannedResultPayload) -> Result<usize, RealmE
     }
 }
 
+fn planned_physical_payload_slots(
+    payload: &PlannedResultPayload,
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+) -> Result<usize, RealmError> {
+    let expected_slots = layouts
+        .physical_slots(expected)
+        .map_err(|_| InterpreterError::TypeMismatch)?;
+    match payload {
+        PlannedResultPayload::Struct { type_id, fields } => {
+            if expected != ValueType::Named(*type_id) {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            let layout = layouts
+                .named_layout(*type_id)
+                .filter(|layout| {
+                    layout.equality_strategy
+                        == nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                        && layout.physical_slots == expected_slots
+                })
+                .ok_or(InterpreterError::TypeMismatch)?;
+            if fields.len() != layout.field_offsets.len() {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            fields.iter().zip(&layout.field_offsets).try_fold(
+                0_usize,
+                |slots, (field, field_layout)| {
+                    if layouts
+                        .physical_slots(field_layout.logical_type)
+                        .map_err(|_| InterpreterError::TypeMismatch)?
+                        != field_layout.slots
+                    {
+                        return Err(InterpreterError::TypeMismatch.into());
+                    }
+                    slots
+                        .checked_add(planned_physical_payload_slots(
+                            field,
+                            field_layout.logical_type,
+                            layouts,
+                        )?)
+                        .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
+                },
+            )
+        }
+        PlannedResultPayload::Enum {
+            type_id,
+            variant,
+            tag,
+            payload,
+        } => {
+            if expected != ValueType::Named(*type_id) {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            let layout = layouts
+                .named_layout(*type_id)
+                .filter(|layout| {
+                    layout.equality_strategy
+                        == nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+                        && layout.physical_slots == expected_slots
+                })
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let variant = layout
+                .enum_layout
+                .as_ref()
+                .and_then(|enum_layout| {
+                    enum_layout
+                        .variants
+                        .iter()
+                        .find(|candidate| candidate.stable_id == *variant && candidate.tag == *tag)
+                })
+                .ok_or(InterpreterError::TypeMismatch)?;
+            match (payload.as_deref(), variant.payload_type) {
+                (Some(payload), Some(payload_type)) => {
+                    planned_physical_payload_slots(payload, payload_type, layouts)
+                }
+                (None, None) => Ok(0),
+                _ => Err(InterpreterError::TypeMismatch.into()),
+            }
+        }
+        _ => {
+            if expected_slots != 1 {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            planned_payload_slots(payload)
+        }
+    }
+}
+
 fn validate_planned_payload(heap: &Heap, payload: &PlannedResultPayload) -> Result<(), RealmError> {
     match payload {
         PlannedResultPayload::String(value) => {
@@ -1194,6 +1282,133 @@ fn commit_planned_payload(
             Ok(value)
         }
     }
+}
+
+fn commit_planned_physical_payload(
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    payload: PlannedResultPayload,
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    destination: &mut [RuntimeValue],
+) -> Result<(), RealmError> {
+    let expected_slots = layouts
+        .physical_slots(expected)
+        .map_err(|_| InterpreterError::TypeMismatch)?;
+    if destination.len() != usize::from(expected_slots) {
+        return Err(InterpreterError::TypeMismatch.into());
+    }
+    match payload {
+        PlannedResultPayload::Struct { type_id, fields } => {
+            if expected != ValueType::Named(type_id) {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            let layout = layouts
+                .named_layout(type_id)
+                .filter(|layout| {
+                    layout.equality_strategy
+                        == nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                        && layout.physical_slots == expected_slots
+                })
+                .ok_or(InterpreterError::TypeMismatch)?;
+            if fields.len() != layout.field_offsets.len() {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            destination.fill(RuntimeValue::Unit);
+            for (field, field_layout) in fields.into_iter().zip(&layout.field_offsets) {
+                let start = usize::from(field_layout.offset);
+                let end = start
+                    .checked_add(usize::from(field_layout.slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                commit_planned_physical_payload(
+                    heap,
+                    reservation,
+                    field,
+                    field_layout.logical_type,
+                    layouts,
+                    destination
+                        .get_mut(start..end)
+                        .ok_or(InterpreterError::TypeMismatch)?,
+                )?;
+            }
+            Ok(())
+        }
+        PlannedResultPayload::Enum {
+            type_id,
+            variant,
+            tag,
+            payload,
+        } => {
+            if expected != ValueType::Named(type_id) {
+                return Err(InterpreterError::TypeMismatch.into());
+            }
+            let layout = layouts
+                .named_layout(type_id)
+                .filter(|layout| {
+                    layout.equality_strategy
+                        == nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+                        && layout.physical_slots == expected_slots
+                })
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let enum_layout = layout
+                .enum_layout
+                .as_ref()
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let variant = enum_layout
+                .variants
+                .iter()
+                .find(|candidate| candidate.stable_id == variant && candidate.tag == tag)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            destination.fill(RuntimeValue::Unit);
+            destination[usize::from(enum_layout.tag_offset)] =
+                RuntimeValue::I32(i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?);
+            match (payload.map(|payload| *payload), variant.payload_type) {
+                (Some(payload), Some(payload_type)) => {
+                    let start = usize::from(enum_layout.payload_offset);
+                    let end = start
+                        .checked_add(usize::from(variant.payload_slots))
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    commit_planned_physical_payload(
+                        heap,
+                        reservation,
+                        payload,
+                        payload_type,
+                        layouts,
+                        destination
+                            .get_mut(start..end)
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                    )
+                }
+                (None, None) => Ok(()),
+                _ => Err(InterpreterError::TypeMismatch.into()),
+            }
+        }
+        payload => commit_planned_scalar_or_reference_payload(
+            heap,
+            reservation,
+            payload,
+            expected,
+            destination,
+        ),
+    }
+}
+
+fn commit_planned_scalar_or_reference_payload(
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    payload: PlannedResultPayload,
+    expected: ValueType,
+    destination: &mut [RuntimeValue],
+) -> Result<(), RealmError> {
+    let value = commit_planned_payload(heap, reservation, payload)?;
+    let [destination] = destination else {
+        return Err(InterpreterError::TypeMismatch.into());
+    };
+    if crate::interpreter::runtime_value_type(value) != Some(expected) {
+        return Err(InterpreterError::TypeMismatch.into());
+    }
+    *destination = value;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4907,7 +5122,7 @@ impl RealmRuntime {
                             buffer_types,
                         )?
                     };
-                    self.preflight_async_result(result, true, payload)?
+                    self.preflight_async_result(snapshot, result, true, payload)?
                 } else if let Some(expected_type) = expected_type {
                     let payload = {
                         let enum_types =
@@ -4976,7 +5191,7 @@ impl RealmRuntime {
                         &module.buffer_types,
                     )?
                 };
-                self.preflight_async_result(result, false, payload)?
+                self.preflight_async_result(snapshot, result, false, payload)?
             }
             HostCompletionResult::Cancelled => match async_result {
                 Some(result) if result.cancel_policy == CancelPolicy::ReturnError => self
@@ -5059,20 +5274,30 @@ impl RealmRuntime {
                 ));
             }
         };
-        self.preflight_async_result(result, false, payload)
+        self.preflight_async_result(snapshot, result, false, payload)
     }
 
     fn preflight_async_result(
         &mut self,
+        snapshot: crate::TaskSnapshot,
         result: AsyncResultType,
         success: bool,
         payload: PlannedResultPayload,
     ) -> Result<ResultWritebackAction, RealmError> {
         validate_planned_payload(&self.heap, &payload)?;
-        // The Result wrapper is reconstructed directly in the continuation's
-        // physical tag/payload range. Only the payload's persistent objects
-        // require heap reservation.
-        let slots = planned_payload_slots(&payload)?;
+        // The Result wrapper and aggregate payload are reconstructed directly
+        // in the continuation's physical register range. Reserve only the
+        // persistent scalar/reference objects nested inside that range.
+        let payload_type = if success {
+            result.success
+        } else {
+            result.error
+        };
+        let slots = planned_physical_payload_slots(
+            &payload,
+            payload_type,
+            self.module_for_task(snapshot)?.verified.layout_table(),
+        )?;
         let heap = self.heap.preflight(slots)?;
         Ok(ResultWritebackAction::ResumeAsync {
             result,
@@ -5090,22 +5315,18 @@ impl RealmRuntime {
         preflight: ResultWritebackPreflight,
     ) -> Result<(), RealmError> {
         let module = Arc::clone(&self.module_for_task(snapshot)?.verified);
-        let (value, async_result) = match preflight.action {
-            ResultWritebackAction::ResumeDirect(value) => (value, None),
-            ResultWritebackAction::ResumeDirectPlanned { payload, mut heap } => (
-                commit_planned_payload(&mut self.heap, &mut heap, payload)?,
-                None,
-            ),
-            ResultWritebackAction::ResumeAsync {
-                result,
-                success,
-                payload,
-                mut heap,
-            } => {
-                let payload = commit_planned_payload(&mut self.heap, &mut heap, payload)?;
-                debug_assert!(Heap::reservation_complete(&heap));
-                (payload, Some((result, success)))
+        let action = match preflight.action {
+            ResultWritebackAction::ResumeDirect(value) => {
+                ResultWritebackAction::ResumeDirect(value)
             }
+            ResultWritebackAction::ResumeDirectPlanned { payload, mut heap } => {
+                ResultWritebackAction::ResumeDirect(commit_planned_payload(
+                    &mut self.heap,
+                    &mut heap,
+                    payload,
+                )?)
+            }
+            action @ ResultWritebackAction::ResumeAsync { .. } => action,
             ResultWritebackAction::Cancel => {
                 return self.cancel_waiting_host_task(task, snapshot);
             }
@@ -5145,26 +5366,48 @@ impl RealmRuntime {
         if waiting_request != request {
             return Err(RealmError::TaskWaiting);
         }
-        if let Some((result, success)) = async_result {
-            continuation.write_resume_async_result(
-                &module,
-                destination,
-                crate::interpreter::AsyncResumeValue {
-                    expected: expected_type,
-                    result,
-                    success,
-                    payload: value,
-                },
-                Some(&self.heap),
-            )?;
-        } else {
-            continuation.write_resume_materialized_value(
-                &module,
-                destination,
-                expected_type,
-                value,
-                Some(&self.heap),
-            )?;
+        match action {
+            ResultWritebackAction::ResumeDirect(value) => {
+                continuation.write_resume_materialized_value(
+                    &module,
+                    destination,
+                    expected_type,
+                    value,
+                    Some(&self.heap),
+                )?;
+            }
+            ResultWritebackAction::ResumeAsync {
+                result,
+                success,
+                payload,
+                mut heap,
+            } => {
+                let (payload_destination, payload_type) = continuation
+                    .prepare_resume_async_result(
+                        &module,
+                        destination,
+                        expected_type,
+                        result,
+                        success,
+                    )?;
+                commit_planned_physical_payload(
+                    &mut self.heap,
+                    &mut heap,
+                    payload,
+                    payload_type,
+                    module.layout_table(),
+                    payload_destination,
+                )?;
+                debug_assert!(Heap::reservation_complete(&heap));
+                continuation.finish_host_resume()?;
+            }
+            ResultWritebackAction::ResumeDirectPlanned { .. }
+            | ResultWritebackAction::Cancel
+            | ResultWritebackAction::TrapFailure(_)
+            | ResultWritebackAction::TrapCode { .. }
+            | ResultWritebackAction::TrapMessage(_) => {
+                unreachable!("non-resume writeback actions return before execution extraction")
+            }
         }
         self.tasks.resume_waiting_task(task)?;
         self.tasks

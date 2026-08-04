@@ -41,6 +41,7 @@ pub struct ExecutionCharge {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub(crate) struct AsyncResumeValue {
     pub expected: Option<ValueType>,
     pub result: AsyncResultType,
@@ -227,6 +228,7 @@ impl InterpreterContinuation {
         self.finish_host_resume()
     }
 
+    #[cfg(test)]
     pub(crate) fn write_resume_async_result(
         &mut self,
         module: &VerifiedModule,
@@ -234,22 +236,47 @@ impl InterpreterContinuation {
         resume: AsyncResumeValue,
         heap: Option<&Heap>,
     ) -> Result<(), InterpreterError> {
-        if resume.expected != Some(ValueType::Named(resume.result.result_type)) {
+        let (destination, payload_type) = self.prepare_resume_async_result(
+            module,
+            destination,
+            resume.expected,
+            resume.result,
+            resume.success,
+        )?;
+        flatten_materialized_value(
+            destination,
+            payload_type,
+            resume.payload,
+            module.layout_table(),
+            heap,
+        )?;
+        self.finish_host_resume()
+    }
+
+    pub(crate) fn prepare_resume_async_result(
+        &mut self,
+        module: &VerifiedModule,
+        destination: u16,
+        expected: Option<ValueType>,
+        result: AsyncResultType,
+        success: bool,
+    ) -> Result<(&mut [RuntimeValue], ValueType), InterpreterError> {
+        if expected != Some(ValueType::Named(result.result_type)) {
             return Err(InterpreterError::TypeMismatch);
         }
         let layout = module
             .layout_table()
-            .named_layout(resume.result.result_type)
+            .named_layout(result.result_type)
             .ok_or(InterpreterError::TypeMismatch)?;
         let enum_layout = layout
             .enum_layout
             .as_ref()
             .ok_or(InterpreterError::TypeMismatch)?;
-        let tag = u32::from(!resume.success);
-        let payload_type = if resume.success {
-            resume.result.success
+        let tag = u32::from(!success);
+        let payload_type = if success {
+            result.success
         } else {
-            resume.result.error
+            result.error
         };
         let variant = enum_layout
             .variants
@@ -266,19 +293,15 @@ impl InterpreterContinuation {
         let payload_end = payload_start
             .checked_add(usize::from(variant.payload_slots))
             .ok_or(InterpreterError::TypeMismatch)?;
-        flatten_materialized_value(
+        Ok((
             destination
                 .get_mut(payload_start..payload_end)
                 .ok_or(InterpreterError::TypeMismatch)?,
             payload_type,
-            resume.payload,
-            module.layout_table(),
-            heap,
-        )?;
-        self.finish_host_resume()
+        ))
     }
 
-    fn finish_host_resume(&mut self) -> Result<(), InterpreterError> {
+    pub(crate) fn finish_host_resume(&mut self) -> Result<(), InterpreterError> {
         increment_pc(&mut self.arena)?;
         self.host_call_boundary = None;
         Ok(())
@@ -6739,7 +6762,7 @@ fn physical_ranges_equal(
     Ok(true)
 }
 
-fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
+pub(crate) fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
     match value {
         RuntimeValue::I32(_) => Some(ValueType::I32),
         RuntimeValue::I64(_) => Some(ValueType::I64),

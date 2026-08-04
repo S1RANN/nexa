@@ -836,8 +836,20 @@ fn completed_tombstones_root_nested_results_until_eviction() {
     };
     let (mut realm, module, host, _) = hosted(async_nominal_result_module(), config, false);
 
+    let allocations_before = realm.vm_allocation_counters();
     let (first, first_collection) =
         complete_nominal_result_and_collect(&mut realm, module, 11, "first retained result");
+    let allocation_delta = realm
+        .vm_allocation_counters()
+        .delta_since(allocations_before);
+    assert_eq!(allocation_delta.object_allocations, 3);
+    assert_eq!(allocation_delta.string_allocations, 1);
+    assert_eq!(allocation_delta.struct_materializations, 1);
+    assert_eq!(allocation_delta.enum_materializations, 1);
+    assert_eq!(
+        allocation_delta.host_codec_copy_bytes,
+        u64::try_from("first retained result".len()).expect("fixture length fits u64")
+    );
     assert_eq!(
         first_collection,
         nexa_runtime::CollectionStats {
