@@ -1044,7 +1044,7 @@ fn async_module(failing_migration: bool) -> VerifiedModule {
         parameters: Vec::new(),
         result: Some(ValueType::Named(async_result.result_type)),
     };
-    let mut function = FunctionBuilder::new(task_signature.clone(), 1);
+    let mut function = FunctionBuilder::new(task_signature.clone(), 2);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -1055,16 +1055,15 @@ fn async_module(failing_migration: bool) -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 0 });
     let mut function = function.finish().expect("model async function");
-    function.root_bitmap[0] = true;
     function.safepoints = vec![0, 1];
     function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false],
+            bitmap: vec![false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![true],
+            bitmap: vec![false, false],
         },
     ];
     let function = builder.function(function);

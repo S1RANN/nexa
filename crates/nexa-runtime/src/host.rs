@@ -1080,10 +1080,19 @@ impl std::ops::Deref for HostStr<'_> {
 pub struct HostValueRef<'a> {
     value: crate::RuntimeValue,
     heap: Option<&'a crate::Heap>,
+    physical: Option<HostPhysicalValue<'a>>,
     /// WP52: set when this logical value is a flattened struct row inside
     /// an array extent; `struct_ref` serves it as a borrowed view without
     /// any materialization.
     row: Option<HostStructRow<'a>>,
+}
+
+/// One logical value borrowed from a verifier-packed frame range.
+#[derive(Clone, Copy, Debug)]
+struct HostPhysicalValue<'a> {
+    logical_type: nexa_bytecode::ValueType,
+    slots: &'a [crate::RuntimeValue],
+    layouts: &'a nexa_bytecode::layout::LayoutTable,
 }
 
 /// One flattened struct row borrowed straight from the collection arena.
@@ -1098,6 +1107,7 @@ impl<'a> HostValueRef<'a> {
         Self {
             value,
             heap: Some(heap),
+            physical: None,
             row: None,
         }
     }
@@ -1160,6 +1170,29 @@ impl<'a> HostValueRef<'a> {
     }
 
     pub fn struct_ref(self, type_id: StableId) -> Result<HostStructRef<'a>, HostTrap> {
+        if let Some(physical) = self.physical {
+            if physical.logical_type != nexa_bytecode::ValueType::Named(type_id) {
+                return Err(HostTrap::Type);
+            }
+            let layout = physical
+                .layouts
+                .named_layout(type_id)
+                .filter(|layout| {
+                    layout.equality_strategy
+                        == nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                        && usize::from(layout.physical_slots) == physical.slots.len()
+                })
+                .ok_or(HostTrap::Type)?;
+            return Ok(HostStructRef {
+                type_id,
+                storage: HostStructStorage::Physical {
+                    slots: physical.slots,
+                    layout,
+                    layouts: physical.layouts,
+                },
+                heap: self.heap,
+            });
+        }
         // WP52: flattened array elements are served as borrowed views over
         // their arena row; nothing is materialized at the host boundary.
         if let Some(row) = self.row {
@@ -1168,8 +1201,8 @@ impl<'a> HostValueRef<'a> {
             }
             return Ok(HostStructRef {
                 type_id,
-                fields: crate::CollectionView::Values(row.fields),
-                heap: self.heap()?,
+                storage: HostStructStorage::FlatRow(row.fields),
+                heap: self.heap,
             });
         }
         let crate::RuntimeValue::Struct {
@@ -1185,8 +1218,8 @@ impl<'a> HostValueRef<'a> {
         let fields = heap.struct_fields(self.value).map_err(|_| HostTrap::Type)?;
         Ok(HostStructRef {
             type_id,
-            fields,
-            heap,
+            storage: HostStructStorage::Materialized(fields),
+            heap: Some(heap),
         })
     }
 
@@ -1210,6 +1243,54 @@ impl<'a> HostValueRef<'a> {
     }
 
     pub fn enum_ref(self, type_id: StableId) -> Result<HostEnumRef<'a>, HostTrap> {
+        if let Some(physical) = self.physical {
+            if physical.logical_type != nexa_bytecode::ValueType::Named(type_id) {
+                return Err(HostTrap::Type);
+            }
+            let layout = physical
+                .layouts
+                .named_layout(type_id)
+                .ok_or(HostTrap::Type)?;
+            let enum_layout = layout.enum_layout.as_ref().ok_or(HostTrap::Type)?;
+            if usize::from(layout.physical_slots) != physical.slots.len() {
+                return Err(HostTrap::Type);
+            }
+            let crate::RuntimeValue::I32(tag) = *physical
+                .slots
+                .get(usize::from(enum_layout.tag_offset))
+                .ok_or(HostTrap::Type)?
+            else {
+                return Err(HostTrap::Type);
+            };
+            let tag = u32::try_from(tag).map_err(|_| HostTrap::Type)?;
+            let variant = enum_layout
+                .variants
+                .iter()
+                .find(|variant| variant.tag == tag)
+                .ok_or(HostTrap::Type)?;
+            let physical_payload = match variant.payload_type {
+                Some(logical_type) => {
+                    let start = usize::from(enum_layout.payload_offset);
+                    let end = start
+                        .checked_add(usize::from(variant.payload_slots))
+                        .ok_or(HostTrap::Type)?;
+                    Some(HostPhysicalValue {
+                        logical_type,
+                        slots: physical.slots.get(start..end).ok_or(HostTrap::Type)?,
+                        layouts: physical.layouts,
+                    })
+                }
+                None => None,
+            };
+            return Ok(HostEnumRef {
+                type_id,
+                variant: variant.stable_id,
+                tag,
+                payload: None,
+                physical_payload,
+                heap: self.heap,
+            });
+        }
         let heap = self.heap()?;
         let (actual, variant, tag, payload) =
             heap.enum_parts(self.value).map_err(|_| HostTrap::Type)?;
@@ -1221,7 +1302,8 @@ impl<'a> HostValueRef<'a> {
             variant,
             tag,
             payload,
-            heap,
+            physical_payload: None,
+            heap: Some(heap),
         })
     }
 
@@ -1300,12 +1382,24 @@ impl<'a> HostValueRef<'a> {
     }
 }
 
-/// A named struct whose fields remain in the VM heap.
+#[derive(Clone, Copy, Debug)]
+enum HostStructStorage<'a> {
+    Materialized(crate::CollectionView<'a>),
+    FlatRow(&'a [crate::RuntimeValue]),
+    Physical {
+        slots: &'a [crate::RuntimeValue],
+        layout: &'a nexa_bytecode::layout::ValueLayout,
+        layouts: &'a nexa_bytecode::layout::LayoutTable,
+    },
+}
+
+/// A named struct borrowed either from persistent VM storage or directly
+/// from a verifier-packed frame range.
 #[derive(Clone, Copy, Debug)]
 pub struct HostStructRef<'a> {
     type_id: StableId,
-    fields: crate::CollectionView<'a>,
-    heap: &'a crate::Heap,
+    storage: HostStructStorage<'a>,
+    heap: Option<&'a crate::Heap>,
 }
 
 impl<'a> HostStructRef<'a> {
@@ -1316,23 +1410,51 @@ impl<'a> HostStructRef<'a> {
 
     #[must_use]
     pub const fn len(self) -> usize {
-        self.fields.len()
+        match self.storage {
+            HostStructStorage::Materialized(fields) => fields.len(),
+            HostStructStorage::FlatRow(fields) => fields.len(),
+            HostStructStorage::Physical { layout, .. } => layout.field_offsets.len(),
+        }
     }
 
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.fields.is_empty()
+        self.len() == 0
     }
 
     pub fn field(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
-        self.fields
-            .get(index)
-            .map(|value| HostValueRef {
-                value,
-                heap: Some(self.heap),
-                row: None,
-            })
-            .ok_or(HostTrap::Type)
+        let (value, physical) = match self.storage {
+            HostStructStorage::Materialized(fields) => {
+                (fields.get(index).ok_or(HostTrap::Type)?, None)
+            }
+            HostStructStorage::FlatRow(fields) => (*fields.get(index).ok_or(HostTrap::Type)?, None),
+            HostStructStorage::Physical {
+                slots,
+                layout,
+                layouts,
+            } => {
+                let field = layout.field_offsets.get(index).ok_or(HostTrap::Type)?;
+                let start = usize::from(field.offset);
+                let end = start
+                    .checked_add(usize::from(field.slots))
+                    .ok_or(HostTrap::Type)?;
+                let slots = slots.get(start..end).ok_or(HostTrap::Type)?;
+                (
+                    slots.first().copied().unwrap_or(crate::RuntimeValue::Unit),
+                    Some(HostPhysicalValue {
+                        logical_type: field.logical_type,
+                        slots,
+                        layouts,
+                    }),
+                )
+            }
+        };
+        Ok(HostValueRef {
+            value,
+            heap: self.heap,
+            physical,
+            row: None,
+        })
     }
 }
 
@@ -1366,6 +1488,7 @@ impl<'a> HostClassRef<'a> {
             .map(|value| HostValueRef {
                 value,
                 heap: Some(self.heap),
+                physical: None,
                 row: None,
             })
             .ok_or(HostTrap::Type)
@@ -1376,19 +1499,22 @@ impl<'a> HostClassRef<'a> {
         self.fields.iter().map(|value| HostValueRef {
             value,
             heap: Some(self.heap),
+            physical: None,
             row: None,
         })
     }
 }
 
-/// A named enum whose optional payload remains in the VM heap.
+/// A named enum borrowed from persistent VM storage or a physical frame
+/// range.
 #[derive(Clone, Copy, Debug)]
 pub struct HostEnumRef<'a> {
     type_id: StableId,
     variant: StableId,
     tag: u32,
     payload: Option<crate::RuntimeValue>,
-    heap: &'a crate::Heap,
+    physical_payload: Option<HostPhysicalValue<'a>>,
+    heap: Option<&'a crate::Heap>,
 }
 
 impl<'a> HostEnumRef<'a> {
@@ -1409,11 +1535,25 @@ impl<'a> HostEnumRef<'a> {
 
     #[must_use]
     pub fn payload(self) -> Option<HostValueRef<'a>> {
-        self.payload.map(|value| HostValueRef {
-            value,
-            heap: Some(self.heap),
-            row: None,
-        })
+        self.physical_payload
+            .map(|physical| HostValueRef {
+                value: physical
+                    .slots
+                    .first()
+                    .copied()
+                    .unwrap_or(crate::RuntimeValue::Unit),
+                heap: self.heap,
+                physical: Some(physical),
+                row: None,
+            })
+            .or_else(|| {
+                self.payload.map(|value| HostValueRef {
+                    value,
+                    heap: self.heap,
+                    physical: None,
+                    row: None,
+                })
+            })
     }
 }
 
@@ -1464,6 +1604,7 @@ macro_rules! host_collection_ref {
                     return Ok(HostValueRef {
                         value: crate::RuntimeValue::Unit,
                         heap: Some(self.heap),
+                        physical: None,
                         row: Some(HostStructRow {
                             type_id: struct_type,
                             fields,
@@ -1475,6 +1616,7 @@ macro_rules! host_collection_ref {
                     .map(|value| HostValueRef {
                         value,
                         heap: Some(self.heap),
+                        physical: None,
                         row: None,
                     })
                     .ok_or(HostTrap::Type)
@@ -1507,6 +1649,7 @@ impl<'a> HostMapEntryRef<'a> {
         HostValueRef {
             value: self.key,
             heap: Some(self.heap),
+            physical: None,
             row: None,
         }
     }
@@ -1516,6 +1659,7 @@ impl<'a> HostMapEntryRef<'a> {
         HostValueRef {
             value: self.value,
             heap: Some(self.heap),
+            physical: None,
             row: None,
         }
     }
@@ -1581,6 +1725,8 @@ pub enum HostResultRef<'a, T, E> {
 #[derive(Debug)]
 pub struct RuntimeHostArgs<'a> {
     values: &'a [crate::RuntimeValue],
+    logical_types: Option<&'a [nexa_bytecode::ValueType]>,
+    layouts: Option<&'a nexa_bytecode::layout::LayoutTable>,
     heap: Option<&'a mut crate::Heap>,
 }
 
@@ -1592,17 +1738,49 @@ impl<'a> RuntimeHostArgs<'a> {
         if values.len() > MAX_HOST_ARGUMENTS {
             return Err(HostTrap::Arity);
         }
-        Ok(Self { values, heap })
+        Ok(Self {
+            values,
+            logical_types: None,
+            layouts: None,
+            heap,
+        })
+    }
+
+    pub(crate) fn from_physical(
+        values: &'a [crate::RuntimeValue],
+        logical_types: &'a [nexa_bytecode::ValueType],
+        layouts: &'a nexa_bytecode::layout::LayoutTable,
+        heap: Option<&'a mut crate::Heap>,
+    ) -> Result<Self, HostTrap> {
+        if logical_types.len() > MAX_HOST_ARGUMENTS {
+            return Err(HostTrap::Arity);
+        }
+        let physical_slots = logical_types.iter().try_fold(0_usize, |total, ty| {
+            let slots = layouts.physical_slots(*ty).map_err(|_| HostTrap::Type)?;
+            total.checked_add(usize::from(slots)).ok_or(HostTrap::Type)
+        })?;
+        if physical_slots != values.len() {
+            return Err(HostTrap::Arity);
+        }
+        Ok(Self {
+            values,
+            logical_types: Some(logical_types),
+            layouts: Some(layouts),
+            heap,
+        })
     }
 
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.values.len()
+        match self.logical_types {
+            Some(types) => types.len(),
+            None => self.values.len(),
+        }
     }
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len() == 0
     }
 
     pub fn i32(&self, index: usize) -> Result<i32, HostTrap> {
@@ -1661,9 +1839,24 @@ impl<'a> RuntimeHostArgs<'a> {
     }
 
     pub fn value_ref(&self, index: usize) -> Result<HostValueRef<'_>, HostTrap> {
+        if let (Some(logical_types), Some(layouts)) = (self.logical_types, self.layouts) {
+            let (logical_type, slots) =
+                physical_host_argument(self.values, logical_types, layouts, index)?;
+            return Ok(HostValueRef {
+                value: slots.first().copied().unwrap_or(crate::RuntimeValue::Unit),
+                heap: self.heap.as_deref(),
+                physical: Some(HostPhysicalValue {
+                    logical_type,
+                    slots,
+                    layouts,
+                }),
+                row: None,
+            });
+        }
         Ok(HostValueRef {
             value: self.value(index)?,
             heap: self.heap.as_deref(),
+            physical: None,
             row: None,
         })
     }
@@ -1756,8 +1949,41 @@ impl<'a> RuntimeHostArgs<'a> {
     }
 
     fn value(&self, index: usize) -> Result<crate::RuntimeValue, HostTrap> {
+        if let (Some(logical_types), Some(layouts)) = (self.logical_types, self.layouts) {
+            let (_, slots) = physical_host_argument(self.values, logical_types, layouts, index)?;
+            return match slots {
+                [value] => Ok(*value),
+                _ => Err(HostTrap::Type),
+            };
+        }
         self.values.get(index).copied().ok_or(HostTrap::Arity)
     }
+}
+
+fn physical_host_argument<'a>(
+    values: &'a [crate::RuntimeValue],
+    logical_types: &[nexa_bytecode::ValueType],
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    index: usize,
+) -> Result<(nexa_bytecode::ValueType, &'a [crate::RuntimeValue]), HostTrap> {
+    let logical_type = *logical_types.get(index).ok_or(HostTrap::Arity)?;
+    let start = logical_types[..index]
+        .iter()
+        .try_fold(0_usize, |total, ty| {
+            total
+                .checked_add(usize::from(
+                    layouts.physical_slots(*ty).map_err(|_| HostTrap::Type)?,
+                ))
+                .ok_or(HostTrap::Type)
+        })?;
+    let end = start
+        .checked_add(usize::from(
+            layouts
+                .physical_slots(logical_type)
+                .map_err(|_| HostTrap::Type)?,
+        ))
+        .ok_or(HostTrap::Type)?;
+    Ok((logical_type, values.get(start..end).ok_or(HostTrap::Arity)?))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1844,6 +2070,7 @@ pub struct HostReturnTransaction<'a> {
     pending_collections: [Option<PendingHostCollection>; MAX_HOST_RETURN_FIELDS],
     remaining_string_bytes: usize,
     remaining_struct_fields: usize,
+    record_host_codec: bool,
     committed: bool,
 }
 
@@ -1852,15 +2079,34 @@ impl<'a> HostReturnTransaction<'a> {
         heap: &'a mut crate::Heap,
         requirements: HostReturnRequirements,
     ) -> Result<Self, HostTrap> {
+        Self::new_with_boundary(heap, requirements, true)
+    }
+
+    pub(crate) fn new_runtime_boundary(
+        heap: &'a mut crate::Heap,
+        requirements: HostReturnRequirements,
+    ) -> Result<Self, HostTrap> {
+        Self::new_with_boundary(heap, requirements, false)
+    }
+
+    fn new_with_boundary(
+        heap: &'a mut crate::Heap,
+        requirements: HostReturnRequirements,
+        record_host_codec: bool,
+    ) -> Result<Self, HostTrap> {
         heap.preflight_host_string_bytes(requirements.string_bytes)
             .map_err(|_| HostTrap::Type)?;
-        if heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnObjectReservation) {
+        if record_host_codec
+            && heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnObjectReservation)
+        {
             return Err(HostTrap::Type);
         }
         let heap_reservation = heap
             .preflight(requirements.object_slots)
             .map_err(|_| HostTrap::Type)?;
-        if heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionReservation) {
+        if record_host_codec
+            && heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionReservation)
+        {
             return Err(HostTrap::Type);
         }
         let mut collection_quota = heap
@@ -1877,6 +2123,7 @@ impl<'a> HostReturnTransaction<'a> {
             pending_collections: [None; MAX_HOST_RETURN_FIELDS],
             remaining_string_bytes: requirements.string_bytes,
             remaining_struct_fields: requirements.struct_fields,
+            record_host_codec,
             committed: false,
         })
     }
@@ -1896,9 +2143,10 @@ impl<'a> HostReturnTransaction<'a> {
         type_id: StableId,
         fields: &[crate::RuntimeValue],
     ) -> Result<crate::RuntimeValue, HostTrap> {
-        if self
-            .heap
-            .failure_trigger(crate::RuntimeFailurePoint::HostReturnStructWrite)
+        if self.record_host_codec
+            && self
+                .heap
+                .failure_trigger(crate::RuntimeFailurePoint::HostReturnStructWrite)
         {
             return Err(HostTrap::Type);
         }
@@ -1910,7 +2158,9 @@ impl<'a> HostReturnTransaction<'a> {
             .heap
             .commit_struct(&mut self.heap_reservation, type_id, fields)
             .map_err(|_| HostTrap::Type)?;
-        self.heap.record_host_codec_field_copy(fields);
+        if self.record_host_codec {
+            self.heap.record_host_codec_field_copy(fields);
+        }
         Ok(value)
     }
 
@@ -1928,7 +2178,7 @@ impl<'a> HostReturnTransaction<'a> {
             tag,
             payload,
         );
-        if payload.is_some() {
+        if self.record_host_codec && payload.is_some() {
             self.heap
                 .record_host_codec_copy(std::mem::size_of::<crate::RuntimeValue>() as u64);
         }
@@ -2084,9 +2334,10 @@ impl<'a> HostReturnTransaction<'a> {
         builder: &mut HostCollectionBuilder,
         value: crate::RuntimeValue,
     ) -> Result<(), HostTrap> {
-        if self
-            .heap
-            .failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionWrite)
+        if self.record_host_codec
+            && self
+                .heap
+                .failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionWrite)
         {
             return Err(HostTrap::Type);
         }
@@ -2099,7 +2350,9 @@ impl<'a> HostReturnTransaction<'a> {
                 value,
             )
             .map_err(|_| HostTrap::Type)?;
-        self.heap.record_host_codec_storage_copy(builder.storage, 1);
+        if self.record_host_codec {
+            self.heap.record_host_codec_storage_copy(builder.storage, 1);
+        }
         builder.written += 1;
         Ok(())
     }
@@ -2118,9 +2371,10 @@ impl<'a> HostReturnTransaction<'a> {
     }
 
     fn finish(&mut self) -> Result<(), HostTrap> {
-        if self
-            .heap
-            .failure_trigger(crate::RuntimeFailurePoint::HostReturnCommit)
+        if (self.record_host_codec
+            && self
+                .heap
+                .failure_trigger(crate::RuntimeFailurePoint::HostReturnCommit))
             || !crate::Heap::reservation_complete(&self.heap_reservation)
             || self.remaining_string_bytes != 0
             || self.remaining_struct_fields != 0

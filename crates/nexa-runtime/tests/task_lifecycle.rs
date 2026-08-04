@@ -136,7 +136,7 @@ fn async_module() -> VerifiedModule {
         cancel_error: Some(1),
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(signature.clone(), 1);
+    let mut function = FunctionBuilder::new(signature.clone(), 2);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -147,16 +147,15 @@ fn async_module() -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 0 });
     let mut function = function.finish().expect("async function");
-    function.root_bitmap[0] = true;
     function.safepoints = vec![0, 1];
     function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false],
+            bitmap: vec![false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![true],
+            bitmap: vec![false, false],
         },
     ];
     let mut module = ModuleBuilder::new();
@@ -201,7 +200,7 @@ fn async_nominal_result_module() -> VerifiedModule {
         cancel_error: None,
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(signature.clone(), 1);
+    let mut function = FunctionBuilder::new(signature.clone(), 3);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -212,21 +211,22 @@ fn async_nominal_result_module() -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 0 });
     let mut function = function.finish().expect("async nominal error function");
-    function.root_bitmap[0] = true;
+    function.root_bitmap[2] = true;
     function.safepoints = vec![0, 1];
     function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false],
+            bitmap: vec![false, false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![true],
+            bitmap: vec![false, false, true],
         },
     ];
     let mut module = ModuleBuilder::new();
     module
         .metadata(HOST, schema())
+        .opaque_type(trace_type)
         .struct_type(StructType {
             type_id: payload_type,
             fields: vec![

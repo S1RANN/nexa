@@ -13,8 +13,8 @@ use nexa_compiler::PackageCompileOutput;
 use nexa_core::{CanonicalSymbolIdentity, FileId, StableId, SymbolKind};
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, FrameLimits, FuelState, Heap, HostTrap,
-    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, OpcodeCostTable, RuntimeValue,
-    TrapKind,
+    InterpreterHost, InterpreterHostArguments, InterpreterHostOutcome, InterpreterOutcome,
+    OpcodeCostTable, RuntimeValue, TrapKind,
 };
 
 const EVIDENCE_PACKAGE: &str = "nexa.compiler.evidence";
@@ -584,7 +584,7 @@ impl InterpreterHost for UnitHost {
     fn call(
         &mut self,
         import: u32,
-        arguments: &[RuntimeValue],
+        arguments: InterpreterHostArguments<'_>,
         _heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
         if import != 0 {
@@ -1248,6 +1248,48 @@ async fn work(value: i32) -> i32 {
 ",
     );
     assert_defer_cleanup_evidence(&compiled);
+}
+
+#[test]
+fn defer_cleanup_captures_the_complete_physical_struct_range() {
+    let compiled = compile_typed_evidence_package(
+        r"
+struct Pair {
+    first: i32,
+    second: i32,
+}
+
+fn finalize(value: Pair) -> i32 {
+    return value.first + value.second;
+}
+
+async fn work() -> i32 {
+    let value: Pair = Pair { first: 3, second: 5 };
+    defer finalize(value);
+    yield;
+    return value.first;
+}
+",
+    );
+    let (cleanup, slots) = compiled
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| &function.code)
+        .find_map(|instruction| match instruction {
+            Instruction::DeferPush {
+                function,
+                args_count,
+                ..
+            } => Some((*function, *args_count)),
+            _ => None,
+        })
+        .expect("typed defer emits a physical capture");
+    assert_eq!(slots, 2);
+    assert_eq!(
+        compiled.module.functions[cleanup as usize].parameter_slots,
+        2
+    );
 }
 
 #[test]

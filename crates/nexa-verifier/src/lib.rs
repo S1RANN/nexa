@@ -219,14 +219,32 @@ pub enum ResolvedNominalOperand {
     EnumVariant {
         type_index: u16,
         variant_index: u16,
+        tag: u32,
+        payload_offset: u16,
+        payload_slots: u16,
+        owner_slots: u16,
+    },
+    EnumLayout {
+        type_index: u16,
+        slots: u16,
+    },
+    StructLayout {
+        type_id: StableId,
+        slots: u16,
     },
     StructField {
         type_id: StableId,
         index: u16,
+        offset: u16,
+        slots: u16,
+        owner_slots: u16,
     },
     ClassField {
         type_index: u16,
         index: u16,
+        offset: u16,
+        slots: u16,
+        owner_slots: u16,
         state_index: Option<u16>,
     },
     StateField {
@@ -234,12 +252,29 @@ pub enum ResolvedNominalOperand {
         field_index: u16,
         sorted_index: u16,
     },
-    ArrayType {
+    ArrayLayout {
         type_index: u16,
-        row_fields: u8,
+        element_slots: u16,
+        row_slots: u16,
     },
-    MapType {
+    ArrayField {
         type_index: u16,
+        offset: u16,
+        slots: u16,
+        row_slots: u16,
+    },
+    MapLayout {
+        type_index: u16,
+        key_slots: u16,
+        value_slots: u16,
+        option_slots: u16,
+        option_payload_offset: u16,
+    },
+    StandardIntrinsic {
+        argument_slots: [u16; 3],
+        result_slots: u16,
+        input_payload_offset: u16,
+        result_payload_offset: u16,
     },
     CallFrame {
         register_count: u16,
@@ -637,10 +672,11 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
         let mut tags = BTreeSet::new();
         if !enum_ids.insert(enum_type.type_id)
             || enum_type.variants.is_empty()
-            || enum_type
-                .variants
-                .iter()
-                .any(|variant| !variant_ids.insert(variant.stable_id) || !tags.insert(variant.tag))
+            || enum_type.variants.iter().any(|variant| {
+                variant.tag > i32::MAX as u32
+                    || !variant_ids.insert(variant.stable_id)
+                    || !tags.insert(variant.tag)
+            })
         {
             return Err(VerifyError {
                 function: 0,
@@ -1350,7 +1386,13 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
 const fn standard_intrinsic_requires_heap(intrinsic: StandardIntrinsic) -> bool {
     !matches!(
         intrinsic,
-        StandardIntrinsic::F32Floor
+        StandardIntrinsic::OptionIsSome { .. }
+            | StandardIntrinsic::OptionIsNone { .. }
+            | StandardIntrinsic::ResultIsOk { .. }
+            | StandardIntrinsic::ResultIsErr { .. }
+            | StandardIntrinsic::OptionUnwrapOr { .. }
+            | StandardIntrinsic::ResultUnwrapOr { .. }
+            | StandardIntrinsic::F32Floor
             | StandardIntrinsic::F64Floor
             | StandardIntrinsic::F32Ceil
             | StandardIntrinsic::F64Ceil
@@ -1390,14 +1432,6 @@ const fn aggregate_instruction_requires_heap(instruction: Instruction) -> bool {
     matches!(
         instruction,
         Instruction::StateHandleResolve { .. }
-            | Instruction::EnumNew { .. }
-            | Instruction::EnumTag { .. }
-            | Instruction::EnumPayload { .. }
-            | Instruction::EnumEqual { .. }
-            | Instruction::StructNew { .. }
-            | Instruction::StructGet { .. }
-            | Instruction::StructWith { .. }
-            | Instruction::StructEqual { .. }
             | Instruction::ClassNew { .. }
             | Instruction::ClassGet { .. }
             | Instruction::ClassSet { .. }
@@ -1474,6 +1508,96 @@ struct PhysicalVerificationContext<'module> {
     module_abi: &'module nexa_bytecode::layout::ModuleAbi,
 }
 
+fn verify_physical_value_range(
+    state: &[Option<ValueType>],
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    base: u16,
+    expected: ValueType,
+) -> Result<u16, VerifyErrorKind> {
+    let slots = layouts
+        .layout_of(expected)
+        .map_err(VerifyErrorKind::InvalidValueLayout)?
+        .physical_slots;
+    if slots == 0 {
+        return Err(VerifyErrorKind::InvalidPhysicalAbi);
+    }
+    let end = base
+        .checked_add(slots)
+        .filter(|end| usize::from(*end) <= state.len())
+        .ok_or(VerifyErrorKind::RegisterOutOfRange(base))?;
+    if state.get(usize::from(base)).copied().flatten() != Some(expected) {
+        return Err(VerifyErrorKind::TypeMismatch);
+    }
+    if (base.saturating_add(1)..end).any(|slot| state[usize::from(slot)].is_some()) {
+        return Err(VerifyErrorKind::InvalidPhysicalAbi);
+    }
+    Ok(slots)
+}
+
+fn write_physical_value_range(
+    state: &mut [Option<ValueType>],
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    base: u16,
+    ty: ValueType,
+) -> Result<u16, VerifyErrorKind> {
+    let slots = layouts
+        .layout_of(ty)
+        .map_err(VerifyErrorKind::InvalidValueLayout)?
+        .physical_slots;
+    if slots == 0 {
+        return Err(VerifyErrorKind::InvalidPhysicalAbi);
+    }
+    let end = base
+        .checked_add(slots)
+        .filter(|end| usize::from(*end) <= state.len())
+        .ok_or(VerifyErrorKind::RegisterOutOfRange(base))?;
+    let destination_start = usize::from(base);
+    let destination_end = usize::from(end);
+    for (existing_base, existing) in state.iter().copied().enumerate() {
+        let Some(existing) = existing else {
+            continue;
+        };
+        let existing_slots = usize::from(
+            layouts
+                .layout_of(existing)
+                .map_err(VerifyErrorKind::InvalidValueLayout)?
+                .physical_slots,
+        );
+        let existing_end = existing_base
+            .checked_add(existing_slots)
+            .ok_or(VerifyErrorKind::InvalidPhysicalAbi)?;
+        let overlaps = existing_base < destination_end && destination_start < existing_end;
+        if overlaps && existing_base != destination_start {
+            return Err(VerifyErrorKind::InvalidPhysicalAbi);
+        }
+    }
+    state[destination_start..destination_end].fill(None);
+    state[destination_start] = Some(ty);
+    Ok(slots)
+}
+
+fn physical_field_offsets(
+    fields: &[StructField],
+    layouts: &nexa_bytecode::layout::LayoutTable,
+) -> Result<(Vec<(u16, u16)>, u16), VerifyErrorKind> {
+    let mut cursor = 0_u16;
+    let mut offsets = Vec::with_capacity(fields.len());
+    for field in fields {
+        let slots = layouts
+            .layout_of(field.ty)
+            .map_err(VerifyErrorKind::InvalidValueLayout)?
+            .physical_slots;
+        if slots == 0 {
+            return Err(VerifyErrorKind::InvalidPhysicalAbi);
+        }
+        offsets.push((cursor, slots));
+        cursor = cursor
+            .checked_add(slots)
+            .ok_or(VerifyErrorKind::InvalidPhysicalAbi)?;
+    }
+    Ok((offsets, cursor))
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
@@ -1533,29 +1657,58 @@ fn verify_function(
                 Err(error(Some(pc), VerifyErrorKind::TypeMismatch))
             }
         };
-        let array_element = |state: &[Option<ValueType>], source: u16| {
+        let array_layout = |state: &[Option<ValueType>], source: u16| {
             let source = register(source)?;
             let Some(ValueType::Named(type_id)) = state[source] else {
                 return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
             };
-            module
+            let (type_index, array_type) = module
                 .array_types
                 .iter()
-                .find(|array_type| array_type.type_id == type_id)
-                .map(|array_type| array_type.element)
-                .ok_or_else(|| error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0)))
+                .enumerate()
+                .find(|(_, array_type)| array_type.type_id == type_id)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0)))?;
+            let layout = physical
+                .layouts
+                .layout_of(array_type.element)
+                .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+            let row_slots = if matches!(
+                layout.equality_strategy,
+                nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                    | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+            ) {
+                layout.physical_slots
+            } else {
+                0
+            };
+            Ok((type_index, array_type.element, layout, row_slots))
         };
-        let map_types = |state: &[Option<ValueType>], source: u16| {
+        let map_layout = |state: &[Option<ValueType>], source: u16| {
             let source = register(source)?;
             let Some(ValueType::Named(type_id)) = state[source] else {
                 return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
             };
-            module
+            let (type_index, map_type) = module
                 .map_types
                 .iter()
-                .find(|map_type| map_type.type_id == type_id)
-                .map(|map_type| (map_type.key, map_type.value))
-                .ok_or_else(|| error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0)))
+                .enumerate()
+                .find(|(_, map_type)| map_type.type_id == type_id)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0)))?;
+            let key_layout = physical
+                .layouts
+                .layout_of(map_type.key)
+                .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+            let value_layout = physical
+                .layouts
+                .layout_of(map_type.value)
+                .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+            Ok((
+                type_index,
+                map_type.key,
+                map_type.value,
+                key_layout,
+                value_layout,
+            ))
         };
         let buffer_element = |state: &[Option<ValueType>], source: u16| {
             let source = register(source)?;
@@ -1652,47 +1805,18 @@ fn verify_function(
                 let source_index = register(source)?;
                 let ty = state[source_index]
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                let layout = physical
-                    .layouts
-                    .layout_of(ty)
-                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
-                if slots != layout.physical_slots || slots < 2 {
+                let source_slots =
+                    verify_physical_value_range(&state, physical.layouts, source, ty)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if slots != source_slots || slots < 2 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                 }
-                let source_end = source
-                    .checked_add(slots)
-                    .filter(|end| *end <= function.registers)
-                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::RegisterOutOfRange(source)))?;
-                let destination_end = dst
-                    .checked_add(slots)
-                    .filter(|end| *end <= function.registers)
-                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst)))?;
-                if (source + 1..source_end).any(|slot| state[usize::from(slot)].is_some()) {
+                let destination_slots =
+                    write_physical_value_range(&mut state, physical.layouts, dst, ty)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if destination_slots != slots {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                 }
-                let destination_start = usize::from(dst);
-                let destination_end = usize::from(destination_end);
-                for (base, existing) in state.iter().copied().enumerate() {
-                    let Some(existing) = existing else {
-                        continue;
-                    };
-                    let existing_slots = usize::from(
-                        physical
-                            .layouts
-                            .layout_of(existing)
-                            .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?
-                            .physical_slots,
-                    );
-                    let existing_end = base
-                        .checked_add(existing_slots)
-                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
-                    let overlaps = base < destination_end && destination_start < existing_end;
-                    if overlaps && base != destination_start {
-                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
-                    }
-                }
-                state[destination_start..destination_end].fill(None);
-                state[usize::from(dst)] = Some(ty);
             }
             Instruction::Add { dst, lhs, rhs }
             | Instruction::Sub { dst, lhs, rhs }
@@ -1814,21 +1938,87 @@ fn verify_function(
                 args_count,
                 dst,
             } => {
-                if args_count != intrinsic.argument_count()
-                    || !standard_intrinsic_metadata_is_complete(module, intrinsic)
-                {
+                if !standard_intrinsic_metadata_is_complete(module, intrinsic) {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
-                for argument in 0..args_count {
-                    let register_index = args_base.checked_add(argument).ok_or_else(|| {
-                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                    })?;
+                let mut argument_slots = [0_u16; 3];
+                let mut packed_slots = 0_u16;
+                for argument in 0..intrinsic.argument_count() {
                     let ty = intrinsic
                         .argument_type(argument)
                         .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                    require(&state, register_index, ty)?;
+                    let register_index = args_base.checked_add(packed_slots).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    let slots =
+                        verify_physical_value_range(&state, physical.layouts, register_index, ty)
+                            .map_err(|kind| error(Some(pc), kind))?;
+                    argument_slots[usize::from(argument)] = slots;
+                    packed_slots = packed_slots
+                        .checked_add(slots)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
                 }
-                state[register(dst)?] = Some(intrinsic.result_type());
+                if args_count != packed_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+
+                let input_payload_offset = match intrinsic {
+                    StandardIntrinsic::OptionIsSome { .. }
+                    | StandardIntrinsic::OptionIsNone { .. }
+                    | StandardIntrinsic::ResultIsOk { .. }
+                    | StandardIntrinsic::ResultIsErr { .. }
+                    | StandardIntrinsic::OptionUnwrapOr { .. }
+                    | StandardIntrinsic::ResultUnwrapOr { .. } => {
+                        let input = intrinsic
+                            .argument_type(0)
+                            .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                        let layout = physical.layouts.layout_of(input).map_err(|kind| {
+                            error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind))
+                        })?;
+                        let enum_layout = layout
+                            .enum_layout
+                            .as_ref()
+                            .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                        if enum_layout.tag_offset != 0 || enum_layout.payload_offset != 1 {
+                            return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                        }
+                        enum_layout.payload_offset
+                    }
+                    _ => 0,
+                };
+
+                let result_type = intrinsic.result_type();
+                let result_layout = physical
+                    .layouts
+                    .layout_of(result_type)
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let result_payload_offset = match intrinsic {
+                    StandardIntrinsic::ArrayGet { .. }
+                    | StandardIntrinsic::MapGet { .. }
+                    | StandardIntrinsic::MapRemove { .. } => {
+                        let enum_layout = result_layout
+                            .enum_layout
+                            .as_ref()
+                            .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                        if enum_layout.tag_offset != 0 || enum_layout.payload_offset != 1 {
+                            return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                        }
+                        enum_layout.payload_offset
+                    }
+                    _ => 0,
+                };
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, result_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != result_layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::StandardIntrinsic {
+                    argument_slots,
+                    result_slots: result_layout.physical_slots,
+                    input_payload_offset,
+                    result_payload_offset,
+                };
             }
             Instruction::CompareEq { dst, lhs, rhs } => {
                 let lhs = register(lhs)?;
@@ -1910,7 +2100,16 @@ fn verify_function(
                             .ok_or_else(|| {
                                 error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
                             })?;
-                    require(&state, argument, parameter.logical_type)?;
+                    let slots = verify_physical_value_range(
+                        &state,
+                        physical.layouts,
+                        argument,
+                        parameter.logical_type,
+                    )
+                    .map_err(|kind| error(Some(pc), kind))?;
+                    if slots != parameter.slot_count {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
                 }
                 resolved_operands[pc] = ResolvedNominalOperand::CallFrame {
                     register_count: callee.registers,
@@ -1927,15 +2126,11 @@ fn verify_function(
                             .as_ref()
                             .map(|result| result.slot_count)
                             .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                    if dst
-                        .checked_add(result_slots)
-                        .is_none_or(|end| end > function.registers)
-                    {
-                        return Err(error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst)));
-                    }
-                    state[register(dst)?] = Some(result);
-                    for continuation in 1..result_slots {
-                        state[usize::from(dst + continuation)] = None;
+                    let written =
+                        write_physical_value_range(&mut state, physical.layouts, dst, result)
+                            .map_err(|kind| error(Some(pc), kind))?;
+                    if written != result_slots {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                     }
                 }
             }
@@ -1948,22 +2143,28 @@ fn verify_function(
                 let host = module.host_imports.get(import as usize).ok_or_else(|| {
                     error(Some(pc), VerifyErrorKind::HostImportOutOfRange(import))
                 })?;
-                if usize::from(args_count) != host.parameters.len()
-                    || restricted_context
+                if restricted_context
                     || (host.mode == HostCallMode::Async && function.effect != FunctionEffect::Task)
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
-                for (argument, ty) in host.parameters.iter().copied().enumerate() {
-                    let argument = args_base
-                        .checked_add(u16::try_from(argument).unwrap())
-                        .ok_or_else(|| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?;
-                    require(&state, argument, ty)?;
+                let mut packed_slots = 0_u16;
+                for ty in host.parameters.iter().copied() {
+                    let argument = args_base.checked_add(packed_slots).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    let slots = verify_physical_value_range(&state, physical.layouts, argument, ty)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                    packed_slots = packed_slots
+                        .checked_add(slots)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                }
+                if args_count != packed_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
                 if let Some(result) = host.result {
-                    state[register(dst)?] = Some(result);
+                    write_physical_value_range(&mut state, physical.layouts, dst, result)
+                        .map_err(|kind| error(Some(pc), kind))?;
                 }
             }
             Instruction::StateOldGet { ty, dst, .. } => {
@@ -2193,11 +2394,45 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
                     })?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let enum_layout = layout
+                    .enum_layout
+                    .as_ref()
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let variant_layout = enum_layout
+                    .variants
+                    .get(variant_index)
+                    .filter(|candidate| {
+                        candidate.stable_id == variant.stable_id && candidate.tag == variant.tag
+                    })
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
                 match (variant.payload_type, payload) {
                     (Some(expected), Some(payload)) => {
-                        require(&state, payload, expected)?;
+                        let payload_slots = verify_physical_value_range(
+                            &state,
+                            physical.layouts,
+                            payload,
+                            expected,
+                        )
+                        .map_err(|kind| error(Some(pc), kind))?;
+                        if payload_slots != variant_layout.payload_slots {
+                            return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                        }
+                        let payload_end = payload.checked_add(payload_slots).ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(payload))
+                        })?;
+                        let destination_end =
+                            dst.checked_add(layout.physical_slots).ok_or_else(|| {
+                                error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst))
+                            })?;
+                        if payload < destination_end && dst < payload_end {
+                            return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                        }
                     }
-                    (None, None) => {}
+                    (None, None) if variant_layout.payload_slots == 0 => {}
                     _ => return Err(error(Some(pc), VerifyErrorKind::TypeMismatch)),
                 }
                 resolved_operands[pc] = ResolvedNominalOperand::EnumVariant {
@@ -2205,24 +2440,43 @@ fn verify_function(
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     variant_index: u16::try_from(variant_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    tag: variant.tag,
+                    payload_offset: enum_layout.payload_offset,
+                    payload_slots: variant_layout.payload_slots,
+                    owner_slots: layout.physical_slots,
                 };
-                state[register(dst)?] = Some(ValueType::Named(type_id));
+                write_physical_value_range(
+                    &mut state,
+                    physical.layouts,
+                    dst,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
             }
             Instruction::EnumTag { source, dst } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                if !module
+                let type_index = module
                     .enum_types
                     .iter()
-                    .any(|enum_type| enum_type.type_id == type_id)
-                {
-                    return Err(error(
-                        Some(pc),
-                        VerifyErrorKind::EnumTypeOutOfRange(type_id.0),
-                    ));
-                }
+                    .position(|enum_type| enum_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumTypeOutOfRange(type_id.0))
+                    })?;
+                let slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    source,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                resolved_operands[pc] = ResolvedNominalOperand::EnumLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?,
+                    slots,
+                };
                 state[register(dst)?] = Some(ValueType::I32);
             }
             Instruction::EnumPayload {
@@ -2230,42 +2484,103 @@ fn verify_function(
                 variant,
                 dst,
             } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let payload_type = module
+                let (type_index, enum_type) = module
                     .enum_types
                     .iter()
-                    .find(|enum_type| enum_type.type_id == type_id)
-                    .and_then(|enum_type| {
-                        enum_type
-                            .variants
-                            .iter()
-                            .find(|candidate| candidate.stable_id == variant)
-                    })
-                    .and_then(|variant| variant.payload_type)
+                    .enumerate()
+                    .find(|(_, enum_type)| enum_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumTypeOutOfRange(type_id.0))
+                    })?;
+                let (variant_index, variant) = enum_type
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, candidate)| candidate.stable_id == variant)
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
                     })?;
-                state[register(dst)?] = Some(payload_type);
+                let payload_type = variant.payload_type.ok_or_else(|| {
+                    error(
+                        Some(pc),
+                        VerifyErrorKind::EnumVariantOutOfRange(variant.stable_id.0),
+                    )
+                })?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let enum_layout = layout
+                    .enum_layout
+                    .as_ref()
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let variant_layout = enum_layout
+                    .variants
+                    .get(variant_index)
+                    .filter(|candidate| candidate.stable_id == variant.stable_id)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    source,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, payload_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != variant_layout.payload_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::EnumVariant {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?,
+                    variant_index: u16::try_from(variant_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?,
+                    tag: variant.tag,
+                    payload_offset: enum_layout.payload_offset,
+                    payload_slots: variant_layout.payload_slots,
+                    owner_slots: layout.physical_slots,
+                };
             }
             Instruction::EnumEqual { lhs, rhs, dst } => {
-                let lhs = register(lhs)?;
-                let Some(ValueType::Named(type_id)) = state[lhs] else {
+                let lhs_index = register(lhs)?;
+                let Some(ValueType::Named(type_id)) = state[lhs_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                if !module
+                let type_index = module
                     .enum_types
                     .iter()
-                    .any(|enum_type| enum_type.type_id == type_id)
-                {
-                    return Err(error(
-                        Some(pc),
-                        VerifyErrorKind::EnumTypeOutOfRange(type_id.0),
-                    ));
+                    .position(|enum_type| enum_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumTypeOutOfRange(type_id.0))
+                    })?;
+                let lhs_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    lhs,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                let rhs_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    rhs,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if lhs_slots != rhs_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                 }
-                require(&state, rhs, ValueType::Named(type_id))?;
+                resolved_operands[pc] = ResolvedNominalOperand::EnumLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?,
+                    slots: lhs_slots,
+                };
                 state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::StructNew {
@@ -2281,24 +2596,49 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::StructTypeOutOfRange(type_id.0))
                     })?;
-                if usize::from(fields_count) != struct_type.fields.len() {
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                if fields_count != layout.physical_slots
+                    || fields_base
+                        .checked_add(fields_count)
+                        .is_none_or(|end| end > function.registers)
+                    || dst
+                        .checked_add(layout.physical_slots)
+                        .is_none_or(|end| end > function.registers)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
-                for (index, field) in struct_type.fields.iter().enumerate() {
-                    let source = fields_base
-                        .checked_add(u16::try_from(index).map_err(|_| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?)
-                        .ok_or_else(|| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?;
-                    require(&state, source, field.ty)?;
+                for (field, placement) in struct_type.fields.iter().zip(&layout.field_offsets) {
+                    let source = fields_base.checked_add(placement.offset).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    let slots =
+                        verify_physical_value_range(&state, physical.layouts, source, field.ty)
+                            .map_err(|kind| error(Some(pc), kind))?;
+                    if slots != placement.slots {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
                 }
-                state[register(dst)?] = Some(ValueType::Named(type_id));
+                resolved_operands[pc] = ResolvedNominalOperand::StructLayout {
+                    type_id,
+                    slots: layout.physical_slots,
+                };
+                let written = write_physical_value_range(
+                    &mut state,
+                    physical.layouts,
+                    dst,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if written != fields_count {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
             }
             Instruction::StructGet { source, field, dst } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
                 let (field_index, field_type) = module
@@ -2316,12 +2656,38 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let placement = layout
+                    .field_offsets
+                    .get(field_index)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let source_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    source,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if source_slots != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
                 resolved_operands[pc] = ResolvedNominalOperand::StructField {
                     type_id,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    offset: placement.offset,
+                    slots: placement.slots,
+                    owner_slots: layout.physical_slots,
                 };
-                state[register(dst)?] = Some(field_type);
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, field_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != placement.slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
             }
             Instruction::StructWith {
                 source,
@@ -2329,8 +2695,8 @@ fn verify_function(
                 value,
                 dst,
             } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
                 let (field_index, field_type) = module
@@ -2348,17 +2714,56 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let placement = layout
+                    .field_offsets
+                    .get(field_index)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let source_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    source,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                let value_slots =
+                    verify_physical_value_range(&state, physical.layouts, value, field_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if source_slots != layout.physical_slots || value_slots != placement.slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                let value_end = value + value_slots;
+                let destination_end = dst
+                    .checked_add(layout.physical_slots)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst)))?;
+                if value < destination_end && dst < value_end {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
                 resolved_operands[pc] = ResolvedNominalOperand::StructField {
                     type_id,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    offset: placement.offset,
+                    slots: placement.slots,
+                    owner_slots: layout.physical_slots,
                 };
-                require(&state, value, field_type)?;
-                state[register(dst)?] = Some(ValueType::Named(type_id));
+                let written = write_physical_value_range(
+                    &mut state,
+                    physical.layouts,
+                    dst,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if written != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
             }
             Instruction::StructEqual { lhs, rhs, dst } => {
-                let lhs = register(lhs)?;
-                let Some(ValueType::Named(type_id)) = state[lhs] else {
+                let lhs_index = register(lhs)?;
+                let Some(ValueType::Named(type_id)) = state[lhs_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
                 if !module
@@ -2371,7 +2776,31 @@ fn verify_function(
                         VerifyErrorKind::StructTypeOutOfRange(type_id.0),
                     ));
                 }
-                require(&state, rhs, ValueType::Named(type_id))?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(type_id))
+                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let lhs_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    lhs,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                let rhs_slots = verify_physical_value_range(
+                    &state,
+                    physical.layouts,
+                    rhs,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if lhs_slots != layout.physical_slots || rhs_slots != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::StructLayout {
+                    type_id,
+                    slots: layout.physical_slots,
+                };
                 state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::ClassNew {
@@ -2387,43 +2816,60 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassTypeOutOfRange(type_id.0))
                     })?;
-                if usize::from(fields_count) != class_type.fields.len() {
+                let (offsets, owner_slots) =
+                    physical_field_offsets(&class_type.fields, physical.layouts)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if fields_count != owner_slots
+                    || fields_base
+                        .checked_add(fields_count)
+                        .is_none_or(|end| end > function.registers)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
-                for (index, field) in class_type.fields.iter().enumerate() {
-                    let source = fields_base
-                        .checked_add(u16::try_from(index).map_err(|_| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?)
-                        .ok_or_else(|| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?;
-                    require(&state, source, field.ty)?;
+                for (field, (offset, slots)) in class_type.fields.iter().zip(offsets) {
+                    let source = fields_base.checked_add(offset).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    let actual =
+                        verify_physical_value_range(&state, physical.layouts, source, field.ty)
+                            .map_err(|kind| error(Some(pc), kind))?;
+                    if actual != slots {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
                 }
-                state[register(dst)?] = Some(ValueType::Named(type_id));
+                write_physical_value_range(
+                    &mut state,
+                    physical.layouts,
+                    dst,
+                    ValueType::Named(type_id),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
             }
             Instruction::ClassGet { source, field, dst } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let (type_index, field_index, field_type) = module
+                let (type_index, class_type) = module
                     .class_types
                     .iter()
                     .enumerate()
                     .find(|(_, class_type)| class_type.type_id == type_id)
-                    .and_then(|(type_index, class_type)| {
-                        class_type
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, candidate)| candidate.stable_id == field)
-                            .map(|(field_index, field)| (type_index, field_index, field))
-                    })
-                    .map(|(type_index, field_index, field)| (type_index, field_index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                let field_index = class_type
+                    .fields
+                    .iter()
+                    .position(|candidate| candidate.stable_id == field)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
+                    })?;
+                let field_type = class_type.fields[field_index].ty;
+                let (offsets, owner_slots) =
+                    physical_field_offsets(&class_type.fields, physical.layouts)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                let (offset, slots) = offsets[field_index];
                 let state_index = resolve_state_field(module, type_id, field)
                     .map(|(_, _, sorted_index, _)| {
                         u16::try_from(sorted_index)
@@ -2435,36 +2881,47 @@ fn verify_function(
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    offset,
+                    slots,
+                    owner_slots,
                     state_index,
                 };
-                state[register(dst)?] = Some(field_type);
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, field_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
             }
             Instruction::ClassSet {
                 source,
                 field,
                 value,
             } => {
-                let source = register(source)?;
-                let Some(ValueType::Named(type_id)) = state[source] else {
+                let source_index = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source_index] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let (type_index, field_index, field_type) = module
+                let (type_index, class_type) = module
                     .class_types
                     .iter()
                     .enumerate()
                     .find(|(_, class_type)| class_type.type_id == type_id)
-                    .and_then(|(type_index, class_type)| {
-                        class_type
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, candidate)| candidate.stable_id == field)
-                            .map(|(field_index, field)| (type_index, field_index, field))
-                    })
-                    .map(|(type_index, field_index, field)| (type_index, field_index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                let field_index = class_type
+                    .fields
+                    .iter()
+                    .position(|candidate| candidate.stable_id == field)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
+                    })?;
+                let field_type = class_type.fields[field_index].ty;
+                let (offsets, owner_slots) =
+                    physical_field_offsets(&class_type.fields, physical.layouts)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                let (offset, slots) = offsets[field_index];
                 let state_index = resolve_state_field(module, type_id, field)
                     .map(|(_, _, sorted_index, _)| {
                         u16::try_from(sorted_index)
@@ -2476,9 +2933,17 @@ fn verify_function(
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    offset,
+                    slots,
+                    owner_slots,
                     state_index,
                 };
-                require(&state, value, field_type)?;
+                let actual =
+                    verify_physical_value_range(&state, physical.layouts, value, field_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if actual != slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
             }
             Instruction::ClassEqual { lhs, rhs, dst } => {
                 let lhs = register(lhs)?;
@@ -2507,32 +2972,47 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0))
                     })?;
-                let row_fields = match array_type.element {
-                    ValueType::Named(element_id) => module
-                        .struct_types
-                        .iter()
-                        .find(|struct_type| struct_type.type_id == element_id)
-                        .and_then(|struct_type| u8::try_from(struct_type.fields.len()).ok())
-                        .filter(|field_count| *field_count != 0)
-                        .unwrap_or_default(),
-                    _ => 0,
+                let layout = physical
+                    .layouts
+                    .layout_of(array_type.element)
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let row_slots = if matches!(
+                    layout.equality_strategy,
+                    nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                        | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+                ) {
+                    layout.physical_slots
+                } else {
+                    0
                 };
-                resolved_operands[pc] = ResolvedNominalOperand::ArrayType {
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
                     type_index: u16::try_from(type_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
-                    row_fields,
+                    element_slots: layout.physical_slots,
+                    row_slots,
                 };
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
             Instruction::ArrayLen { source, dst } => {
-                array_element(&state, source)?;
+                array_layout(&state, source)?;
                 state[register(dst)?] = Some(ValueType::I32);
             }
             Instruction::ArrayGet { source, index, dst }
             | Instruction::ArrayRemove { source, index, dst } => {
-                let element = array_element(&state, source)?;
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
                 require(&state, index, ValueType::I32)?;
-                state[register(dst)?] = Some(element);
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, element)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::ArrayFieldGet {
                 source,
@@ -2543,24 +3023,37 @@ fn verify_function(
                 // WP52: one struct-element field projected without
                 // materializing the element; the field operand is the
                 // positional index inside the declared field order.
-                let element = array_element(&state, source)?;
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
                 require(&state, index, ValueType::I32)?;
                 let ValueType::Named(type_id) = element else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field_type = module
+                let (field_type, placement) = module
                     .struct_types
                     .iter()
                     .find(|struct_type| struct_type.type_id == type_id)
                     .and_then(|struct_type| struct_type.fields.get(usize::from(field)))
-                    .map(|field| field.ty)
+                    .zip(layout.field_offsets.get(usize::from(field)))
+                    .map(|(field, placement)| (field.ty, placement))
                     .ok_or_else(|| {
                         error(
                             Some(pc),
                             VerifyErrorKind::StructFieldOutOfRange(u64::from(field)),
                         )
                     })?;
-                state[register(dst)?] = Some(field_type);
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, field_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != placement.slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayField {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    offset: placement.offset,
+                    slots: placement.slots,
+                    row_slots,
+                };
             }
             Instruction::ArraySet {
                 source,
@@ -2572,22 +3065,42 @@ fn verify_function(
                 index,
                 value,
             } => {
-                let element = array_element(&state, source)?;
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
                 require(&state, index, ValueType::I32)?;
-                require(&state, value, element)?;
+                let slots = verify_physical_value_range(&state, physical.layouts, value, element)
+                    .map_err(|kind| error(Some(pc), kind))?;
+                if slots != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::ArrayPush { source, value } => {
-                let element = array_element(&state, source)?;
-                require(&state, value, element)?;
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
+                let slots = verify_physical_value_range(&state, physical.layouts, value, element)
+                    .map_err(|kind| error(Some(pc), kind))?;
+                if slots != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::ArrayPushRow {
                 source,
                 fields_base,
                 fields_count,
             } => {
-                // WP52 push-side fusion: the register range must carry the
-                // element struct's declared fields, in order.
-                let element = array_element(&state, source)?;
+                // WP52 push-side fusion: the register range carries the
+                // element struct's flattened physical fields, in order.
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
                 let ValueType::Named(type_id) = element else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
@@ -2596,28 +3109,53 @@ fn verify_function(
                     .iter()
                     .find(|struct_type| struct_type.type_id == type_id)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                if usize::from(fields_count) != struct_type.fields.len() {
+                if row_slots == 0 || fields_count != layout.physical_slots {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
-                for (offset, field) in struct_type.fields.iter().enumerate() {
+                for (field, placement) in struct_type.fields.iter().zip(&layout.field_offsets) {
                     let register = fields_base
-                        .checked_add(
-                            u16::try_from(offset)
-                                .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
-                        )
+                        .checked_add(placement.offset)
                         .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                    require(&state, register, field.ty)?;
+                    let slots =
+                        verify_physical_value_range(&state, physical.layouts, register, field.ty)
+                            .map_err(|kind| error(Some(pc), kind))?;
+                    if slots != placement.slots {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
                 }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::ArrayPop { source, dst } => {
-                let element = array_element(&state, source)?;
-                state[register(dst)?] = Some(element);
+                let (type_index, element, layout, row_slots) = array_layout(&state, source)?;
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, dst, element)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::ArrayClear { source } => {
-                array_element(&state, source)?;
+                let (type_index, _element, layout, row_slots) = array_layout(&state, source)?;
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    element_slots: layout.physical_slots,
+                    row_slots,
+                };
             }
             Instruction::MapNew { type_id, dst } => {
-                let (type_index, _) = module
+                let (type_index, map_type) = module
                     .map_types
                     .iter()
                     .enumerate()
@@ -2625,14 +3163,28 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0))
                     })?;
-                resolved_operands[pc] = ResolvedNominalOperand::MapType {
+                let key_slots = physical
+                    .layouts
+                    .layout_of(map_type.key)
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?
+                    .physical_slots;
+                let value_slots = physical
+                    .layouts
+                    .layout_of(map_type.value)
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?
+                    .physical_slots;
+                resolved_operands[pc] = ResolvedNominalOperand::MapLayout {
                     type_index: u16::try_from(type_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    key_slots,
+                    value_slots,
+                    option_slots: 0,
+                    option_payload_offset: 0,
                 };
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
             Instruction::MapLen { source, dst } => {
-                map_types(&state, source)?;
+                map_layout(&state, source)?;
                 state[register(dst)?] = Some(ValueType::I32);
             }
             Instruction::MapGet {
@@ -2647,8 +3199,14 @@ fn verify_function(
                 result_type,
                 dst,
             } => {
-                let (key_type, value_type) = map_types(&state, source)?;
-                require(&state, key, key_type)?;
+                let (type_index, key_type, value_type, key_layout, value_layout) =
+                    map_layout(&state, source)?;
+                let key_slots =
+                    verify_physical_value_range(&state, physical.layouts, key, key_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if key_slots != key_layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
                 let option = nexa_bytecode::option_type(value_type);
                 if result_type != option.type_id || !module.enum_types.contains(&option) {
                     return Err(error(
@@ -2656,20 +3214,82 @@ fn verify_function(
                         VerifyErrorKind::EnumTypeOutOfRange(result_type.0),
                     ));
                 }
-                state[register(dst)?] = Some(ValueType::Named(result_type));
+                let option_layout = physical
+                    .layouts
+                    .layout_of(ValueType::Named(result_type))
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let enum_layout = option_layout
+                    .enum_layout
+                    .as_ref()
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let some = enum_layout
+                    .variants
+                    .get(1)
+                    .filter(|variant| variant.payload_slots == value_layout.physical_slots)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                let written = write_physical_value_range(
+                    &mut state,
+                    physical.layouts,
+                    dst,
+                    ValueType::Named(result_type),
+                )
+                .map_err(|kind| error(Some(pc), kind))?;
+                if written != option_layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::MapLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    key_slots,
+                    value_slots: some.payload_slots,
+                    option_slots: option_layout.physical_slots,
+                    option_payload_offset: enum_layout.payload_offset,
+                };
             }
             Instruction::MapSet { source, key, value } => {
-                let (key_type, value_type) = map_types(&state, source)?;
-                require(&state, key, key_type)?;
-                require(&state, value, value_type)?;
+                let (type_index, key_type, value_type, key_layout, value_layout) =
+                    map_layout(&state, source)?;
+                let key_slots =
+                    verify_physical_value_range(&state, physical.layouts, key, key_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                let value_slots =
+                    verify_physical_value_range(&state, physical.layouts, value, value_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if key_slots != key_layout.physical_slots
+                    || value_slots != value_layout.physical_slots
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::MapLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    key_slots,
+                    value_slots,
+                    option_slots: 0,
+                    option_payload_offset: 0,
+                };
             }
             Instruction::MapContains { source, key, dst } => {
-                let (key_type, _) = map_types(&state, source)?;
-                require(&state, key, key_type)?;
+                let (type_index, key_type, _value_type, key_layout, value_layout) =
+                    map_layout(&state, source)?;
+                let key_slots =
+                    verify_physical_value_range(&state, physical.layouts, key, key_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if key_slots != key_layout.physical_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                resolved_operands[pc] = ResolvedNominalOperand::MapLayout {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    key_slots,
+                    value_slots: value_layout.physical_slots,
+                    option_slots: 0,
+                    option_payload_offset: 0,
+                };
                 state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::MapClear { source } => {
-                map_types(&state, source)?;
+                map_layout(&state, source)?;
             }
             Instruction::BufferLen { source, dst } => {
                 buffer_element(&state, source)?;
@@ -2727,13 +3347,12 @@ fn verify_function(
                     .as_ref()
                     .map(|result| result.slot_count)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
-                if source
-                    .checked_add(result_slots)
-                    .is_none_or(|end| end > function.registers)
-                {
-                    return Err(error(Some(pc), VerifyErrorKind::RegisterOutOfRange(source)));
+                let source_slots =
+                    verify_physical_value_range(&state, physical.layouts, source, result)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if source_slots != result_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                 }
-                require(&state, source, result)?;
             }
             Instruction::ReturnVoid => {
                 if function.signature.result.is_some() {
@@ -2745,24 +3364,40 @@ fn verify_function(
                 args_base,
                 args_count,
             } => {
+                let cleanup_index = cleanup as usize;
                 let cleanup = module
                     .functions
-                    .get(cleanup as usize)
+                    .get(cleanup_index)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(cleanup)))?;
+                let cleanup_abi = physical
+                    .module_abi
+                    .function(cleanup_index)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
                 if !matches!(
                     cleanup.effect,
                     FunctionEffect::Ordinary | FunctionEffect::Cleanup
-                ) || cleanup.signature.parameters.len() != usize::from(args_count)
+                ) || args_count != cleanup_abi.parameter_slots
+                    || args_count > 8
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
-                for (argument, ty) in cleanup.signature.parameters.iter().copied().enumerate() {
-                    let argument = args_base
-                        .checked_add(u16::try_from(argument).unwrap())
-                        .ok_or_else(|| {
-                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
-                        })?;
-                    require(&state, argument, ty)?;
+                for parameter in &cleanup_abi.parameters {
+                    let argument =
+                        args_base
+                            .checked_add(parameter.slot_offset)
+                            .ok_or_else(|| {
+                                error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                            })?;
+                    let slots = verify_physical_value_range(
+                        &state,
+                        physical.layouts,
+                        argument,
+                        parameter.logical_type,
+                    )
+                    .map_err(|kind| error(Some(pc), kind))?;
+                    if slots != parameter.slot_count {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
                 }
             }
             Instruction::Yield if !matches!(function.effect, FunctionEffect::Task) => {
@@ -2818,11 +3453,15 @@ fn verify_function(
             }
         }
     }
-    for register in 0..register_count {
-        let can_hold_ref = states
-            .iter()
-            .flatten()
-            .any(|state| state[register].is_some_and(ValueType::is_reference));
+    let mut can_hold_refs = vec![false; register_count];
+    for state in states.iter().flatten() {
+        let roots = physical_state_roots(module, physical.layouts, state, |_| true)
+            .map_err(|kind| error(None, kind))?;
+        for (can_hold, root) in can_hold_refs.iter_mut().zip(roots) {
+            *can_hold |= root;
+        }
+    }
+    for (register, can_hold_ref) in can_hold_refs.into_iter().enumerate() {
         match (function.root_bitmap[register], can_hold_ref) {
             (true, false) => {
                 return Err(error(
@@ -2839,7 +3478,7 @@ fn verify_function(
             _ => {}
         }
     }
-    verify_safepoints(module, function_index, function, &states)?;
+    verify_safepoints(module, physical.layouts, function_index, function, &states)?;
     Ok(resolved_operands)
 }
 
@@ -2874,8 +3513,55 @@ fn verify_loop_bounds(
     Ok(())
 }
 
+fn physical_state_roots(
+    module: &Module,
+    layout_table: &nexa_bytecode::layout::LayoutTable,
+    state: &[Option<ValueType>],
+    active: impl Fn(usize) -> bool,
+) -> Result<Vec<bool>, VerifyErrorKind> {
+    let mut roots = vec![false; state.len()];
+    for (base, ty) in state.iter().copied().enumerate() {
+        let Some(ty) = ty.filter(|_| active(base)) else {
+            continue;
+        };
+        let layout = layout_table
+            .layout_of(ty)
+            .map_err(VerifyErrorKind::InvalidValueLayout)?;
+        let physical_aggregate = matches!(ty, ValueType::Named(type_id)
+            if module
+                .struct_types
+                .iter()
+                .any(|struct_type| struct_type.type_id == type_id)
+                || module
+                    .enum_types
+                    .iter()
+                    .any(|enum_type| enum_type.type_id == type_id));
+        if physical_aggregate {
+            let end = base
+                .checked_add(usize::from(layout.physical_slots))
+                .filter(|end| *end <= state.len())
+                .ok_or(VerifyErrorKind::InvalidPhysicalAbi)?;
+            if state[base + 1..end].iter().any(Option::is_some) {
+                return Err(VerifyErrorKind::InvalidPhysicalAbi);
+            }
+            for (offset, is_root) in layout.gc_bitmap.iter().copied().enumerate() {
+                if is_root {
+                    roots[base + offset] = true;
+                }
+            }
+        } else if layout.physical_slots == 1 {
+            roots[base] = layout.gc_bitmap[0];
+        } else {
+            // Compact persistent/Host staging uses one carrier slot.
+            roots[base] = ty.is_reference();
+        }
+    }
+    Ok(roots)
+}
+
 fn verify_safepoints(
     module: &Module,
+    layout_table: &nexa_bytecode::layout::LayoutTable,
     function_index: usize,
     function: &Function,
     states: &[Option<Vec<Option<ValueType>>>],
@@ -2937,18 +3623,16 @@ fn verify_safepoints(
                     kind: VerifyErrorKind::InvalidRootMap(pc_u32),
                 });
             };
-            let exact = states[pc].as_ref().map_or_else(
-                || vec![false; usize::from(function.registers)],
-                |state| {
-                    state
-                        .iter()
-                        .enumerate()
-                        .map(|(register, ty)| {
-                            ty.is_some_and(ValueType::is_reference) && live_before[pc][register]
-                        })
-                        .collect()
-                },
-            );
+            let exact = if let Some(state) = states[pc].as_ref() {
+                physical_state_roots(module, layout_table, state, |base| live_before[pc][base])
+                    .map_err(|kind| VerifyError {
+                        function: function_index,
+                        instruction: Some(pc),
+                        kind,
+                    })?
+            } else {
+                vec![false; usize::from(function.registers)]
+            };
             if root_map.bitmap != exact {
                 return Err(VerifyError {
                     function: function_index,
@@ -3368,11 +4052,6 @@ fn instruction_requires_safepoint(
                 | Instruction::RuneToString { .. }
                 | Instruction::StringToString { .. }
                 | Instruction::StandardIntrinsic { .. }
-                | Instruction::EnumNew { .. }
-                | Instruction::EnumEqual { .. }
-                | Instruction::StructNew { .. }
-                | Instruction::StructWith { .. }
-                | Instruction::StructEqual { .. }
                 | Instruction::ClassNew { .. }
                 | Instruction::ArrayNew { .. }
                 | Instruction::ArrayLen { .. }
@@ -4033,10 +4712,6 @@ mod tests {
         );
         identity
             .parameter_slots(2)
-            .set_root(0)
-            .expect("aggregate parameter is rooted")
-            .set_root(2)
-            .expect("aggregate result is rooted")
             .emit(Instruction::CopyValue {
                 dst: 2,
                 source: 0,
@@ -4047,11 +4722,11 @@ mod tests {
         identity.root_maps = vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![true, false, false, false],
+                bitmap: vec![false; 4],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, false, true, false],
+                bitmap: vec![false; 4],
             },
         ];
         module.function(identity);
@@ -4064,10 +4739,6 @@ mod tests {
         );
         wrapper
             .parameter_slots(2)
-            .set_root(0)
-            .expect("aggregate argument root")
-            .set_root(2)
-            .expect("aggregate result root")
             .emit(Instruction::Call {
                 function: 0,
                 args_base: 0,
@@ -4079,11 +4750,11 @@ mod tests {
         wrapper.root_maps = vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![true, false, false, false],
+                bitmap: vec![false; 4],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, false, true, false],
+                bitmap: vec![false; 4],
             },
         ];
         module.function(wrapper);
@@ -4490,10 +5161,7 @@ mod tests {
             },
             1,
         );
-        identity
-            .set_root(0)
-            .unwrap()
-            .emit(Instruction::Return { source: 0 });
+        identity.emit(Instruction::Return { source: 0 });
         let mut valid = ModuleBuilder::new();
         valid
             .struct_type(content.clone())
@@ -4574,7 +5242,7 @@ mod tests {
         );
         get.set_root(0)
             .unwrap()
-            .set_root(2)
+            .set_root(3)
             .unwrap()
             .emit(Instruction::MapGet {
                 source: 0,
@@ -4591,7 +5259,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, false, true, false],
+                bitmap: vec![false, false, false, true],
             },
         ];
         let mut valid = ModuleBuilder::new();
@@ -4599,7 +5267,8 @@ mod tests {
             .map_type(map)
             .enum_type(option.clone())
             .function(get.clone());
-        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+        let verified = verify(valid.finish(), VerifierLimits::default());
+        assert!(verified.is_ok(), "{:?}", verified.err());
 
         let opaque = ValueType::Named(StableId::from_name("EntityHandle"));
         let mut opaque_key = ModuleBuilder::new();
@@ -5373,7 +6042,7 @@ mod tests {
         assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
     }
 
-    fn heap_dependent_struct_helper(type_id: StableId) -> Function {
+    fn heap_dependent_class_helper(type_id: StableId) -> Function {
         let mut helper = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -5384,7 +6053,7 @@ mod tests {
         helper
             .set_root(0)
             .unwrap()
-            .emit(Instruction::StructNew {
+            .emit(Instruction::ClassNew {
                 type_id,
                 fields_base: 0,
                 fields_count: 0,
@@ -5408,15 +6077,15 @@ mod tests {
     #[test]
     fn migration_call_and_defer_closures_reject_heap_dependent_ordinary_helpers() {
         let type_id = StableId::from_name("HeapDependentHelperValue");
-        let helper = heap_dependent_struct_helper(type_id);
-        let struct_type = StructType {
+        let helper = heap_dependent_class_helper(type_id);
+        let class_type = ClassType {
             type_id,
             fields: Vec::new(),
         };
 
         let mut ordinary = ModuleBuilder::new();
         ordinary
-            .struct_type(struct_type.clone())
+            .class_type(class_type.clone())
             .function(helper.clone());
         verify(ordinary.finish(), VerifierLimits::default())
             .expect("the helper is valid in an ordinary heap-backed execution");
@@ -5449,7 +6118,7 @@ mod tests {
 
             let mut module = ModuleBuilder::new();
             module
-                .struct_type(struct_type.clone())
+                .class_type(class_type.clone())
                 .function(migration.finish().unwrap());
             module.function(helper.clone());
 
@@ -5475,7 +6144,7 @@ mod tests {
             .emit(Instruction::ReturnVoid);
         let mut module = ModuleBuilder::new();
         module
-            .struct_type(struct_type)
+            .class_type(class_type)
             .function(task.finish().unwrap());
         module.function(helper);
 
@@ -6413,21 +7082,35 @@ mod tests {
             result: Some(result),
         };
         let abi = nexa_bytecode::layout::FunctionAbi::for_signature(&table, &signature).unwrap();
-        let argument_count =
-            u16::try_from(signature.parameters.len()).expect("frozen intrinsic arity fits in u16");
         let args_base = abi.parameter_slots;
+        let argument_count = abi
+            .parameters
+            .iter()
+            .try_fold(0_u16, |total, parameter| {
+                total.checked_add(parameter.slot_count)
+            })
+            .expect("frozen intrinsic physical arguments fit in u16");
         let dst = args_base + argument_count;
         let result_slots = abi.result.as_ref().unwrap().slot_count;
         let registers = dst + result_slots;
-        let mut code = abi
-            .parameters
-            .iter()
-            .enumerate()
-            .map(|(index, parameter)| Instruction::Move {
-                dst: args_base + u16::try_from(index).unwrap(),
-                source: parameter.slot_offset,
-            })
-            .collect::<Vec<_>>();
+        let mut argument_offset = 0_u16;
+        let mut code = Vec::with_capacity(abi.parameters.len() + 2);
+        for parameter in &abi.parameters {
+            let dst = args_base + argument_offset;
+            code.push(if parameter.slot_count == 1 {
+                Instruction::Move {
+                    dst,
+                    source: parameter.slot_offset,
+                }
+            } else {
+                Instruction::CopyValue {
+                    dst,
+                    source: parameter.slot_offset,
+                    slots: parameter.slot_count,
+                }
+            });
+            argument_offset += parameter.slot_count;
+        }
         let intrinsic_pc = u32::try_from(code.len()).unwrap();
         code.push(Instruction::StandardIntrinsic {
             intrinsic: spec.intrinsic,
@@ -6438,18 +7121,26 @@ mod tests {
         let return_pc = u32::try_from(code.len()).unwrap();
         code.push(Instruction::Return { source: dst });
         let mut roots_at_entry = vec![false; usize::from(registers)];
-        if argument_count != 0 {
-            for parameter in &abi.parameters {
-                roots_at_entry[usize::from(parameter.slot_offset)] =
-                    parameter.logical_type.is_reference();
+        for parameter in &abi.parameters {
+            let layout = table.layout_of(parameter.logical_type).unwrap();
+            for (offset, root) in layout.gc_bitmap.iter().copied().enumerate() {
+                roots_at_entry[usize::from(parameter.slot_offset) + offset] = root;
             }
         }
         let mut roots_at_intrinsic = vec![false; usize::from(registers)];
-        for (index, ty) in signature.parameters.iter().copied().enumerate() {
-            roots_at_intrinsic[usize::from(args_base) + index] = ty.is_reference();
+        let mut argument_offset = 0_u16;
+        for parameter in &abi.parameters {
+            let layout = table.layout_of(parameter.logical_type).unwrap();
+            for (offset, root) in layout.gc_bitmap.iter().copied().enumerate() {
+                roots_at_intrinsic[usize::from(args_base + argument_offset) + offset] = root;
+            }
+            argument_offset += parameter.slot_count;
         }
         let mut roots_at_return = vec![false; usize::from(registers)];
-        roots_at_return[usize::from(dst)] = result.is_reference();
+        let result_layout = table.layout_of(result).unwrap();
+        for (offset, root) in result_layout.gc_bitmap.iter().copied().enumerate() {
+            roots_at_return[usize::from(dst) + offset] = root;
+        }
         let root_bitmap = roots_at_entry
             .iter()
             .zip(&roots_at_intrinsic)
@@ -6619,7 +7310,7 @@ mod tests {
                 fields: Vec::new(),
             }],
         };
-        let module = |effect: FunctionEffect, requested_type: StableId, rooted: bool| {
+        let module = |effect: FunctionEffect, requested_type: StableId, forged_gc_root: bool| {
             let signature = Signature {
                 parameters: Vec::new(),
                 result: Some(ValueType::Named(requested_type)),
@@ -6633,11 +7324,11 @@ mod tests {
                     dst: 0,
                 })
                 .emit(Instruction::Return { source: 0 });
-            if rooted {
+            if forged_gc_root {
                 function.set_root(0).unwrap();
             }
             let mut function = function.finish().unwrap();
-            if rooted {
+            if forged_gc_root {
                 function.root_maps[0].bitmap[0] = false;
             }
             let mut module = ModuleBuilder::new();
@@ -6656,12 +7347,12 @@ mod tests {
         };
 
         verify(
-            module(FunctionEffect::Ordinary, type_id, true),
+            module(FunctionEffect::Ordinary, type_id, false),
             VerifierLimits::default(),
         )
         .unwrap();
         verify(
-            module(FunctionEffect::Task, type_id, true),
+            module(FunctionEffect::Task, type_id, false),
             VerifierLimits::default(),
         )
         .unwrap();
@@ -6671,7 +7362,7 @@ mod tests {
             FunctionEffect::Cleanup,
         ] {
             assert_eq!(
-                verify(module(effect, type_id, true), VerifierLimits::default())
+                verify(module(effect, type_id, false), VerifierLimits::default())
                     .unwrap_err()
                     .kind,
                 VerifyErrorKind::InvalidEffect
@@ -6680,7 +7371,7 @@ mod tests {
         let unknown = StableId::from_name("repl::UnknownEnvironment");
         assert_eq!(
             verify(
-                module(FunctionEffect::Ordinary, unknown, true),
+                module(FunctionEffect::Ordinary, unknown, false),
                 VerifierLimits::default(),
             )
             .unwrap_err()
@@ -6691,14 +7382,14 @@ mod tests {
         );
         assert_eq!(
             verify(
-                module(FunctionEffect::Ordinary, type_id, false),
+                module(FunctionEffect::Ordinary, type_id, true),
                 VerifierLimits::default(),
             )
             .unwrap_err()
             .kind,
-            VerifyErrorKind::MissingRoot(0)
+            VerifyErrorKind::ForgedRoot(0)
         );
-        let mut forged_export = module(FunctionEffect::Ordinary, type_id, true);
+        let mut forged_export = module(FunctionEffect::Ordinary, type_id, false);
         forged_export.exports[0].effect = FunctionEffect::Task;
         assert_eq!(
             verify(forged_export, VerifierLimits::default())
@@ -6706,7 +7397,7 @@ mod tests {
                 .kind,
             VerifyErrorKind::InvalidExportSignature
         );
-        let mut mismatched_state_class = module(FunctionEffect::Ordinary, type_id, true);
+        let mut mismatched_state_class = module(FunctionEffect::Ordinary, type_id, false);
         mismatched_state_class.class_types[0]
             .fields
             .push(StructField {
@@ -6744,21 +7435,13 @@ mod tests {
             2,
         );
         function
-            .set_root(0)
-            .unwrap()
             .emit(Instruction::ClassGet {
                 source: 0,
                 field: high_field,
                 dst: 1,
             })
             .emit(Instruction::Return { source: 1 });
-        let mut function = function.finish().unwrap();
-        function
-            .root_maps
-            .iter_mut()
-            .find(|root_map| root_map.pc == 1)
-            .expect("return root map")
-            .bitmap[0] = false;
+        let function = function.finish().unwrap();
         let mut module = ModuleBuilder::new();
         module
             .state_schema(StateSchema {
@@ -6783,6 +7466,7 @@ mod tests {
                 type_index: 0,
                 index: 0,
                 state_index: Some(1),
+                ..
             }
         ));
     }
@@ -6821,8 +7505,6 @@ mod tests {
                     2,
                 );
                 function
-                    .set_root(0)
-                    .unwrap()
                     .effect(FunctionEffect::Migration)
                     .emit(Instruction::StateOldFieldGet {
                         object: 0,
@@ -6835,7 +7517,7 @@ mod tests {
                 function.root_maps = vec![
                     RootMap {
                         pc: 0,
-                        bitmap: vec![true, false],
+                        bitmap: vec![false, false],
                     },
                     RootMap {
                         pc: 1,
@@ -6880,8 +7562,6 @@ mod tests {
                 1,
             );
             function
-                .set_root(0)
-                .unwrap()
                 .effect(FunctionEffect::Migration)
                 .emit(Instruction::StateReplace {
                     old_id: StableId::from_name("old"),
@@ -6892,7 +7572,7 @@ mod tests {
             function.root_maps = vec![
                 RootMap {
                     pc: 0,
-                    bitmap: vec![true],
+                    bitmap: vec![false],
                 },
                 RootMap {
                     pc: 1,

@@ -206,13 +206,14 @@ impl InterpreterHost for RealmHostBridge<'_> {
     fn call(
         &mut self,
         import: u32,
-        arguments: &[RuntimeValue],
+        arguments: crate::InterpreterHostArguments<'_>,
         heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
         let slot = self.function_slots.get(import as usize).ok_or_else(|| {
             HostTrap::Host("host import index is outside the verified module".into())
         })?;
-        let values = RuntimeHostArgs::new(arguments, heap)?;
+        let (slots, logical_types, layouts) = arguments.parts();
+        let values = RuntimeHostArgs::from_physical(slots, logical_types, layouts, heap)?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
@@ -2856,13 +2857,15 @@ impl RealmRuntime {
         // H1: reuse pooled continuation storage when its retained
         // capacities satisfy this module's reservation; the constructor
         // falls back to a fresh reservation otherwise.
-        let continuation = crate::InterpreterContinuation::new_with_storage(
+        let storage = self.continuation_pool.pop();
+        let continuation = crate::InterpreterContinuation::new_with_storage_and_heap(
             &verified,
             function,
             arguments,
             config.limits.frames,
             reservation,
-            self.continuation_pool.pop(),
+            storage,
+            Some(&self.heap),
         )?;
         let task = self.tasks.admit_task(config.owner, epoch, true)?;
         if let Err(error) = self.tasks.attach_continuation(
@@ -3127,13 +3130,15 @@ impl RealmRuntime {
             };
         }
         let reservation = reservation_for_module(&verified, limits.frames);
-        let continuation = crate::InterpreterContinuation::new_with_storage(
+        let storage = self.continuation_pool.pop();
+        let continuation = crate::InterpreterContinuation::new_with_storage_and_heap(
             &verified,
             function,
             &values,
             limits.frames,
             reservation,
-            self.continuation_pool.pop(),
+            storage,
+            Some(&self.heap),
         )
         .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))?;
         let mut recycled = None;
@@ -4629,9 +4634,10 @@ impl RealmRuntime {
         payload: PlannedResultPayload,
     ) -> Result<ResultWritebackAction, RealmError> {
         validate_planned_payload(&self.heap, &payload)?;
-        let slots = planned_payload_slots(&payload)?
-            .checked_add(1)
-            .ok_or(RealmError::Heap(HeapError::CapacityExhausted))?;
+        // The Result wrapper is reconstructed directly in the continuation's
+        // physical tag/payload range. Only the payload's persistent objects
+        // require heap reservation.
+        let slots = planned_payload_slots(&payload)?;
         let heap = self.heap.preflight(slots)?;
         Ok(ResultWritebackAction::ResumeAsync {
             result,
@@ -4648,11 +4654,13 @@ impl RealmRuntime {
         snapshot: crate::TaskSnapshot,
         preflight: ResultWritebackPreflight,
     ) -> Result<(), RealmError> {
-        let value = match preflight.action {
-            ResultWritebackAction::ResumeDirect(value) => value,
-            ResultWritebackAction::ResumeDirectPlanned { payload, mut heap } => {
-                commit_planned_payload(&mut self.heap, &mut heap, payload)?
-            }
+        let module = Arc::clone(&self.module_for_task(snapshot)?.verified);
+        let (value, async_result) = match preflight.action {
+            ResultWritebackAction::ResumeDirect(value) => (value, None),
+            ResultWritebackAction::ResumeDirectPlanned { payload, mut heap } => (
+                commit_planned_payload(&mut self.heap, &mut heap, payload)?,
+                None,
+            ),
             ResultWritebackAction::ResumeAsync {
                 result,
                 success,
@@ -4660,25 +4668,8 @@ impl RealmRuntime {
                 mut heap,
             } => {
                 let payload = commit_planned_payload(&mut self.heap, &mut heap, payload)?;
-                let (variant, tag) = if success {
-                    (StableId::from_parts(&["Result", "::Ok"]), 0)
-                } else {
-                    (StableId::from_parts(&["Result", "::Err"]), 1)
-                };
-                let reference = self.heap.commit(
-                    &mut heap,
-                    Object::Enum {
-                        type_id: result.result_type,
-                        variant,
-                        tag,
-                        payload: Some(payload),
-                    },
-                );
                 debug_assert!(Heap::reservation_complete(&heap));
-                RuntimeValue::NamedRef {
-                    reference,
-                    type_id: result.result_type,
-                }
+                (payload, Some((result, success)))
             }
             ResultWritebackAction::Cancel => {
                 return self.cancel_waiting_host_task(task, snapshot);
@@ -4719,7 +4710,25 @@ impl RealmRuntime {
         if waiting_request != request {
             return Err(RealmError::TaskWaiting);
         }
-        continuation.write_resume_value(destination, expected_type, value)?;
+        if let Some((result, success)) = async_result {
+            continuation.write_resume_async_result(
+                &module,
+                destination,
+                expected_type,
+                result,
+                success,
+                value,
+                Some(&self.heap),
+            )?;
+        } else {
+            continuation.write_resume_materialized_value(
+                &module,
+                destination,
+                expected_type,
+                value,
+                Some(&self.heap),
+            )?;
+        }
         self.tasks.resume_waiting_task(task)?;
         self.tasks
             .put_execution(task, TaskExecution::Running(continuation), snapshot.fuel)?;

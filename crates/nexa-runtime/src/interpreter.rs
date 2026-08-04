@@ -100,6 +100,27 @@ impl InterpreterContinuation {
         reservation: ContinuationReservation,
         storage: Option<FrameArena>,
     ) -> Result<Self, InterpreterError> {
+        Self::new_with_storage_and_heap(
+            module,
+            function,
+            arguments,
+            limits,
+            reservation,
+            storage,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_storage_and_heap(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        limits: FrameLimits,
+        reservation: ContinuationReservation,
+        storage: Option<FrameArena>,
+        heap: Option<&Heap>,
+    ) -> Result<Self, InterpreterError> {
         if limits.max_call_depth as usize > MAX_SCRIPT_CALL_STACK_DEPTH {
             return Err(InterpreterError::ContinuationLimit(
                 FrameError::ReservationExceedsLimit,
@@ -126,7 +147,16 @@ impl InterpreterContinuation {
             None => FrameArena::with_reserved_capacity(limits, reservation)?,
         };
         arena.push_call(function, function_meta.registers, None)?;
-        arena.initialize_abi_arguments(function_abi, arguments)?;
+        for (argument, parameter) in arguments.iter().copied().zip(&function_abi.parameters) {
+            write_materialized_value_range(
+                &mut arena,
+                parameter.slot_offset,
+                parameter.logical_type,
+                argument,
+                module.layout_table(),
+                heap,
+            )?;
+        }
         Ok(Self {
             arena,
             current_function: function,
@@ -165,18 +195,85 @@ impl InterpreterContinuation {
         self.cumulative_exhausted
     }
 
-    pub(crate) fn write_resume_value(
+    pub(crate) fn write_resume_materialized_value(
         &mut self,
+        module: &VerifiedModule,
         destination: u16,
         expected: Option<ValueType>,
         value: RuntimeValue,
+        heap: Option<&Heap>,
     ) -> Result<(), InterpreterError> {
         if runtime_value_type(value) != expected {
             return Err(InterpreterError::TypeMismatch);
         }
-        if expected.is_some() {
-            set_register(&mut self.arena, destination, value)?;
+        if let Some(expected) = expected {
+            write_materialized_value_range(
+                &mut self.arena,
+                destination,
+                expected,
+                value,
+                module.layout_table(),
+                heap,
+            )?;
         }
+        self.finish_host_resume()
+    }
+
+    pub(crate) fn write_resume_async_result(
+        &mut self,
+        module: &VerifiedModule,
+        destination: u16,
+        expected: Option<ValueType>,
+        result: AsyncResultType,
+        success: bool,
+        payload: RuntimeValue,
+        heap: Option<&Heap>,
+    ) -> Result<(), InterpreterError> {
+        if expected != Some(ValueType::Named(result.result_type)) {
+            return Err(InterpreterError::TypeMismatch);
+        }
+        let layout = module
+            .layout_table()
+            .named_layout(result.result_type)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let enum_layout = layout
+            .enum_layout
+            .as_ref()
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let tag = u32::from(!success);
+        let payload_type = if success {
+            result.success
+        } else {
+            result.error
+        };
+        let variant = enum_layout
+            .variants
+            .iter()
+            .find(|variant| variant.tag == tag && variant.payload_type == Some(payload_type))
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let destination = self
+            .arena
+            .register_range_mut(destination, layout.physical_slots)?;
+        destination.fill(RuntimeValue::Unit);
+        destination[usize::from(enum_layout.tag_offset)] =
+            RuntimeValue::I32(i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?);
+        let payload_start = usize::from(enum_layout.payload_offset);
+        let payload_end = payload_start
+            .checked_add(usize::from(variant.payload_slots))
+            .ok_or(InterpreterError::TypeMismatch)?;
+        flatten_materialized_value(
+            destination
+                .get_mut(payload_start..payload_end)
+                .ok_or(InterpreterError::TypeMismatch)?,
+            payload_type,
+            payload,
+            module.layout_table(),
+            heap,
+        )?;
+        self.finish_host_resume()
+    }
+
+    fn finish_host_resume(&mut self) -> Result<(), InterpreterError> {
         increment_pc(&mut self.arena)?;
         self.host_call_boundary = None;
         Ok(())
@@ -610,29 +707,17 @@ const PROFILE_STRING_TYPE: StableId = profile_builtin_type(b"String");
 const PROFILE_BUFFER_TYPE: StableId = profile_builtin_type(b"Buffer");
 
 /// Stable WP14 allocation kind and type identity; `None` marks a
-/// non-allocating instruction. Verifier-resolved nominal metadata supplies
-/// the source type for copy-style Struct materialization.
+/// non-allocating instruction. Struct values live in frame slot ranges and
+/// therefore never appear here.
 pub(crate) const fn allocation_profile(
     instruction: Instruction,
-    resolved: nexa_verifier::ResolvedNominalOperand,
+    _resolved: nexa_verifier::ResolvedNominalOperand,
 ) -> Option<(crate::profiler::AllocationKind, StableId)> {
     use crate::profiler::AllocationKind;
     match instruction {
-        Instruction::StructNew { type_id, .. } => {
-            Some((AllocationKind::StructMaterialization, type_id))
-        }
         Instruction::ClassNew { type_id, .. } => Some((AllocationKind::Class, type_id)),
-        Instruction::EnumNew { type_id, .. } => {
-            Some((AllocationKind::EnumMaterialization, type_id))
-        }
         Instruction::ArrayNew { type_id, .. } => Some((AllocationKind::ArrayStorage, type_id)),
         Instruction::MapNew { type_id, .. } => Some((AllocationKind::MapSlots, type_id)),
-        Instruction::StructWith { .. } => match resolved {
-            nexa_verifier::ResolvedNominalOperand::StructField { type_id, .. } => {
-                Some((AllocationKind::StructMaterialization, type_id))
-            }
-            _ => Some((AllocationKind::StructMaterialization, StableId(0))),
-        },
         Instruction::LoadString { .. }
         | Instruction::StringConcat { .. }
         | Instruction::StringBuild { .. }
@@ -722,9 +807,7 @@ fn execute_static_leaf_instruction(
         | Instruction::JumpIfFalse { .. }) => execute_static_leaf_control(instruction, registers),
         instruction @ (Instruction::EnumNew { .. }
         | Instruction::EnumTag { .. }
-        | Instruction::EnumPayload { .. }) => {
-            execute_static_leaf_enum(instruction, row, registers, module, heap)
-        }
+        | Instruction::EnumPayload { .. }) => execute_static_leaf_enum(instruction, row, registers),
         instruction @ (Instruction::ClassNew { .. }
         | Instruction::ClassGet { .. }
         | Instruction::ClassSet { .. }) => {
@@ -878,37 +961,67 @@ fn execute_static_leaf_enum(
     instruction: Instruction,
     row: crate::executable::ExecutableInstruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
-    module: &VerifiedModule,
-    heap: &mut Heap,
 ) -> Result<StaticLeafStep, InterpreterError> {
     match instruction {
-        Instruction::EnumNew {
-            type_id,
-            variant,
-            payload,
-            dst,
-        } => {
-            let (variant_id, tag) =
-                resolved_enum_variant(module, type_id, variant, row.resolved_nominal)?;
-            let payload =
-                payload.map(|payload| crate::trusted::read_static_leaf(registers, payload));
-            let value = heap.allocate_enum(type_id, variant_id, tag, payload)?;
-            crate::trusted::write_static_leaf(registers, dst, value);
+        Instruction::EnumNew { payload, dst, .. } => {
+            let ExecutableNominalOperand::EnumVariant {
+                tag,
+                payload_offset,
+                payload_slots,
+                owner_slots,
+                ..
+            } = row.resolved_nominal
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            crate::trusted::clear_static_leaf_range(registers, dst, owner_slots);
+            crate::trusted::write_static_leaf(
+                registers,
+                dst,
+                RuntimeValue::I32(i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?),
+            );
+            match (payload, payload_slots) {
+                (Some(payload), slots) if slots > 0 => {
+                    let destination = dst
+                        .checked_add(payload_offset)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    crate::trusted::copy_static_leaf_range(registers, payload, destination, slots);
+                }
+                (None, 0) => {}
+                _ => return Err(InterpreterError::TypeMismatch),
+            }
         }
         Instruction::EnumTag { source, dst } => {
-            let value = crate::trusted::read_static_leaf(registers, source);
-            let tag =
-                i32::try_from(heap.enum_tag(value)?).map_err(|_| InterpreterError::TypeMismatch)?;
-            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(tag));
+            let ExecutableNominalOperand::EnumLayout { .. } = row.resolved_nominal else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let tag = crate::trusted::read_static_leaf(registers, source);
+            if !matches!(tag, RuntimeValue::I32(_)) {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            crate::trusted::write_static_leaf(registers, dst, tag);
         }
-        Instruction::EnumPayload {
-            source,
-            variant,
-            dst,
-        } => {
-            let value = crate::trusted::read_static_leaf(registers, source);
-            let payload = heap.enum_payload(value, variant)?;
-            crate::trusted::write_static_leaf(registers, dst, payload);
+        Instruction::EnumPayload { source, dst, .. } => {
+            let ExecutableNominalOperand::EnumVariant {
+                tag,
+                payload_offset,
+                payload_slots,
+                ..
+            } = row.resolved_nominal
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            if crate::trusted::read_static_leaf(registers, source)
+                != RuntimeValue::I32(
+                    i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?,
+                )
+            {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let payload_source = source
+                .checked_add(payload_offset)
+                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+            crate::trusted::copy_static_leaf_range(registers, payload_source, dst, payload_slots);
         }
         _ => unreachable!("enum leaf helper receives only enum instructions"),
     }
@@ -939,13 +1052,15 @@ fn execute_static_leaf_class(
             let RuntimeValue::NamedRef { type_id, .. } = value else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (index, expected, _) =
+            let (_index, offset, slots, _owner_slots, _expected, _) =
                 resolved_class_field(module, type_id, field, row.resolved_nominal)?;
-            let field_value = heap.class_field(value, index)?;
-            if runtime_value_type(field_value) != Some(expected) {
-                return Err(InterpreterError::TypeMismatch);
-            }
-            crate::trusted::write_static_leaf(registers, dst, field_value);
+            let field_values = heap.class_field_range(value, offset, slots)?;
+            crate::trusted::write_static_leaf_values(
+                registers,
+                dst,
+                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                field_values.iter(),
+            )?;
         }
         Instruction::ClassSet {
             source,
@@ -953,16 +1068,17 @@ fn execute_static_leaf_class(
             value,
         } => {
             let object = crate::trusted::read_static_leaf(registers, source);
-            let replacement = crate::trusted::read_static_leaf(registers, value);
             let RuntimeValue::NamedRef { type_id, .. } = object else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (index, expected, _) =
+            let (_index, offset, slots, _owner_slots, _expected, _) =
                 resolved_class_field(module, type_id, field, row.resolved_nominal)?;
-            if runtime_value_type(replacement) != Some(expected) {
-                return Err(InterpreterError::TypeMismatch);
-            }
-            heap.set_class_field(object, index, replacement)?;
+            let replacement = crate::trusted::read_static_leaf_window(
+                registers,
+                value,
+                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+            );
+            heap.set_class_field_range(object, offset, replacement)?;
         }
         _ => unreachable!("class leaf helper receives only class instructions"),
     }
@@ -982,7 +1098,7 @@ fn execute_static_leaf_array(
                 resolved_array_layout(module, type_id, row.resolved_nominal)?;
             let value = match row_fields {
                 Some(field_count) => {
-                    heap.allocate_struct_row_array(type_id, element_type, field_count)?
+                    heap.allocate_value_row_array(type_id, element_type, field_count)?
                 }
                 None => heap.allocate_array(type_id, element_type)?,
             };
@@ -990,8 +1106,16 @@ fn execute_static_leaf_array(
         }
         Instruction::ArrayPush { source, value } => {
             let array = crate::trusted::read_static_leaf(registers, source);
-            let value = crate::trusted::read_static_leaf(registers, value);
-            heap.array_push(array, value)?;
+            let (_element, element_slots, row_slots) =
+                resolved_array_value(module, row.resolved_nominal)?;
+            if row_slots.is_some() {
+                let value =
+                    crate::trusted::read_static_leaf_window(registers, value, element_slots);
+                heap.array_push_row(array, value)?;
+            } else {
+                let value = crate::trusted::read_static_leaf(registers, value);
+                heap.array_push(array, value)?;
+            }
         }
         Instruction::ArraySet {
             source,
@@ -1003,9 +1127,17 @@ fn execute_static_leaf_array(
             else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let replacement = crate::trusted::read_static_leaf(registers, value);
             let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
-            heap.array_set(array, index, replacement)?;
+            let (_element, element_slots, row_slots) =
+                resolved_array_value(module, row.resolved_nominal)?;
+            if row_slots.is_some() {
+                let replacement =
+                    crate::trusted::read_static_leaf_window(registers, value, element_slots);
+                heap.array_set_row(array, index, replacement)?;
+            } else {
+                let replacement = crate::trusted::read_static_leaf(registers, value);
+                heap.array_set(array, index, replacement)?;
+            }
         }
         Instruction::ArrayGet { source, index, dst } => {
             let array = crate::trusted::read_static_leaf(registers, source);
@@ -1014,8 +1146,10 @@ fn execute_static_leaf_array(
                 return Err(InterpreterError::TypeMismatch);
             };
             let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
-            let value = heap.array_get(array, index)?;
-            crate::trusted::write_static_leaf(registers, dst, value);
+            let (_element, element_slots, _row_slots) =
+                resolved_array_value(module, row.resolved_nominal)?;
+            let value = heap.array_value_range(array, index)?;
+            crate::trusted::write_static_leaf_values(registers, dst, element_slots, value.iter())?;
         }
         Instruction::ArrayLen { source, dst } => {
             let array = crate::trusted::read_static_leaf(registers, source);
@@ -1038,14 +1172,24 @@ fn execute_static_leaf_map(
     match instruction {
         Instruction::MapNew { type_id, dst } => {
             let (key, value) = resolved_map_layout(module, type_id, row.resolved_nominal)?;
-            let value = heap.allocate_map(type_id, key, value)?;
+            let (_key_type, _value_type, key_slots, value_slots, _, _) =
+                resolved_map_value(module, row.resolved_nominal)?;
+            if key_slots != 1 {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let value = heap.allocate_physical_map(type_id, key, value, value_slots)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
         Instruction::MapSet { source, key, value } => {
+            let (_key_type, _value_type, key_slots, value_slots, _, _) =
+                resolved_map_value(module, row.resolved_nominal)?;
+            if key_slots != 1 || value_slots == 0 {
+                return Err(InterpreterError::TypeMismatch);
+            }
             let map = crate::trusted::read_static_leaf(registers, source);
             let key = crate::trusted::read_static_leaf(registers, key);
-            let value = crate::trusted::read_static_leaf(registers, value);
-            if heap.map_set(map, key, value)? != MapSetOutcome::Complete {
+            let value = crate::trusted::read_static_leaf_window(registers, value, value_slots);
+            if heap.map_set_value_range(map, key, value)? != MapSetOutcome::Complete {
                 debug_assert!(false, "certified one-entry map unexpectedly entered rehash");
                 return Err(InterpreterError::TypeMismatch);
             }
@@ -1053,21 +1197,34 @@ fn execute_static_leaf_map(
         Instruction::MapGet {
             source,
             key,
-            result_type,
+            result_type: _,
             dst,
         } => {
+            let (_key_type, _value_type, key_slots, value_slots, option_slots, payload_offset) =
+                resolved_map_value(module, row.resolved_nominal)?;
+            if key_slots != 1 || value_slots == 0 || option_slots == 0 {
+                return Err(InterpreterError::TypeMismatch);
+            }
             let map = crate::trusted::read_static_leaf(registers, source);
             let key = crate::trusted::read_static_leaf(registers, key);
-            let mut reservation = heap.preflight(1)?;
-            let value = heap.map_get(map, key)?;
-            let (variant, tag, payload) = if let Some(value) = value {
-                (StableId::from_parts(&["Option", "::Some"]), 1, Some(value))
-            } else {
-                (StableId::from_parts(&["Option", "::None"]), 0, None)
-            };
-            let value =
-                heap.allocate_enum_reserved(&mut reservation, result_type, variant, tag, payload);
-            crate::trusted::write_static_leaf(registers, dst, value);
+            let value = heap.map_get_value_range(map, key)?;
+            crate::trusted::clear_static_leaf_range(registers, dst, option_slots);
+            crate::trusted::write_static_leaf(
+                registers,
+                dst,
+                RuntimeValue::I32(i32::from(value.is_some())),
+            );
+            if let Some(value) = value {
+                let payload = dst
+                    .checked_add(payload_offset)
+                    .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                crate::trusted::write_static_leaf_values(
+                    registers,
+                    payload,
+                    value_slots,
+                    value.iter().copied(),
+                )?;
+            }
         }
         _ => unreachable!("map leaf helper receives only map instructions"),
     }
@@ -1123,12 +1280,6 @@ fn execute_static_leaf_constant_kernel(
         crate::executable::StaticLeafConstantEffect::None => {}
         crate::executable::StaticLeafConstantEffect::LoadString { string } => {
             let _ = load_static_leaf_string(module, heap, executable, string)?;
-        }
-        crate::executable::StaticLeafConstantEffect::EnumNew { type_id, variant } => {
-            let variant = module
-                .enum_variant(type_id.0, variant.0)
-                .ok_or(InterpreterError::TypeMismatch)?;
-            let _ = heap.allocate_enum(type_id, variant.stable_id, variant.tag, None)?;
         }
     }
     settle_static_leaf_return(
@@ -1195,60 +1346,59 @@ fn finish_static_leaf(
     })
 }
 
-fn resolved_enum_variant(
-    module: &VerifiedModule,
-    type_id: StableId,
-    variant: StableId,
-    resolved: ExecutableNominalOperand,
-) -> Result<(StableId, u32), InterpreterError> {
-    match resolved {
-        ExecutableNominalOperand::EnumVariant {
-            type_index,
-            variant_index,
-        } => module
-            .module()
-            .enum_types
-            .get(usize::from(type_index))
-            .and_then(|enum_type| enum_type.variants.get(usize::from(variant_index)))
-            .map(|variant| (variant.stable_id, variant.tag))
-            .ok_or(InterpreterError::TypeMismatch),
-        _ => module
-            .enum_variant(type_id.0, variant.0)
-            .map(|variant| (variant.stable_id, variant.tag))
-            .ok_or(InterpreterError::TypeMismatch),
-    }
-}
-
 fn resolved_array_layout(
     module: &VerifiedModule,
     type_id: StableId,
     resolved: ExecutableNominalOperand,
-) -> Result<(ValueType, Option<std::num::NonZeroU8>), InterpreterError> {
-    if let ExecutableNominalOperand::ArrayType {
+) -> Result<(ValueType, Option<std::num::NonZeroU16>), InterpreterError> {
+    let (element, _element_slots, row_slots) = resolved_array_value(module, resolved)?;
+    module
+        .array_type(type_id.0)
+        .filter(|array_type| array_type.element == element)
+        .map(|_| (element, row_slots))
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn resolved_array_value(
+    module: &VerifiedModule,
+    resolved: ExecutableNominalOperand,
+) -> Result<(ValueType, u16, Option<std::num::NonZeroU16>), InterpreterError> {
+    let ExecutableNominalOperand::ArrayLayout {
         type_index,
-        row_fields,
+        element_slots,
+        row_slots,
     } = resolved
-    {
-        module
-            .module()
-            .array_types
-            .get(usize::from(type_index))
-            .map(|array_type| (array_type.element, std::num::NonZeroU8::new(row_fields)))
-            .ok_or(InterpreterError::TypeMismatch)
-    } else {
-        let element = module
-            .array_type(type_id.0)
-            .map(|array_type| array_type.element)
-            .ok_or(InterpreterError::TypeMismatch)?;
-        let row_fields = match element {
-            ValueType::Named(element_id) => module
-                .struct_type(element_id.0)
-                .and_then(|layout| u8::try_from(layout.fields.len()).ok())
-                .and_then(std::num::NonZeroU8::new),
-            _ => None,
-        };
-        Ok((element, row_fields))
-    }
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    module
+        .module()
+        .array_types
+        .get(usize::from(type_index))
+        .map(|array_type| {
+            (
+                array_type.element,
+                element_slots,
+                std::num::NonZeroU16::new(row_slots),
+            )
+        })
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn resolved_array_field(
+    resolved: ExecutableNominalOperand,
+) -> Result<(u16, u16, std::num::NonZeroU16), InterpreterError> {
+    let ExecutableNominalOperand::ArrayField {
+        offset,
+        slots,
+        row_slots,
+        ..
+    } = resolved
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    let row_slots = std::num::NonZeroU16::new(row_slots).ok_or(InterpreterError::TypeMismatch)?;
+    Ok((offset, slots, row_slots))
 }
 
 fn resolved_map_layout(
@@ -1256,18 +1406,43 @@ fn resolved_map_layout(
     type_id: StableId,
     resolved: ExecutableNominalOperand,
 ) -> Result<(ValueType, ValueType), InterpreterError> {
-    match resolved {
-        ExecutableNominalOperand::MapType { type_index } => module
-            .module()
-            .map_types
-            .get(usize::from(type_index))
-            .map(|map_type| (map_type.key, map_type.value))
-            .ok_or(InterpreterError::TypeMismatch),
-        _ => module
-            .map_type(type_id.0)
-            .map(|map_type| (map_type.key, map_type.value))
-            .ok_or(InterpreterError::TypeMismatch),
-    }
+    let (key, value, ..) = resolved_map_value(module, resolved)?;
+    module
+        .map_type(type_id.0)
+        .filter(|map_type| map_type.key == key && map_type.value == value)
+        .map(|_| (key, value))
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn resolved_map_value(
+    module: &VerifiedModule,
+    resolved: ExecutableNominalOperand,
+) -> Result<(ValueType, ValueType, u16, u16, u16, u16), InterpreterError> {
+    let ExecutableNominalOperand::MapLayout {
+        type_index,
+        key_slots,
+        value_slots,
+        option_slots,
+        option_payload_offset,
+    } = resolved
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    module
+        .module()
+        .map_types
+        .get(usize::from(type_index))
+        .map(|map_type| {
+            (
+                map_type.key,
+                map_type.value,
+                key_slots,
+                value_slots,
+                option_slots,
+                option_payload_offset,
+            )
+        })
+        .ok_or(InterpreterError::TypeMismatch)
 }
 
 fn resolved_class_field(
@@ -1275,11 +1450,13 @@ fn resolved_class_field(
     type_id: StableId,
     field: StableId,
     resolved: ExecutableNominalOperand,
-) -> Result<(usize, ValueType, Option<usize>), InterpreterError> {
+) -> Result<(usize, usize, usize, usize, ValueType, Option<usize>), InterpreterError> {
     match resolved {
         ExecutableNominalOperand::ClassField {
             type_index,
             index,
+            offset,
+            slots,
             state_index,
         } => {
             let expected = module
@@ -1289,12 +1466,19 @@ fn resolved_class_field(
                 .and_then(|class_type| class_type.fields.get(usize::from(index)))
                 .map(|field| field.ty)
                 .ok_or(InterpreterError::TypeMismatch)?;
-            Ok((usize::from(index), expected, state_index.map(usize::from)))
+            Ok((
+                usize::from(index),
+                usize::from(offset),
+                usize::from(slots),
+                1,
+                expected,
+                (state_index != u16::MAX).then_some(usize::from(state_index)),
+            ))
         }
-        _ => module
-            .class_field(type_id.0, field.0)
-            .map(|(index, field)| (index, field.ty, None))
-            .ok_or(InterpreterError::TypeMismatch),
+        _ => {
+            let _ = (module, type_id, field);
+            Err(InterpreterError::TypeMismatch)
+        }
     }
 }
 
@@ -1326,7 +1510,7 @@ fn static_leaf_upper_fuel(
     heap: &Heap,
 ) -> Result<Option<u64>, InterpreterError> {
     let mut upper = fuel_add(
-        certificate.fixed_fuel,
+        fuel_add(certificate.fixed_fuel, certificate.physical_value_fuel)?,
         fuel_add(
             certificate.array_push_element_fuel,
             certificate.buffer_work_fuel,
@@ -1368,6 +1552,7 @@ fn static_leaf_upper_fuel(
 }
 
 fn static_leaf_attempt_fuel(
+    nominal_shape: nexa_verifier::NominalIndexShape,
     instruction: Instruction,
     row: crate::executable::ExecutableInstruction,
     registers: &crate::trusted::StaticLeafRegisters,
@@ -1376,13 +1561,22 @@ fn static_leaf_attempt_fuel(
     if !row.dynamic_fuel() || matches!(instruction, Instruction::Return { .. }) {
         return Ok(row.attempt_fuel);
     }
+    let physical_work =
+        physical_instruction_work_fuel(nominal_shape, instruction, row.resolved_nominal)?
+            .unwrap_or(0);
     let work = match instruction {
         Instruction::ArrayPush { source, .. } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = row.resolved_nominal
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             let array = crate::trusted::read_static_leaf(registers, source);
             let (live, capacity) = heap.array_fuel_shape(array)?;
             let moved = if live < capacity { 1 } else { live.max(1) };
-            let element_work =
-                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            let moved_slots = fuel_usize(moved)?
+                .checked_mul(u64::from(element_slots))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            let element_work = fuel_blocks(moved_slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
             fuel_add(
                 element_work,
                 collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
@@ -1408,12 +1602,13 @@ fn static_leaf_attempt_fuel(
             crate::trusted::read_static_leaf(registers, source),
             crate::trusted::read_static_leaf(registers, key),
         )?,
+        _ if physical_work != 0 => 0,
         _ => {
             debug_assert!(false, "certified leaf dynamic-fuel surface diverged");
             return Err(InterpreterError::TypeMismatch);
         }
     };
-    fuel_add(row.attempt_fuel, work)
+    fuel_add(row.attempt_fuel, fuel_add(work, physical_work)?)
 }
 
 fn prepare_static_leaf_buffers(
@@ -1446,11 +1641,58 @@ fn prepare_static_leaf_buffers(
     Some(PreparedStaticLeafBuffers { copy, get })
 }
 
+/// Verifier-packed Host arguments borrowed directly from the current frame.
+///
+/// `slots` is the contiguous physical ABI range while `types` preserves the
+/// logical argument boundary required by generated bindings. The layout
+/// table lets the Host codec expose Struct/Enum views without constructing
+/// temporary VM objects.
+#[derive(Clone, Copy, Debug)]
+pub struct InterpreterHostArguments<'a> {
+    slots: &'a [RuntimeValue],
+    types: &'a [ValueType],
+    layouts: &'a nexa_bytecode::layout::LayoutTable,
+}
+
+impl<'a> InterpreterHostArguments<'a> {
+    fn new(
+        slots: &'a [RuntimeValue],
+        types: &'a [ValueType],
+        layouts: &'a nexa_bytecode::layout::LayoutTable,
+    ) -> Self {
+        Self {
+            slots,
+            types,
+            layouts,
+        }
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.types.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.types.is_empty()
+    }
+
+    pub(crate) const fn parts(
+        self,
+    ) -> (
+        &'a [RuntimeValue],
+        &'a [ValueType],
+        &'a nexa_bytecode::layout::LayoutTable,
+    ) {
+        (self.slots, self.types, self.layouts)
+    }
+}
+
 pub trait InterpreterHost {
     fn call(
         &mut self,
         import: u32,
-        arguments: &[RuntimeValue],
+        arguments: InterpreterHostArguments<'_>,
         heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, crate::HostTrap>;
 }
@@ -1584,6 +1826,25 @@ impl CheckedInterpreter {
         InterpreterContinuation::new(module, function, arguments, limits, reservation)
     }
 
+    pub fn start_with_heap(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        limits: FrameLimits,
+        reservation: ContinuationReservation,
+        heap: &Heap,
+    ) -> Result<InterpreterContinuation, InterpreterError> {
+        InterpreterContinuation::new_with_storage_and_heap(
+            module,
+            function,
+            arguments,
+            limits,
+            reservation,
+            None,
+            Some(heap),
+        )
+    }
+
     /// Executes a verifier-certified tiny leaf without constructing a
     /// continuation or touching the frame pool. Admission is all-or-nothing:
     /// the executable image supplies a static upper fuel bound, and
@@ -1652,6 +1913,30 @@ impl CheckedInterpreter {
         let Some(certificate) = executable_function.static_leaf_certificate() else {
             return Ok(None);
         };
+        if executable_function
+            .abi()
+            .result
+            .as_ref()
+            .is_some_and(|result| {
+                result.slot_count != 1
+                    || matches!(
+                        result.logical_type,
+                        ValueType::Named(type_id)
+                            if module.layout_table().named_layout(type_id).is_some_and(|layout| {
+                                matches!(
+                                    layout.equality_strategy,
+                                    nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                                        | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+                                )
+                            })
+                    )
+            })
+        {
+            // The fixed leaf outcome carries one persistent RuntimeValue.
+            // Aggregate export results therefore stay on the full path,
+            // which performs the transactional materialization boundary.
+            return Ok(None);
+        }
         // `ExecutableModule` is normally owned beside the exact verified
         // module it was built from. Keep the fixed register kernel sound
         // even for direct callers that accidentally cross those objects:
@@ -1666,8 +1951,29 @@ impl CheckedInterpreter {
         }
         validate_arguments(arguments, &function_meta.signature.parameters)?;
         let mut registers = crate::trusted::new_static_leaf_registers();
-        for (destination, argument) in (0_u16..).zip(arguments.iter().copied()) {
-            crate::trusted::write_static_leaf(&mut registers, destination, argument);
+        let mut packed_arguments =
+            [RuntimeValue::Unit; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+        let abi = executable_function.abi();
+        if usize::from(abi.parameter_slots) > packed_arguments.len() {
+            return Ok(None);
+        }
+        for (argument, parameter) in arguments.iter().copied().zip(&abi.parameters) {
+            let start = usize::from(parameter.slot_offset);
+            let end = start + usize::from(parameter.slot_count);
+            flatten_materialized_value(
+                &mut packed_arguments[start..end],
+                parameter.logical_type,
+                argument,
+                module.layout_table(),
+                Some(heap),
+            )?;
+        }
+        for destination in 0..abi.parameter_slots {
+            crate::trusted::write_static_leaf(
+                &mut registers,
+                destination,
+                packed_arguments[usize::from(destination)],
+            );
         }
         let Some(prepared_buffers) = prepare_static_leaf_buffers(certificate, &registers, heap)
         else {
@@ -1741,7 +2047,13 @@ impl CheckedInterpreter {
                 .get(pc)
                 .ok_or(InterpreterError::FellOffFunction)?;
             charge.instructions = charge.instructions.saturating_add(1);
-            let attempt_fuel = static_leaf_attempt_fuel(instruction, *row, &registers, heap)?;
+            let attempt_fuel = static_leaf_attempt_fuel(
+                module.nominal_index_shape(),
+                instruction,
+                *row,
+                &registers,
+                heap,
+            )?;
             charge.fuel_used = charge
                 .fuel_used
                 .checked_add(attempt_fuel)
@@ -2044,12 +2356,13 @@ impl CheckedInterpreter {
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         let limits = FrameLimits::default();
-        let continuation = Self::start(
+        let continuation = Self::start_with_heap(
             module,
             function,
             arguments,
             limits,
             ContinuationReservation::for_limits(limits),
+            heap,
         )?;
         Self::poll_with_heap(
             module,
@@ -2071,12 +2384,13 @@ impl CheckedInterpreter {
         executable: &crate::executable::ExecutableModule,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         let limits = FrameLimits::default();
-        let continuation = Self::start(
+        let continuation = Self::start_with_heap(
             module,
             function,
             arguments,
             limits,
             ContinuationReservation::for_limits(limits),
+            heap,
         )?;
         Self::poll_with_heap_and_executable(
             module,
@@ -2126,12 +2440,13 @@ impl CheckedInterpreter {
         migration: &mut dyn InterpreterMigration,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        let continuation = Self::start(
+        let continuation = Self::start_with_heap(
             module,
             function,
             arguments,
             limits,
             ContinuationReservation::for_limits(limits),
+            heap,
         )?;
         Self::execute::<false, true>(
             module,
@@ -2454,6 +2769,7 @@ impl CheckedInterpreter {
                         &continuation.arena,
                         heap.as_deref(),
                         costs,
+                        resolved_nominal,
                         Some(row.attempt_fuel),
                     )?
                 } else {
@@ -2473,6 +2789,7 @@ impl CheckedInterpreter {
                         &continuation.arena,
                         heap.as_deref(),
                         costs,
+                        resolved_nominal,
                         Some(row.attempt_fuel),
                     )?
                 } else {
@@ -2490,6 +2807,7 @@ impl CheckedInterpreter {
                     &continuation.arena,
                     heap.as_deref(),
                     costs,
+                    resolved_nominal,
                 )?
                 .checked_add(if let Instruction::HostCall { import, .. } = instruction {
                     u64::from(
@@ -2889,26 +3207,22 @@ impl CheckedInterpreter {
                 Instruction::StandardIntrinsic {
                     intrinsic,
                     args_base,
-                    args_count,
                     dst,
+                    ..
                 } => {
-                    let arguments = standard_intrinsic_arguments(
+                    match run_physical_standard_intrinsic(
                         intrinsic,
                         args_base,
-                        args_count,
-                        &continuation.arena,
-                    )?;
-                    match run_standard_intrinsic(
-                        intrinsic,
-                        &arguments[..usize::from(args_count)],
+                        dst,
+                        &mut continuation.arena,
                         heap.as_deref_mut(),
+                        resolved_nominal,
                     )? {
-                        StandardIntrinsicOutcome::Returned(value) => {
-                            set_register(&mut continuation.arena, dst, value)?;
+                        PhysicalStandardIntrinsicOutcome::Returned => {
                             increment_pc(&mut continuation.arena)?;
                         }
-                        StandardIntrinsicOutcome::Retry => {}
-                        StandardIntrinsicOutcome::Trapped(message) => {
+                        PhysicalStandardIntrinsicOutcome::Retry => {}
+                        PhysicalStandardIntrinsicOutcome::Trapped(message) => {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                             let trap = Trap::from_continuation(
                                 module,
@@ -3126,18 +3440,32 @@ impl CheckedInterpreter {
                         .host_imports
                         .get(import as usize)
                         .ok_or(InterpreterError::HostUnavailable)?;
-                    if args_count > 8 {
+                    if metadata.parameters.len() > 8 {
                         return Err(InterpreterError::ArgumentCount);
                     }
-                    let mut arguments = [RuntimeValue::Unit; 8];
-                    for offset in 0..args_count {
-                        arguments[usize::from(offset)] = register(
-                            &continuation.arena,
-                            args_base
-                                .checked_add(offset)
-                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?,
-                        )?;
+                    let layouts = module.layout_table();
+                    let expected_argument_slots =
+                        metadata.parameters.iter().try_fold(0_u16, |total, ty| {
+                            total
+                                .checked_add(
+                                    layouts
+                                        .physical_slots(*ty)
+                                        .map_err(|_| InterpreterError::TypeMismatch)?,
+                                )
+                                .ok_or(InterpreterError::ArgumentCount)
+                        })?;
+                    if args_count != expected_argument_slots {
+                        return Err(InterpreterError::ArgumentCount);
                     }
+                    let result_slots = metadata
+                        .result
+                        .map(|ty| {
+                            layouts
+                                .physical_slots(ty)
+                                .map_err(|_| InterpreterError::TypeMismatch)
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
                     continuation.host_call_boundary = Some(HostCallBoundary {
                         import,
                         function: frame.function,
@@ -3145,16 +3473,20 @@ impl CheckedInterpreter {
                         source_span: module.module().source_span(frame.function, frame.pc),
                     });
                     if metadata.result.is_some() {
-                        set_register(&mut continuation.arena, dst, RuntimeValue::Unit)?;
+                        continuation.arena.clear_register_range(dst, result_slots)?;
                     }
+                    let argument_slots =
+                        continuation.arena.register_range(args_base, args_count)?;
+                    let arguments = InterpreterHostArguments::new(
+                        argument_slots,
+                        &metadata.parameters,
+                        layouts,
+                    );
                     let outcome = match host
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
-                        .call(
-                            import,
-                            &arguments[..usize::from(args_count)],
-                            heap.as_deref_mut(),
-                        ) {
+                        .call(import, arguments, heap.as_deref_mut())
+                    {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
@@ -3200,8 +3532,15 @@ impl CheckedInterpreter {
                                 reclaim_storage!();
                                 return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                             }
-                            if metadata.result.is_some() {
-                                set_register(&mut continuation.arena, dst, value)?;
+                            if let Some(result) = metadata.result {
+                                write_materialized_value_range(
+                                    &mut continuation.arena,
+                                    dst,
+                                    result,
+                                    value,
+                                    layouts,
+                                    heap.as_deref(),
+                                )?;
                             }
                             increment_pc(&mut continuation.arena)?;
                             continuation.host_call_boundary = None;
@@ -3449,133 +3788,156 @@ impl CheckedInterpreter {
                     )?;
                     increment_pc(&mut continuation.arena)?;
                 }
-                Instruction::EnumNew {
-                    type_id,
-                    variant,
-                    payload,
-                    dst,
-                } => {
-                    let (variant_id, tag) =
-                        resolved_enum_variant(module, type_id, variant, resolved_nominal)?;
-                    let payload = payload
-                        .map(|payload| register(&continuation.arena, payload))
-                        .transpose()?;
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HostUnavailable)?;
-                    let value = heap.allocate_enum(type_id, variant_id, tag, payload)?;
-                    set_register(&mut continuation.arena, dst, value)?;
+                Instruction::EnumNew { payload, dst, .. } => {
+                    let ExecutableNominalOperand::EnumVariant {
+                        tag,
+                        payload_offset,
+                        payload_slots,
+                        owner_slots,
+                        ..
+                    } = resolved_nominal
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    continuation.arena.clear_register_range(dst, owner_slots)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(
+                            i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?,
+                        ),
+                    )?;
+                    match (payload, payload_slots) {
+                        (Some(payload), slots) if slots > 0 => {
+                            let destination = dst
+                                .checked_add(payload_offset)
+                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                            continuation
+                                .arena
+                                .copy_register_range(payload, destination, slots)?;
+                        }
+                        (None, 0) => {}
+                        _ => return Err(InterpreterError::TypeMismatch),
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::EnumTag { source, dst } => {
-                    let value = register(&continuation.arena, source)?;
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HostUnavailable)?;
-                    let tag = i32::try_from(heap.enum_tag(value)?)
-                        .map_err(|_| InterpreterError::TypeMismatch)?;
-                    set_register(&mut continuation.arena, dst, RuntimeValue::I32(tag))?;
+                    let ExecutableNominalOperand::EnumLayout { .. } = resolved_nominal else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let tag = register(&continuation.arena, source)?;
+                    if !matches!(tag, RuntimeValue::I32(_)) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, tag)?;
                     increment_pc(&mut continuation.arena)?;
                 }
-                Instruction::EnumPayload {
-                    source,
-                    variant,
-                    dst,
-                } => {
-                    let value = register(&continuation.arena, source)?;
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HostUnavailable)?;
-                    let payload = heap.enum_payload(value, variant)?;
-                    set_register(&mut continuation.arena, dst, payload)?;
+                Instruction::EnumPayload { source, dst, .. } => {
+                    let ExecutableNominalOperand::EnumVariant {
+                        tag,
+                        payload_offset,
+                        payload_slots,
+                        ..
+                    } = resolved_nominal
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    if register(&continuation.arena, source)?
+                        != RuntimeValue::I32(
+                            i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?,
+                        )
+                    {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    let payload_source = source
+                        .checked_add(payload_offset)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    continuation
+                        .arena
+                        .copy_register_range(payload_source, dst, payload_slots)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::EnumEqual { lhs, rhs, dst } => {
-                    let lhs = register(&continuation.arena, lhs)?;
-                    let rhs = register(&continuation.arena, rhs)?;
-                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        RuntimeValue::Bool(heap.enum_equal(lhs, rhs)?),
+                    let ExecutableNominalOperand::EnumLayout { slots, .. } = resolved_nominal
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let equal = physical_ranges_equal(
+                        &continuation.arena,
+                        lhs,
+                        rhs,
+                        slots,
+                        heap.as_deref(),
                     )?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(equal))?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::StructNew {
-                    type_id,
                     fields_base,
                     fields_count,
                     dst,
+                    ..
                 } => {
-                    let fields = crate::trusted::read_register_window(
-                        &continuation.arena,
-                        fields_base,
-                        fields_count,
-                    )?;
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?;
-                    let value = heap.allocate_struct(type_id, fields)?;
-                    set_register(&mut continuation.arena, dst, value)?;
-                    increment_pc(&mut continuation.arena)?;
-                }
-                Instruction::StructGet { source, field, dst } => {
-                    let value = register(&continuation.arena, source)?;
-                    let RuntimeValue::Struct { type_id, .. } = value else {
+                    let ExecutableNominalOperand::StructLayout { slots } = resolved_nominal else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = match resolved_nominal {
-                        ExecutableNominalOperand::StructField { index } => usize::from(index),
-                        _ => module
-                            .struct_field(type_id.0, field.0)
-                            .map(|(index, _)| index)
-                            .ok_or(InterpreterError::TypeMismatch)?,
+                    if slots != fields_count {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    continuation
+                        .arena
+                        .copy_register_range(fields_base, dst, slots)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StructGet { source, dst, .. } => {
+                    let ExecutableNominalOperand::StructField { offset, slots, .. } =
+                        resolved_nominal
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
                     };
-                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        heap.struct_field(value, index)?,
-                    )?;
+                    let field_source = source
+                        .checked_add(offset)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    continuation
+                        .arena
+                        .copy_register_range(field_source, dst, slots)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::StructWith {
-                    source,
-                    field,
-                    value,
-                    dst,
+                    source, value, dst, ..
                 } => {
-                    let source = register(&continuation.arena, source)?;
-                    let replacement = register(&continuation.arena, value)?;
-                    let RuntimeValue::Struct { type_id, .. } = source else {
+                    let ExecutableNominalOperand::StructField {
+                        offset,
+                        slots,
+                        owner_slots,
+                        ..
+                    } = resolved_nominal
+                    else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = match resolved_nominal {
-                        ExecutableNominalOperand::StructField { index } => usize::from(index),
-                        _ => module
-                            .struct_field(type_id.0, field.0)
-                            .map(|(index, _)| index)
-                            .ok_or(InterpreterError::TypeMismatch)?,
-                    };
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        heap.struct_with(source, index, replacement)?,
-                    )?;
+                    continuation
+                        .arena
+                        .copy_register_range(source, dst, owner_slots)?;
+                    let field_destination = dst
+                        .checked_add(offset)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    continuation
+                        .arena
+                        .copy_register_range(value, field_destination, slots)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::StructEqual { lhs, rhs, dst } => {
-                    let lhs = register(&continuation.arena, lhs)?;
-                    let rhs = register(&continuation.arena, rhs)?;
-                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        RuntimeValue::Bool(heap.struct_equal(lhs, rhs)?),
+                    let ExecutableNominalOperand::StructLayout { slots } = resolved_nominal else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let equal = physical_ranges_equal(
+                        &continuation.arena,
+                        lhs,
+                        rhs,
+                        slots,
+                        heap.as_deref(),
                     )?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(equal))?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ClassNew {
@@ -3603,16 +3965,26 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected, state_index) =
+                    let (_index, offset, slots, _owner_slots, expected, state_index) =
                         resolved_class_field(module, type_id, field, resolved_nominal)?;
-                    let field_value = match value {
-                        RuntimeValue::NamedRef { .. } => heap
-                            .as_deref()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .class_field(value, index)?,
+                    match value {
+                        RuntimeValue::NamedRef { .. } => {
+                            let field_values = heap
+                                .as_deref()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .class_field_range(value, offset, slots)?;
+                            continuation.arena.write_register_values(
+                                dst,
+                                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                                field_values.iter(),
+                            )?;
+                        }
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
+                            if slots != 1 {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
                             let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let field_value = state_registry.as_deref_mut().map_or_else(
                                 || {
@@ -3630,14 +4002,14 @@ impl CheckedInterpreter {
                                     )
                                 },
                             );
-                            state_operation!(field_value)
+                            let field_value = state_operation!(field_value);
+                            if runtime_value_type(field_value) != Some(expected) {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            set_register(&mut continuation.arena, dst, field_value)?;
                         }
                         _ => unreachable!("class receiver was checked above"),
-                    };
-                    if runtime_value_type(field_value) != Some(expected) {
-                        return Err(InterpreterError::TypeMismatch);
                     }
-                    set_register(&mut continuation.arena, dst, field_value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ClassSet {
@@ -3646,25 +4018,34 @@ impl CheckedInterpreter {
                     value,
                 } => {
                     let object = register(&continuation.arena, source)?;
-                    let replacement = register(&continuation.arena, value)?;
                     let (RuntimeValue::NamedRef { type_id, .. }
                     | RuntimeValue::Opaque { type_id, .. }) = object
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected, state_index) =
+                    let (_index, offset, slots, _owner_slots, expected, state_index) =
                         resolved_class_field(module, type_id, field, resolved_nominal)?;
-                    if runtime_value_type(replacement) != Some(expected) {
-                        return Err(InterpreterError::TypeMismatch);
-                    }
                     match object {
-                        RuntimeValue::NamedRef { .. } => heap
-                            .as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .set_class_field(object, index, replacement)?,
+                        RuntimeValue::NamedRef { .. } => {
+                            let replacement = crate::trusted::read_register_window(
+                                &continuation.arena,
+                                value,
+                                u16::try_from(slots).map_err(|_| InterpreterError::TypeMismatch)?,
+                            )?;
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .set_class_field_range(object, offset, replacement)?;
+                        }
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
+                            if slots != 1 {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            let replacement = register(&continuation.arena, value)?;
+                            if runtime_value_type(replacement) != Some(expected) {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
                             let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let update = state_registry.as_deref_mut().map_or_else(
                                 || {
@@ -3725,7 +4106,7 @@ impl CheckedInterpreter {
                     // enums) and fieldless structs keep the cell layout.
                     let value = match row_fields {
                         Some(field_count) => {
-                            heap.allocate_struct_row_array(type_id, element_type, field_count)?
+                            heap.allocate_value_row_array(type_id, element_type, field_count)?
                         }
                         None => heap.allocate_array(type_id, element_type)?,
                     };
@@ -3749,38 +4130,48 @@ impl CheckedInterpreter {
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayGet { source, index, dst } => {
+                    let (_element, element_slots, _row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
                     let array = register(&continuation.arena, source)?;
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let value = array_operation!(
-                        heap.as_deref_mut()
+                    let values = array_operation!(
+                        heap.as_deref()
                             .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_get(array, index)
+                            .array_value_range(array, index)
                     );
-                    set_register(&mut continuation.arena, dst, value)?;
+                    continuation
+                        .arena
+                        .write_register_values(dst, element_slots, values.iter())?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayFieldGet {
                     source,
                     index,
-                    field,
+                    field: _,
                     dst,
                 } => {
-                    // WP52 fused projection: the element is never
-                    // materialized; both layouts read the field directly.
+                    let (offset, slots, _row_slots) = resolved_array_field(resolved_nominal)?;
                     let array = register(&continuation.arena, source)?;
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let value = array_operation!(
+                    let values = array_operation!(
                         heap.as_deref()
                             .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_field_get(array, index, usize::from(field))
+                            .array_field_range(
+                                array,
+                                index,
+                                usize::from(offset),
+                                usize::from(slots),
+                            )
                     );
-                    set_register(&mut continuation.arena, dst, value)?;
+                    continuation
+                        .arena
+                        .write_register_values(dst, slots, values.iter())?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArraySet {
@@ -3792,21 +4183,49 @@ impl CheckedInterpreter {
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let replacement = register(&continuation.arena, value)?;
                     let index = array_index!(index);
-                    array_operation!(
-                        heap.as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_set(array, index, replacement)
-                    );
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_some() {
+                        let replacement = crate::trusted::read_register_window(
+                            &continuation.arena,
+                            value,
+                            element_slots,
+                        )?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_set_row(array, index, replacement)
+                        );
+                    } else {
+                        let replacement = register(&continuation.arena, value)?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_set(array, index, replacement)
+                        );
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayPush { source, value } => {
                     let array = register(&continuation.arena, source)?;
-                    let value = register(&continuation.arena, value)?;
-                    heap.as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?
-                        .array_push(array, value)?;
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_some() {
+                        let value = crate::trusted::read_register_window(
+                            &continuation.arena,
+                            value,
+                            element_slots,
+                        )?;
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_push_row(array, value)?;
+                    } else {
+                        let value = register(&continuation.arena, value)?;
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_push(array, value)?;
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayPushRow {
@@ -3814,8 +4233,11 @@ impl CheckedInterpreter {
                     fields_base,
                     fields_count,
                 } => {
-                    // WP52 push-side fusion: the element's fields flow from
-                    // their registers straight into the row storage.
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_none() || fields_count != element_slots {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let array = register(&continuation.arena, source)?;
                     let fields = crate::trusted::read_register_window(
                         &continuation.arena,
@@ -3829,12 +4251,30 @@ impl CheckedInterpreter {
                 }
                 Instruction::ArrayPop { source, dst } => {
                     let array = register(&continuation.arena, source)?;
-                    let value = array_operation!(
-                        heap.as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_pop(array)
-                    );
-                    set_register(&mut continuation.arena, dst, value)?;
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_some() {
+                        let heap_ref = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                        let index = heap_ref.array_len(array)?.saturating_sub(1);
+                        let values = array_operation!(heap_ref.array_value_range(array, index));
+                        continuation.arena.write_register_values(
+                            dst,
+                            element_slots,
+                            values.iter(),
+                        )?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_pop_row_discard(array)
+                        );
+                    } else {
+                        let value = array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_pop(array)
+                        );
+                        set_register(&mut continuation.arena, dst, value)?;
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayInsert {
@@ -3846,13 +4286,28 @@ impl CheckedInterpreter {
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let value = register(&continuation.arena, value)?;
                     let index = array_index!(index);
-                    array_operation!(
-                        heap.as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_insert(array, index, value)
-                    );
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_some() {
+                        let value = crate::trusted::read_register_window(
+                            &continuation.arena,
+                            value,
+                            element_slots,
+                        )?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_insert_row(array, index, value)
+                        );
+                    } else {
+                        let value = register(&continuation.arena, value)?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_insert(array, index, value)
+                        );
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayRemove { source, index, dst } => {
@@ -3861,12 +4316,32 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let value = array_operation!(
-                        heap.as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_remove(array, index)
-                    );
-                    set_register(&mut continuation.arena, dst, value)?;
+                    let (_element, element_slots, row_slots) =
+                        resolved_array_value(module, resolved_nominal)?;
+                    if row_slots.is_some() {
+                        let values = array_operation!(
+                            heap.as_deref()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_value_range(array, index)
+                        );
+                        continuation.arena.write_register_values(
+                            dst,
+                            element_slots,
+                            values.iter(),
+                        )?;
+                        array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_remove_row_discard(array, index)
+                        );
+                    } else {
+                        let value = array_operation!(
+                            heap.as_deref_mut()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .array_remove(array, index)
+                        );
+                        set_register(&mut continuation.arena, dst, value)?;
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayClear { source } => {
@@ -3878,10 +4353,15 @@ impl CheckedInterpreter {
                 }
                 Instruction::MapNew { type_id, dst } => {
                     let (key, value) = resolved_map_layout(module, type_id, resolved_nominal)?;
+                    let (_key_type, _value_type, key_slots, value_slots, _, _) =
+                        resolved_map_value(module, resolved_nominal)?;
+                    if key_slots != 1 {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let value = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?
-                        .allocate_map(type_id, key, value)?;
+                        .allocate_physical_map(type_id, key, value, value_slots)?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -3904,55 +4384,79 @@ impl CheckedInterpreter {
                 Instruction::MapGet {
                     source,
                     key,
-                    result_type,
+                    result_type: _,
                     dst,
                 }
                 | Instruction::MapRemove {
                     source,
                     key,
-                    result_type,
+                    result_type: _,
                     dst,
                 } => {
+                    let (
+                        _key_type,
+                        _value_type,
+                        key_slots,
+                        value_slots,
+                        option_slots,
+                        payload_offset,
+                    ) = resolved_map_value(module, resolved_nominal)?;
+                    if key_slots != 1 || value_slots == 0 || option_slots == 0 {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let map = register(&continuation.arena, source)?;
                     let key = register(&continuation.arena, key)?;
-                    let heap = heap
-                        .as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?;
-                    let mut reservation = heap.preflight(1)?;
-                    let value = if matches!(instruction, Instruction::MapGet { .. }) {
-                        heap.map_get(map, key)?
+                    continuation.arena.clear_register_range(dst, option_slots)?;
+                    let payload = dst
+                        .checked_add(payload_offset)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    let destination = continuation
+                        .arena
+                        .register_range_mut(payload, value_slots)?;
+                    let found = if matches!(instruction, Instruction::MapGet { .. }) {
+                        heap.as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .map_get_value_into(map, key, destination)?
                     } else {
-                        heap.map_remove(map, key)?
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .map_remove_value_into(map, key, destination)?
                     };
-                    let (variant, tag, payload) = if let Some(value) = value {
-                        (StableId::from_parts(&["Option", "::Some"]), 1, Some(value))
-                    } else {
-                        (StableId::from_parts(&["Option", "::None"]), 0, None)
-                    };
-                    let value = heap.allocate_enum_reserved(
-                        &mut reservation,
-                        result_type,
-                        variant,
-                        tag,
-                        payload,
-                    );
-                    set_register(&mut continuation.arena, dst, value)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(i32::from(found)),
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::MapSet { source, key, value } => {
+                    let (_key_type, _value_type, key_slots, value_slots, _, _) =
+                        resolved_map_value(module, resolved_nominal)?;
+                    if key_slots != 1 || value_slots == 0 {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let map = register(&continuation.arena, source)?;
                     let key = register(&continuation.arena, key)?;
-                    let value = register(&continuation.arena, value)?;
+                    let value = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        value,
+                        value_slots,
+                    )?;
                     if heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?
-                        .map_set(map, key, value)?
+                        .map_set_value_range(map, key, value)?
                         == MapSetOutcome::Complete
                     {
                         increment_pc(&mut continuation.arena)?;
                     }
                 }
                 Instruction::MapContains { source, key, dst } => {
+                    let (_key_type, _value_type, key_slots, _value_slots, _, _) =
+                        resolved_map_value(module, resolved_nominal)?;
+                    if key_slots != 1 {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let map = register(&continuation.arena, source)?;
                     let key = register(&continuation.arena, key)?;
                     let contains = heap
@@ -4111,7 +4615,24 @@ impl CheckedInterpreter {
                         pending_cost = 0;
                         continue;
                     }
-                    let result = register(&continuation.arena, source)?;
+                    let returning_function = continuation.arena.current()?.function as usize;
+                    let result_type = module
+                        .module()
+                        .functions
+                        .get(returning_function)
+                        .and_then(|function| function.signature.result)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let result_slots = module
+                        .layout_table()
+                        .physical_slots(result_type)
+                        .map_err(|_| InterpreterError::TypeMismatch)?;
+                    let result_range = continuation.arena.register_range(source, result_slots)?;
+                    let result = materialize_physical_value_range(
+                        result_range,
+                        result_type,
+                        module.layout_table(),
+                        heap.as_deref_mut(),
+                    )?;
                     let completed = continuation.arena.pop_verified()?;
                     let returning_cleanup =
                         completed.return_range.is_none() && continuation.arena.depth() > 0;
@@ -4215,9 +4736,10 @@ impl CheckedInterpreter {
                             .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
                         arguments[usize::from(offset)] = register(&continuation.arena, source)?;
                     }
-                    continuation
-                        .arena
-                        .push_defer_call(function, &arguments[..usize::from(args_count)])?;
+                    continuation.arena.push_defer_call_physical(
+                        function,
+                        &arguments[..usize::from(args_count)],
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::DeferPop => {
@@ -4279,7 +4801,10 @@ fn start_next_defer(
                 .function(function as usize)
                 .ok_or(InterpreterError::TypeMismatch)?;
             arena.push_call(function, cleanup.registers, None)?;
-            arena.initialize_abi_arguments(abi, &args[..usize::from(args_count)])?;
+            if u16::from(args_count) != abi.parameter_slots {
+                return Err(InterpreterError::ArgumentCount);
+            }
+            arena.initialize_packed_abi_arguments(abi, &args[..usize::from(args_count)])?;
         }
         crate::DeferAction::Trap => return Err(InterpreterError::TypeMismatch),
         crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
@@ -4292,6 +4817,61 @@ enum StandardIntrinsicOutcome {
     Retry,
     Trapped(crate::RuntimeMessage),
 }
+
+enum PhysicalStandardIntrinsicOutcome {
+    Returned,
+    Retry,
+    Trapped(crate::RuntimeMessage),
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalStandardIntrinsicAbi {
+    argument_slots: [u16; 3],
+    result_slots: u16,
+}
+
+impl PhysicalStandardIntrinsicAbi {
+    fn from_resolved(resolved: ExecutableNominalOperand) -> Result<Self, InterpreterError> {
+        let ExecutableNominalOperand::StandardIntrinsic {
+            argument_slots,
+            result_slots,
+        } = resolved
+        else {
+            return Err(InterpreterError::TypeMismatch);
+        };
+        Ok(Self {
+            argument_slots,
+            result_slots,
+        })
+    }
+
+    fn argument_base(self, args_base: u16, index: usize) -> Result<u16, InterpreterError> {
+        if index >= self.argument_slots.len() || self.argument_slots[index] == 0 {
+            return Err(InterpreterError::TypeMismatch);
+        }
+        self.argument_slots[..index]
+            .iter()
+            .try_fold(args_base, |base, slots| {
+                base.checked_add(*slots)
+                    .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))
+            })
+    }
+
+    fn physical_argument_slots(self, logical_count: u16) -> Result<u16, InterpreterError> {
+        self.argument_slots[..usize::from(logical_count)]
+            .iter()
+            .try_fold(0_u16, |total, slots| {
+                if *slots == 0 {
+                    return Err(InterpreterError::TypeMismatch);
+                }
+                total
+                    .checked_add(*slots)
+                    .ok_or(InterpreterError::FuelCostOverflow)
+            })
+    }
+}
+
+const PHYSICAL_ENUM_PAYLOAD_OFFSET: u16 = 1;
 
 #[allow(clippy::too_many_lines)]
 /// F1: attempt fuel for instructions whose whole cost is determined by the
@@ -4314,10 +4894,17 @@ pub(crate) fn static_instruction_fuel(
         | Instruction::StringEqual { .. }
         | Instruction::StringConcat { .. }
         | Instruction::StringBuild { .. }
-        | Instruction::StructNew { .. }
+        | Instruction::StructGet { .. }
         | Instruction::StructWith { .. }
+        | Instruction::EnumNew { .. }
+        | Instruction::EnumPayload { .. }
         | Instruction::EnumEqual { .. }
         | Instruction::StructEqual { .. }
+        | Instruction::ArrayGet { .. }
+        | Instruction::ArrayFieldGet { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ClassGet { .. }
+        | Instruction::ClassSet { .. }
         | Instruction::ArrayPush { .. }
         | Instruction::ArrayPushRow { .. }
         | Instruction::ArrayInsert { .. }
@@ -4360,12 +4947,10 @@ pub(crate) fn static_instruction_fuel(
             ..
         } => call_frame_attempt_fuel(module, function, args_count)?,
         Instruction::CopyValue { slots, .. } => value_visit_fuel(u64::from(slots), 1)?,
-        Instruction::EnumNew { .. } => nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
-        Instruction::StructGet { .. } => nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
-        Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
-        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
-            nominal_index_lookup_fuel(nominal_shape.class_fields)?
+        Instruction::StructNew { fields_count, .. } => {
+            value_visit_fuel(u64::from(fields_count), 1)?
         }
+        Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
         Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
         Instruction::MapNew { .. } => nominal_index_lookup_fuel(nominal_shape.map_types)?,
         _ => 0,
@@ -4380,6 +4965,7 @@ fn instruction_attempt_fuel(
     arena: &FrameArena,
     heap: Option<&Heap>,
     costs: &OpcodeCostTable,
+    resolved: ExecutableNominalOperand,
 ) -> Result<u64, InterpreterError> {
     // F1 single source of truth: instructions whose whole attempt fuel is
     // known at module load time settle here; only operand-dependent
@@ -4387,11 +4973,103 @@ fn instruction_attempt_fuel(
     if let Some(static_fuel) = static_instruction_fuel(module, nominal_shape, instruction, costs)? {
         return Ok(static_fuel);
     }
-    dynamic_instruction_fuel(module, nominal_shape, instruction, arena, heap, costs, None)
+    dynamic_instruction_fuel(
+        module,
+        nominal_shape,
+        instruction,
+        arena,
+        heap,
+        costs,
+        resolved,
+        None,
+    )
 }
 
 /// Operand-dependent attempt-fuel surcharges (frame arena or heap inputs).
 /// Reached only for instructions [`static_instruction_fuel`] declines.
+pub(crate) fn physical_instruction_work_fuel(
+    nominal_shape: nexa_verifier::NominalIndexShape,
+    instruction: Instruction,
+    resolved: ExecutableNominalOperand,
+) -> Result<Option<u64>, InterpreterError> {
+    let work = match instruction {
+        Instruction::EnumNew { .. } => {
+            let ExecutableNominalOperand::EnumVariant {
+                payload_slots,
+                owner_slots,
+                ..
+            } = resolved
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
+                value_visit_fuel(u64::from(owner_slots) + u64::from(payload_slots), 1)?,
+            )?
+        }
+        Instruction::EnumPayload { .. } => {
+            let ExecutableNominalOperand::EnumVariant { payload_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
+                value_visit_fuel(u64::from(payload_slots), 1)?,
+            )?
+        }
+        Instruction::EnumEqual { .. } => {
+            let ExecutableNominalOperand::EnumLayout { slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(slots), 1)?
+        }
+        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
+            let ExecutableNominalOperand::ClassField { slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.class_fields)?,
+                value_visit_fuel(u64::from(slots), 1)?,
+            )?
+        }
+        Instruction::ArrayGet { .. } | Instruction::ArraySet { .. } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(element_slots), 1)?
+        }
+        Instruction::ArrayFieldGet { .. } => {
+            let ExecutableNominalOperand::ArrayField { slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(slots), 1)?
+        }
+        Instruction::MapGet { .. } | Instruction::MapRemove { .. } => {
+            let ExecutableNominalOperand::MapLayout {
+                value_slots,
+                option_slots,
+                ..
+            } = resolved
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(option_slots) + u64::from(value_slots), 1)?
+        }
+        Instruction::MapSet { .. } => {
+            let ExecutableNominalOperand::MapLayout {
+                key_slots,
+                value_slots,
+                ..
+            } = resolved
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(key_slots) + u64::from(value_slots), 1)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(work))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn dynamic_instruction_fuel(
     module: &nexa_bytecode::Module,
@@ -4400,10 +5078,13 @@ pub(crate) fn dynamic_instruction_fuel(
     arena: &FrameArena,
     heap: Option<&Heap>,
     costs: &OpcodeCostTable,
+    resolved: ExecutableNominalOperand,
     predecoded_base: Option<u64>,
 ) -> Result<u64, InterpreterError> {
     let heap_required = || heap.ok_or(InterpreterError::HeapUnavailable);
     let base = predecoded_base.unwrap_or_else(|| costs.cost(instruction));
+    let physical_work =
+        physical_instruction_work_fuel(nominal_shape, instruction, resolved)?.unwrap_or(0);
     let work = match instruction {
         Instruction::StandardIntrinsic {
             intrinsic,
@@ -4411,7 +5092,9 @@ pub(crate) fn dynamic_instruction_fuel(
             args_count,
             ..
         } => {
-            return standard_intrinsic_attempt_fuel(intrinsic, args_base, args_count, arena, heap);
+            return standard_intrinsic_attempt_fuel(
+                intrinsic, args_base, args_count, arena, heap, resolved,
+            );
         }
         Instruction::StringLen { source, .. } | Instruction::StringRuneAt { source, .. } => {
             fuel_blocks(
@@ -4442,74 +5125,81 @@ pub(crate) fn dynamic_instruction_fuel(
         Instruction::Return { .. } | Instruction::ReturnVoid | Instruction::CleanupReturn => {
             return_defer_attempt_fuel(module, instruction, arena)?
         }
-        Instruction::StructNew {
-            fields_base,
-            fields_count,
-            ..
-        } => register_structural_hash_fuel(arena, heap_required()?, fields_base, fields_count)?,
-        Instruction::StructWith { source, value, .. } => {
-            let heap = heap_required()?;
-            let source = register(arena, source)?;
-            let replacement = register(arena, value)?;
-            let fields = heap.struct_fields(source)?;
+        Instruction::StructGet { .. } => {
+            let ExecutableNominalOperand::StructField { slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             fuel_add(
                 nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
-                fuel_add(
-                    runtime_values_hash_fuel(heap, fields)?,
-                    fuel_add(
-                        value_visit_fuel(1, 1)?,
-                        runtime_value_hash_fuel(heap, replacement)?,
-                    )?,
-                )?,
+                value_visit_fuel(u64::from(slots), 1)?,
             )?
         }
-        Instruction::EnumEqual { lhs, .. } | Instruction::StructEqual { lhs, .. } => {
-            runtime_value_comparison_fuel(heap_required()?, register(arena, lhs)?)?
+        Instruction::StructWith { .. } => {
+            let ExecutableNominalOperand::StructField {
+                slots, owner_slots, ..
+            } = resolved
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
+                value_visit_fuel(u64::from(owner_slots) + u64::from(slots), 1)?,
+            )?
+        }
+        Instruction::StructEqual { .. } => {
+            let ExecutableNominalOperand::StructLayout { slots } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            value_visit_fuel(u64::from(slots), 1)?
         }
         Instruction::ArrayPush { source, .. } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             let heap = heap_required()?;
             let array = register(arena, source)?;
             let (live, capacity) = heap.array_fuel_shape(array)?;
             // Amortized push (WP49): spare capacity is a constant-cost
             // in-place write; growth relocates exactly the live prefix.
             let moved = if live < capacity { 1 } else { live.max(1) };
-            let element_work =
-                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            let moved_slots = fuel_usize(moved)?
+                .checked_mul(u64::from(element_slots))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            let element_work = fuel_blocks(moved_slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
             fuel_add(
                 element_work,
                 collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
             )?
         }
-        Instruction::ArrayPushRow {
-            source,
-            fields_base,
-            fields_count,
-        } => {
-            // WP52: the fused push settles the same growth shape as
-            // ArrayPush plus the structural-hash work the replaced
-            // StructNew would have charged, so the fused sequence stays in
-            // the same fuel regime as the unfused one.
+        Instruction::ArrayPushRow { source, .. } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             let heap = heap_required()?;
             let array = register(arena, source)?;
             let (live, capacity) = heap.array_fuel_shape(array)?;
             let moved = if live < capacity { 1 } else { live.max(1) };
-            let element_work =
-                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            let moved_slots = fuel_usize(moved)?
+                .checked_mul(u64::from(element_slots))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            let element_work = fuel_blocks(moved_slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
             fuel_add(
-                fuel_add(
-                    element_work,
-                    collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
-                )?,
-                register_structural_hash_fuel(arena, heap, fields_base, fields_count)?,
+                element_work,
+                collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
             )?
         }
         Instruction::ArrayInsert { source, .. } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             let heap = heap_required()?;
             let array = register(arena, source)?;
             let (live, capacity) = heap.array_fuel_shape(array)?;
             let moved = live.max(1);
-            let element_work =
-                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            let moved_slots = fuel_usize(moved)?
+                .checked_mul(u64::from(element_slots))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            let element_work = fuel_blocks(moved_slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
             fuel_add(
                 element_work,
                 collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
@@ -4518,16 +5208,24 @@ pub(crate) fn dynamic_instruction_fuel(
         Instruction::ArrayPop { source, .. }
         | Instruction::ArrayRemove { source, .. }
         | Instruction::ArrayClear { source } => {
+            let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                return Err(InterpreterError::TypeMismatch);
+            };
             let heap = heap_required()?;
             let old_length = heap.array_len(register(arena, source)?)?;
-            fuel_blocks(
-                fuel_usize(old_length.max(1))?,
-                STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+            let visited_slots = fuel_usize(old_length.max(1))?
+                .checked_mul(u64::from(element_slots))
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            fuel_blocks(visited_slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+        }
+        Instruction::MapGet { source, key, .. } | Instruction::MapRemove { source, key, .. } => {
+            map_lookup_fuel(
+                heap_required()?,
+                register(arena, source)?,
+                register(arena, key)?,
             )?
         }
-        Instruction::MapGet { source, key, .. }
-        | Instruction::MapRemove { source, key, .. }
-        | Instruction::MapContains { source, key, .. } => map_lookup_fuel(
+        Instruction::MapContains { source, key, .. } => map_lookup_fuel(
             heap_required()?,
             register(arena, source)?,
             register(arena, key)?,
@@ -4565,7 +5263,7 @@ pub(crate) fn dynamic_instruction_fuel(
         }
         _ => 0,
     };
-    fuel_add(base, work)
+    fuel_add(base, fuel_add(work, physical_work)?)
 }
 
 fn call_frame_attempt_fuel(
@@ -4730,34 +5428,6 @@ fn runtime_value_comparison_fuel(
     fuel_add(string_work, structural_work)
 }
 
-fn register_structural_hash_fuel(
-    arena: &FrameArena,
-    heap: &Heap,
-    fields_base: u16,
-    fields_count: u16,
-) -> Result<u64, InterpreterError> {
-    if usize::from(fields_count) > nexa_bytecode::MAX_STRUCT_FIELDS {
-        return Err(InterpreterError::TypeMismatch);
-    }
-    let mut work = value_visit_fuel(u64::from(fields_count), 3)?;
-    let fields = crate::trusted::read_register_window(arena, fields_base, fields_count)?;
-    for field in fields {
-        work = fuel_add(work, runtime_value_hash_fuel(heap, *field)?)?;
-    }
-    Ok(work)
-}
-
-fn runtime_values_hash_fuel(
-    heap: &Heap,
-    values: crate::CollectionView<'_>,
-) -> Result<u64, InterpreterError> {
-    let mut work = value_visit_fuel(fuel_usize(values.len())?, 3)?;
-    for value in values.iter() {
-        work = fuel_add(work, runtime_value_hash_fuel(heap, value)?)?;
-    }
-    Ok(work)
-}
-
 fn value_visit_fuel(values: u64, passes: u64) -> Result<u64, InterpreterError> {
     let work = values
         .checked_mul(passes)
@@ -4816,15 +5486,16 @@ fn standard_intrinsic_arguments(
     args_base: u16,
     args_count: u16,
     arena: &FrameArena,
+    abi: PhysicalStandardIntrinsicAbi,
 ) -> Result<[RuntimeValue; 3], InterpreterError> {
-    if args_count != intrinsic.argument_count() || args_count > 3 {
+    if intrinsic.argument_count() > 3
+        || args_count != abi.physical_argument_slots(intrinsic.argument_count())?
+    {
         return Err(InterpreterError::TypeMismatch);
     }
     let mut arguments = [RuntimeValue::Unit; 3];
-    for argument in 0..args_count {
-        let source = args_base
-            .checked_add(argument)
-            .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+    for argument in 0..intrinsic.argument_count() {
+        let source = abi.argument_base(args_base, usize::from(argument))?;
         arguments[usize::from(argument)] = register(arena, source)?;
     }
     Ok(arguments)
@@ -4836,8 +5507,10 @@ fn standard_intrinsic_attempt_fuel(
     args_count: u16,
     arena: &FrameArena,
     heap: Option<&Heap>,
+    resolved: ExecutableNominalOperand,
 ) -> Result<u64, InterpreterError> {
-    let arguments = standard_intrinsic_arguments(intrinsic, args_base, args_count, arena)?;
+    let abi = PhysicalStandardIntrinsicAbi::from_resolved(resolved)?;
+    let arguments = standard_intrinsic_arguments(intrinsic, args_base, args_count, arena, abi)?;
     let heap_required = || heap.ok_or(InterpreterError::HeapUnavailable);
     let work = match intrinsic.fuel_model() {
         StandardIntrinsicFuelModel::Fixed => 0,
@@ -4881,21 +5554,21 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::ArrayCopy => {
             let heap = heap_required()?;
-            let (live, capacity) = heap.array_fuel_shape(arguments[0])?;
+            let (live, capacity, stride) = heap.array_physical_fuel_shape(arguments[0])?;
             if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
                 // Amortized push (WP49): in-place unless the extent is full.
                 let moved = if live < capacity { 1 } else { live.max(1) };
+                let cells = moved
+                    .checked_mul(stride)
+                    .ok_or(InterpreterError::FuelCostOverflow)?;
                 let element_work =
-                    fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+                    fuel_blocks(fuel_usize(cells)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
                 fuel_add(
                     element_work,
                     collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
                 )?
             } else {
-                fuel_blocks(
-                    fuel_usize(live.max(1))?,
-                    STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
-                )?
+                fuel_blocks(fuel_usize(stride)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
             }
         }
         StandardIntrinsicFuelModel::ArrayResize => {
@@ -4903,8 +5576,11 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::ArrayClear => {
             let heap = heap_required()?;
-            let (live, _) = heap.array_fuel_shape(arguments[0])?;
-            fuel_blocks(fuel_usize(live)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+            let (live, _, stride) = heap.array_physical_fuel_shape(arguments[0])?;
+            let cells = live
+                .checked_mul(stride)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            fuel_blocks(fuel_usize(cells)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
         }
         StandardIntrinsicFuelModel::MapLookup => {
             map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
@@ -4913,7 +5589,22 @@ fn standard_intrinsic_attempt_fuel(
             map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
         }
     };
-    fuel_add(u64::from(intrinsic.base_fuel_cost()), work)
+    let logical_slots = intrinsic.argument_count().saturating_add(1);
+    let physical_slots = args_count
+        .checked_add(abi.result_slots)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let physical_copy_work = if matches!(
+        intrinsic.fuel_model(),
+        StandardIntrinsicFuelModel::ArrayCopy
+    ) {
+        0
+    } else {
+        value_visit_fuel(u64::from(physical_slots.saturating_sub(logical_slots)), 1)?
+    };
+    fuel_add(
+        fuel_add(u64::from(intrinsic.base_fuel_cost()), work)?,
+        physical_copy_work,
+    )
 }
 
 fn array_resize_intrinsic_fuel(
@@ -4921,7 +5612,7 @@ fn array_resize_intrinsic_fuel(
     arguments: &[RuntimeValue; 3],
     heap: &Heap,
 ) -> Result<u64, InterpreterError> {
-    let (live, capacity) = heap.array_fuel_shape(arguments[0])?;
+    let (live, capacity, stride) = heap.array_physical_fuel_shape(arguments[0])?;
     match intrinsic {
         StandardIntrinsic::ArrayReserve { .. } => {
             let RuntimeValue::I32(additional) = arguments[1] else {
@@ -4934,8 +5625,11 @@ fn array_resize_intrinsic_fuel(
             if !grows {
                 return Ok(0);
             }
+            let cells = live
+                .checked_mul(stride)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
             let move_work =
-                fuel_blocks(fuel_usize(live)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+                fuel_blocks(fuel_usize(cells)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
             fuel_add(
                 move_work,
                 collection_arena_metadata_fuel(heap, true, capacity != 0)?,
@@ -5041,6 +5735,199 @@ fn map_insert_attempt_fuel(
     )?;
     scan.checked_add(mutation)
         .ok_or(InterpreterError::FuelCostOverflow)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_physical_standard_intrinsic(
+    intrinsic: StandardIntrinsic,
+    args_base: u16,
+    dst: u16,
+    arena: &mut FrameArena,
+    mut heap: Option<&mut Heap>,
+    resolved: ExecutableNominalOperand,
+) -> Result<PhysicalStandardIntrinsicOutcome, InterpreterError> {
+    use StandardIntrinsic as Intrinsic;
+
+    let abi = PhysicalStandardIntrinsicAbi::from_resolved(resolved)?;
+    let argument_base = |index| abi.argument_base(args_base, index);
+    let argument = |arena: &FrameArena, index| register(arena, argument_base(index)?);
+
+    match intrinsic {
+        Intrinsic::OptionIsSome { .. }
+        | Intrinsic::OptionIsNone { .. }
+        | Intrinsic::ResultIsOk { .. }
+        | Intrinsic::ResultIsErr { .. } => {
+            let RuntimeValue::I32(tag) = argument(arena, 0)? else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let result = match intrinsic {
+                Intrinsic::OptionIsSome { .. } | Intrinsic::ResultIsErr { .. } => tag == 1,
+                Intrinsic::OptionIsNone { .. } | Intrinsic::ResultIsOk { .. } => tag == 0,
+                _ => unreachable!(),
+            };
+            set_register(arena, dst, RuntimeValue::Bool(result))?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::OptionUnwrapOr { .. } | Intrinsic::ResultUnwrapOr { .. } => {
+            let RuntimeValue::I32(tag) = argument(arena, 0)? else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let success_tag = i32::from(matches!(intrinsic, Intrinsic::OptionUnwrapOr { .. }));
+            let source = if tag == success_tag {
+                argument_base(0)?
+                    .checked_add(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                    .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?
+            } else {
+                argument_base(1)?
+            };
+            arena.copy_register_range(source, dst, abi.result_slots)?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::ArrayGet { .. } => {
+            let array = argument(arena, 0)?;
+            let RuntimeValue::I32(index) = argument(arena, 1)? else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let index = usize::try_from(index).ok();
+            arena.clear_register_range(dst, abi.result_slots)?;
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let value = index
+                .map(|index| heap.array_value_range(array, index))
+                .transpose();
+            match value {
+                Ok(Some(value)) => {
+                    let payload_slots = abi
+                        .result_slots
+                        .checked_sub(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    if value.len() != usize::from(payload_slots) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(arena, dst, RuntimeValue::I32(1))?;
+                    let payload = dst
+                        .checked_add(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                    arena.write_register_values(payload, payload_slots, value.iter())?;
+                }
+                Ok(None) | Err(HeapError::IndexOutOfBounds { .. }) => {
+                    set_register(arena, dst, RuntimeValue::I32(0))?;
+                }
+                Err(error) => return Err(InterpreterError::Heap(error)),
+            }
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::ArrayPush { .. } => {
+            let array = argument(arena, 0)?;
+            let value_base = argument_base(1)?;
+            let value =
+                crate::trusted::read_register_window(arena, value_base, abi.argument_slots[1])?;
+            heap.as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_push_value_range(array, value)?;
+            set_register(arena, dst, RuntimeValue::Bool(true))?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::ArrayPop { .. } => {
+            let array = argument(arena, 0)?;
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let length = heap.array_len(array)?;
+            if length == 0 {
+                return Ok(PhysicalStandardIntrinsicOutcome::Trapped(
+                    "cannot pop an empty array".into(),
+                ));
+            }
+            {
+                let value = heap.array_value_range(array, length - 1)?;
+                if value.len() != usize::from(abi.result_slots) {
+                    return Err(InterpreterError::TypeMismatch);
+                }
+                arena.write_register_values(dst, abi.result_slots, value.iter())?;
+            }
+            heap.array_pop_value_discard(array)?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::MapGet { .. } | Intrinsic::MapRemove { .. } => {
+            if abi.argument_slots[0] != 1 || abi.argument_slots[1] != 1 {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let value_slots = abi
+                .result_slots
+                .checked_sub(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                .filter(|slots| *slots != 0)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let map = argument(arena, 0)?;
+            let key = argument(arena, 1)?;
+            arena.clear_register_range(dst, abi.result_slots)?;
+            let payload = dst
+                .checked_add(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+            let destination = arena.register_range_mut(payload, value_slots)?;
+            let found = if matches!(intrinsic, Intrinsic::MapGet { .. }) {
+                heap.as_deref()
+                    .ok_or(InterpreterError::HeapUnavailable)?
+                    .map_get_value_into(map, key, destination)?
+            } else {
+                heap.as_deref_mut()
+                    .ok_or(InterpreterError::HeapUnavailable)?
+                    .map_remove_value_into(map, key, destination)?
+            };
+            set_register(arena, dst, RuntimeValue::I32(i32::from(found)))?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::MapInsert { .. } => {
+            if abi.argument_slots[0] != 1
+                || abi.argument_slots[1] != 1
+                || abi.argument_slots[2] == 0
+                || abi.result_slots != 1
+            {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let value_base = argument_base(2)?;
+            let value =
+                crate::trusted::read_register_window(arena, value_base, abi.argument_slots[2])?;
+            let outcome = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .map_set_value_range(argument(arena, 0)?, argument(arena, 1)?, value)?;
+            if outcome == MapSetOutcome::Complete {
+                set_register(arena, dst, RuntimeValue::Bool(true))?;
+                Ok(PhysicalStandardIntrinsicOutcome::Returned)
+            } else {
+                Ok(PhysicalStandardIntrinsicOutcome::Retry)
+            }
+        }
+        _ => {
+            if abi.result_slots != 1
+                || abi.argument_slots[..usize::from(intrinsic.argument_count())]
+                    .iter()
+                    .any(|slots| *slots != 1)
+            {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let mut arguments = [RuntimeValue::Unit; 3];
+            for index in 0..usize::from(intrinsic.argument_count()) {
+                arguments[index] = argument(arena, index)?;
+            }
+            match run_standard_intrinsic(
+                intrinsic,
+                &arguments[..usize::from(intrinsic.argument_count())],
+                heap,
+            )? {
+                StandardIntrinsicOutcome::Returned(value) => {
+                    set_register(arena, dst, value)?;
+                    Ok(PhysicalStandardIntrinsicOutcome::Returned)
+                }
+                StandardIntrinsicOutcome::Retry => Ok(PhysicalStandardIntrinsicOutcome::Retry),
+                StandardIntrinsicOutcome::Trapped(message) => {
+                    Ok(PhysicalStandardIntrinsicOutcome::Trapped(message))
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5582,6 +6469,37 @@ fn runtime_values_equal(lhs: RuntimeValue, rhs: RuntimeValue) -> bool {
     }
 }
 
+fn physical_ranges_equal(
+    arena: &FrameArena,
+    lhs: u16,
+    rhs: u16,
+    slots: u16,
+    heap: Option<&Heap>,
+) -> Result<bool, InterpreterError> {
+    let lhs = crate::trusted::read_register_window(arena, lhs, slots)?;
+    let rhs = crate::trusted::read_register_window(arena, rhs, slots)?;
+    for (lhs, rhs) in lhs.iter().copied().zip(rhs.iter().copied()) {
+        let equal = if matches!(
+            (lhs, rhs),
+            (
+                RuntimeValue::String { .. }
+                    | RuntimeValue::Struct { .. }
+                    | RuntimeValue::NamedRef { .. },
+                _
+            )
+        ) {
+            heap.ok_or(InterpreterError::HeapUnavailable)?
+                .runtime_value_equal(lhs, rhs)?
+        } else {
+            runtime_values_equal(lhs, rhs)
+        };
+        if !equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
     match value {
         RuntimeValue::I32(_) => Some(ValueType::I32),
@@ -5606,6 +6524,317 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::Snapshot(snapshot) => Some(ValueType::Named(snapshot.type_id())),
         RuntimeValue::Unit => None,
     }
+}
+
+fn write_materialized_value_range(
+    arena: &mut FrameArena,
+    destination: u16,
+    expected: ValueType,
+    value: RuntimeValue,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: Option<&Heap>,
+) -> Result<(), InterpreterError> {
+    let slots = layouts
+        .physical_slots(expected)
+        .map_err(|_| InterpreterError::TypeMismatch)?;
+    let destination = arena.register_range_mut(destination, slots)?;
+    flatten_materialized_value(destination, expected, value, layouts, heap)
+}
+
+fn flatten_materialized_value(
+    destination: &mut [RuntimeValue],
+    expected: ValueType,
+    value: RuntimeValue,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: Option<&Heap>,
+) -> Result<(), InterpreterError> {
+    if runtime_value_type(value) != Some(expected) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let expected_slots = layouts
+        .physical_slots(expected)
+        .map_err(|_| InterpreterError::TypeMismatch)?;
+    if destination.len() != usize::from(expected_slots) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+
+    let ValueType::Named(type_id) = expected else {
+        let [slot] = destination else {
+            return Err(InterpreterError::TypeMismatch);
+        };
+        *slot = value;
+        return Ok(());
+    };
+    let Some(layout) = layouts.named_layout(type_id) else {
+        let [slot] = destination else {
+            return Err(InterpreterError::TypeMismatch);
+        };
+        *slot = value;
+        return Ok(());
+    };
+    match layout.equality_strategy {
+        nexa_bytecode::layout::EqualityStrategy::StructFieldwise => {
+            let heap = heap.ok_or(InterpreterError::HeapUnavailable)?;
+            let fields = heap.struct_fields(value)?;
+            if fields.len() != layout.field_offsets.len() {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            destination.fill(RuntimeValue::Unit);
+            for (index, field) in layout.field_offsets.iter().enumerate() {
+                let start = usize::from(field.offset);
+                let end = start
+                    .checked_add(usize::from(field.slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                let target = destination
+                    .get_mut(start..end)
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                let field_value = fields.get(index).ok_or(InterpreterError::TypeMismatch)?;
+                flatten_materialized_value(
+                    target,
+                    field.logical_type,
+                    field_value,
+                    layouts,
+                    Some(heap),
+                )?;
+            }
+            Ok(())
+        }
+        nexa_bytecode::layout::EqualityStrategy::EnumTagPayload => {
+            let heap = heap.ok_or(InterpreterError::HeapUnavailable)?;
+            let (actual, variant_id, tag, payload) = heap.enum_parts(value)?;
+            if actual != type_id {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let enum_layout = layout
+                .enum_layout
+                .as_ref()
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let variant = enum_layout
+                .variants
+                .iter()
+                .find(|variant| variant.tag == tag && variant.stable_id == variant_id)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            destination.fill(RuntimeValue::Unit);
+            destination[usize::from(enum_layout.tag_offset)] =
+                RuntimeValue::I32(i32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?);
+            match (variant.payload_type, payload) {
+                (Some(payload_type), Some(payload)) => {
+                    let start = usize::from(enum_layout.payload_offset);
+                    let end = start
+                        .checked_add(usize::from(variant.payload_slots))
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let target = destination
+                        .get_mut(start..end)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    flatten_materialized_value(target, payload_type, payload, layouts, Some(heap))
+                }
+                (None, None) => Ok(()),
+                _ => Err(InterpreterError::TypeMismatch),
+            }
+        }
+        _ => {
+            let [slot] = destination else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            *slot = value;
+            Ok(())
+        }
+    }
+}
+
+fn materialize_physical_value_range(
+    slots: &[RuntimeValue],
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: Option<&mut Heap>,
+) -> Result<RuntimeValue, InterpreterError> {
+    let requirements = physical_materialization_requirements(slots, expected, layouts)?;
+    if requirements == crate::HostReturnRequirements::ZERO {
+        return physical_scalar_value(slots, expected);
+    }
+    let heap = heap.ok_or(InterpreterError::HeapUnavailable)?;
+    let mut transaction = crate::HostReturnTransaction::new_runtime_boundary(heap, requirements)
+        .map_err(InterpreterError::Host)?;
+    let value = materialize_physical_value(&mut transaction, slots, expected, layouts)?;
+    transaction.commit(value).map_err(InterpreterError::Host)
+}
+
+fn physical_materialization_requirements(
+    slots: &[RuntimeValue],
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+) -> Result<crate::HostReturnRequirements, InterpreterError> {
+    let expected_slots = layouts
+        .physical_slots(expected)
+        .map_err(|_| InterpreterError::TypeMismatch)?;
+    if slots.len() != usize::from(expected_slots) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let ValueType::Named(type_id) = expected else {
+        physical_scalar_value(slots, expected)?;
+        return Ok(crate::HostReturnRequirements::ZERO);
+    };
+    let Some(layout) = layouts.named_layout(type_id) else {
+        physical_scalar_value(slots, expected)?;
+        return Ok(crate::HostReturnRequirements::ZERO);
+    };
+    match layout.equality_strategy {
+        nexa_bytecode::layout::EqualityStrategy::StructFieldwise => {
+            let mut requirements = crate::HostReturnRequirements::ZERO
+                .with_object()
+                .map_err(InterpreterError::Host)?
+                .with_struct_fields(layout.field_offsets.len())
+                .map_err(InterpreterError::Host)?;
+            for field in &layout.field_offsets {
+                let start = usize::from(field.offset);
+                let end = start
+                    .checked_add(usize::from(field.slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                requirements = requirements
+                    .checked_add(physical_materialization_requirements(
+                        slots
+                            .get(start..end)
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                        field.logical_type,
+                        layouts,
+                    )?)
+                    .map_err(InterpreterError::Host)?;
+            }
+            Ok(requirements)
+        }
+        nexa_bytecode::layout::EqualityStrategy::EnumTagPayload => {
+            let enum_layout = layout
+                .enum_layout
+                .as_ref()
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let tag = physical_enum_tag(slots, enum_layout)?;
+            let variant = enum_layout
+                .variants
+                .iter()
+                .find(|variant| variant.tag == tag)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let mut requirements = crate::HostReturnRequirements::ZERO
+                .with_object()
+                .map_err(InterpreterError::Host)?;
+            if let Some(payload_type) = variant.payload_type {
+                let start = usize::from(enum_layout.payload_offset);
+                let end = start
+                    .checked_add(usize::from(variant.payload_slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                requirements = requirements
+                    .checked_add(physical_materialization_requirements(
+                        slots
+                            .get(start..end)
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                        payload_type,
+                        layouts,
+                    )?)
+                    .map_err(InterpreterError::Host)?;
+            }
+            Ok(requirements)
+        }
+        _ => {
+            physical_scalar_value(slots, expected)?;
+            Ok(crate::HostReturnRequirements::ZERO)
+        }
+    }
+}
+
+fn materialize_physical_value(
+    transaction: &mut crate::HostReturnTransaction<'_>,
+    slots: &[RuntimeValue],
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+) -> Result<RuntimeValue, InterpreterError> {
+    let ValueType::Named(type_id) = expected else {
+        return physical_scalar_value(slots, expected);
+    };
+    let Some(layout) = layouts.named_layout(type_id) else {
+        return physical_scalar_value(slots, expected);
+    };
+    match layout.equality_strategy {
+        nexa_bytecode::layout::EqualityStrategy::StructFieldwise => {
+            let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+            if layout.field_offsets.len() > fields.len() {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            for (index, field) in layout.field_offsets.iter().enumerate() {
+                let start = usize::from(field.offset);
+                let end = start
+                    .checked_add(usize::from(field.slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                fields[index] = materialize_physical_value(
+                    transaction,
+                    slots
+                        .get(start..end)
+                        .ok_or(InterpreterError::TypeMismatch)?,
+                    field.logical_type,
+                    layouts,
+                )?;
+            }
+            transaction
+                .write_struct(type_id, &fields[..layout.field_offsets.len()])
+                .map_err(InterpreterError::Host)
+        }
+        nexa_bytecode::layout::EqualityStrategy::EnumTagPayload => {
+            let enum_layout = layout
+                .enum_layout
+                .as_ref()
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let tag = physical_enum_tag(slots, enum_layout)?;
+            let variant = enum_layout
+                .variants
+                .iter()
+                .find(|variant| variant.tag == tag)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let payload = if let Some(payload_type) = variant.payload_type {
+                let start = usize::from(enum_layout.payload_offset);
+                let end = start
+                    .checked_add(usize::from(variant.payload_slots))
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                Some(materialize_physical_value(
+                    transaction,
+                    slots
+                        .get(start..end)
+                        .ok_or(InterpreterError::TypeMismatch)?,
+                    payload_type,
+                    layouts,
+                )?)
+            } else {
+                None
+            };
+            transaction
+                .write_enum(type_id, variant.stable_id, tag, payload)
+                .map_err(InterpreterError::Host)
+        }
+        _ => physical_scalar_value(slots, expected),
+    }
+}
+
+fn physical_scalar_value(
+    slots: &[RuntimeValue],
+    expected: ValueType,
+) -> Result<RuntimeValue, InterpreterError> {
+    let [value] = slots else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    if runtime_value_type(*value) != Some(expected) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    Ok(*value)
+}
+
+fn physical_enum_tag(
+    slots: &[RuntimeValue],
+    layout: &nexa_bytecode::layout::EnumLayout,
+) -> Result<u32, InterpreterError> {
+    let RuntimeValue::I32(tag) = *slots
+        .get(usize::from(layout.tag_offset))
+        .ok_or(InterpreterError::TypeMismatch)?
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    u32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)
 }
 
 fn runtime_state_handle(
@@ -5667,12 +6896,6 @@ pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::RuneToString { .. }
         | Instruction::StringToString { .. }
         | Instruction::StandardIntrinsic { .. }
-        | Instruction::EnumNew { .. }
-        | Instruction::EnumEqual { .. }
-        | Instruction::StructNew { .. }
-        | Instruction::StructGet { .. }
-        | Instruction::StructWith { .. }
-        | Instruction::StructEqual { .. }
         | Instruction::ClassNew { .. }
         | Instruction::ClassGet { .. }
         | Instruction::ClassSet { .. }
@@ -5831,10 +7054,15 @@ define_opcode_cost_schedule! {
         index: 24,
         name: "EnumNew",
         base_cost: 1,
-        dynamic_work: "binary_search_fuel(enum_variant_index_entries)"
+        dynamic_work: "binary_search_fuel(enum_variant_index_entries)+ceil((owner_slots+payload_slots)/8)"
     },
     Instruction::EnumTag { .. } => { index: 25, name: "EnumTag", base_cost: 1 },
-    Instruction::EnumPayload { .. } => { index: 26, name: "EnumPayload", base_cost: 1 },
+    Instruction::EnumPayload { .. } => {
+        index: 26,
+        name: "EnumPayload",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(enum_variant_index_entries)+ceil(payload_slots/8)"
+    },
     Instruction::StatePreserve { .. } => { index: 27, name: "StatePreserve", base_cost: 1 },
     Instruction::StateFinish => { index: 28, name: "StateFinish", base_cost: 1 },
     Instruction::StateOldFieldGet { .. } => { index: 29, name: "StateOldFieldGet", base_cost: 1 },
@@ -5897,43 +7125,43 @@ define_opcode_cost_schedule! {
         index: 60,
         name: "StructNew",
         base_cost: 1,
-        dynamic_work: "ceil(fields_count*3/8)+sum(field_recursive_hash_shape)"
+        dynamic_work: "ceil(physical_slots/8)"
     },
     Instruction::StructGet { .. } => {
         index: 61,
         name: "StructGet",
         base_cost: 1,
-        dynamic_work: "binary_search_fuel(struct_field_index_entries)"
+        dynamic_work: "binary_search_fuel(struct_field_index_entries)+ceil(field_slots/8)"
     },
     Instruction::StructWith { .. } => {
         index: 62,
         name: "StructWith",
         base_cost: 1,
-        dynamic_work: "binary_search_fuel(struct_field_index_entries)+ceil(existing_fields*3/8)+sum(existing_recursive_hash_shape)+ceil(1/8)+replacement_recursive_hash_shape"
+        dynamic_work: "binary_search_fuel(struct_field_index_entries)+ceil((owner_slots+field_slots)/8)"
     },
     Instruction::StructEqual { .. } => {
         index: 63,
         name: "StructEqual",
         base_cost: 1,
-        dynamic_work: "lhs_structural_comparison_shape"
+        dynamic_work: "ceil(physical_slots/8)"
     },
     Instruction::ClassNew { .. } => {
         index: 64,
         name: "ClassNew",
         base_cost: 1,
-        dynamic_work: "ceil(fields_count*2/8)"
+        dynamic_work: "ceil(physical_field_slots*2/8)"
     },
     Instruction::ClassGet { .. } => {
         index: 65,
         name: "ClassGet",
         base_cost: 1,
-        dynamic_work: "binary_search_fuel(class_field_index_entries)"
+        dynamic_work: "binary_search_fuel(class_field_index_entries)+ceil(field_slots/8)"
     },
     Instruction::ClassSet { .. } => {
         index: 66,
         name: "ClassSet",
         base_cost: 1,
-        dynamic_work: "binary_search_fuel(class_field_index_entries)"
+        dynamic_work: "binary_search_fuel(class_field_index_entries)+ceil(field_slots/8)"
     },
     Instruction::ClassEqual { .. } => { index: 67, name: "ClassEqual", base_cost: 1 },
     Instruction::ArrayNew { .. } => {
@@ -5943,37 +7171,47 @@ define_opcode_cost_schedule! {
         dynamic_work: "binary_search_fuel(array_type_index_entries)"
     },
     Instruction::ArrayLen { .. } => { index: 69, name: "ArrayLen", base_cost: 1 },
-    Instruction::ArrayGet { .. } => { index: 70, name: "ArrayGet", base_cost: 1 },
-    Instruction::ArraySet { .. } => { index: 71, name: "ArraySet", base_cost: 1 },
+    Instruction::ArrayGet { .. } => {
+        index: 70,
+        name: "ArrayGet",
+        base_cost: 1,
+        dynamic_work: "ceil(element_slots/8)"
+    },
+    Instruction::ArraySet { .. } => {
+        index: 71,
+        name: "ArraySet",
+        base_cost: 1,
+        dynamic_work: "ceil(element_slots/8)"
+    },
     Instruction::ArrayPush { .. } => {
         index: 72,
         name: "ArrayPush",
         base_cost: 1,
-        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+        dynamic_work: "ceil(moved_elements*element_slots/8)+collection_claim_release_metadata"
     },
     Instruction::ArrayPop { .. } => {
         index: 73,
         name: "ArrayPop",
         base_cost: 1,
-        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+        dynamic_work: "ceil(max(old_len,1)*element_slots/8)"
     },
     Instruction::ArrayInsert { .. } => {
         index: 74,
         name: "ArrayInsert",
         base_cost: 1,
-        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+        dynamic_work: "ceil(max(old_len,1)*element_slots/8)+collection_claim_release_metadata"
     },
     Instruction::ArrayRemove { .. } => {
         index: 75,
         name: "ArrayRemove",
         base_cost: 1,
-        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+        dynamic_work: "ceil(max(old_len,1)*element_slots/8)"
     },
     Instruction::ArrayClear { .. } => {
         index: 76,
         name: "ArrayClear",
         base_cost: 1,
-        dynamic_work: "ceil(old_len/8)+collection_release_metadata"
+        dynamic_work: "ceil(max(old_len,1)*element_slots/8)"
     },
     Instruction::MapNew { .. } => {
         index: 77,
@@ -5986,19 +7224,19 @@ define_opcode_cost_schedule! {
         index: 79,
         name: "MapGet",
         base_cost: 1,
-        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape"
+        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape+ceil((option_slots+value_slots)/8)"
     },
     Instruction::MapSet { .. } => {
         index: 80,
         name: "MapSet",
         base_cost: 1,
-        dynamic_work: "map_insert_attempt_slots+key_hash_and_comparison_shape"
+        dynamic_work: "map_insert_attempt_slots+key_hash_and_comparison_shape+ceil((key_slots+value_slots)/8)"
     },
     Instruction::MapRemove { .. } => {
         index: 81,
         name: "MapRemove",
         base_cost: 1,
-        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape"
+        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape+ceil((option_slots+value_slots)/8)"
     },
     Instruction::MapContains { .. } => {
         index: 82,
@@ -6084,14 +7322,19 @@ define_opcode_cost_schedule! {
         index: 106,
         name: "EnumEqual",
         base_cost: 1,
-        dynamic_work: "lhs_recursive_enum_comparison_shape"
+        dynamic_work: "ceil(physical_slots/8)"
     },
-    Instruction::ArrayFieldGet { .. } => { index: 107, name: "ArrayFieldGet", base_cost: 1 },
+    Instruction::ArrayFieldGet { .. } => {
+        index: 107,
+        name: "ArrayFieldGet",
+        base_cost: 1,
+        dynamic_work: "ceil(field_slots/8)"
+    },
     Instruction::ArrayPushRow { .. } => {
         index: 108,
         name: "ArrayPushRow",
         base_cost: 1,
-        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata+fields_hash"
+        dynamic_work: "ceil(moved_elements*element_slots/8)+collection_claim_release_metadata"
     },
     Instruction::StringBuild { .. } => {
         index: 109,
@@ -6115,19 +7358,20 @@ mod tests {
         AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
         ModuleBuilder, RootMap, SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
         STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, Signature,
-        SourceMapEntry, StandardIntrinsic, ValueType,
+        SourceMapEntry, StandardIntrinsic, StructField, StructType, ValueType,
     };
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{
-        CheckedInterpreter, FuelState, InterpreterError, InterpreterMigration, InterpreterOutcome,
-        OPCODE_COST_SCHEDULE, StandardIntrinsicOutcome, SuspendReason, allocate_runtime_string,
+        CheckedInterpreter, FuelState, InterpreterError, InterpreterHost, InterpreterHostArguments,
+        InterpreterHostOutcome, InterpreterMigration, InterpreterOutcome, OPCODE_COST_SCHEDULE,
+        StandardIntrinsicOutcome, SuspendReason, allocate_runtime_string,
         ensure_host_call_available, fuel_add, fuel_blocks, run_standard_intrinsic,
     };
     use crate::{
         ContinuationReservation, ExecutableModule, FrameError, FrameLimits, GcRoots, Heap,
-        HeapError, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
+        HeapError, HostTrap, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
     };
 
     #[test]
@@ -6156,12 +7400,13 @@ fn work() -> i32 {
             .position(|function| function.signature.parameters.is_empty())
             .and_then(|index| u32::try_from(index).ok())
             .expect("work function");
-        let sum = module
+        let sum_index = module
             .module()
             .functions
             .iter()
-            .find(|function| function.signature.parameters.len() == 2)
+            .position(|function| function.signature.parameters.len() == 2)
             .expect("sum function");
+        let sum = &module.module().functions[sum_index];
         assert_eq!(sum.parameter_slots, 3);
         assert!(sum.registers >= 3);
         let echo = module
@@ -6230,6 +7475,179 @@ fn work() -> i32 {
                 ..
             }
         ));
+        assert_eq!(portable_heap.live_len(), 0);
+        assert_eq!(dense_heap.live_len(), 0);
+        assert_eq!(portable_heap.vm_allocation_counters().object_allocations, 0);
+        assert_eq!(dense_heap.vm_allocation_counters().object_allocations, 0);
+        assert_eq!(
+            portable_heap
+                .vm_allocation_counters()
+                .struct_materializations,
+            0
+        );
+        assert_eq!(
+            dense_heap.vm_allocation_counters().struct_materializations,
+            0
+        );
+
+        let pair_type = module.module().struct_types[0].type_id;
+        let mut entry_heap = Heap::new_with_limits(64, 4_096, 64);
+        let pair = entry_heap
+            .allocate_struct(pair_type, &[RuntimeValue::I32(20), RuntimeValue::I32(22)])
+            .unwrap();
+        let materializations = entry_heap.vm_allocation_counters().struct_materializations;
+        let outcome = CheckedInterpreter::run_with_heap(
+            &module,
+            u32::try_from(sum_index).unwrap(),
+            &[pair, RuntimeValue::I32(1)],
+            1_000,
+            &mut entry_heap,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(43)),
+                ..
+            }
+        ));
+        assert_eq!(
+            entry_heap.vm_allocation_counters().struct_materializations,
+            materializations,
+            "entry flattening borrows the boundary object and creates no temporary Struct"
+        );
+    }
+
+    struct BorrowedPairHost {
+        pair: StableId,
+    }
+
+    impl InterpreterHost for BorrowedPairHost {
+        fn call(
+            &mut self,
+            import: u32,
+            arguments: InterpreterHostArguments<'_>,
+            _heap: Option<&mut Heap>,
+        ) -> Result<InterpreterHostOutcome, HostTrap> {
+            if import != 0 || arguments.len() != 1 {
+                return Err(HostTrap::Arity);
+            }
+            let (slots, types, layouts) = arguments.parts();
+            let values = crate::RuntimeHostArgs::from_physical(slots, types, layouts, None)?;
+            let pair = values.struct_ref(0, self.pair)?;
+            if pair.len() != 2 {
+                return Err(HostTrap::Type);
+            }
+            let first = pair.field(0)?.i32()?;
+            let second = pair.field(1)?.i64()?;
+            Ok(InterpreterHostOutcome::Immediate(RuntimeValue::I32(
+                first
+                    .checked_add(i32::try_from(second).map_err(|_| HostTrap::Type)?)
+                    .ok_or(HostTrap::Type)?,
+            )))
+        }
+    }
+
+    #[test]
+    fn host_arguments_borrow_physical_struct_slots_without_materialization() {
+        let pair = StableId::from_name("test.HostPair");
+        let first = StableId::from_name("test.HostPair.first");
+        let second = StableId::from_name("test.HostPair.second");
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            5,
+        );
+        function
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::LoadI64 { dst: 1, value: 9 })
+            .emit(Instruction::StructNew {
+                type_id: pair,
+                fields_base: 0,
+                fields_count: 2,
+                dst: 2,
+            })
+            .emit(Instruction::HostCall {
+                import: 0,
+                args_base: 2,
+                args_count: 2,
+                dst: 4,
+            })
+            .emit(Instruction::Return { source: 4 });
+        let mut function = function.finish().unwrap();
+        function.root_bitmap = vec![false; 5];
+        function.safepoints = vec![0, 3, 4];
+        function.root_maps = function
+            .safepoints
+            .iter()
+            .copied()
+            .map(|pc| RootMap {
+                pc,
+                bitmap: vec![false; 5],
+            })
+            .collect();
+
+        let mut module = ModuleBuilder::new();
+        module
+            .metadata(
+                StableId::from_name("test.physical-host"),
+                nexa_bytecode::StateSchema::default().fingerprint(),
+            )
+            .struct_type(StructType {
+                type_id: pair,
+                fields: vec![
+                    StructField {
+                        stable_id: first,
+                        ty: ValueType::I32,
+                    },
+                    StructField {
+                        stable_id: second,
+                        ty: ValueType::I64,
+                    },
+                ],
+            });
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("test.physical-host.sum"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
+            parameters: vec![ValueType::Named(pair)],
+            result: Some(ValueType::I32),
+            mode: HostCallMode::Immediate,
+            fuel_cost: 1,
+            async_result: None,
+        });
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+        let limits = FrameLimits::default();
+        let continuation = CheckedInterpreter::start(
+            &module,
+            0,
+            &[],
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )
+        .unwrap();
+        let mut host = BorrowedPairHost { pair };
+        let mut heap = Heap::new_with_limits(8, 256, 8);
+        let outcome = CheckedInterpreter::poll_with_host_and_heap(
+            &module,
+            continuation,
+            FuelState::new(100, 0, 100),
+            OpcodeCostTable::canonical(),
+            &mut host,
+            &mut heap,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(16)),
+                ..
+            }
+        ));
+        assert_eq!(heap.vm_allocation_counters().struct_materializations, 0);
     }
 
     #[test]
@@ -6396,7 +7814,7 @@ fn work() -> i32 {
     }
 
     #[test]
-    fn static_leaf_constant_kernel_replays_string_and_enum_effects() {
+    fn static_leaf_constant_kernel_and_physical_enum_path_match_full_execution() {
         let source = r#"
 class Cell { mut value: i32, next: Option<Cell>, }
 fn string_constant() -> i32 {
@@ -6419,13 +7837,28 @@ fn arithmetic_constant() -> i32 {
         let module = nexa_compiler::compile(source).expect("constant kernels compile");
         let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
             .expect("constant kernels build");
+        assert!(
+            executable.functions()[0]
+                .static_leaf_constant_kernel()
+                .is_some()
+        );
+        assert!(
+            executable.functions()[1]
+                .static_leaf_certificate()
+                .is_some()
+        );
+        assert!(
+            executable.functions()[1]
+                .static_leaf_constant_kernel()
+                .is_none(),
+            "physical Enum/Class mutation stays on the general certified leaf path"
+        );
+        assert!(
+            executable.functions()[2]
+                .static_leaf_constant_kernel()
+                .is_some()
+        );
         for function in 0..3 {
-            assert!(
-                executable.functions()[function]
-                    .static_leaf_constant_kernel()
-                    .is_some(),
-                "function {function} must receive a constant-kernel certificate"
-            );
             assert_constant_leaf_parity(
                 &module,
                 &executable,
@@ -6731,7 +8164,7 @@ fn work(x: i32) -> i32 {
             cancel_error: Some(1),
             abandon_error: None,
         };
-        let mut function = FunctionBuilder::new(signature, 1);
+        let mut function = FunctionBuilder::new(signature, 2);
         function
             .effect(FunctionEffect::Task)
             .emit(Instruction::HostCall {
@@ -6742,16 +8175,16 @@ fn work(x: i32) -> i32 {
             })
             .emit(Instruction::Return { source: 0 });
         let mut function = function.finish().unwrap();
-        function.root_bitmap = vec![true];
+        function.root_bitmap = vec![false, true];
         function.safepoints = vec![0, 1];
         function.root_maps = vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![false],
+                bitmap: vec![false, false],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true],
+                bitmap: vec![false, true],
             },
         ];
 
@@ -6800,13 +8233,14 @@ fn work(x: i32) -> i32 {
         let mut heap = Heap::new(1);
         let reference = heap.allocate(Object::String("host result".into())).unwrap();
         continuation
-            .write_resume_value(
+            .write_resume_async_result(
+                &module,
                 0,
                 Some(ValueType::Named(result_type)),
-                RuntimeValue::NamedRef {
-                    type_id: result_type,
-                    reference,
-                },
+                async_result,
+                true,
+                RuntimeValue::Ref(reference),
+                Some(&heap),
             )
             .unwrap();
 
@@ -7671,7 +9105,7 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
-    fn enum_new_tag_and_payload_execute_through_the_gc_heap() {
+    fn enum_new_tag_and_payload_stay_in_physical_registers() {
         let enum_type = nexa_bytecode::option_type(ValueType::I32);
         let some = StableId::from_parts(&["Option", "::Some"]);
         let mut function = FunctionBuilder::new(
@@ -7679,7 +9113,7 @@ fn work(x: i32) -> i32 {
                 parameters: vec![ValueType::I32],
                 result: Some(ValueType::I32),
             },
-            3,
+            4,
         );
         function
             .emit(Instruction::EnumNew {
@@ -7688,25 +9122,14 @@ fn work(x: i32) -> i32 {
                 payload: Some(0),
                 dst: 1,
             })
-            .emit(Instruction::EnumTag { source: 1, dst: 2 })
+            .emit(Instruction::EnumTag { source: 1, dst: 3 })
             .emit(Instruction::EnumPayload {
                 source: 1,
                 variant: some,
                 dst: 0,
             })
             .emit(Instruction::Return { source: 0 });
-        let mut function = function.finish().unwrap();
-        function.root_bitmap[1] = true;
-        function.root_maps = vec![
-            nexa_bytecode::RootMap {
-                pc: 0,
-                bitmap: vec![false, false, false],
-            },
-            nexa_bytecode::RootMap {
-                pc: 3,
-                bitmap: vec![false, false, false],
-            },
-        ];
+        let function = function.finish().unwrap();
         let mut module = ModuleBuilder::new();
         module.enum_type(enum_type).function(function);
         let module = verify(module.finish(), VerifierLimits::default()).unwrap();
@@ -7719,6 +9142,9 @@ fn work(x: i32) -> i32 {
                 ..
             }
         ));
+        let counters = heap.vm_allocation_counters();
+        assert_eq!(counters.object_allocations, 0);
+        assert_eq!(counters.enum_materializations, 0);
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -7734,79 +9160,354 @@ fn work(x: i32) -> i32 {
     fn standard_core_option_and_result_intrinsics_execute() {
         let mut heap = Heap::new(16);
         let option = nexa_bytecode::option_type(ValueType::I32);
-        let some = heap
-            .allocate_enum(
-                option.type_id,
-                StableId::from_parts(&["Option", "::Some"]),
-                1,
-                Some(RuntimeValue::I32(7)),
-            )
-            .unwrap();
-        assert_eq!(
-            returned_value(
-                run_standard_intrinsic(
-                    StandardIntrinsic::OptionIsSome {
-                        value: ValueType::I32
-                    },
-                    &[some],
-                    Some(&mut heap),
-                )
-                .unwrap()
-            ),
-            RuntimeValue::Bool(true)
+        let mut unwrap = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            6,
         );
-        assert_eq!(
-            returned_value(
-                run_standard_intrinsic(
-                    StandardIntrinsic::OptionUnwrapOr {
-                        value: ValueType::I32
-                    },
-                    &[some, RuntimeValue::I32(9)],
-                    Some(&mut heap),
-                )
-                .unwrap()
-            ),
-            RuntimeValue::I32(7)
-        );
+        unwrap
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::EnumNew {
+                type_id: option.type_id,
+                variant: StableId::from_parts(&["Option", "::Some"]),
+                payload: Some(0),
+                dst: 2,
+            })
+            .emit(Instruction::LoadI32 { dst: 4, value: 9 })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::OptionUnwrapOr {
+                    value: ValueType::I32,
+                },
+                args_base: 2,
+                args_count: 3,
+                dst: 5,
+            })
+            .emit(Instruction::Return { source: 5 });
 
         let result = nexa_bytecode::result_type(ValueType::I32, ValueType::String);
-        let error = allocate_runtime_string(&mut heap, "nope").unwrap();
-        let err = heap
-            .allocate_enum(
-                result.type_id,
-                StableId::from_parts(&["Result", "::Err"]),
-                1,
-                Some(error),
-            )
-            .unwrap();
-        assert_eq!(
-            returned_value(
-                run_standard_intrinsic(
-                    StandardIntrinsic::ResultIsErr {
-                        success: ValueType::I32,
-                        error: ValueType::String,
-                    },
-                    &[err],
-                    Some(&mut heap),
-                )
-                .unwrap()
-            ),
-            RuntimeValue::Bool(true)
+        let mut is_err = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::Bool),
+            },
+            4,
         );
-        assert_eq!(
-            returned_value(
-                run_standard_intrinsic(
-                    StandardIntrinsic::ResultUnwrapOr {
-                        success: ValueType::I32,
-                        error: ValueType::String,
-                    },
-                    &[err, RuntimeValue::I32(11)],
-                    Some(&mut heap),
-                )
-                .unwrap()
-            ),
-            RuntimeValue::I32(11)
+        is_err
+            .set_root(0)
+            .unwrap()
+            .set_root(2)
+            .unwrap()
+            .emit(Instruction::LoadString { dst: 0, string: 0 })
+            .emit(Instruction::EnumNew {
+                type_id: result.type_id,
+                variant: StableId::from_parts(&["Result", "::Err"]),
+                payload: Some(0),
+                dst: 1,
+            })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::ResultIsErr {
+                    success: ValueType::I32,
+                    error: ValueType::String,
+                },
+                args_base: 1,
+                args_count: 2,
+                dst: 3,
+            })
+            .emit(Instruction::Return { source: 3 });
+        let mut is_err = is_err.finish().unwrap();
+        is_err.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false, false, false, false],
+            },
+            RootMap {
+                pc: 2,
+                bitmap: vec![false, false, true, false],
+            },
+            RootMap {
+                pc: 3,
+                bitmap: vec![false, false, false, false],
+            },
+        ];
+
+        let mut module = ModuleBuilder::new();
+        module.string("nope");
+        module.enum_type(option).enum_type(result);
+        module.function(unwrap.finish().unwrap());
+        module.function(is_err);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[], 32, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(7)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[], 32, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::Bool(true)),
+                ..
+            }
+        ));
+        assert_eq!(heap.vm_allocation_counters().enum_materializations, 0);
+    }
+
+    #[test]
+    fn standard_map_intrinsics_preserve_physical_struct_values() {
+        let pair = StableId::from_name("test.Pair");
+        let first = StableId::from_name("test.Pair.first");
+        let second = StableId::from_name("test.Pair.second");
+        let pair_type = ValueType::Named(pair);
+        let map_type = nexa_bytecode::map_type(ValueType::I32, pair_type);
+        let option = nexa_bytecode::option_type(pair_type);
+        let some = StableId::from_parts(&["Option", "::Some"]);
+
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            19,
         );
+        for root in [0, 6, 11] {
+            function.set_root(root).unwrap();
+        }
+        function
+            .emit(Instruction::MapNew {
+                type_id: map_type,
+                dst: 0,
+            })
+            .emit(Instruction::LoadI32 { dst: 1, value: 7 })
+            .emit(Instruction::LoadI32 { dst: 2, value: 11 })
+            .emit(Instruction::LoadI32 { dst: 3, value: 29 })
+            .emit(Instruction::StructNew {
+                type_id: pair,
+                fields_base: 2,
+                fields_count: 2,
+                dst: 4,
+            })
+            .emit(Instruction::Move { dst: 6, source: 0 })
+            .emit(Instruction::Move { dst: 7, source: 1 })
+            .emit(Instruction::CopyValue {
+                dst: 8,
+                source: 4,
+                slots: 2,
+            })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::MapInsert {
+                    key: ValueType::I32,
+                    value: pair_type,
+                },
+                args_base: 6,
+                args_count: 4,
+                dst: 10,
+            })
+            .emit(Instruction::Move { dst: 11, source: 0 })
+            .emit(Instruction::Move { dst: 12, source: 1 })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::MapGet {
+                    key: ValueType::I32,
+                    value: pair_type,
+                },
+                args_base: 11,
+                args_count: 2,
+                dst: 13,
+            })
+            .emit(Instruction::EnumPayload {
+                source: 13,
+                variant: some,
+                dst: 16,
+            })
+            .emit(Instruction::StructGet {
+                source: 16,
+                field: second,
+                dst: 18,
+            })
+            .emit(Instruction::Return { source: 18 });
+        let mut function = function.finish().unwrap();
+        let roots = |registers: &[usize]| {
+            let mut bitmap = vec![false; 19];
+            for register in registers {
+                bitmap[*register] = true;
+            }
+            bitmap
+        };
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: roots(&[]),
+            },
+            RootMap {
+                pc: 8,
+                bitmap: roots(&[0, 6]),
+            },
+            RootMap {
+                pc: 11,
+                bitmap: roots(&[11]),
+            },
+            RootMap {
+                pc: 14,
+                bitmap: roots(&[]),
+            },
+        ];
+
+        let mut module = ModuleBuilder::new();
+        module
+            .struct_type(StructType {
+                type_id: pair,
+                fields: vec![
+                    StructField {
+                        stable_id: first,
+                        ty: ValueType::I32,
+                    },
+                    StructField {
+                        stable_id: second,
+                        ty: ValueType::I32,
+                    },
+                ],
+            })
+            .map_type(nexa_bytecode::MapType::new(ValueType::I32, pair_type))
+            .enum_type(option);
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+        let mut heap = Heap::new_with_limits(16, usize::MAX, 16);
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[], 256, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(29)),
+                ..
+            }
+        ));
+        let counters = heap.vm_allocation_counters();
+        assert_eq!(counters.struct_materializations, 0);
+        assert_eq!(counters.enum_materializations, 0);
+    }
+
+    #[test]
+    fn standard_array_intrinsics_preserve_physical_struct_values() {
+        let pair = StableId::from_name("test.ArrayPair");
+        let first = StableId::from_name("test.ArrayPair.first");
+        let second = StableId::from_name("test.ArrayPair.second");
+        let pair_type = ValueType::Named(pair);
+        let array_type = nexa_bytecode::array_type(pair_type);
+        let option = nexa_bytecode::option_type(pair_type);
+        let some = StableId::from_parts(&["Option", "::Some"]);
+
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            17,
+        );
+        for root in [0, 5, 9] {
+            function.set_root(root).unwrap();
+        }
+        function
+            .emit(Instruction::ArrayNew {
+                type_id: array_type,
+                dst: 0,
+            })
+            .emit(Instruction::LoadI32 { dst: 1, value: 13 })
+            .emit(Instruction::LoadI32 { dst: 2, value: 31 })
+            .emit(Instruction::StructNew {
+                type_id: pair,
+                fields_base: 1,
+                fields_count: 2,
+                dst: 3,
+            })
+            .emit(Instruction::Move { dst: 5, source: 0 })
+            .emit(Instruction::CopyValue {
+                dst: 6,
+                source: 3,
+                slots: 2,
+            })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::ArrayPush { element: pair_type },
+                args_base: 5,
+                args_count: 3,
+                dst: 8,
+            })
+            .emit(Instruction::Move { dst: 9, source: 0 })
+            .emit(Instruction::LoadI32 { dst: 10, value: 0 })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::ArrayGet { element: pair_type },
+                args_base: 9,
+                args_count: 2,
+                dst: 11,
+            })
+            .emit(Instruction::EnumPayload {
+                source: 11,
+                variant: some,
+                dst: 14,
+            })
+            .emit(Instruction::StructGet {
+                source: 14,
+                field: second,
+                dst: 16,
+            })
+            .emit(Instruction::Return { source: 16 });
+        let mut function = function.finish().unwrap();
+        let roots = |registers: &[usize]| {
+            let mut bitmap = vec![false; 17];
+            for register in registers {
+                bitmap[*register] = true;
+            }
+            bitmap
+        };
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: roots(&[]),
+            },
+            RootMap {
+                pc: 6,
+                bitmap: roots(&[0, 5]),
+            },
+            RootMap {
+                pc: 9,
+                bitmap: roots(&[9]),
+            },
+            RootMap {
+                pc: 12,
+                bitmap: roots(&[]),
+            },
+        ];
+
+        let mut module = ModuleBuilder::new();
+        module
+            .struct_type(StructType {
+                type_id: pair,
+                fields: vec![
+                    StructField {
+                        stable_id: first,
+                        ty: ValueType::I32,
+                    },
+                    StructField {
+                        stable_id: second,
+                        ty: ValueType::I32,
+                    },
+                ],
+            })
+            .array_type(nexa_bytecode::ArrayType::new(pair_type))
+            .enum_type(option);
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+        let mut heap = Heap::new_with_limits(16, usize::MAX, 16);
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[], 256, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(31)),
+                ..
+            }
+        ));
+        let counters = heap.vm_allocation_counters();
+        assert_eq!(counters.struct_materializations, 0);
+        assert_eq!(counters.enum_materializations, 0);
     }
 
     #[test]

@@ -101,6 +101,67 @@ pub(crate) fn read_static_leaf_window(
     unsafe { std::slice::from_raw_parts(registers.as_ptr().add(start).cast(), count) }
 }
 
+#[inline]
+pub(crate) fn clear_static_leaf_range(registers: &mut StaticLeafRegisters, base: u16, count: u16) {
+    let start = usize::from(base);
+    let count = usize::from(count);
+    debug_assert!(count != 0);
+    debug_assert!(start.saturating_add(count) <= registers.len());
+    for register in &mut registers[start..start + count] {
+        register.write(RuntimeValue::Unit);
+    }
+}
+
+#[inline]
+pub(crate) fn copy_static_leaf_range(
+    registers: &mut StaticLeafRegisters,
+    source: u16,
+    destination: u16,
+    count: u16,
+) {
+    let source = usize::from(source);
+    let destination = usize::from(destination);
+    let count = usize::from(count);
+    debug_assert!(count != 0);
+    debug_assert!(source.saturating_add(count) <= registers.len());
+    debug_assert!(destination.saturating_add(count) <= registers.len());
+    // SAFETY: static-leaf certification proves both ranges fit the fixed
+    // register bank and definite initialization proves every source slot is
+    // initialized. `ptr::copy` intentionally gives snapshot semantics for
+    // overlapping physical-value assignments.
+    unsafe {
+        std::ptr::copy(
+            registers.as_ptr().add(source),
+            registers.as_mut_ptr().add(destination),
+            count,
+        );
+    }
+}
+
+#[inline]
+pub(crate) fn write_static_leaf_values(
+    registers: &mut StaticLeafRegisters,
+    destination: u16,
+    count: u16,
+    values: impl ExactSizeIterator<Item = RuntimeValue>,
+) -> Result<(), InterpreterError> {
+    if values.len() != usize::from(count) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let start = usize::from(destination);
+    let count = usize::from(count);
+    if start
+        .checked_add(count)
+        .is_none_or(|end| end > registers.len())
+    {
+        return Err(InterpreterError::RegisterOutOfRange(destination));
+    }
+    for (target, value) in registers[start..start + count].iter_mut().zip(values) {
+        target.write(value);
+    }
+    Ok(())
+}
+
 /// Reads one register of the current frame with the bounds re-checks the
 /// verifier already discharged removed. Error mapping matches the checked
 /// path exactly: any failure is `RegisterOutOfRange(register)`.

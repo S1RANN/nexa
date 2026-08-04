@@ -1241,8 +1241,12 @@ pub enum Instruction {
     },
     HostCall {
         import: u32,
+        /// Base of the caller-owned packed physical Host argument range.
         args_base: u16,
+        /// Exact physical slot width; logical Host arity comes from the
+        /// verified import contract.
         args_count: u16,
+        /// Base of the caller-owned physical result range.
         dst: u16,
     },
     StateOldGet {
@@ -1495,7 +1499,10 @@ pub enum Instruction {
     },
     DeferPush {
         function: u32,
+        /// Base of the packed physical cleanup-capture range.
         args_base: u16,
+        /// Exact physical slot width, bounded by the continuation's inline
+        /// defer-capture capacity.
         args_count: u16,
     },
     DeferPop,
@@ -4816,11 +4823,6 @@ impl FunctionBuilder {
                         | Instruction::RuneToString { .. }
                         | Instruction::StringToString { .. }
                         | Instruction::StandardIntrinsic { .. }
-                        | Instruction::EnumNew { .. }
-                        | Instruction::EnumEqual { .. }
-                        | Instruction::StructNew { .. }
-                        | Instruction::StructWith { .. }
-                        | Instruction::StructEqual { .. }
                         | Instruction::ClassNew { .. }
                         | Instruction::Call { .. }
                         | Instruction::HostCall { .. }

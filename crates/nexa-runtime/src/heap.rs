@@ -10,7 +10,6 @@ use crate::{RuntimeFailureInjector, RuntimeFailurePoint, RuntimeValue};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapEntry {
     key: RuntimeValue,
-    value: RuntimeValue,
     hash: u64,
 }
 
@@ -18,6 +17,8 @@ pub struct MapEntry {
 struct MapRehash {
     old_slots: CollectionRange,
     new_slots: CollectionRange,
+    old_values: CollectionRange,
+    new_values: CollectionRange,
     cursor: usize,
 }
 
@@ -26,7 +27,9 @@ pub struct VmMap {
     type_id: StableId,
     key_type: nexa_bytecode::ValueType,
     value_type: nexa_bytecode::ValueType,
+    value_slots: u16,
     slots: CollectionRange,
+    values: CollectionRange,
     length: usize,
     rehash: Option<MapRehash>,
 }
@@ -34,22 +37,37 @@ pub struct VmMap {
 impl VmMap {
     // WP73: stream child references into the mark queue instead of
     // materializing a temporary Vec per object during GC.
-    fn trace_references(&self, arena: &MapSlotArena, visit: &mut impl FnMut(GcRef)) {
-        let current = arena
-            .slots(self.slots)
-            .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(|entry| [entry.key, entry.value]);
-        let rehash = self.rehash.iter().flat_map(|rehash| {
-            arena
-                .slots(rehash.old_slots)
-                .iter()
-                .chain(arena.slots(rehash.new_slots))
-                .filter_map(Option::as_ref)
-                .flat_map(|entry| [entry.key, entry.value])
-        });
-        for reference in current.chain(rehash).filter_map(value_reference) {
-            visit(reference);
+    fn trace_references(
+        &self,
+        arena: &MapSlotArena,
+        values: &CollectionArena,
+        visit: &mut impl FnMut(GcRef),
+    ) {
+        let mut trace_table = |slots: CollectionRange, value_range: CollectionRange| {
+            for (index, entry) in arena.slots(slots).iter().copied().enumerate() {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                if let Some(reference) = value_reference(entry.key) {
+                    visit(reference);
+                }
+                let row = map_value_row(value_range, self.value_slots, index)
+                    .expect("map value table matches its slot capacity");
+                for reference in values
+                    .values(row)
+                    .expect("map value table remains live with its slots")
+                    .iter()
+                    .copied()
+                    .filter_map(value_reference)
+                {
+                    visit(reference);
+                }
+            }
+        };
+        trace_table(self.slots, self.values);
+        if let Some(rehash) = &self.rehash {
+            trace_table(rehash.old_slots, rehash.old_values);
+            trace_table(rehash.new_slots, rehash.new_values);
         }
     }
 
@@ -57,16 +75,28 @@ impl VmMap {
     /// including both sides of an in-flight incremental rehash.
     fn storage_bytes(&self) -> usize {
         let slot_bytes = size_of::<Option<MapEntry>>();
-        let rehash_slots = self.rehash.as_ref().map_or(0, |rehash| {
-            rehash
-                .old_slots
-                .length
-                .saturating_add(rehash.new_slots.length)
+        let (rehash_slots, rehash_values) = self.rehash.as_ref().map_or((0, 0), |rehash| {
+            (
+                rehash
+                    .old_slots
+                    .length
+                    .saturating_add(rehash.new_slots.length),
+                rehash
+                    .old_values
+                    .length
+                    .saturating_add(rehash.new_values.length),
+            )
         });
         self.slots
             .length
             .saturating_add(rehash_slots)
             .saturating_mul(slot_bytes)
+            .saturating_add(
+                self.values
+                    .length
+                    .saturating_add(rehash_values)
+                    .saturating_mul(size_of::<RuntimeValue>()),
+            )
     }
 }
 
@@ -75,6 +105,11 @@ pub(crate) struct MapEntries<'a> {
     current: &'a [Option<MapEntry>],
     old: &'a [Option<MapEntry>],
     new: &'a [Option<MapEntry>],
+    values: &'a CollectionArena,
+    current_values: CollectionRange,
+    old_values: CollectionRange,
+    new_values: CollectionRange,
+    value_slots: u16,
     phase: u8,
     index: usize,
     remaining: usize,
@@ -102,7 +137,19 @@ impl Iterator for MapEntries<'_> {
                     .remaining
                     .checked_sub(1)
                     .expect("map length matches occupied slots");
-                return Some((entry.key, entry.value));
+                let values = match self.phase {
+                    0 => self.current_values,
+                    1 => self.old_values,
+                    2 => self.new_values,
+                    _ => unreachable!(),
+                };
+                let row = map_value_row(values, self.value_slots, self.index - 1)
+                    .expect("scalar Host map table has a matching value row");
+                let value = self
+                    .values
+                    .values(row)
+                    .expect("scalar Host map entry has a live value extent")[0];
+                return Some((entry.key, value));
             }
         }
     }
@@ -567,14 +614,14 @@ pub enum Object {
         type_id: StableId,
         storage: CollectionStorage,
         range: CollectionRange,
-        field_count: u8,
+        field_count: u16,
         hash: u64,
     },
     Class {
         type_id: StableId,
         storage: CollectionStorage,
         range: CollectionRange,
-        field_count: u8,
+        field_count: u16,
     },
     Array {
         type_id: StableId,
@@ -590,7 +637,7 @@ pub enum Object {
         /// WP52: `Some(fields)` flattens struct elements into `fields`
         /// arena cells per element instead of one heap object each;
         /// `None` keeps the plain one-cell-per-element layout.
-        row_stride: Option<std::num::NonZeroU8>,
+        row_stride: Option<std::num::NonZeroU16>,
     },
     Buffer {
         type_id: StableId,
@@ -929,6 +976,24 @@ impl<'a> CollectionView<'a> {
                 .map(|values| Self::NamedRef { values, type_id }),
         }
     }
+
+    fn slice(self, start: usize, length: usize) -> Option<Self> {
+        let end = start.checked_add(length)?;
+        match self {
+            Self::Values(values) => values.get(start..end).map(Self::Values),
+            Self::I32(values) => values.get(start..end).map(Self::I32),
+            Self::I64(values) => values.get(start..end).map(Self::I64),
+            Self::F32(values) => values.get(start..end).map(Self::F32),
+            Self::F64(values) => values.get(start..end).map(Self::F64),
+            Self::Bool(values) => values.get(start..end).map(Self::Bool),
+            Self::Rune(values) => values.get(start..end).map(Self::Rune),
+            Self::String(values) => values.get(start..end).map(Self::String),
+            Self::Ref(values) => values.get(start..end).map(Self::Ref),
+            Self::NamedRef { values, type_id } => values
+                .get(start..end)
+                .map(|values| Self::NamedRef { values, type_id }),
+        }
+    }
 }
 
 /// Resolved array header shared by every logical array operation (WP52).
@@ -938,7 +1003,7 @@ struct ArrayParts {
     range: CollectionRange,
     /// Logical element count.
     length: usize,
-    row_stride: Option<std::num::NonZeroU8>,
+    row_stride: Option<std::num::NonZeroU16>,
     element_type: nexa_bytecode::ValueType,
     storage: CollectionStorage,
 }
@@ -950,7 +1015,7 @@ impl ArrayParts {
             .map_or(1, |stride| usize::from(stride.get()))
     }
 
-    /// `Some(stride)` when elements are flattened struct rows.
+    /// `Some(stride)` when elements are flattened physical value rows.
     fn rows(self) -> Option<usize> {
         self.row_stride.map(|stride| usize::from(stride.get()))
     }
@@ -1971,6 +2036,7 @@ impl Heap {
             Object::Map { storage } => {
                 let storage = *storage as usize;
                 if let Some(map) = self.maps.get_mut(storage).and_then(Option::take) {
+                    self.release_map_value_extents(&map);
                     self.map_slots.release(map.slots);
                     if let Some(rehash) = map.rehash {
                         self.map_slots.release(rehash.old_slots);
@@ -1983,6 +2049,36 @@ impl Heap {
             Object::String(_) | Object::SharedString(_) | Object::Enum { .. } => {}
         }
         payload
+    }
+
+    /// Releases every persistent physical value range owned by a map.
+    ///
+    /// Entries can reside in the current table or either side of an
+    /// incremental rehash, but never in more than one of them. The returned
+    /// byte count is used by mutation paths; object sweep/rollback already
+    /// release the map's complete payload as one aggregate.
+    fn release_map_value_extents(&mut self, map: &VmMap) -> u64 {
+        let mut released = 0_u64;
+        let ranges = [
+            map.values,
+            map.rehash
+                .as_ref()
+                .map_or(CollectionRange::default(), |rehash| rehash.old_values),
+            map.rehash
+                .as_ref()
+                .map_or(CollectionRange::default(), |rehash| rehash.new_values),
+        ];
+        for values in ranges {
+            if values.length != 0 {
+                released = released.saturating_add(
+                    u64::try_from(values.length)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(size_of::<RuntimeValue>() as u64),
+                );
+                self.release_typed_collection(CollectionStorage::Values, values);
+            }
+        }
+        released
     }
 
     pub(crate) fn preflight(&mut self, count: usize) -> Result<HeapReservation, HeapError> {
@@ -2745,6 +2841,7 @@ impl Heap {
                     }
                     Object::Map { storage } => {
                         if let Some(map) = self.maps[storage as usize].take() {
+                            self.release_map_value_extents(&map);
                             self.map_slots.release(map.slots);
                             if let Some(rehash) = map.rehash {
                                 self.map_slots.release(rehash.old_slots);
@@ -2991,7 +3088,7 @@ impl Heap {
         type_id: StableId,
         fields: &[RuntimeValue],
     ) -> Result<RuntimeValue, HeapError> {
-        if fields.len() > nexa_bytecode::MAX_STRUCT_FIELDS {
+        if u16::try_from(fields.len()).is_err() {
             return Err(HeapError::CapacityExhausted);
         }
         let mut reservation = self.preflight(1)?;
@@ -3019,7 +3116,8 @@ impl Heap {
                 type_id,
                 storage,
                 range,
-                field_count: u8::try_from(fields.len()).expect("struct field limit fits into u8"),
+                field_count: u16::try_from(fields.len())
+                    .map_err(|_| HeapError::CapacityExhausted)?,
                 hash,
             },
         );
@@ -3170,7 +3268,7 @@ impl Heap {
         type_id: StableId,
         fields: &[RuntimeValue],
     ) -> Result<RuntimeValue, HeapError> {
-        if fields.len() > nexa_bytecode::MAX_CLASS_FIELDS {
+        if u16::try_from(fields.len()).is_err() {
             return Err(HeapError::CapacityExhausted);
         }
         let field_bytes = (fields.len() as u64)
@@ -3187,7 +3285,8 @@ impl Heap {
                 type_id,
                 storage,
                 range,
-                field_count: u8::try_from(fields.len()).expect("class field limit fits into u8"),
+                field_count: u16::try_from(fields.len())
+                    .map_err(|_| HeapError::CapacityExhausted)?,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -3203,6 +3302,20 @@ impl Heap {
         };
         self.class_fields(value)?
             .get(index)
+            .ok_or(HeapError::InvalidReference(reference))
+    }
+
+    pub(crate) fn class_field_range(
+        &self,
+        value: RuntimeValue,
+        offset: usize,
+        slots: usize,
+    ) -> Result<CollectionView<'_>, HeapError> {
+        let RuntimeValue::NamedRef { reference, .. } = value else {
+            return Err(invalid_value_reference());
+        };
+        self.class_fields(value)?
+            .slice(offset, slots)
             .ok_or(HeapError::InvalidReference(reference))
     }
 
@@ -3269,6 +3382,44 @@ impl Heap {
         self.typed_collection_set(range.0, element_type, range.1, index, replacement)
     }
 
+    pub(crate) fn set_class_field_range(
+        &mut self,
+        value: RuntimeValue,
+        offset: usize,
+        replacement: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        let (storage, range, field_count) = match self.resolve(reference)? {
+            Object::Class {
+                type_id: actual,
+                storage,
+                range,
+                field_count,
+            } if *actual == type_id => (*storage, *range, usize::from(*field_count)),
+            _ => return Err(HeapError::InvalidReference(reference)),
+        };
+        let _end = offset
+            .checked_add(replacement.len())
+            .filter(|end| *end <= field_count)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: offset.saturating_add(replacement.len()),
+                length: field_count,
+            })?;
+        self.validate_reference(reference)?;
+        for value in replacement {
+            if let Some(child) = value_reference(*value) {
+                self.validate_reference(child)?;
+            }
+        }
+        let element_type = field_type_for_storage(storage).unwrap_or(nexa_bytecode::ValueType::Ref);
+        for (index, replacement) in replacement.iter().copied().enumerate() {
+            self.typed_collection_set(storage, element_type, range, offset + index, replacement)?;
+        }
+        Ok(())
+    }
+
     /// Publishes a value into an already allocated GC object.
     ///
     /// Validates both sides before mutation: a forged or stale child
@@ -3332,18 +3483,17 @@ impl Heap {
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
 
-    /// WP52: allocates an array whose struct elements live flattened in
-    /// the collection arena - `field_count` cells per element, zero heap
-    /// objects per element. `element_type` must name the struct type.
-    pub fn allocate_struct_row_array(
+    /// WP52: allocates an array whose aggregate elements live flattened in
+    /// the collection arena - `row_slots` physical cells per element, zero
+    /// heap objects per element.
+    pub fn allocate_value_row_array(
         &mut self,
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
-        field_count: std::num::NonZeroU8,
+        row_slots: std::num::NonZeroU16,
     ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::array_type(element_type)
             || !matches!(element_type, nexa_bytecode::ValueType::Named(_))
-            || usize::from(field_count.get()) > nexa_bytecode::MAX_STRUCT_FIELDS
         {
             return Err(invalid_value_reference());
         }
@@ -3353,7 +3503,7 @@ impl Heap {
             storage: CollectionStorage::Values,
             range: CollectionRange::default(),
             length: 0,
-            row_stride: Some(field_count),
+            row_stride: Some(row_slots),
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
@@ -3435,6 +3585,80 @@ impl Heap {
         fields[..stride].copy_from_slice(&cells[index * stride..(index + 1) * stride]);
         let mut reservation = self.preflight(1)?;
         self.commit_struct(&mut reservation, struct_type, &fields[..stride])
+    }
+
+    /// Borrows one element in its physical storage layout. Aggregate rows
+    /// expose their complete flattened slot range; scalar/reference arrays
+    /// expose a one-cell typed view.
+    pub fn array_value_range(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<CollectionView<'_>, HeapError> {
+        let parts = self.array_parts(value)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            });
+        }
+        if let Some(stride) = parts.rows() {
+            return self
+                .collections
+                .values(parts.range)?
+                .get(index * stride..(index + 1) * stride)
+                .map(CollectionView::Values)
+                .ok_or(HeapError::IndexOutOfBounds {
+                    index: (index + 1) * stride,
+                    length: parts.range.length,
+                });
+        }
+        self.typed_collection_view(parts.storage, parts.element_type, parts.range)?
+            .slice(index, 1)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            })
+    }
+
+    /// Borrows a physical field subrange from one flattened aggregate row.
+    pub fn array_field_range(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+        offset: usize,
+        slots: usize,
+    ) -> Result<CollectionView<'_>, HeapError> {
+        let row = self.array_value_range(value, index)?;
+        row.slice(offset, slots).ok_or(HeapError::IndexOutOfBounds {
+            index: offset.saturating_add(slots),
+            length: row.len(),
+        })
+    }
+
+    pub fn array_set_row(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        replacement: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            });
+        }
+        let stride = parts.rows().ok_or_else(invalid_value_reference)?;
+        if replacement.len() != stride {
+            return Err(invalid_value_reference());
+        }
+        for value in replacement {
+            self.shade_on_write(*value);
+        }
+        self.collections.values_mut(parts.range)?[index * stride..(index + 1) * stride]
+            .copy_from_slice(replacement);
+        Ok(())
     }
 
     pub fn array_set(
@@ -3587,14 +3811,142 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
-        let Some(stride) = parts.rows() else {
-            let element = self.allocate_struct(parts.element_struct_type()?, fields)?;
-            return self.array_push(value, element);
-        };
+        let stride = parts.rows().ok_or_else(invalid_value_reference)?;
         if fields.len() != stride {
             return Err(invalid_value_reference());
         }
         self.push_row_cells(parts, length, fields)
+    }
+
+    /// Appends one verifier-proven physical element range.
+    ///
+    /// Aggregate arrays consume the complete flattened row. Scalar and
+    /// reference arrays consume the single value slot. This is the
+    /// materialization boundary used by the physical standard-library ABI;
+    /// it never constructs an intermediate Struct or Enum heap object.
+    pub(crate) fn array_push_value_range(
+        &mut self,
+        value: RuntimeValue,
+        element: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        if let Some(stride) = parts.rows() {
+            let length = parts
+                .length
+                .checked_add(1)
+                .ok_or(HeapError::CollectionTooLarge {
+                    length: usize::MAX,
+                    max_length: self.max_collection_length,
+                })?;
+            self.validate_collection_length(length)?;
+            if element.len() != stride {
+                return Err(invalid_value_reference());
+            }
+            return self.push_row_cells(parts, length, element);
+        }
+        let [element] = element else {
+            return Err(invalid_value_reference());
+        };
+        self.array_push(value, *element)
+    }
+
+    pub fn array_insert_row(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        row: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        let current = parts.length;
+        if index > current {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: current,
+            });
+        }
+        let stride = parts.rows().ok_or_else(invalid_value_reference)?;
+        if row.len() != stride {
+            return Err(invalid_value_reference());
+        }
+        let length = current
+            .checked_add(1)
+            .ok_or(HeapError::CollectionTooLarge {
+                length: usize::MAX,
+                max_length: self.max_collection_length,
+            })?;
+        self.validate_collection_length(length)?;
+        for value in row {
+            self.shade_on_write(*value);
+        }
+        let needed_cells = length
+            .checked_mul(stride)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if needed_cells <= parts.range.length {
+            let values = self.collections.values_mut(parts.range)?;
+            values.copy_within(index * stride..current * stride, (index + 1) * stride);
+            values[index * stride..(index + 1) * stride].copy_from_slice(row);
+            self.counters.collection_relocation_bytes =
+                self.counters.collection_relocation_bytes.saturating_add(
+                    ((current - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
+                );
+            self.set_array_length(parts.reference, length)?;
+            return Ok(());
+        }
+        let capacity_cells = grown_array_capacity(
+            parts.range.length / stride,
+            length,
+            self.max_collection_length,
+        )
+        .saturating_mul(stride);
+        self.regrow_array(
+            parts.reference,
+            parts.range,
+            current * stride,
+            capacity_cells,
+            |values| {
+                values.copy_within(index * stride..current * stride, (index + 1) * stride);
+                values[index * stride..(index + 1) * stride].copy_from_slice(row);
+            },
+        )?;
+        self.set_array_length(parts.reference, length)
+    }
+
+    pub fn array_pop_row_discard(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        let stride = parts.rows().ok_or_else(invalid_value_reference)?;
+        if parts.length == 0 {
+            return Err(HeapError::IndexOutOfBounds {
+                index: 0,
+                length: 0,
+            });
+        }
+        self.collections.values_mut(parts.range)?
+            [(parts.length - 1) * stride..parts.length * stride]
+            .fill(RuntimeValue::Unit);
+        self.set_array_length(parts.reference, parts.length - 1)
+    }
+
+    pub fn array_remove_row_discard(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        let stride = parts.rows().ok_or_else(invalid_value_reference)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            });
+        }
+        let values = self.collections.values_mut(parts.range)?;
+        values.copy_within((index + 1) * stride..parts.length * stride, index * stride);
+        values[(parts.length - 1) * stride..parts.length * stride].fill(RuntimeValue::Unit);
+        self.counters.collection_relocation_bytes =
+            self.counters.collection_relocation_bytes.saturating_add(
+                ((parts.length - 1 - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
+            );
+        self.set_array_length(parts.reference, parts.length - 1)
     }
 
     /// Shared row-append tail for [`Self::array_push`] and
@@ -3656,6 +4008,26 @@ impl Heap {
         values[(length - 1) * stride..length * stride].fill(RuntimeValue::Unit);
         self.set_array_length(parts.reference, length - 1)?;
         Ok(result)
+    }
+
+    /// Removes the final element after its physical range has been copied to
+    /// the caller-owned result slots.
+    pub(crate) fn array_pop_value_discard(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        if parts.length == 0 {
+            return Err(HeapError::IndexOutOfBounds {
+                index: 0,
+                length: 0,
+            });
+        }
+        let index = parts.length - 1;
+        if let Some(stride) = parts.rows() {
+            self.collections.values_mut(parts.range)?[index * stride..parts.length * stride]
+                .fill(RuntimeValue::Unit);
+        } else {
+            self.typed_collection_clear(parts.storage, parts.range, index..parts.length)?;
+        }
+        self.set_array_length(parts.reference, index)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4095,6 +4467,18 @@ impl Heap {
     pub fn array_fuel_shape(&self, value: RuntimeValue) -> Result<(usize, usize), HeapError> {
         let parts = self.array_parts(value)?;
         Ok((parts.length, parts.range.length / parts.stride()))
+    }
+
+    pub(crate) fn array_physical_fuel_shape(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<(usize, usize, usize), HeapError> {
+        let parts = self.array_parts(value)?;
+        Ok((
+            parts.length,
+            parts.range.length / parts.stride(),
+            parts.stride(),
+        ))
     }
 
     /// Moves the live prefix into a larger extent, applies `write`, and
@@ -4569,21 +4953,47 @@ impl Heap {
         key_type: nexa_bytecode::ValueType,
         value_type: nexa_bytecode::ValueType,
     ) -> Result<RuntimeValue, HeapError> {
+        self.allocate_physical_map(type_id, key_type, value_type, 1)
+    }
+
+    pub(crate) fn allocate_physical_map(
+        &mut self,
+        type_id: StableId,
+        key_type: nexa_bytecode::ValueType,
+        value_type: nexa_bytecode::ValueType,
+        value_slots: u16,
+    ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::map_type(key_type, value_type) {
             return Err(invalid_value_reference());
         }
+        if value_slots == 0 {
+            return Err(invalid_value_reference());
+        }
         let initial_capacity = self.empty_map_capacity();
-        let payload_bytes =
-            (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
+        let value_cells = initial_capacity
+            .checked_mul(usize::from(value_slots))
+            .ok_or(HeapError::CapacityExhausted)?;
+        let payload_bytes = (initial_capacity as u64)
+            .saturating_mul(size_of::<Option<MapEntry>>() as u64)
+            .saturating_add((value_cells as u64).saturating_mul(size_of::<RuntimeValue>() as u64));
         self.ensure_new_object_headroom(payload_bytes, true)?;
         self.ensure_collection_headroom(payload_bytes)?;
         let mut reservation = self.preflight(1)?;
         let slots = self.map_slots.claim(initial_capacity)?;
+        let values = match self.claim_typed_collection(CollectionStorage::Values, value_cells) {
+            Ok(values) => values,
+            Err(error) => {
+                self.map_slots.release(slots);
+                return Err(error);
+            }
+        };
         let storage = self.claim_map_storage(VmMap {
             type_id,
             key_type,
             value_type,
+            value_slots,
             slots,
+            values,
             length: 0,
             rehash: None,
         });
@@ -4616,17 +5026,35 @@ impl Heap {
     /// slots followed by populated new slots in the same order.
     pub(crate) fn map_entries(&self, value: RuntimeValue) -> Result<MapEntries<'_>, HeapError> {
         let map = self.map(value)?;
+        if map.value_slots != 1 {
+            return Err(invalid_value_reference());
+        }
         let empty: &[Option<MapEntry>] = &[];
-        let (old, new) = map.rehash.as_ref().map_or((empty, empty), |rehash| {
+        let (old, new, old_values, new_values) = map.rehash.as_ref().map_or(
             (
-                self.map_slots.slots(rehash.old_slots),
-                self.map_slots.slots(rehash.new_slots),
-            )
-        });
+                empty,
+                empty,
+                CollectionRange::default(),
+                CollectionRange::default(),
+            ),
+            |rehash| {
+                (
+                    self.map_slots.slots(rehash.old_slots),
+                    self.map_slots.slots(rehash.new_slots),
+                    rehash.old_values,
+                    rehash.new_values,
+                )
+            },
+        );
         Ok(MapEntries {
             current: self.map_slots.slots(map.slots),
             old,
             new,
+            values: &self.collections,
+            current_values: map.values,
+            old_values,
+            new_values,
+            value_slots: map.value_slots,
             phase: 0,
             index: 0,
             remaining: map.length,
@@ -4719,15 +5147,46 @@ impl Heap {
         value: RuntimeValue,
         key: RuntimeValue,
     ) -> Result<Option<RuntimeValue>, HeapError> {
+        let mut result = [RuntimeValue::Unit];
+        Ok(self
+            .map_get_value_into(value, key, &mut result)?
+            .then_some(result[0]))
+    }
+
+    pub(crate) fn map_get_value_into(
+        &self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+        destination: &mut [RuntimeValue],
+    ) -> Result<bool, HeapError> {
+        let Some(value) = self.map_get_value_range(value, key)? else {
+            return Ok(false);
+        };
+        if destination.len() != value.len() {
+            return Err(invalid_value_reference());
+        }
+        destination.copy_from_slice(value);
+        Ok(true)
+    }
+
+    pub(crate) fn map_get_value_range(
+        &self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Result<Option<&[RuntimeValue]>, HeapError> {
         let hash = self.runtime_value_hash(key)?;
         let map = self.map(value)?;
-        Ok(self
-            .find_map_entry(map, key, hash)?
-            .map(|location| map_entry(map, &self.map_slots, location).value))
+        let Some(location) = self.find_map_entry(map, key, hash)? else {
+            return Ok(None);
+        };
+        let range = map_entry_value_range(map, location)?;
+        Ok(Some(self.collections.values(range)?))
     }
 
     pub fn map_contains(&self, value: RuntimeValue, key: RuntimeValue) -> Result<bool, HeapError> {
-        self.map_get(value, key).map(|value| value.is_some())
+        let hash = self.runtime_value_hash(key)?;
+        let map = self.map(value)?;
+        Ok(self.find_map_entry(map, key, hash)?.is_some())
     }
 
     pub fn map_set(
@@ -4736,15 +5195,36 @@ impl Heap {
         key: RuntimeValue,
         replacement: RuntimeValue,
     ) -> Result<MapSetOutcome, HeapError> {
+        self.map_set_value_range(value, key, std::slice::from_ref(&replacement))
+    }
+
+    pub(crate) fn map_set_value_range(
+        &mut self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+        replacement: &[RuntimeValue],
+    ) -> Result<MapSetOutcome, HeapError> {
         // G1 barrier: shading before the outcome branches is conservative
         // (a pending rehash publishes nothing yet) but always safe.
         self.shade_on_write(key);
-        self.shade_on_write(replacement);
+        for replacement in replacement {
+            self.shade_on_write(*replacement);
+        }
         // Resolve and validate the public map handle once. The previous
         // implementation repeatedly walked heap slot -> map arena for every
         // branch below, even though neither identity can change during one
         // synchronous insertion.
         let storage = self.map_storage_index(value)?;
+        if replacement.len()
+            != usize::from(
+                self.maps[storage]
+                    .as_ref()
+                    .expect("validated map storage exists")
+                    .value_slots,
+            )
+        {
+            return Err(invalid_value_reference());
+        }
         // A retry resumes only the bounded rehash chunk. Looking up the key
         // again here would repeat an entire map scan on every retry and make
         // deterministic attempt-based fuel either free or overcharged.
@@ -4759,9 +5239,13 @@ impl Heap {
                     .as_mut()
                     .expect("validated map storage exists"),
                 &mut self.map_slots,
+                &mut self.collections,
             )?;
-            // G6: rehash completion just released the old typed extent.
-            self.release_collection_payload(released);
+            if let Some((old_values, released_bytes)) = released {
+                self.release_typed_collection(CollectionStorage::Values, old_values);
+                // G6: rehash completion released the old slot/value table.
+                self.release_collection_payload(released_bytes);
+            }
             return Ok(MapSetOutcome::RehashPending);
         }
 
@@ -4776,11 +5260,10 @@ impl Heap {
             let map = self.maps[storage]
                 .as_ref()
                 .expect("validated map storage exists");
-            let range = map_location_range(map, location);
-            self.map_slots.slots_mut(range)[map_location_index(location)]
-                .as_mut()
-                .expect("located map entry exists")
-                .value = replacement;
+            let value_range = map_entry_value_range(map, location)?;
+            self.collections
+                .values_mut(value_range)?
+                .copy_from_slice(replacement);
             return Ok(MapSetOutcome::Complete);
         }
 
@@ -4799,17 +5282,37 @@ impl Heap {
                 next_map_capacity(map, self.max_collection_length).expect("map needs rehash");
             if new_capacity > old_capacity {
                 let entry_bytes = size_of::<Option<MapEntry>>() as u64;
+                let value_cells = new_capacity
+                    .checked_mul(usize::from(map.value_slots))
+                    .ok_or(HeapError::CapacityExhausted)?;
                 // G6 admission and charge: the new slot vector joins the
-                // map's footprint now; the old vector is released when the
-                // rehash completes.
-                let new_bytes = (new_capacity as u64).saturating_mul(entry_bytes);
+                // map's footprint with its companion value rows. Both old
+                // extents are released when the bounded rehash completes.
+                let new_bytes = (new_capacity as u64)
+                    .saturating_mul(entry_bytes)
+                    .saturating_add(
+                        (value_cells as u64).saturating_mul(size_of::<RuntimeValue>() as u64),
+                    );
                 self.ensure_payload_headroom(new_bytes)?;
                 self.ensure_collection_headroom(new_bytes)?;
                 let new_slots = self.map_slots.claim(new_capacity)?;
+                let new_values =
+                    match self.claim_typed_collection(CollectionStorage::Values, value_cells) {
+                        Ok(values) => values,
+                        Err(error) => {
+                            self.map_slots.release(new_slots);
+                            return Err(error);
+                        }
+                    };
                 self.charge_collection_payload(
                     u64::try_from(new_slots.length)
                         .unwrap_or(u64::MAX)
-                        .saturating_mul(entry_bytes),
+                        .saturating_mul(entry_bytes)
+                        .saturating_add(
+                            u64::try_from(new_values.length)
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(size_of::<RuntimeValue>() as u64),
+                        ),
                 );
                 self.counters.map_slot_allocations = self
                     .counters
@@ -4819,27 +5322,34 @@ impl Heap {
                     .as_mut()
                     .expect("validated map storage exists");
                 let old_slots = map.slots;
+                let old_values = map.values;
                 map.slots = CollectionRange::default();
+                map.values = CollectionRange::default();
                 map.rehash = Some(MapRehash {
                     old_slots,
                     new_slots,
+                    old_values,
+                    new_values,
                     cursor: 0,
                 });
                 return Ok(MapSetOutcome::RehashPending);
             }
         }
 
-        let entry = MapEntry {
-            key,
-            value: replacement,
-            hash,
-        };
+        let entry = MapEntry { key, hash };
         self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
-        let range = self.maps[storage]
+        let map = self.maps[storage]
             .as_ref()
-            .expect("validated map storage exists")
-            .slots;
-        insert_map_entry(self.map_slots.slots_mut(range), entry)?;
+            .expect("validated map storage exists");
+        let range = map.slots;
+        let values = map.values;
+        let value_slots = map.value_slots;
+        let index = insert_map_entry(self.map_slots.slots_mut(range), entry)?;
+        let value_range =
+            map_value_row(values, value_slots, index).ok_or_else(invalid_value_reference)?;
+        self.collections
+            .values_mut(value_range)?
+            .copy_from_slice(replacement);
         self.maps[storage]
             .as_mut()
             .expect("validated map storage exists")
@@ -4852,57 +5362,107 @@ impl Heap {
         value: RuntimeValue,
         key: RuntimeValue,
     ) -> Result<Option<RuntimeValue>, HeapError> {
+        let mut result = [RuntimeValue::Unit];
+        Ok(self
+            .map_remove_value_into(value, key, &mut result)?
+            .then_some(result[0]))
+    }
+
+    pub(crate) fn map_remove_value_into(
+        &mut self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+        destination: &mut [RuntimeValue],
+    ) -> Result<bool, HeapError> {
         let hash = self.runtime_value_hash(key)?;
         let location = {
             let map = self.map(value)?;
+            if destination.len() != usize::from(map.value_slots) {
+                return Err(invalid_value_reference());
+            }
             self.find_map_entry(map, key, hash)?
         };
         let Some(location) = location else {
-            return Ok(None);
+            return Ok(false);
         };
         let storage = self.map_storage_index(value)?;
         let map = self.maps[storage]
             .as_ref()
             .expect("validated map storage exists");
         let range = map_location_range(map, location);
-        let entry = match location {
-            MapLocation::RehashOld(_) => self.map_slots.slots_mut(range)
-                [map_location_index(location)]
-            .take()
-            .expect("located map entry exists"),
-            MapLocation::Current(_) | MapLocation::RehashNew(_) => remove_probed_entry(
-                self.map_slots.slots_mut(range),
-                map_location_index(location),
-            ),
+        let values = map_location_values(map, location);
+        let value_slots = map.value_slots;
+        let value_range = map_entry_value_range(map, location)?;
+        destination.copy_from_slice(self.collections.values(value_range)?);
+        match location {
+            MapLocation::RehashOld(_) => {
+                self.map_slots.slots_mut(range)[map_location_index(location)]
+                    .take()
+                    .expect("located map entry exists");
+                self.collections
+                    .values_mut(value_range)?
+                    .fill(RuntimeValue::Unit);
+            }
+            MapLocation::Current(_) | MapLocation::RehashNew(_) => {
+                remove_probed_entry_with_values(
+                    self.map_slots.slots_mut(range),
+                    &mut self.collections,
+                    values,
+                    value_slots,
+                    map_location_index(location),
+                );
+            }
         };
         self.maps[storage]
             .as_mut()
             .expect("validated map storage exists")
             .length -= 1;
-        Ok(Some(entry.value))
+        Ok(true)
     }
 
     pub fn map_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
         let storage = self.map_storage_index(value)?;
-        let map = self.maps[storage]
-            .as_mut()
-            .expect("validated map storage exists");
-        self.map_slots.slots_mut(map.slots).fill(None);
-        // G6: dropping an in-flight rehash releases both side extents;
-        // the primary extent keeps its capacity.
-        let rehash = map.rehash.take();
-        map.length = 0;
-        let released = rehash.map_or(0, |rehash| {
+        let snapshot = self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists")
+            .clone();
+        if let Some(rehash) = snapshot.rehash {
+            // G6: an in-flight map has no primary table. Clear releases both
+            // sides and lets the next insertion choose a fresh capacity.
+            self.map_slots.release(rehash.old_slots);
+            self.map_slots.release(rehash.new_slots);
+            self.release_typed_collection(CollectionStorage::Values, rehash.old_values);
+            self.release_typed_collection(CollectionStorage::Values, rehash.new_values);
             let bytes = (rehash
                 .old_slots
                 .length
                 .saturating_add(rehash.new_slots.length) as u64)
-                .saturating_mul(size_of::<Option<MapEntry>>() as u64);
-            self.map_slots.release(rehash.old_slots);
-            self.map_slots.release(rehash.new_slots);
-            bytes
-        });
-        self.release_collection_payload(released);
+                .saturating_mul(size_of::<Option<MapEntry>>() as u64)
+                .saturating_add(
+                    (rehash
+                        .old_values
+                        .length
+                        .saturating_add(rehash.new_values.length) as u64)
+                        .saturating_mul(size_of::<RuntimeValue>() as u64),
+                );
+            let map = self.maps[storage]
+                .as_mut()
+                .expect("validated map storage exists");
+            map.slots = CollectionRange::default();
+            map.values = CollectionRange::default();
+            map.rehash = None;
+            map.length = 0;
+            self.release_collection_payload(bytes);
+        } else {
+            self.map_slots.slots_mut(snapshot.slots).fill(None);
+            self.collections
+                .values_mut(snapshot.values)?
+                .fill(RuntimeValue::Unit);
+            self.maps[storage]
+                .as_mut()
+                .expect("validated map storage exists")
+                .length = 0;
+        }
         Ok(())
     }
 
@@ -5139,7 +5699,11 @@ impl Heap {
     }
 
     #[allow(clippy::float_cmp)]
-    fn runtime_value_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
+    pub(crate) fn runtime_value_equal(
+        &self,
+        lhs: RuntimeValue,
+        rhs: RuntimeValue,
+    ) -> Result<bool, HeapError> {
         Ok(match (lhs, rhs) {
             (RuntimeValue::F32(lhs), RuntimeValue::F32(rhs)) => {
                 f32::from_bits(lhs) == f32::from_bits(rhs)
@@ -5861,7 +6425,7 @@ impl Heap {
                         .and_then(Option::as_ref)
                         .ok_or(HeapError::InvalidReference(reference))?;
                     let slots = &mut self.slots;
-                    map.trace_references(&self.map_slots, &mut |child| {
+                    map.trace_references(&self.map_slots, &self.collections, &mut |child| {
                         if Self::enqueue_gray(slots, queue, child) {
                             grayed += 1;
                         }
@@ -6137,7 +6701,7 @@ fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize>
     )
 }
 
-fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<(), HeapError> {
+fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<usize, HeapError> {
     if slots.is_empty() {
         return Err(HeapError::CapacityExhausted);
     }
@@ -6147,16 +6711,61 @@ fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<(
         let index = (start + offset) % slots.len();
         if slots[index].is_none() {
             slots[index] = Some(entry);
-            return Ok(());
+            return Ok(index);
         }
     }
     Err(HeapError::CapacityExhausted)
 }
 
-/// Advances one bounded rehash chunk. Returns the payload bytes released
-/// by completing the rehash (the dropped old slot vector), zero while the
-/// rehash is still in flight (G6).
-fn progress_map_rehash(map: &mut VmMap, arena: &mut MapSlotArena) -> Result<u64, HeapError> {
+fn map_value_row(
+    values: CollectionRange,
+    value_slots: u16,
+    index: usize,
+) -> Option<CollectionRange> {
+    let slots = usize::from(value_slots);
+    let offset = index.checked_mul(slots)?;
+    let start = values.start.checked_add(offset)?;
+    let end = offset.checked_add(slots)?;
+    (end <= values.length).then_some(CollectionRange {
+        start,
+        length: slots,
+    })
+}
+
+fn map_location_values(map: &VmMap, location: MapLocation) -> CollectionRange {
+    match location {
+        MapLocation::Current(_) => map.values,
+        MapLocation::RehashOld(_) => {
+            map.rehash
+                .as_ref()
+                .expect("located rehash entry has state")
+                .old_values
+        }
+        MapLocation::RehashNew(_) => {
+            map.rehash
+                .as_ref()
+                .expect("located rehash entry has state")
+                .new_values
+        }
+    }
+}
+
+fn map_entry_value_range(map: &VmMap, location: MapLocation) -> Result<CollectionRange, HeapError> {
+    map_value_row(
+        map_location_values(map, location),
+        map.value_slots,
+        map_location_index(location),
+    )
+    .ok_or_else(invalid_value_reference)
+}
+
+/// Advances one bounded rehash chunk. Completion returns the old companion
+/// value extent and the exact slot+value bytes leaving the live footprint.
+fn progress_map_rehash(
+    map: &mut VmMap,
+    arena: &mut MapSlotArena,
+    values: &mut CollectionArena,
+) -> Result<Option<(CollectionRange, u64)>, HeapError> {
     const REHASH_CHUNK: usize = 8;
     let rehash = map.rehash.as_mut().expect("rehash state checked by caller");
     let end = rehash
@@ -6165,24 +6774,35 @@ fn progress_map_rehash(map: &mut VmMap, arena: &mut MapSlotArena) -> Result<u64,
         .min(rehash.old_slots.length);
     for index in rehash.cursor..end {
         if let Some(entry) = arena.slots_mut(rehash.old_slots)[index].take() {
-            insert_map_entry(arena.slots_mut(rehash.new_slots), entry)?;
+            let destination = insert_map_entry(arena.slots_mut(rehash.new_slots), entry)?;
+            let source = map_value_row(rehash.old_values, map.value_slots, index)
+                .ok_or_else(invalid_value_reference)?;
+            let destination = map_value_row(rehash.new_values, map.value_slots, destination)
+                .ok_or_else(invalid_value_reference)?;
+            values
+                .values
+                .copy_within(source.start..source.end(), destination.start);
+            values.values[source.start..source.end()].fill(RuntimeValue::Unit);
         }
     }
     rehash.cursor = end;
     if end == rehash.old_slots.length {
-        let released =
-            (rehash.old_slots.length as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
-        arena.release(rehash.old_slots);
-        map.slots = rehash.new_slots;
+        let old_slots = rehash.old_slots;
+        let new_slots = rehash.new_slots;
+        let old_values = rehash.old_values;
+        let new_values = rehash.new_values;
+        let released = (old_slots.length as u64)
+            .saturating_mul(size_of::<Option<MapEntry>>() as u64)
+            .saturating_add(
+                (old_values.length as u64).saturating_mul(size_of::<RuntimeValue>() as u64),
+            );
+        arena.release(old_slots);
+        map.slots = new_slots;
+        map.values = new_values;
         map.rehash = None;
-        return Ok(released);
+        return Ok(Some((old_values, released)));
     }
-    Ok(0)
-}
-
-fn map_entry(map: &VmMap, arena: &MapSlotArena, location: MapLocation) -> MapEntry {
-    arena.slots(map_location_range(map, location))[map_location_index(location)]
-        .expect("located map entry exists")
+    Ok(None)
 }
 
 fn map_location_range(map: &VmMap, location: MapLocation) -> CollectionRange {
@@ -6218,7 +6838,38 @@ const fn map_location_index(location: MapLocation) -> usize {
 /// the hole; entries sitting at or after their home stay put. The walk
 /// stops at the first empty slot, or after one full cycle for tables
 /// running without an empty slot at the capacity ceiling.
+#[cfg(test)]
 fn remove_probed_entry(slots: &mut [Option<MapEntry>], index: usize) -> MapEntry {
+    remove_probed_entry_with_moves(slots, index, |_, _| {}).0
+}
+
+fn remove_probed_entry_with_values(
+    slots: &mut [Option<MapEntry>],
+    values: &mut CollectionArena,
+    value_table: CollectionRange,
+    value_slots: u16,
+    index: usize,
+) -> MapEntry {
+    let (removed, hole) = remove_probed_entry_with_moves(slots, index, |source, destination| {
+        let source = map_value_row(value_table, value_slots, source)
+            .expect("map slot source has a companion value row");
+        let destination = map_value_row(value_table, value_slots, destination)
+            .expect("map slot destination has a companion value row");
+        values
+            .values
+            .copy_within(source.start..source.end(), destination.start);
+    });
+    let hole = map_value_row(value_table, value_slots, hole)
+        .expect("map deletion hole has a companion value row");
+    values.values[hole.start..hole.end()].fill(RuntimeValue::Unit);
+    removed
+}
+
+fn remove_probed_entry_with_moves(
+    slots: &mut [Option<MapEntry>],
+    index: usize,
+    mut moved: impl FnMut(usize, usize),
+) -> (MapEntry, usize) {
     let removed = slots[index].take().expect("located map entry exists");
     let len = slots.len();
     let mut hole = index;
@@ -6233,11 +6884,12 @@ fn remove_probed_entry(slots: &mut [Option<MapEntry>], index: usize) -> MapEntry
         let origin_distance = (cursor + len - origin) % len;
         if origin_distance >= hole_distance {
             slots[hole] = slots[cursor].take();
+            moved(cursor, hole);
             hole = cursor;
         }
         cursor = (cursor + 1) % len;
     }
-    removed
+    (removed, hole)
 }
 
 fn write_hash(hash: &mut u64, bytes: &[u8]) {
@@ -6271,7 +6923,6 @@ mod tests {
     fn probe_entry(key: i32, hash: u64) -> MapEntry {
         MapEntry {
             key: RuntimeValue::I32(key),
-            value: RuntimeValue::I32(key),
             hash,
         }
     }
@@ -6573,6 +7224,7 @@ mod tests {
                 break;
             }
         }
+
         assert!(heap.resolve(staged).is_ok());
 
         heap.commit_host_transaction();
@@ -6589,6 +7241,58 @@ mod tests {
         }
         assert_eq!(reclaimed, Some(1));
         assert!(heap.resolve(staged).is_err());
+    }
+
+    #[test]
+    fn map_values_use_contiguous_physical_rows_across_rehash_and_removal() {
+        let mut heap = Heap::new_with_limits(32, usize::MAX, 32);
+        let pair = nexa_core::StableId::from_name("test.Pair");
+        let map_type = nexa_bytecode::map_type(
+            nexa_bytecode::ValueType::I32,
+            nexa_bytecode::ValueType::Named(pair),
+        );
+        let map = heap
+            .allocate_physical_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::Named(pair),
+                2,
+            )
+            .unwrap();
+        for key in 0..13 {
+            let row = [
+                RuntimeValue::I32(key),
+                RuntimeValue::I64(i64::from(key) * 10),
+            ];
+            while heap
+                .map_set_value_range(map, RuntimeValue::I32(key), &row)
+                .unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        }
+        let mut row = [RuntimeValue::Unit; 2];
+        assert!(
+            heap.map_get_value_into(map, RuntimeValue::I32(9), &mut row)
+                .unwrap()
+        );
+        assert_eq!(row, [RuntimeValue::I32(9), RuntimeValue::I64(90)]);
+
+        let replacement = [RuntimeValue::I32(90), RuntimeValue::I64(900)];
+        assert_eq!(
+            heap.map_set_value_range(map, RuntimeValue::I32(9), &replacement),
+            Ok(MapSetOutcome::Complete)
+        );
+        assert!(
+            heap.map_remove_value_into(map, RuntimeValue::I32(9), &mut row)
+                .unwrap()
+        );
+        assert_eq!(row, replacement);
+        assert!(
+            !heap
+                .map_get_value_into(map, RuntimeValue::I32(9), &mut row)
+                .unwrap()
+        );
+        assert_eq!(heap.map_len(map), Ok(12));
     }
 
     #[test]
@@ -6690,10 +7394,10 @@ mod tests {
         let element = nexa_bytecode::ValueType::Named(record);
         let array_type = nexa_bytecode::array_type(element);
         let array = heap
-            .allocate_struct_row_array(
+            .allocate_value_row_array(
                 array_type,
                 element,
-                std::num::NonZeroU8::new(2).expect("non-zero"),
+                std::num::NonZeroU16::new(2).expect("non-zero"),
             )
             .unwrap();
         for index in 0..8_i32 {
@@ -6768,10 +7472,10 @@ mod tests {
         let element = nexa_bytecode::ValueType::Named(record);
         let array_type = nexa_bytecode::array_type(element);
         let array = heap
-            .allocate_struct_row_array(
+            .allocate_value_row_array(
                 array_type,
                 element,
-                std::num::NonZeroU8::new(1).expect("non-zero"),
+                std::num::NonZeroU16::new(1).expect("non-zero"),
             )
             .unwrap();
         let first = make(&mut heap, record, 10);

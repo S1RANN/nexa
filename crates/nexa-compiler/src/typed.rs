@@ -548,14 +548,6 @@ struct FunctionEmitter<'a> {
     files: &'a BTreeMap<SourceKey, FileId>,
     string_indices: &'a BTreeMap<String, u32>,
     locals: BTreeMap<DefinitionId, u16>,
-    /// M5 WP27/WP45 slice: immutable struct locals whose every use is a
-    /// direct field read live as per-field registers and never materialize
-    /// a heap object. Maps the binding to its owner struct and the base of
-    /// its contiguous field register range.
-    inline_structs: BTreeMap<DefinitionId, (DefinitionId, u16)>,
-    /// Inlined enum locals: statically known variant plus the optional
-    /// payload register (M5 stage-C enum slice).
-    inline_enums: BTreeMap<DefinitionId, (DefinitionId, Option<u16>)>,
     /// WP45 local-map scalar replacement. Each admitted map has at most one
     /// constant-key write in a straight-line block, so its sole value lives
     /// in one typed register until a use requires materialization.
@@ -1986,6 +1978,7 @@ fn append_repl_task_wrapper(
     let safepoints = collect_safepoints(&code);
     let (root_bitmap, root_maps) = typed_exact_root_maps(
         &register_types,
+        None,
         0,
         &code,
         &safepoints,
@@ -2248,8 +2241,14 @@ fn emit_standalone_main_export(
                 Some(ValueType::I32),
             ];
             let safepoints = collect_safepoints(&code);
-            let (root_bitmap, root_maps) =
-                typed_exact_root_maps(&register_types, 1, &code, &safepoints, definition_span)?;
+            let (root_bitmap, root_maps) = typed_exact_root_maps(
+                &register_types,
+                None,
+                1,
+                &code,
+                &safepoints,
+                definition_span,
+            )?;
             source_map.extend(code.iter().enumerate().map(|(pc, _)| SourceMapEntry {
                 function: wrapper_index,
                 pc_start: u32::try_from(pc).unwrap_or(u32::MAX),
@@ -2917,400 +2916,17 @@ fn allocate_inline_class_states(
         }
         let fields_base = u16::try_from(register_types.len())
             .map_err(|_| CompileError::too_many_registers(function_span))?;
-        register_types.extend(layout.fields.iter().map(|field| Some(field.ty)));
+        for field in &layout.fields {
+            register_types.push(Some(field.ty));
+            let slots = layouts.physical_slots(field.ty, function_span)?;
+            register_types.extend((1..slots).map(|_| None));
+        }
         states.insert(definition, (owner, fields_base));
     }
     Ok(states)
 }
 
-/// M5 WP45 minimal escape analysis: immutable locals initialized by a
-/// struct construction whose every later use is a direct field read.
-///
-/// Any bare reference (call argument, return value, container write, match
-/// scrutinee, struct-field value, place root, ...) disqualifies the binding,
-/// so the inlined form can never need re-materialization.
-fn inline_struct_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, DefinitionId> {
-    let mut candidates = BTreeMap::new();
-    collect_inline_candidates(&function.body, &mut candidates);
-    if candidates.is_empty() {
-        return candidates;
-    }
-    let mut disqualified = BTreeSet::new();
-    scan_block_escapes(&function.body, &candidates, &mut disqualified);
-    candidates.retain(|definition, _| !disqualified.contains(definition));
-    candidates
-}
-
-/// M5 stage-C enum slice: locals initialized by a direct user-enum variant
-/// construction whose every later use is a statically selectable match
-/// scrutinee. The constructed variant is a compile-time constant, so the
-/// match collapses to the matching arm and the binding needs at most one
-/// payload register; no `EnumNew`, `EnumTag`, or `EnumPayload` is emitted.
-///
-/// Any bare reference, any write, a top-level binding pattern, or a
-/// multi-payload pattern disqualifies the binding to the heap path.
-fn inline_enum_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, DefinitionId> {
-    let mut candidates = BTreeMap::new();
-    collect_inline_enum_candidates(&function.body, &mut candidates);
-    if candidates.is_empty() {
-        return candidates;
-    }
-    let mut disqualified = BTreeSet::new();
-    scan_enum_block_escapes(&function.body, &candidates, &mut disqualified);
-    candidates.retain(|definition, _| !disqualified.contains(definition));
-    candidates
-}
-
-fn collect_inline_enum_candidates(
-    block: &TypedBlockIr,
-    candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
-) {
-    for statement in &block.statements {
-        match statement {
-            TypedStatementIr::Let {
-                definition,
-                mutable: _,
-                value: Some(value),
-            } => {
-                if let TypedExpressionKind::EnumConstruct {
-                    variant_definition, ..
-                } = &value.kind
-                {
-                    candidates.insert(*definition, *variant_definition);
-                }
-            }
-            TypedStatementIr::If {
-                then_block,
-                else_block,
-                ..
-            } => {
-                collect_inline_enum_candidates(then_block, candidates);
-                if let Some(else_block) = else_block {
-                    collect_inline_enum_candidates(else_block, candidates);
-                }
-            }
-            TypedStatementIr::While { body, .. }
-            | TypedStatementIr::StaticRangeFor { body, .. } => {
-                collect_inline_enum_candidates(body, candidates);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Static arm selection needs every top-level pattern to name a variant (at
-/// most one payload sub-pattern) or be a wildcard; a top-level binding
-/// would need the materialized enum value.
-fn enum_match_is_static(arms: &[nexa_analysis::TypedMatchArmIr]) -> bool {
-    arms.iter().all(|arm| match &arm.pattern.kind {
-        TypedPatternKind::Variant { payload, .. } => payload.len() <= 1,
-        TypedPatternKind::Wildcard => true,
-        _ => false,
-    })
-}
-
-fn scan_enum_block_escapes(
-    block: &TypedBlockIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    for statement in &block.statements {
-        scan_enum_statement_escapes(statement, candidates, disqualified);
-    }
-    if let Some(tail) = &block.tail {
-        scan_enum_expression_escapes(tail, candidates, disqualified);
-    }
-}
-
-fn scan_enum_statement_escapes(
-    statement: &TypedStatementIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match statement {
-        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
-            if let Some(value) = value {
-                scan_enum_expression_escapes(value, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::Assign { target, value } => {
-            // No sanctioned mutation in this slice: the statically known
-            // variant is what makes the match collapse legal.
-            scan_enum_place_escapes(target, candidates, disqualified);
-            scan_enum_expression_escapes(value, candidates, disqualified);
-        }
-        TypedStatementIr::Expression(expression) => {
-            scan_enum_expression_escapes(expression, candidates, disqualified);
-        }
-        TypedStatementIr::If {
-            condition,
-            then_block,
-            else_block,
-        } => {
-            scan_enum_expression_escapes(condition, candidates, disqualified);
-            scan_enum_block_escapes(then_block, candidates, disqualified);
-            if let Some(else_block) = else_block {
-                scan_enum_block_escapes(else_block, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::While {
-            condition, body, ..
-        } => {
-            scan_enum_expression_escapes(condition, candidates, disqualified);
-            scan_enum_block_escapes(body, candidates, disqualified);
-        }
-        TypedStatementIr::StaticRangeFor {
-            start, end, body, ..
-        } => {
-            scan_enum_expression_escapes(start, candidates, disqualified);
-            scan_enum_expression_escapes(end, candidates, disqualified);
-            scan_enum_block_escapes(body, candidates, disqualified);
-        }
-        TypedStatementIr::Defer { captures, .. } => {
-            for capture in captures {
-                scan_enum_expression_escapes(capture, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {}
-    }
-}
-
-fn scan_enum_place_escapes(
-    place: &TypedPlaceIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match place {
-        TypedPlaceIr::Definition(definition) => {
-            if candidates.contains_key(definition) {
-                disqualified.insert(*definition);
-            }
-        }
-        TypedPlaceIr::Field { base, .. } => scan_enum_place_escapes(base, candidates, disqualified),
-        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
-            scan_enum_expression_escapes(object, candidates, disqualified);
-        }
-        TypedPlaceIr::Index { base, index } => {
-            scan_enum_expression_escapes(base, candidates, disqualified);
-            scan_enum_expression_escapes(index, candidates, disqualified);
-        }
-    }
-}
-
-fn scan_enum_expression_escapes(
-    expression: &TypedExpressionIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match &expression.kind {
-        // A bare reference needs the materialized enum value.
-        TypedExpressionKind::Reference(definition) => {
-            if candidates.contains_key(definition) {
-                disqualified.insert(*definition);
-            }
-        }
-        // A statically selectable match over the binding is the one
-        // sanctioned use; arm values are still scanned.
-        TypedExpressionKind::Match { value, arms } => {
-            if !matches!(&value.kind, TypedExpressionKind::Reference(definition)
-                if candidates.contains_key(definition) && enum_match_is_static(arms))
-            {
-                scan_enum_expression_escapes(value, candidates, disqualified);
-            }
-            for arm in arms {
-                scan_enum_expression_escapes(&arm.value, candidates, disqualified);
-            }
-        }
-        _ => {
-            let mut children = Vec::new();
-            collect_expression_children(expression, &mut children);
-            for child in children {
-                scan_enum_expression_escapes(child, candidates, disqualified);
-            }
-        }
-    }
-}
-
-fn collect_inline_candidates(
-    block: &TypedBlockIr,
-    candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
-) {
-    for statement in &block.statements {
-        match statement {
-            TypedStatementIr::Let {
-                definition,
-                mutable: _,
-                value: Some(value),
-            } => {
-                if let TypedExpressionKind::Construct {
-                    definition: owner, ..
-                } = &value.kind
-                {
-                    candidates.insert(*definition, *owner);
-                } else if let TypedExpressionKind::BuiltinCall {
-                    operation: BuiltinOperationIr::ArrayGet,
-                    ..
-                } = &value.kind
-                    && let IrType::Named(owner) = &value.ty
-                {
-                    // WP52 fused projection: a struct binding read out of
-                    // an array fills its field registers directly through
-                    // ArrayFieldGet; the element is never materialized.
-                    candidates.insert(*definition, *owner);
-                }
-            }
-            TypedStatementIr::If {
-                then_block,
-                else_block,
-                ..
-            } => {
-                collect_inline_candidates(then_block, candidates);
-                if let Some(else_block) = else_block {
-                    collect_inline_candidates(else_block, candidates);
-                }
-            }
-            TypedStatementIr::While { body, .. }
-            | TypedStatementIr::StaticRangeFor { body, .. } => {
-                collect_inline_candidates(body, candidates);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn scan_block_escapes(
-    block: &TypedBlockIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    for statement in &block.statements {
-        scan_statement_escapes(statement, candidates, disqualified);
-    }
-    if let Some(tail) = &block.tail {
-        scan_expression_escapes(tail, candidates, disqualified);
-    }
-}
-
-fn scan_statement_escapes(
-    statement: &TypedStatementIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match statement {
-        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
-            if let Some(value) = value {
-                scan_expression_escapes(value, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::Assign { target, value } => {
-            // Inline-struct discipline (WP27 slice, mutable extension):
-            // a single-level field write and a whole-binding re-assignment
-            // from a fresh construction are the two sanctioned mutations;
-            // everything else disqualifies the binding.
-            match target {
-                TypedPlaceIr::Field { base, .. }
-                    if matches!(base.as_ref(), TypedPlaceIr::Definition(definition)
-                        if candidates.contains_key(definition)) => {}
-                TypedPlaceIr::Definition(definition) if candidates.contains_key(definition) => {
-                    if !matches!(&value.kind, TypedExpressionKind::Construct { .. }) {
-                        disqualified.insert(*definition);
-                    }
-                }
-                _ => scan_place_escapes(target, candidates, disqualified),
-            }
-            scan_expression_escapes(value, candidates, disqualified);
-        }
-        TypedStatementIr::Expression(expression) => {
-            scan_expression_escapes(expression, candidates, disqualified);
-        }
-        TypedStatementIr::If {
-            condition,
-            then_block,
-            else_block,
-        } => {
-            scan_expression_escapes(condition, candidates, disqualified);
-            scan_block_escapes(then_block, candidates, disqualified);
-            if let Some(else_block) = else_block {
-                scan_block_escapes(else_block, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::While {
-            condition, body, ..
-        } => {
-            scan_expression_escapes(condition, candidates, disqualified);
-            scan_block_escapes(body, candidates, disqualified);
-        }
-        TypedStatementIr::StaticRangeFor {
-            start, end, body, ..
-        } => {
-            scan_expression_escapes(start, candidates, disqualified);
-            scan_expression_escapes(end, candidates, disqualified);
-            scan_block_escapes(body, candidates, disqualified);
-        }
-        TypedStatementIr::Defer { captures, .. } => {
-            for capture in captures {
-                scan_expression_escapes(capture, candidates, disqualified);
-            }
-        }
-        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {}
-    }
-}
-
-fn scan_place_escapes(
-    place: &TypedPlaceIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match place {
-        // Whole-binding and field writes both disqualify: this slice only
-        // inlines read-only bindings.
-        TypedPlaceIr::Definition(definition) => {
-            if candidates.contains_key(definition) {
-                disqualified.insert(*definition);
-            }
-        }
-        TypedPlaceIr::Field { base, .. } => scan_place_escapes(base, candidates, disqualified),
-        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
-            scan_expression_escapes(object, candidates, disqualified);
-        }
-        TypedPlaceIr::Index { base, index } => {
-            scan_expression_escapes(base, candidates, disqualified);
-            scan_expression_escapes(index, candidates, disqualified);
-        }
-    }
-}
-
-fn scan_expression_escapes(
-    expression: &TypedExpressionIr,
-    candidates: &BTreeMap<DefinitionId, DefinitionId>,
-    disqualified: &mut BTreeSet<DefinitionId>,
-) {
-    match &expression.kind {
-        // A bare reference escapes the field-read-only discipline.
-        TypedExpressionKind::Reference(definition) => {
-            if candidates.contains_key(definition) {
-                disqualified.insert(*definition);
-            }
-        }
-        // A direct field read off the binding is the one sanctioned use.
-        TypedExpressionKind::Field { base, .. } => {
-            if !matches!(&base.kind, TypedExpressionKind::Reference(definition)
-                if candidates.contains_key(definition))
-            {
-                scan_expression_escapes(base, candidates, disqualified);
-            }
-        }
-        _ => {
-            let mut children = Vec::new();
-            collect_expression_children(expression, &mut children);
-            for child in children {
-                scan_expression_escapes(child, candidates, disqualified);
-            }
-        }
-    }
-}
-
-/// Read-only child enumeration for the escape scan.
+/// Read-only child enumeration shared by the specialized escape scans.
 fn collect_expression_children<'expr>(
     expression: &'expr TypedExpressionIr,
     children: &mut Vec<&'expr TypedExpressionIr>,
@@ -3445,48 +3061,10 @@ impl<'a> FunctionEmitter<'a> {
             mut register_types,
             parameter_slots,
         } = allocate_function_bindings(package, layouts, function, function_span)?;
-        // M5 WP27/WP45 slice: immutable struct locals used exclusively
-        // through direct field reads get one register per field and skip
-        // heap materialization entirely. Their primary register is never
-        // written, so the exact dataflow root maps ignore it. The WP36
-        // reference pipeline materializes every struct on the heap.
-        let mut inline_structs = BTreeMap::new();
-        let mut inline_enums = BTreeMap::new();
         let mut inline_maps = BTreeMap::new();
         let mut inline_arrays = BTreeMap::new();
         let mut inline_classes = BTreeMap::new();
         if optimize {
-            for (definition, owner) in inline_struct_candidates(function) {
-                let Some(layout) = layouts.aggregates.get(&owner) else {
-                    continue;
-                };
-                if layout.kind != TypedAggregateKind::Struct {
-                    continue;
-                }
-                let fields_base = u16::try_from(register_types.len())
-                    .map_err(|_| CompileError::too_many_registers(function_span))?;
-                for field in &layout.fields {
-                    register_types.push(Some(field.ty));
-                }
-                inline_structs.insert(definition, (owner, fields_base));
-            }
-            // Enum slice: the variant is fixed at the Let site, so the
-            // binding collapses to one optional payload register.
-            for (definition, variant_definition) in inline_enum_candidates(function) {
-                let Some((_, variant)) = layouts.variants.get(&variant_definition) else {
-                    continue;
-                };
-                let payload_register = match variant.payload {
-                    Some(payload_type) => {
-                        let register = u16::try_from(register_types.len())
-                            .map_err(|_| CompileError::too_many_registers(function_span))?;
-                        register_types.push(Some(payload_type));
-                        Some(register)
-                    }
-                    None => None,
-                };
-                inline_enums.insert(definition, (variant_definition, payload_register));
-            }
             for (definition, plan) in inline_map_candidates(function) {
                 let value_register = u16::try_from(register_types.len())
                     .map_err(|_| CompileError::too_many_registers(function_span))?;
@@ -3522,8 +3100,6 @@ impl<'a> FunctionEmitter<'a> {
             files,
             string_indices,
             locals,
-            inline_structs,
-            inline_enums,
             inline_maps,
             inline_arrays,
             inline_classes,
@@ -3650,109 +3226,11 @@ impl<'a> FunctionEmitter<'a> {
                         self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
                         return Ok(());
                     }
-                    if let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
-                    {
-                        // WP27 slice: evaluate initializers straight into the
-                        // per-field registers; no StructNew is emitted and no
-                        // heap object ever exists for this binding.
-                        match &value.kind {
-                            TypedExpressionKind::Construct { fields, .. } => {
-                                self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
-                            }
-                            TypedExpressionKind::BuiltinCall {
-                                operation: BuiltinOperationIr::ArrayGet,
-                                arguments,
-                                ..
-                            } if arguments.len() == 2 => {
-                                self.emit_inline_struct_from_array(
-                                    owner,
-                                    fields_base,
-                                    &arguments[0],
-                                    &arguments[1],
-                                    value,
-                                )?;
-                            }
-                            _ => {
-                                return Err(CompileError::type_mismatch(
-                                    None,
-                                    None,
-                                    self.span(&value.span)?,
-                                ));
-                            }
-                        }
-                        return Ok(());
-                    }
-                    if let Some((variant_definition, payload_register)) =
-                        self.inline_enums.get(definition).copied()
-                    {
-                        // Enum slice: the variant is statically known, so
-                        // only the payload (if any) is evaluated - into its
-                        // dedicated register. No EnumNew is emitted and no
-                        // heap object ever exists for this binding.
-                        let TypedExpressionKind::EnumConstruct {
-                            variant_definition: constructed,
-                            payload,
-                            ..
-                        } = &value.kind
-                        else {
-                            return Err(CompileError::type_mismatch(
-                                None,
-                                None,
-                                self.span(&value.span)?,
-                            ));
-                        };
-                        if *constructed != variant_definition
-                            || payload.is_some() != payload_register.is_some()
-                        {
-                            return Err(CompileError::type_mismatch(
-                                None,
-                                None,
-                                self.span(&value.span)?,
-                            ));
-                        }
-                        if let (Some(payload), Some(register)) =
-                            (payload.as_deref(), payload_register)
-                        {
-                            self.emit_expression(payload, register)?;
-                        }
-                        return Ok(());
-                    }
                     let destination = self.local(*definition)?;
                     self.emit_expression(value, destination)?;
                 }
             }
             TypedStatementIr::Assign { target, value } => match target {
-                TypedPlaceIr::Definition(definition)
-                    if self.inline_structs.contains_key(definition) =>
-                {
-                    // WP27 slice: re-assignment from a fresh construction
-                    // stages every field first, then publishes with moves,
-                    // so initializers reading the old fields stay correct.
-                    let (owner, fields_base) = self.inline_structs[definition];
-                    let TypedExpressionKind::Construct { fields, .. } = &value.kind else {
-                        return Err(CompileError::type_mismatch(
-                            None,
-                            None,
-                            self.span(&value.span)?,
-                        ));
-                    };
-                    self.emit_inline_struct_reassign(owner, fields_base, fields, value)?;
-                }
-                TypedPlaceIr::Field { base, field }
-                    if matches!(base.as_ref(), TypedPlaceIr::Definition(definition)
-                        if self.inline_structs.contains_key(definition)) =>
-                {
-                    let TypedPlaceIr::Definition(definition) = base.as_ref() else {
-                        unreachable!("guard matched a definition base");
-                    };
-                    let (owner, fields_base) = self.inline_structs[definition];
-                    let span = self.span(&value.span)?;
-                    let register = self.inline_field_register(owner, fields_base, *field, span)?;
-                    // Right-hand sides evaluate through their own temporary
-                    // registers, so reads of the old field value complete
-                    // before this final write lands.
-                    self.emit_expression(value, register)?;
-                }
                 TypedPlaceIr::ClassField { object, field }
                     if matches!(&object.kind, TypedExpressionKind::Reference(definition)
                         if self.inline_classes.contains_key(definition)) =>
@@ -4057,28 +3535,22 @@ impl<'a> FunctionEmitter<'a> {
                 loop_patch.continues.push(patch);
             }
             TypedStatementIr::Defer { cleanup, captures } => {
-                if captures.len() > 8 {
-                    return Err(CompileError::defer_capture_limit(self.function_span));
-                }
                 let function = *self.function_indices.get(cleanup).ok_or_else(|| {
                     CompileError::unknown_name(self.definition_name(*cleanup), self.function_span)
                 })?;
-                let args_base = self.reserve_arguments(captures)?;
-                for (offset, capture) in captures.iter().enumerate() {
-                    let register =
-                        args_base
-                            .checked_add(u16::try_from(offset).map_err(|_| {
-                                CompileError::too_many_registers(self.function_span)
-                            })?)
-                            .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+                let (args_base, capture_registers, capture_slots) =
+                    self.reserve_physical_arguments(captures)?;
+                if capture_slots > 8 {
+                    return Err(CompileError::defer_capture_limit(self.function_span));
+                }
+                for (capture, register) in captures.iter().zip(capture_registers) {
                     self.emit_expression(capture, register)?;
                 }
                 self.push(
                     Instruction::DeferPush {
                         function,
                         args_base,
-                        args_count: u16::try_from(captures.len())
-                            .map_err(|_| CompileError::too_many_registers(self.function_span))?,
+                        args_count: capture_slots,
                     },
                     self.function_span,
                 );
@@ -4633,22 +4105,16 @@ impl<'a> FunctionEmitter<'a> {
                         }
                     }
                 }
-                let args_base = self.reserve_arguments(arguments)?;
-                for (offset, argument) in arguments.iter().enumerate() {
-                    let register =
-                        args_base
-                            .checked_add(u16::try_from(offset).map_err(|_| {
-                                CompileError::too_many_registers(self.function_span)
-                            })?)
-                            .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+                let (args_base, argument_registers, argument_slots) =
+                    self.reserve_physical_arguments(arguments)?;
+                for (argument, register) in arguments.iter().zip(argument_registers) {
                     self.emit_expression(argument, register)?;
                 }
                 self.push(
                     Instruction::HostCall {
                         import,
                         args_base,
-                        args_count: u16::try_from(arguments.len())
-                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        args_count: argument_slots,
                         dst: destination,
                     },
                     span,
@@ -5096,14 +4562,9 @@ impl<'a> FunctionEmitter<'a> {
             result,
             span,
         )?;
-        let args_base = self.reserve_arguments(arguments)?;
-        for (offset, argument) in arguments.iter().enumerate() {
-            let register = args_base
-                .checked_add(
-                    u16::try_from(offset)
-                        .map_err(|_| CompileError::too_many_registers(self.function_span))?,
-                )
-                .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+        let (args_base, argument_registers, argument_slots) =
+            self.reserve_physical_arguments(arguments)?;
+        for (argument, register) in arguments.iter().zip(argument_registers) {
             self.emit_expression(argument, register)?;
         }
         match lowering {
@@ -5111,8 +4572,7 @@ impl<'a> FunctionEmitter<'a> {
                 Instruction::StandardIntrinsic {
                     intrinsic,
                     args_base,
-                    args_count: u16::try_from(arguments.len())
-                        .map_err(|_| CompileError::too_many_registers(span))?,
+                    args_count: argument_slots,
                     dst: destination,
                 },
                 span,
@@ -5324,8 +4784,7 @@ impl<'a> FunctionEmitter<'a> {
         // no source object. Evaluation order matches the unfused pipeline
         // exactly: the array first, then every field in declared layout
         // order (the same order the construct emission uses).
-        if self.optimize
-            && matches!(operation, BuiltinOperationIr::ArrayPush)
+        if matches!(operation, BuiltinOperationIr::ArrayPush)
             && arguments.len() == 2
             && let TypedExpressionKind::Construct {
                 definition: owner,
@@ -5349,22 +4808,15 @@ impl<'a> FunctionEmitter<'a> {
                 .iter()
                 .map(|field| field.ty)
                 .collect::<Vec<_>>();
-            let fields_base = self.reserve_types(&field_types)?;
-            for (offset, field) in layout.fields.iter().enumerate() {
+            let (fields_base, field_registers, fields_count) =
+                self.reserve_physical_types(&field_types)?;
+            for (field, register) in layout.fields.iter().zip(field_registers) {
                 let value = values
                     .get(&field.definition)
                     .copied()
                     .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
-                let register = fields_base
-                    .checked_add(
-                        u16::try_from(offset)
-                            .map_err(|_| CompileError::too_many_registers(span))?,
-                    )
-                    .ok_or_else(|| CompileError::too_many_registers(span))?;
                 self.emit_expression(value, register)?;
             }
-            let fields_count = u16::try_from(layout.fields.len())
-                .map_err(|_| CompileError::too_many_registers(span))?;
             self.push(
                 Instruction::ArrayPushRow {
                     source,
@@ -5383,12 +4835,79 @@ impl<'a> FunctionEmitter<'a> {
             return Ok(());
         }
 
-        let args_base = self.reserve_arguments(arguments)?;
-        for (offset, argument) in arguments.iter().enumerate() {
-            let register = builtin_argument_register(args_base, offset, span)?;
+        if matches!(
+            operation,
+            BuiltinOperationIr::ArrayPush
+                | BuiltinOperationIr::ArraySet
+                | BuiltinOperationIr::ArrayInsert
+        ) {
+            let expected = match operation {
+                BuiltinOperationIr::ArrayPush => 2,
+                BuiltinOperationIr::ArraySet | BuiltinOperationIr::ArrayInsert => 3,
+                _ => unreachable!(),
+            };
+            if arguments.len() != expected {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            let source = self.allocate_expression(&arguments[0])?;
+            self.emit_expression(&arguments[0], source)?;
+            let index = if expected == 3 {
+                let index = self.allocate_expression(&arguments[1])?;
+                self.emit_expression(&arguments[1], index)?;
+                Some(index)
+            } else {
+                None
+            };
+            let value_index = expected - 1;
+            let value = self.allocate_expression(&arguments[value_index])?;
+            self.emit_expression(&arguments[value_index], value)?;
+            match operation {
+                BuiltinOperationIr::ArrayPush => {
+                    self.push(Instruction::ArrayPush { source, value }, span);
+                }
+                BuiltinOperationIr::ArraySet => {
+                    self.push(
+                        Instruction::ArraySet {
+                            source,
+                            index: index.expect("ArraySet has an index"),
+                            value,
+                        },
+                        span,
+                    );
+                }
+                BuiltinOperationIr::ArrayInsert => {
+                    self.push(
+                        Instruction::ArrayInsert {
+                            source,
+                            index: index.expect("ArrayInsert has an index"),
+                            value,
+                        },
+                        span,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            self.push(
+                Instruction::LoadBool {
+                    dst: destination,
+                    value: true,
+                },
+                span,
+            );
+            return Ok(());
+        }
+
+        let (args_base, argument_registers, argument_slots) =
+            self.reserve_physical_arguments(arguments)?;
+        for (argument, register) in arguments.iter().zip(argument_registers.iter().copied()) {
             self.emit_expression(argument, register)?;
         }
-        let argument = |index| builtin_argument_register(args_base, index, span);
+        let argument = |index: usize| {
+            argument_registers
+                .get(index)
+                .copied()
+                .ok_or_else(|| CompileError::type_mismatch(None, None, span))
+        };
         let load_true = |emitter: &mut Self| {
             emitter.push(
                 Instruction::LoadBool {
@@ -5561,8 +5080,7 @@ impl<'a> FunctionEmitter<'a> {
                     Instruction::StandardIntrinsic {
                         intrinsic,
                         args_base,
-                        args_count: u16::try_from(arguments.len())
-                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        args_count: argument_slots,
                         dst: destination,
                     },
                     span,
@@ -5759,21 +5277,15 @@ impl<'a> FunctionEmitter<'a> {
             .iter()
             .map(|field| field.ty)
             .collect::<Vec<_>>();
-        let fields_base = self.reserve_types(&field_types)?;
-        for (offset, field) in layout.fields.iter().enumerate() {
+        let (fields_base, field_registers, fields_count) =
+            self.reserve_physical_types(&field_types)?;
+        for (field, register) in layout.fields.iter().zip(field_registers) {
             let value = values
                 .get(&field.definition)
                 .copied()
                 .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
-            let register = fields_base
-                .checked_add(
-                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
-                )
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
             self.emit_expression(value, register)?;
         }
-        let fields_count = u16::try_from(layout.fields.len())
-            .map_err(|_| CompileError::too_many_registers(span))?;
         self.push(
             match layout.kind {
                 TypedAggregateKind::Struct => Instruction::StructNew {
@@ -5867,14 +5379,10 @@ impl<'a> FunctionEmitter<'a> {
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
-        // WP27/WP45: field reads off scalar-replaced aggregate bindings are
-        // plain register moves; the aggregate never existed on the heap.
+        // WP45: field reads off scalar-replaced class bindings are plain
+        // register moves; the object never existed on the heap.
         if let TypedExpressionKind::Reference(definition) = &base.kind
-            && let Some((owner, fields_base)) = self
-                .inline_structs
-                .get(definition)
-                .or_else(|| self.inline_classes.get(definition))
-                .copied()
+            && let Some((owner, fields_base)) = self.inline_classes.get(definition).copied()
         {
             let source = self.inline_field_register(owner, fields_base, field, span)?;
             let (_, field_layout) = self
@@ -6018,21 +5526,20 @@ impl<'a> FunctionEmitter<'a> {
         let ValueType::Named(type_id) = lower_type(self.package, ty, span)? else {
             return Err(CompileError::type_mismatch(None, None, span));
         };
-        let fields_base = self.reserve_arguments(values)?;
-        for (offset, value) in values.iter().enumerate() {
-            let register = fields_base
-                .checked_add(
-                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
-                )
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
+        let field_types = values
+            .iter()
+            .map(|value| lower_type(self.package, &value.ty, span))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (fields_base, field_registers, fields_count) =
+            self.reserve_physical_types(&field_types)?;
+        for (value, register) in values.iter().zip(field_registers) {
             self.emit_expression(value, register)?;
         }
         self.push(
             Instruction::StructNew {
                 type_id,
                 fields_base,
-                fields_count: u16::try_from(values.len())
-                    .map_err(|_| CompileError::too_many_registers(span))?,
+                fields_count,
                 dst: destination,
             },
             span,
@@ -6101,14 +5608,9 @@ impl<'a> FunctionEmitter<'a> {
                     .iter()
                     .map(|field| field.ty)
                     .collect::<Vec<_>>();
-                let fields_base = self.reserve_types(&field_types)?;
-                for (offset, field) in layout.fields.iter().enumerate() {
-                    let target = fields_base
-                        .checked_add(
-                            u16::try_from(offset)
-                                .map_err(|_| CompileError::too_many_registers(span))?,
-                        )
-                        .ok_or_else(|| CompileError::too_many_registers(span))?;
+                let (fields_base, field_registers, fields_count) =
+                    self.reserve_physical_types(&field_types)?;
+                for (target, field) in field_registers.iter().copied().zip(&layout.fields) {
                     self.push(
                         Instruction::ClassGet {
                             source,
@@ -6124,20 +5626,14 @@ impl<'a> FunctionEmitter<'a> {
                         .iter()
                         .position(|field| field.definition == *field_definition)
                         .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
-                    let target = fields_base
-                        .checked_add(
-                            u16::try_from(offset)
-                                .map_err(|_| CompileError::too_many_registers(span))?,
-                        )
-                        .ok_or_else(|| CompileError::too_many_registers(span))?;
+                    let target = field_registers[offset];
                     self.emit_expression(value, target)?;
                 }
                 self.push(
                     Instruction::ClassNew {
                         type_id: layout.type_id,
                         fields_base,
-                        fields_count: u16::try_from(layout.fields.len())
-                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        fields_count,
                         dst: destination,
                     },
                     span,
@@ -6177,20 +5673,6 @@ impl<'a> FunctionEmitter<'a> {
                 span,
             );
         }
-        // Enum slice: a match over an inlined binding selects its arm at
-        // compile time; no scrutinee register and no tag comparison exist.
-        if let TypedExpressionKind::Reference(definition) = &value.kind
-            && let Some((variant_definition, payload_register)) =
-                self.inline_enums.get(definition).copied()
-        {
-            return self.emit_inline_enum_match(
-                variant_definition,
-                payload_register,
-                arms,
-                destination,
-                span,
-            );
-        }
         let source = self.allocate_expression(value)?;
         self.emit_expression(value, source)?;
         let mut ends = Vec::new();
@@ -6202,67 +5684,6 @@ impl<'a> FunctionEmitter<'a> {
             let next = self.position();
             for failure in failures {
                 self.patch_target(failure, next)?;
-            }
-        }
-        self.push(Instruction::Trap, span);
-        let end = self.position();
-        for patch in ends {
-            self.patch_target(patch, end)?;
-        }
-        Ok(())
-    }
-
-    /// Match emission for an inlined enum binding (M5 stage-C enum slice):
-    /// arms naming other variants vanish, the matching variant's payload
-    /// sub-pattern guards run against the payload register, and the first
-    /// unconditional arm ends the chain. The trailing `Trap` is kept so a
-    /// failing literal payload guard traps exactly like the heap path.
-    fn emit_inline_enum_match(
-        &mut self,
-        variant_definition: DefinitionId,
-        payload_register: Option<u16>,
-        arms: &[nexa_analysis::TypedMatchArmIr],
-        destination: u16,
-        span: SourceSpan,
-    ) -> Result<(), CompileError> {
-        let mut ends = Vec::new();
-        for arm in arms {
-            let mut failures = Vec::new();
-            match &arm.pattern.kind {
-                TypedPatternKind::Variant {
-                    definition,
-                    payload,
-                } if *definition == variant_definition => {
-                    match (payload.as_slice(), payload_register) {
-                        ([], None) => {}
-                        ([single], Some(register)) => {
-                            self.emit_pattern_guard(register, single, &mut failures, span)?;
-                        }
-                        _ => {
-                            return Err(CompileError::type_mismatch(None, None, span));
-                        }
-                    }
-                }
-                TypedPatternKind::Variant { .. } => {
-                    // Statically unreachable arm: no code.
-                    continue;
-                }
-                TypedPatternKind::Wildcard => {}
-                _ => {
-                    // The escape scan only admits statically selectable
-                    // matches; anything else is a compiler bug.
-                    return Err(CompileError::type_mismatch(None, None, span));
-                }
-            }
-            let unconditional = failures.is_empty();
-            self.emit_expression(&arm.value, destination)?;
-            ends.push(self.push(Instruction::Jump { target: 0 }, span));
-            let next = self.position();
-            for failure in failures {
-                self.patch_target(failure, next)?;
-            }
-            if unconditional {
-                break;
             }
         }
         self.push(Instruction::Trap, span);
@@ -6866,22 +6287,12 @@ impl<'a> FunctionEmitter<'a> {
         self.push(ty.zero(destination), span);
     }
 
-    fn reserve_arguments(&mut self, arguments: &[TypedExpressionIr]) -> Result<u16, CompileError> {
-        let base = u16::try_from(self.register_types.len())
-            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
-        for argument in arguments {
-            let ty = lower_type(self.package, &argument.ty, self.span(&argument.span)?)?;
-            self.allocate_staging(ty)?;
-        }
-        Ok(base)
-    }
-
     /// Reserves the packed physical ABI range of an ordinary Nexa call.
     ///
-    /// Unlike Host, standard-intrinsic, and persistent-storage staging
-    /// windows, every logical argument here owns its complete `ValueLayout`
-    /// range. The returned register list contains each logical base while
-    /// `slots` is the exact contiguous width encoded in `Call.args_count`.
+    /// Every logical argument owns its complete `ValueLayout` range. The
+    /// returned register list contains each logical base while `slots` is
+    /// the exact contiguous width encoded in `Call.args_count` or
+    /// `StandardIntrinsic.args_count`.
     fn reserve_physical_arguments(
         &mut self,
         arguments: &[TypedExpressionIr],
@@ -6909,53 +6320,26 @@ impl<'a> FunctionEmitter<'a> {
         Ok(base)
     }
 
-    /// WP52 fused projection: a struct binding initialized from an array
-    /// element loads every field straight into its per-field registers via
-    /// `ArrayFieldGet`; the element itself is never materialized. Fields
-    /// copy eagerly at the Let site, so later writes to the array cannot
-    /// leak into the binding (value snapshot semantics), and the first
-    /// field load carries the same span the reference pipeline's
-    /// `ArrayGet` traps with on an out-of-bounds index.
-    fn emit_inline_struct_from_array(
+    fn reserve_physical_types(
         &mut self,
-        owner: DefinitionId,
-        fields_base: u16,
-        array: &TypedExpressionIr,
-        index: &TypedExpressionIr,
-        value: &TypedExpressionIr,
-    ) -> Result<(), CompileError> {
-        let span = self.span(&value.span)?;
-        let layout = self
-            .layouts
-            .aggregates
-            .get(&owner)
-            .cloned()
-            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
-        let source = self.allocate_expression(array)?;
-        self.emit_expression(array, source)?;
-        let index_register = self.allocate_expression(index)?;
-        self.emit_expression(index, index_register)?;
-        for offset in 0..layout.fields.len() {
-            let offset =
-                u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?;
-            let register = fields_base
-                .checked_add(offset)
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
-            self.push(
-                Instruction::ArrayFieldGet {
-                    source,
-                    index: index_register,
-                    field: offset,
-                    dst: register,
-                },
-                span,
-            );
+        types: &[ValueType],
+    ) -> Result<(u16, Vec<u16>, u16), CompileError> {
+        let base = u16::try_from(self.register_types.len())
+            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
+        let mut registers = Vec::with_capacity(types.len());
+        for ty in types {
+            registers.push(self.allocate(*ty)?);
         }
-        Ok(())
+        let end = u16::try_from(self.register_types.len())
+            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
+        let slots = end
+            .checked_sub(base)
+            .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+        Ok((base, registers, slots))
     }
 
-    /// Evaluates construct initializers directly into the inline field
-    /// register range, in declared field order (WP27 slice).
+    /// Evaluates a scalar-replaced class construction directly into its
+    /// inline field register range.
     fn emit_inline_struct_fields(
         &mut self,
         owner: DefinitionId,
@@ -6977,78 +6361,19 @@ impl<'a> FunctionEmitter<'a> {
         if values.len() != fields.len() || values.len() != layout.fields.len() {
             return Err(CompileError::type_mismatch(None, None, span));
         }
-        for (offset, field) in layout.fields.iter().enumerate() {
+        for field in &layout.fields {
             let value = values
                 .get(&field.definition)
                 .copied()
                 .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
-            let register = fields_base
-                .checked_add(
-                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
-                )
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            let register =
+                self.inline_field_register(owner, fields_base, field.definition, span)?;
             self.emit_expression(value, register)?;
         }
         Ok(())
     }
 
-    /// Re-assigns an inlined struct binding: initializers evaluate into a
-    /// staging range first, then publish into the field registers, keeping
-    /// `s = S { x: s.y, y: s.x }` style self-references correct.
-    fn emit_inline_struct_reassign(
-        &mut self,
-        owner: DefinitionId,
-        fields_base: u16,
-        fields: &[(DefinitionId, TypedExpressionIr)],
-        value: &TypedExpressionIr,
-    ) -> Result<(), CompileError> {
-        let span = self.span(&value.span)?;
-        let layout = self
-            .layouts
-            .aggregates
-            .get(&owner)
-            .cloned()
-            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
-        let values = fields
-            .iter()
-            .map(|(field, value)| (*field, value))
-            .collect::<BTreeMap<_, _>>();
-        if values.len() != fields.len() || values.len() != layout.fields.len() {
-            return Err(CompileError::type_mismatch(None, None, span));
-        }
-        let field_types = layout
-            .fields
-            .iter()
-            .map(|field| field.ty)
-            .collect::<Vec<_>>();
-        let staging_base = self.reserve_types(&field_types)?;
-        for (offset, field) in layout.fields.iter().enumerate() {
-            let value = values
-                .get(&field.definition)
-                .copied()
-                .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
-            let register = staging_base
-                .checked_add(
-                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
-                )
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
-            self.emit_expression(value, register)?;
-        }
-        for offset in 0..layout.fields.len() {
-            let offset =
-                u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?;
-            let source = staging_base
-                .checked_add(offset)
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
-            let dst = fields_base
-                .checked_add(offset)
-                .ok_or_else(|| CompileError::too_many_registers(span))?;
-            self.push(Instruction::Move { dst, source }, span);
-        }
-        Ok(())
-    }
-
-    /// Register carrying one field of an inlined struct binding.
+    /// Register carrying one field of a scalar-replaced class binding.
     fn inline_field_register(
         &self,
         owner: DefinitionId,
@@ -7061,13 +6386,25 @@ impl<'a> FunctionEmitter<'a> {
             .aggregates
             .get(&owner)
             .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
-        let offset = layout
-            .fields
-            .iter()
-            .position(|candidate| candidate.definition == field)
-            .ok_or_else(|| CompileError::unknown_name(self.definition_name(field), span))?;
+        let mut offset = 0_u16;
+        let mut found = false;
+        for candidate in &layout.fields {
+            if candidate.definition == field {
+                found = true;
+                break;
+            }
+            offset = offset
+                .checked_add(self.layouts.physical_slots(candidate.ty, span)?)
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+        }
+        if !found {
+            return Err(CompileError::unknown_name(
+                self.definition_name(field),
+                span,
+            ));
+        }
         fields_base
-            .checked_add(u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?)
+            .checked_add(offset)
             .ok_or_else(|| CompileError::too_many_registers(span))
     }
 
@@ -7184,6 +6521,7 @@ impl<'a> FunctionEmitter<'a> {
         let safepoints = collect_safepoints(&self.code);
         let (root_bitmap, root_maps) = typed_exact_root_maps(
             &self.register_types,
+            Some(&self.layouts.layout_table),
             self.parameter_slots,
             &self.code,
             &safepoints,
@@ -7236,15 +6574,6 @@ fn collect_string_concat_parts<'a>(
     } else {
         parts.push(expression);
     }
-}
-
-fn builtin_argument_register(
-    base: u16,
-    index: usize,
-    span: SourceSpan,
-) -> Result<u16, CompileError> {
-    base.checked_add(u16::try_from(index).map_err(|_| CompileError::too_many_registers(span))?)
-        .ok_or_else(|| CompileError::too_many_registers(span))
 }
 
 fn validate_builtin_arguments(
@@ -7534,6 +6863,7 @@ fn validate_builtin_call_signature(
 #[allow(clippy::too_many_lines)]
 fn typed_exact_root_maps(
     register_types: &[Option<ValueType>],
+    layout_table: Option<&LayoutTable>,
     parameter_count: usize,
     code: &[Instruction],
     safepoints: &[u32],
@@ -7544,7 +6874,7 @@ fn typed_exact_root_maps(
     let register_count = register_types.len();
     let mut entry = vec![false; register_count];
     for register in 0..parameter_count {
-        entry[register] = register_types[register].is_some_and(ValueType::is_reference);
+        entry[register] = register_types[register].is_some();
     }
 
     let mut successors = vec![Vec::new(); code.len()];
@@ -7595,7 +6925,7 @@ fn typed_exact_root_maps(
                     span,
                 ));
             }
-            if register_types[destination].is_some_and(ValueType::is_reference) {
+            if register_types[destination].is_some() {
                 state[destination] = true;
             }
         }
@@ -7674,34 +7004,70 @@ fn typed_exact_root_maps(
         }
     }
 
-    let root_bitmap = (0..register_count)
-        .map(|register| {
-            register_types[register].is_some_and(ValueType::is_reference)
-                && states.iter().flatten().any(|state| state[register])
-        })
-        .collect::<Vec<_>>();
+    let mut root_bitmap = vec![false; register_count];
+    for state in states.iter().flatten() {
+        merge_physical_roots(&mut root_bitmap, register_types, layout_table, |base| {
+            state[base]
+        })?;
+    }
     let root_maps = safepoints
         .iter()
         .map(|pc| {
             let pc_index = usize::try_from(*pc).unwrap_or(usize::MAX);
-            let bitmap = states.get(pc_index).and_then(Option::as_ref).map_or_else(
-                || vec![false; register_count],
-                |state| {
-                    state
-                        .iter()
-                        .enumerate()
-                        .map(|(register, initialized)| {
-                            *initialized
-                                && live_before[pc_index][register]
-                                && register_types[register].is_some_and(ValueType::is_reference)
-                        })
-                        .collect()
-                },
-            );
-            RootMap { pc: *pc, bitmap }
+            let mut bitmap = vec![false; register_count];
+            if let Some(state) = states.get(pc_index).and_then(Option::as_ref) {
+                merge_physical_roots(&mut bitmap, register_types, layout_table, |base| {
+                    state[base] && live_before[pc_index][base]
+                })?;
+            }
+            Ok(RootMap { pc: *pc, bitmap })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CompileError>>()?;
     Ok((root_bitmap, root_maps))
+}
+
+fn merge_physical_roots(
+    roots: &mut [bool],
+    register_types: &[Option<ValueType>],
+    layout_table: Option<&LayoutTable>,
+    active: impl Fn(usize) -> bool,
+) -> Result<(), CompileError> {
+    for (base, ty) in register_types.iter().copied().enumerate() {
+        let Some(ty) = ty.filter(|_| active(base)) else {
+            continue;
+        };
+        let Some(layout_table) = layout_table else {
+            roots[base] |= ty.is_reference();
+            continue;
+        };
+        let layout = layout_table
+            .layout_of(ty)
+            .map_err(|error| CompileError::verify(error.to_string(), SourceSpan::default()))?;
+        let end = base
+            .checked_add(usize::from(layout.physical_slots))
+            .ok_or_else(|| {
+                CompileError::verify("physical root range overflow".into(), SourceSpan::default())
+            })?;
+        let owns_full_range = end <= register_types.len()
+            && register_types[base + 1..end].iter().all(Option::is_none);
+        let physical_aggregate = matches!(
+            layout.equality_strategy,
+            nexa_bytecode::layout::EqualityStrategy::StructFieldwise
+                | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
+        ) && owns_full_range;
+        if physical_aggregate || layout.physical_slots == 1 {
+            for (offset, is_root) in layout.gc_bitmap.iter().copied().enumerate() {
+                if is_root {
+                    roots[base + offset] = true;
+                }
+            }
+        } else {
+            // Compact boundary staging uses one carrier slot until the
+            // corresponding persistent/Host codec consumes a physical range.
+            roots[base] |= ty.is_reference();
+        }
+    }
+    Ok(())
 }
 
 /// Removes codegen-only register traffic after structured lowering.
@@ -11359,11 +10725,6 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::RuneToString { .. }
                     | Instruction::StringToString { .. }
                     | Instruction::StandardIntrinsic { .. }
-                    | Instruction::EnumNew { .. }
-                    | Instruction::EnumEqual { .. }
-                    | Instruction::StructNew { .. }
-                    | Instruction::StructWith { .. }
-                    | Instruction::StructEqual { .. }
                     | Instruction::ClassNew { .. }
                     | Instruction::ArrayNew { .. }
                     | Instruction::ArrayLen { .. }
@@ -11642,9 +11003,28 @@ mod tests {
         effect: FunctionEffect,
         code: Vec<Instruction>,
     ) -> Function {
+        rooted_function_with_layout(
+            register_types,
+            None,
+            parameter_count,
+            signature,
+            effect,
+            code,
+        )
+    }
+
+    fn rooted_function_with_layout(
+        register_types: &[Option<ValueType>],
+        layout_table: Option<&nexa_bytecode::layout::LayoutTable>,
+        parameter_count: usize,
+        signature: Signature,
+        effect: FunctionEffect,
+        code: Vec<Instruction>,
+    ) -> Function {
         let safepoints = collect_safepoints(&code);
         let (root_bitmap, root_maps) = typed_exact_root_maps(
             register_types,
+            layout_table,
             parameter_count,
             &code,
             &safepoints,
@@ -11734,8 +11114,13 @@ mod tests {
     fn exact_roots_add_async_host_result_at_resume_pc() {
         let async_enum = result_type(ValueType::String, ValueType::I32);
         let async_type = ValueType::Named(async_enum.type_id);
-        let function = rooted_function(
-            &[Some(async_type)],
+        let mut layout_module = ModuleBuilder::new();
+        layout_module.enum_type(async_enum.clone());
+        let layout_module = layout_module.finish();
+        let layouts = nexa_bytecode::layout::LayoutTable::for_module(&layout_module).unwrap();
+        let function = rooted_function_with_layout(
+            &[Some(async_type), None],
+            Some(&layouts),
             0,
             Signature {
                 parameters: Vec::new(),
@@ -11752,8 +11137,8 @@ mod tests {
                 Instruction::Return { source: 0 },
             ],
         );
-        assert_eq!(function.root_maps[0].bitmap, vec![false]);
-        assert_eq!(function.root_maps[1].bitmap, vec![true]);
+        assert_eq!(function.root_maps[0].bitmap, vec![false, false]);
+        assert_eq!(function.root_maps[1].bitmap, vec![false, true]);
 
         let mut module = ModuleBuilder::new();
         module

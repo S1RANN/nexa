@@ -253,7 +253,20 @@ enum Observed {
 fn observe(module: &VerifiedModule, function: u32, arguments: &[RuntimeValue]) -> (Observed, u64) {
     let mut heap = Heap::new_with_limits(256, 16_384, 256);
     let outcome = CheckedInterpreter::run_with_heap(module, function, arguments, FUEL, &mut heap)
-        .expect("differential corpus stays within limits");
+        .unwrap_or_else(|error| {
+            panic!(
+                "differential function {function} with {arguments:?} stays within limits: {error}"
+            )
+        });
+    let counters = heap.vm_allocation_counters();
+    assert_eq!(
+        counters.struct_materializations, 0,
+        "function {function} must not materialize a physical Struct"
+    );
+    assert_eq!(
+        counters.enum_materializations, 0,
+        "function {function} must not materialize a physical Enum"
+    );
     match outcome {
         InterpreterOutcome::Returned { value, charge, .. } => {
             (Observed::Returned(value), charge.fuel_used)
@@ -408,72 +421,37 @@ fn assert_scalar_collection_materializations(
 #[test]
 fn reference_pipeline_actually_disables_the_optimizations() {
     let (optimized, reference) = pipelines();
-    let materializations = |module: &VerifiedModule, function: u32| {
+    let struct_constructions = |module: &VerifiedModule, function: u32| {
         module.module().functions[function as usize]
             .code
             .iter()
             .filter(|instruction| matches!(instruction, Instruction::StructNew { .. }))
             .count()
     };
-    // WP27/WP45: the read-only struct local is physically inlined only by
-    // the optimized pipeline; the reference side must keep the heap path.
-    assert_eq!(
-        materializations(&optimized, STRUCT_READ),
-        0,
-        "optimized pipeline inlines the read-only struct local"
-    );
+    // WP27/WP28 are representation semantics, not optional optimizations:
+    // both pipelines construct Struct/Enum values in physical register
+    // ranges and neither opcode denotes a heap materialization.
     assert!(
-        materializations(&reference, STRUCT_READ) > 0,
-        "reference pipeline materializes the struct on the heap"
+        struct_constructions(&optimized, STRUCT_READ) > 0
+            && struct_constructions(&reference, STRUCT_READ) > 0,
+        "both pipelines retain the physical Struct construction"
     );
-    // Stage-C enum slice: the statically selectable match binding loses its
-    // EnumNew in the optimized pipeline only, while the escaping binding
-    // (top-level binding pattern) keeps the heap path on both sides.
-    let enum_materializations = |module: &VerifiedModule, function: u32| {
+    let enum_constructions = |module: &VerifiedModule, function: u32| {
         module.module().functions[function as usize]
             .code
             .iter()
             .filter(|instruction| matches!(instruction, Instruction::EnumNew { .. }))
             .count()
     };
-    assert_eq!(
-        enum_materializations(&optimized, ENUM_ROUND),
-        0,
-        "optimized pipeline inlines the match-only enum local"
-    );
     assert!(
-        enum_materializations(&reference, ENUM_ROUND) > 0,
-        "reference pipeline materializes the enum on the heap"
+        [ENUM_ROUND, ENUM_STATIC_QUIET, ENUM_ESCAPE]
+            .into_iter()
+            .all(|function| enum_constructions(&optimized, function) > 0
+                && enum_constructions(&reference, function) > 0),
+        "both pipelines retain physical Enum tag/payload construction"
     );
-    assert_eq!(
-        enum_materializations(&optimized, ENUM_STATIC_QUIET),
-        0,
-        "optimized pipeline inlines the payload-less enum local"
-    );
-    assert!(
-        enum_materializations(&optimized, ENUM_ESCAPE) > 0,
-        "a top-level binding pattern disqualifies the enum local on both sides"
-    );
-    // WP52: the struct-element read fuses into ArrayFieldGet only in the
-    // optimized pipeline; the reference side keeps the materializing get.
-    let field_gets = |module: &VerifiedModule, function: u32| {
-        module.module().functions[function as usize]
-            .code
-            .iter()
-            .filter(|instruction| matches!(instruction, Instruction::ArrayFieldGet { .. }))
-            .count()
-    };
-    assert!(
-        field_gets(&optimized, ROW_PROJECTION) > 0,
-        "optimized pipeline projects struct array fields without materializing"
-    );
-    assert_eq!(
-        field_gets(&reference, ROW_PROJECTION),
-        0,
-        "reference pipeline keeps the materializing array get"
-    );
-    // WP52 push side: the pushed struct literal fuses into ArrayPushRow,
-    // so the optimized row_projection body materializes no struct at all.
+    // WP52 row storage is likewise a mandatory materialization boundary:
+    // both pipelines push and read flattened physical rows.
     let push_rows = |module: &VerifiedModule, function: u32| {
         module.module().functions[function as usize]
             .code
@@ -485,15 +463,19 @@ fn reference_pipeline_actually_disables_the_optimizations() {
         push_rows(&optimized, ROW_PROJECTION) > 0,
         "optimized pipeline pushes struct literals as rows"
     );
-    assert_eq!(
-        push_rows(&reference, ROW_PROJECTION),
-        0,
-        "reference pipeline keeps the materializing push"
+    assert!(
+        push_rows(&reference, ROW_PROJECTION) > 0,
+        "reference pipeline also uses the physical row boundary"
     );
     assert_eq!(
-        materializations(&optimized, ROW_PROJECTION),
+        struct_constructions(&optimized, ROW_PROJECTION),
         0,
         "the fused row workload emits no StructNew anywhere"
+    );
+    assert_eq!(
+        struct_constructions(&reference, ROW_PROJECTION),
+        0,
+        "the reference row boundary also avoids heap Struct materialization"
     );
     assert_scalar_collection_materializations(&optimized, &reference);
     // WP37/WP38: constant folding shortens the arithmetic chain, so the

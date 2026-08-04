@@ -408,7 +408,7 @@ fn async_cell_module() -> (VerifiedModule, Signature) {
         cancel_error: Some(1),
         abandon_error: None,
     };
-    let mut cell = FunctionBuilder::new(signature.clone(), 1);
+    let mut cell = FunctionBuilder::new(signature.clone(), 2);
     cell.effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
             import: 0,
@@ -418,16 +418,15 @@ fn async_cell_module() -> (VerifiedModule, Signature) {
         })
         .emit(Instruction::Return { source: 0 });
     let mut cell = cell.finish().expect("async cell");
-    cell.root_bitmap[0] = true;
     cell.safepoints = vec![0, 1];
     cell.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false],
+            bitmap: vec![false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![true],
+            bitmap: vec![false, false],
         },
     ];
     let mut module = ModuleBuilder::new();

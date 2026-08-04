@@ -227,6 +227,37 @@ impl LayoutTable {
         }
     }
 
+    /// Borrows a module-owned named layout without cloning its field,
+    /// variant, or bitmap metadata. Runtime Host views use this at the ABI
+    /// boundary so flattening an aggregate never allocates merely to inspect
+    /// its already-verified layout.
+    #[must_use]
+    pub fn named_layout(&self, id: StableId) -> Option<&ValueLayout> {
+        self.named.get(&id.0)
+    }
+
+    /// Returns only the physical width of a logical value. Unlike
+    /// [`Self::layout_of`], this hot-boundary query never clones layout
+    /// metadata.
+    pub fn physical_slots(&self, ty: ValueType) -> Result<u16, LayoutError> {
+        match ty {
+            ValueType::Named(id) => self
+                .named
+                .get(&id.0)
+                .map(|layout| layout.physical_slots)
+                .or_else(|| builtin_named_layout(id).map(|layout| layout.physical_slots))
+                .ok_or(LayoutError::UnknownType(id)),
+            ValueType::I32
+            | ValueType::I64
+            | ValueType::F32
+            | ValueType::F64
+            | ValueType::Bool
+            | ValueType::Rune
+            | ValueType::String
+            | ValueType::Ref => Ok(1),
+        }
+    }
+
     pub fn named_layouts(&self) -> impl Iterator<Item = (&u64, &ValueLayout)> {
         self.named.iter()
     }

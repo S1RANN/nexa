@@ -3,7 +3,7 @@
 //! These cases pin the required production scales while staying deterministic:
 //! no wall-clock assertions, randomized inputs, or release-only behavior.
 
-use std::num::NonZeroU8;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use nexa_bytecode::{Instruction, ValueType};
@@ -39,10 +39,10 @@ fn ten_thousand_struct_rows_stay_flat_without_element_objects() {
     let element = ValueType::Named(struct_type);
     let mut heap = Heap::new_with_arena_limits(8, 1 << 20, ROWS, ROWS * FIELDS, 32);
     let rows = heap
-        .allocate_struct_row_array(
+        .allocate_value_row_array(
             nexa_bytecode::array_type(element),
             element,
-            NonZeroU8::new(u8::try_from(FIELDS).unwrap()).unwrap(),
+            NonZeroU16::new(u16::try_from(FIELDS).unwrap()).unwrap(),
         )
         .expect("flattened row array");
     let before = heap.vm_allocation_counters();

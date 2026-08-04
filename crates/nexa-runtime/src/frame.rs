@@ -490,15 +490,15 @@ impl FrameArena {
         Ok(())
     }
 
-    /// Initializes an entry or detached frame from logical API arguments
-    /// using the exact same physical parameter placement as nested calls.
-    pub(crate) fn initialize_abi_arguments(
+    /// Initializes a detached cleanup frame from an already packed physical
+    /// capture range.
+    pub(crate) fn initialize_packed_abi_arguments(
         &mut self,
         abi: &nexa_bytecode::layout::FunctionAbi,
         arguments: &[RuntimeValue],
     ) -> Result<(), FrameError> {
         let frame = *self.current()?;
-        if arguments.len() != abi.parameters.len()
+        if arguments.len() != usize::from(abi.parameter_slots)
             || abi.parameter_slots > frame.register_count
             || abi.parameters.iter().any(|parameter| {
                 parameter.slot_count == 0
@@ -511,12 +511,8 @@ impl FrameArena {
             return Err(FrameError::RegisterOutOfRange);
         }
         let frame_start = frame.register_start as usize;
-        for (argument, parameter) in arguments.iter().copied().zip(&abi.parameters) {
-            let start = frame_start + usize::from(parameter.slot_offset);
-            let end = start + usize::from(parameter.slot_count);
-            self.registers[start..end].fill(RuntimeValue::Unit);
-            self.registers[start] = argument;
-        }
+        let end = frame_start + usize::from(abi.parameter_slots);
+        self.registers[frame_start..end].copy_from_slice(arguments);
         Ok(())
     }
 
@@ -645,6 +641,71 @@ impl FrameArena {
         Ok(())
     }
 
+    pub(crate) fn clear_register_range(&mut self, base: u16, slots: u16) -> Result<(), FrameError> {
+        let frame = *self.current()?;
+        let end = base
+            .checked_add(slots)
+            .filter(|end| *end <= frame.register_count)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        let frame_start = frame.register_start as usize;
+        self.registers[frame_start + usize::from(base)..frame_start + usize::from(end)]
+            .fill(RuntimeValue::Unit);
+        Ok(())
+    }
+
+    pub(crate) fn register_range(
+        &self,
+        base: u16,
+        slots: u16,
+    ) -> Result<&[RuntimeValue], FrameError> {
+        let frame = *self.current()?;
+        let end = base
+            .checked_add(slots)
+            .filter(|end| *end <= frame.register_count)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        let frame_start = frame.register_start as usize;
+        Ok(&self.registers[frame_start + usize::from(base)..frame_start + usize::from(end)])
+    }
+
+    pub(crate) fn register_range_mut(
+        &mut self,
+        base: u16,
+        slots: u16,
+    ) -> Result<&mut [RuntimeValue], FrameError> {
+        let frame = *self.current()?;
+        let end = base
+            .checked_add(slots)
+            .filter(|end| *end <= frame.register_count)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        let frame_start = frame.register_start as usize;
+        Ok(&mut self.registers[frame_start + usize::from(base)..frame_start + usize::from(end)])
+    }
+
+    pub(crate) fn write_register_values(
+        &mut self,
+        destination: u16,
+        slots: u16,
+        values: impl ExactSizeIterator<Item = RuntimeValue>,
+    ) -> Result<(), FrameError> {
+        let frame = *self.current()?;
+        if values.len() != usize::from(slots) {
+            return Err(FrameError::RegisterOutOfRange);
+        }
+        let end = destination
+            .checked_add(slots)
+            .filter(|end| *end <= frame.register_count)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        let frame_start = frame.register_start as usize;
+        for (target, value) in self.registers
+            [frame_start + usize::from(destination)..frame_start + usize::from(end)]
+            .iter_mut()
+            .zip(values)
+        {
+            *target = value;
+        }
+        Ok(())
+    }
+
     pub fn frame_register(
         &self,
         frame_index: usize,
@@ -694,20 +755,20 @@ impl FrameArena {
         Ok(())
     }
 
-    pub fn push_defer_call(
+    pub(crate) fn push_defer_call_physical(
         &mut self,
         function: u32,
-        arguments: &[RuntimeValue],
+        slots: &[RuntimeValue],
     ) -> Result<(), FrameError> {
-        if arguments.len() > 8 {
+        if slots.len() > 8 {
             return Err(FrameError::DeferLimit);
         }
         let mut args = [RuntimeValue::Unit; 8];
-        args[..arguments.len()].copy_from_slice(arguments);
+        args[..slots.len()].copy_from_slice(slots);
         self.push_defer(DeferAction::Call {
             function,
             args,
-            args_count: u8::try_from(arguments.len()).map_err(|_| FrameError::DeferLimit)?,
+            args_count: u8::try_from(slots.len()).map_err(|_| FrameError::DeferLimit)?,
         })
     }
 

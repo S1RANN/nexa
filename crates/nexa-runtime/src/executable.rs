@@ -36,28 +36,57 @@ pub(crate) enum ExecutableNominalOperand {
     #[default]
     None,
     EnumVariant {
+        tag: u32,
+        payload_offset: u16,
+        payload_slots: u16,
+        owner_slots: u16,
+    },
+    EnumLayout {
         type_index: u16,
-        variant_index: u16,
+        slots: u16,
+    },
+    StructLayout {
+        slots: u16,
     },
     StructField {
         index: u16,
+        offset: u16,
+        slots: u16,
+        owner_slots: u16,
     },
     ClassField {
         type_index: u16,
         index: u16,
-        state_index: Option<u16>,
+        offset: u16,
+        slots: u16,
+        state_index: u16,
     },
     StateField {
         type_index: u16,
         field_index: u16,
         sorted_index: u16,
     },
-    ArrayType {
+    ArrayLayout {
         type_index: u16,
-        row_fields: u8,
+        element_slots: u16,
+        row_slots: u16,
     },
-    MapType {
+    ArrayField {
         type_index: u16,
+        offset: u16,
+        slots: u16,
+        row_slots: u16,
+    },
+    MapLayout {
+        type_index: u16,
+        key_slots: u16,
+        value_slots: u16,
+        option_slots: u16,
+        option_payload_offset: u16,
+    },
+    StandardIntrinsic {
+        argument_slots: [u16; 3],
+        result_slots: u16,
     },
     CallFrame {
         register_count: u16,
@@ -71,21 +100,46 @@ impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
         match resolved {
             ResolvedNominalOperand::None => Self::None,
             ResolvedNominalOperand::EnumVariant {
-                type_index,
-                variant_index,
+                tag,
+                payload_offset,
+                payload_slots,
+                owner_slots,
+                ..
             } => Self::EnumVariant {
-                type_index,
-                variant_index,
+                tag,
+                payload_offset,
+                payload_slots,
+                owner_slots,
             },
-            ResolvedNominalOperand::StructField { index, .. } => Self::StructField { index },
+            ResolvedNominalOperand::EnumLayout { type_index, slots } => {
+                Self::EnumLayout { type_index, slots }
+            }
+            ResolvedNominalOperand::StructLayout { slots, .. } => Self::StructLayout { slots },
+            ResolvedNominalOperand::StructField {
+                index,
+                offset,
+                slots,
+                owner_slots,
+                ..
+            } => Self::StructField {
+                index,
+                offset,
+                slots,
+                owner_slots,
+            },
             ResolvedNominalOperand::ClassField {
                 type_index,
                 index,
+                offset,
+                slots,
                 state_index,
+                ..
             } => Self::ClassField {
                 type_index,
                 index,
-                state_index,
+                offset,
+                slots,
+                state_index: state_index.unwrap_or(u16::MAX),
             },
             ResolvedNominalOperand::StateField {
                 type_index,
@@ -96,14 +150,47 @@ impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
                 field_index,
                 sorted_index,
             },
-            ResolvedNominalOperand::ArrayType {
+            ResolvedNominalOperand::ArrayLayout {
                 type_index,
-                row_fields,
-            } => Self::ArrayType {
+                element_slots,
+                row_slots,
+            } => Self::ArrayLayout {
                 type_index,
-                row_fields,
+                element_slots,
+                row_slots,
             },
-            ResolvedNominalOperand::MapType { type_index } => Self::MapType { type_index },
+            ResolvedNominalOperand::ArrayField {
+                type_index,
+                offset,
+                slots,
+                row_slots,
+            } => Self::ArrayField {
+                type_index,
+                offset,
+                slots,
+                row_slots,
+            },
+            ResolvedNominalOperand::MapLayout {
+                type_index,
+                key_slots,
+                value_slots,
+                option_slots,
+                option_payload_offset,
+            } => Self::MapLayout {
+                type_index,
+                key_slots,
+                value_slots,
+                option_slots,
+                option_payload_offset,
+            },
+            ResolvedNominalOperand::StandardIntrinsic {
+                argument_slots,
+                result_slots,
+                ..
+            } => Self::StandardIntrinsic {
+                argument_slots,
+                result_slots,
+            },
             ResolvedNominalOperand::CallFrame {
                 register_count,
                 parameter_slots,
@@ -137,12 +224,12 @@ struct ExecutableExport {
 /// density while preserving portable bytecode as the safety boundary.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutableInstruction {
-    /// Verifier-proven dense nominal operand for allocation and field rows.
-    pub(crate) resolved_nominal: ExecutableNominalOperand,
     /// Full attempt charge for static rows, base opcode charge for dynamic
     /// rows. The dynamic flag is a compact discriminator (unlike
     /// `Option<u64>`, which occupies 16 bytes).
     pub attempt_fuel: u64,
+    /// Verifier-proven dense nominal operand for allocation and field rows.
+    pub(crate) resolved_nominal: ExecutableNominalOperand,
     /// Three execution flags plus the eight-bit profiler code share one word.
     /// This keeps the row at 24 bytes while avoiding a cold metadata read.
     flags: u16,
@@ -234,6 +321,7 @@ pub struct ExecutableFunction {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StaticLeafCertificate {
     pub fixed_fuel: u64,
+    pub physical_value_fuel: u64,
     pub array_pushes: u8,
     pub array_push_element_fuel: u64,
     pub buffer_copy: Option<StaticLeafBufferCopy>,
@@ -264,13 +352,7 @@ pub(crate) struct StaticLeafBufferGet {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StaticLeafConstantEffect {
     None,
-    LoadString {
-        string: u32,
-    },
-    EnumNew {
-        type_id: StableId,
-        variant: StableId,
-    },
+    LoadString { string: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -592,7 +674,7 @@ fn build_executable_function(
             host_call,
         });
     }
-    let static_leaf = certify_static_leaf(function, &rows);
+    let static_leaf = certify_static_leaf(function, &rows, nominal_shape);
     let constant_leaf =
         static_leaf.and_then(|_| certify_static_leaf_constant_kernel(module, function));
     Ok(ExecutableFunction::new(
@@ -706,8 +788,14 @@ fn function_has_root_map(function: &Function, pc: u32) -> bool {
 
 const fn dense_plan_matches(instruction: Instruction, resolved: ExecutableNominalOperand) -> bool {
     match instruction {
-        Instruction::EnumNew { .. } => {
+        Instruction::EnumNew { .. } | Instruction::EnumPayload { .. } => {
             matches!(resolved, ExecutableNominalOperand::EnumVariant { .. })
+        }
+        Instruction::EnumTag { .. } | Instruction::EnumEqual { .. } => {
+            matches!(resolved, ExecutableNominalOperand::EnumLayout { .. })
+        }
+        Instruction::StructNew { .. } | Instruction::StructEqual { .. } => {
+            matches!(resolved, ExecutableNominalOperand::StructLayout { .. })
         }
         Instruction::StructGet { .. } | Instruction::StructWith { .. } => {
             matches!(resolved, ExecutableNominalOperand::StructField { .. })
@@ -718,11 +806,29 @@ const fn dense_plan_matches(instruction: Instruction, resolved: ExecutableNomina
         Instruction::StateOldFieldGet { .. } | Instruction::StateNewSet { .. } => {
             matches!(resolved, ExecutableNominalOperand::StateField { .. })
         }
-        Instruction::ArrayNew { .. } => {
-            matches!(resolved, ExecutableNominalOperand::ArrayType { .. })
+        Instruction::ArrayNew { .. }
+        | Instruction::ArrayGet { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPushRow { .. }
+        | Instruction::ArrayPop { .. }
+        | Instruction::ArrayInsert { .. }
+        | Instruction::ArrayRemove { .. }
+        | Instruction::ArrayClear { .. } => {
+            matches!(resolved, ExecutableNominalOperand::ArrayLayout { .. })
         }
-        Instruction::MapNew { .. } => {
-            matches!(resolved, ExecutableNominalOperand::MapType { .. })
+        Instruction::ArrayFieldGet { .. } => {
+            matches!(resolved, ExecutableNominalOperand::ArrayField { .. })
+        }
+        Instruction::MapNew { .. }
+        | Instruction::MapGet { .. }
+        | Instruction::MapSet { .. }
+        | Instruction::MapRemove { .. }
+        | Instruction::MapContains { .. } => {
+            matches!(resolved, ExecutableNominalOperand::MapLayout { .. })
+        }
+        Instruction::StandardIntrinsic { .. } => {
+            matches!(resolved, ExecutableNominalOperand::StandardIntrinsic { .. })
         }
         Instruction::Call { .. } => {
             matches!(resolved, ExecutableNominalOperand::CallFrame { .. })
@@ -737,7 +843,7 @@ struct StaticLeafAnalysis {
     // therefore records only values created by a local `ClassNew`.
     local_class: [bool; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
     // Identity plus exact length for locally created arrays.
-    local_array: [Option<(u8, usize)>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    local_array: [Option<(u8, usize, u16)>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
     i32_constant: [Option<i32>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
     // Original argument register for buffers; moves retain the origin so
     // preflight never needs to inspect an uninitialized temporary register.
@@ -791,7 +897,11 @@ impl StaticLeafAnalysis {
         Some(())
     }
 
-    fn observe(&mut self, instruction: Instruction) -> Option<()> {
+    fn observe(
+        &mut self,
+        instruction: Instruction,
+        resolved: ExecutableNominalOperand,
+    ) -> Option<()> {
         // Once paths split, only scalar/enum control-tail operations remain
         // admissible. This deliberately avoids pretending that a linear
         // provenance walk can prove a class/array/map created on just one
@@ -807,7 +917,7 @@ impl StaticLeafAnalysis {
             | Instruction::ArrayPush { .. }
             | Instruction::ArraySet { .. }
             | Instruction::ArrayGet { .. }
-            | Instruction::ArrayLen { .. }) => self.observe_array(instruction),
+            | Instruction::ArrayLen { .. }) => self.observe_array(instruction, resolved),
             instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
                 self.observe_buffer(instruction)
             }
@@ -881,26 +991,35 @@ impl StaticLeafAnalysis {
         Some(())
     }
 
-    fn observe_array(&mut self, instruction: Instruction) -> Option<()> {
+    fn observe_array(
+        &mut self,
+        instruction: Instruction,
+        resolved: ExecutableNominalOperand,
+    ) -> Option<()> {
         match instruction {
             Instruction::ArrayNew { dst, .. } => {
+                let ExecutableNominalOperand::ArrayLayout { element_slots, .. } = resolved else {
+                    return None;
+                };
                 let identity = self.next_array;
                 self.next_array = self.next_array.checked_add(1)?;
                 self.clear_destination(dst)?;
-                *self.local_array.get_mut(usize::from(dst))? = Some((identity, 0));
+                *self.local_array.get_mut(usize::from(dst))? = Some((identity, 0, element_slots));
             }
             Instruction::ArrayPush { source, .. } => {
-                let (identity, length) = (*self.local_array.get(usize::from(source))?)?;
+                let (identity, length, element_slots) =
+                    (*self.local_array.get(usize::from(source))?)?;
                 self.array_pushes = self.array_pushes.checked_add(1)?;
                 self.array_push_element_fuel = self.array_push_element_fuel.checked_add(
                     u64::try_from(length.max(1))
                         .ok()?
+                        .checked_mul(u64::from(element_slots))?
                         .div_ceil(nexa_bytecode::STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS),
                 )?;
                 let next_length = length.checked_add(1)?;
                 for array in &mut self.local_array {
-                    if array.is_some_and(|(candidate, _)| candidate == identity) {
-                        *array = Some((identity, next_length));
+                    if array.is_some_and(|(candidate, _, _)| candidate == identity) {
+                        *array = Some((identity, next_length, element_slots));
                     }
                 }
             }
@@ -914,7 +1033,7 @@ impl StaticLeafAnalysis {
                 self.clear_destination(dst)?;
             }
             Instruction::ArrayLen { source, dst } => {
-                let (_, length) = (*self.local_array.get(usize::from(source))?)?;
+                let (_, length, _) = (*self.local_array.get(usize::from(source))?)?;
                 self.clear_destination(dst)?;
                 *self.i32_constant.get_mut(usize::from(dst))? = i32::try_from(length).ok();
             }
@@ -924,7 +1043,7 @@ impl StaticLeafAnalysis {
     }
 
     fn validate_array_index(&self, source: u16, index: u16) -> Option<()> {
-        let (_, length) = (*self.local_array.get(usize::from(source))?)?;
+        let (_, length, _) = (*self.local_array.get(usize::from(source))?)?;
         let index = usize::try_from((*self.i32_constant.get(usize::from(index))?)?).ok()?;
         (index < length).then_some(())
     }
@@ -1014,10 +1133,12 @@ impl StaticLeafAnalysis {
     const fn finish(
         self,
         fixed_fuel: u64,
+        physical_value_fuel: u64,
         buffer_kernel_instructions: Option<u8>,
     ) -> StaticLeafCertificate {
         StaticLeafCertificate {
             fixed_fuel,
+            physical_value_fuel,
             array_pushes: self.array_pushes,
             array_push_element_fuel: self.array_push_element_fuel,
             buffer_copy: self.buffer_copy,
@@ -1033,6 +1154,7 @@ impl StaticLeafAnalysis {
 fn certify_static_leaf(
     function: &nexa_bytecode::Function,
     rows: &[ExecutableInstruction],
+    nominal_shape: NominalIndexShape,
 ) -> Option<StaticLeafCertificate> {
     if usize::from(function.registers) > crate::trusted::STATIC_LEAF_REGISTER_CAPACITY
         || function.code.len() > STATIC_LEAF_MAX_INSTRUCTIONS
@@ -1051,12 +1173,31 @@ fn certify_static_leaf(
                 return None;
             }
         }
-        analysis.observe(instruction)?;
+        analysis.observe(instruction, rows.get(pc)?.resolved_nominal)?;
     }
     let fixed_fuel = rows
         .iter()
         .try_fold(0_u64, |fuel, row| fuel.checked_add(row.attempt_fuel))?;
-    Some(analysis.finish(fixed_fuel, certify_static_leaf_buffer_kernel(function)))
+    let physical_value_fuel = function
+        .code
+        .iter()
+        .copied()
+        .zip(rows.iter().copied())
+        .try_fold(0_u64, |fuel, (instruction, row)| {
+            let work = crate::interpreter::physical_instruction_work_fuel(
+                nominal_shape,
+                instruction,
+                row.resolved_nominal,
+            )
+            .ok()?
+            .unwrap_or(0);
+            fuel.checked_add(work)
+        })?;
+    Some(analysis.finish(
+        fixed_fuel,
+        physical_value_fuel,
+        certify_static_leaf_buffer_kernel(function),
+    ))
 }
 
 fn certify_static_leaf_buffer_kernel(function: &nexa_bytecode::Function) -> Option<u8> {
@@ -1143,15 +1284,6 @@ fn certify_static_leaf_constant_kernel(
                     return None;
                 };
                 *values.get_mut(usize::from(dst))? = StaticConstantValue::I32(length);
-            }
-            Instruction::EnumNew {
-                type_id,
-                variant,
-                payload: None,
-                dst,
-            } if effect.is_none() => {
-                effect = Some(StaticLeafConstantEffect::EnumNew { type_id, variant });
-                *values.get_mut(usize::from(dst))? = StaticConstantValue::Unknown;
             }
             Instruction::Return { source } if pc + 1 == function.code.len() => {
                 let StaticConstantValue::I32(value) = *values.get(usize::from(source))? else {
@@ -1272,11 +1404,19 @@ fn update_counter() -> i32 {
                 | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
                 | Instruction::StringBuild { .. }
-                | Instruction::StructNew { .. }
+                | Instruction::EnumNew { .. }
+                | Instruction::EnumPayload { .. }
+                | Instruction::StructGet { .. }
                 | Instruction::StructWith { .. }
                 | Instruction::EnumEqual { .. }
                 | Instruction::StructEqual { .. }
+                | Instruction::ArrayGet { .. }
+                | Instruction::ArrayFieldGet { .. }
+                | Instruction::ArraySet { .. }
+                | Instruction::ClassGet { .. }
+                | Instruction::ClassSet { .. }
                 | Instruction::ArrayPush { .. }
+                | Instruction::ArrayPushRow { .. }
                 | Instruction::ArrayInsert { .. }
                 | Instruction::ArrayPop { .. }
                 | Instruction::ArrayRemove { .. }
@@ -1394,14 +1534,14 @@ fn update_counter() -> i32 {
                 Instruction::ArrayNew { .. } => assert!(
                     matches!(
                         row.resolved_nominal,
-                        super::ExecutableNominalOperand::ArrayType { .. }
+                        super::ExecutableNominalOperand::ArrayLayout { .. }
                     ),
                     "array construction rows carry dense type and row-layout slots"
                 ),
                 Instruction::MapNew { .. } => assert!(
                     matches!(
                         row.resolved_nominal,
-                        super::ExecutableNominalOperand::MapType { .. }
+                        super::ExecutableNominalOperand::MapLayout { .. }
                     ),
                     "map construction rows carry a dense type slot"
                 ),
@@ -1508,7 +1648,12 @@ fn update_counter() -> i32 {
         }
         assert!(!super::dense_plan_matches(
             Instruction::LoadI32 { dst: 0, value: 1 },
-            super::ExecutableNominalOperand::StructField { index: 0 }
+            super::ExecutableNominalOperand::StructField {
+                index: 0,
+                offset: 0,
+                slots: 1,
+                owner_slots: 1,
+            }
         ));
     }
 
