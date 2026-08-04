@@ -113,6 +113,9 @@ fn hundred_thousand_push_pop_and_repeated_map_rehash_converge() {
         0,
         "an unblocked typed i32 arena tail must extend in place"
     );
+    heap.array_shrink_to_fit(array)
+        .expect("release the empty array extent before reusing the typed arena");
+    assert_eq!(heap.array_capacity(array), Ok(0));
 
     let map = heap
         .allocate_map(
