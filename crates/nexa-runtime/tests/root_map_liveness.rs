@@ -224,16 +224,15 @@ fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
         .position(|instruction| matches!(instruction, Instruction::Yield))
         .expect("handle task has a yield");
     let yield_pc = u32::try_from(yield_pc).expect("test bytecode position fits u32");
+    let yield_roots = &function
+        .root_maps
+        .iter()
+        .find(|root_map| root_map.pc == yield_pc)
+        .expect("handle yield has a root map")
+        .bitmap;
     assert!(
-        function
-            .root_maps
-            .iter()
-            .find(|root_map| root_map.pc == yield_pc)
-            .expect("handle yield has a root map")
-            .bitmap
-            .iter()
-            .any(|is_root| *is_root),
-        "the verifier-visible Named Host value is live at the yield"
+        yield_roots.iter().all(|is_root| !is_root),
+        "Host handles are registry-owned scalar slots, not GC references"
     );
 
     let contract_fingerprint = nexa_idl::contract_fingerprint(&contract);
@@ -326,8 +325,10 @@ fn compiler_state_handle_remains_live_across_yield_and_realm_gc() {
         .find(|root_map| root_map.pc == yield_pc)
         .expect("StateHandle yield has a root map")
         .bitmap;
-    assert!(yield_roots[0]);
-    assert!(yield_roots[1..].iter().all(|is_root| !is_root));
+    assert!(
+        yield_roots.iter().all(|is_root| !is_root),
+        "StateHandle values are rooted by the state registry, not frame GC maps"
+    );
     let state_type = verified.module().state_schema.types[0].clone();
     let field_id = state_type.fields[0].stable_id;
     let schema = verified.module().state_schema_fingerprint;
