@@ -2180,6 +2180,11 @@ fn verify_function(
                     if written != result_slots {
                         return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
                     }
+                } else {
+                    // Ordinary Unit calls still carry one bounded dummy return
+                    // slot so the frame arena can distinguish them from
+                    // cleanup frames, whose return range is absent.
+                    register(dst)?;
                 }
             }
             Instruction::HostCall {
@@ -4838,6 +4843,49 @@ mod tests {
             verify(forged, VerifierLimits::default()).unwrap_err().kind,
             VerifyErrorKind::InvalidPhysicalAbi
         );
+    }
+
+    #[test]
+    fn unit_call_requires_a_bounded_dummy_return_slot() {
+        let module = |caller_registers| {
+            let mut module = ModuleBuilder::new();
+            let mut callee = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: None,
+                },
+                0,
+            );
+            callee.emit(Instruction::ReturnVoid);
+            module.function(callee.finish().expect("Unit callee"));
+
+            let mut caller = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: None,
+                },
+                caller_registers,
+            );
+            caller
+                .emit(Instruction::Call {
+                    function: 0,
+                    args_base: 0,
+                    args_count: 0,
+                    dst: 0,
+                })
+                .emit(Instruction::ReturnVoid);
+            module.function(caller.finish().expect("Unit caller"));
+            module.finish()
+        };
+
+        assert_eq!(
+            verify(module(0), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::RegisterOutOfRange(0)
+        );
+        verify(module(1), VerifierLimits::default())
+            .expect("Unit call with one bounded dummy return slot");
     }
 
     #[test]

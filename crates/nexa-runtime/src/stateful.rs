@@ -3082,17 +3082,18 @@ mod tests {
     fn call_depth_module(depth: u32) -> nexa_verifier::VerifiedModule {
         let mut module = ModuleBuilder::new();
         for function_id in 0..depth {
+            let has_callee = function_id + 1 < depth;
             let mut function = FunctionBuilder::new(
                 Signature {
                     parameters: Vec::new(),
                     result: None,
                 },
-                0,
+                u16::from(has_callee),
             );
             if function_id == 0 {
                 function.effect(FunctionEffect::Migration);
             }
-            if function_id + 1 < depth {
+            if has_callee {
                 function.emit(Instruction::Call {
                     function: function_id + 1,
                     args_base: 0,
@@ -3193,10 +3194,6 @@ mod tests {
         );
         function
             .effect(FunctionEffect::Migration)
-            .set_root(0)
-            .unwrap()
-            .set_root(2)
-            .unwrap()
             .emit(Instruction::StateOldGet {
                 stable_id: object_id,
                 ty: ValueType::Named(type_id),
@@ -3648,7 +3645,9 @@ mod tests {
             InterpreterOutcome::Returned { .. }
         ));
         let report = depth_migration.usage_report();
-        assert_eq!(report.fuel_used, 5);
+        // Five base-cost instructions plus one frozen Call work unit for the
+        // intermediate function's bounded Unit-return discriminator slot.
+        assert_eq!(report.fuel_used, 6);
         assert_eq!(report.max_call_depth_used, 3);
 
         let type_id = StableId::from_name("UsageReport");
