@@ -1598,6 +1598,26 @@ fn physical_field_offsets(
     Ok((offsets, cursor))
 }
 
+fn array_row_slots(
+    module: &Module,
+    element: ValueType,
+    layout: &nexa_bytecode::layout::ValueLayout,
+) -> u16 {
+    let ValueType::Named(type_id) = element else {
+        return 0;
+    };
+    if layout.physical_slots != 0
+        && module
+            .struct_types
+            .iter()
+            .any(|struct_type| struct_type.type_id == type_id)
+    {
+        layout.physical_slots
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
@@ -1672,15 +1692,7 @@ fn verify_function(
                 .layouts
                 .layout_of(array_type.element)
                 .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
-            let row_slots = if matches!(
-                layout.equality_strategy,
-                nexa_bytecode::layout::EqualityStrategy::StructFieldwise
-                    | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
-            ) {
-                layout.physical_slots
-            } else {
-                0
-            };
+            let row_slots = array_row_slots(module, array_type.element, &layout);
             Ok((type_index, array_type.element, layout, row_slots))
         };
         let map_layout = |state: &[Option<ValueType>], source: u16| {
@@ -2976,15 +2988,7 @@ fn verify_function(
                     .layouts
                     .layout_of(array_type.element)
                     .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
-                let row_slots = if matches!(
-                    layout.equality_strategy,
-                    nexa_bytecode::layout::EqualityStrategy::StructFieldwise
-                        | nexa_bytecode::layout::EqualityStrategy::EnumTagPayload
-                ) {
-                    layout.physical_slots
-                } else {
-                    0
-                };
+                let row_slots = array_row_slots(module, array_type.element, &layout);
                 resolved_operands[pc] = ResolvedNominalOperand::ArrayLayout {
                     type_index: u16::try_from(type_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,

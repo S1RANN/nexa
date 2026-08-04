@@ -70,6 +70,18 @@ fn index_trap(n: i32) -> i32 {
     values.push(1);
     return values.get(n);
 }
+fn enum_collection(n: i32) -> i32 {
+    let values: Array<Signal> = Array::new();
+    let mut index: i32 = 0;
+    while index < n {
+        values.push(Signal::Loud(index + 17));
+        index = index + 1;
+    }
+    return match values.get(0) {
+        Signal::Quiet => 0,
+        Signal::Loud(value) => value,
+    };
+}
 "#;
 
 const ARITHMETIC: u32 = 0;
@@ -78,6 +90,7 @@ const AGGREGATES: u32 = 3;
 const COLLECTIONS: u32 = 4;
 const DIV_TRAP: u32 = 5;
 const INDEX_TRAP: u32 = 6;
+const ENUM_COLLECTION: u32 = 7;
 
 /// Everything both interpreters must agree on, item by item.
 #[derive(Debug, PartialEq)]
@@ -181,6 +194,7 @@ fn portable_and_executable_interpreters_match_item_by_item() {
         (DIV_TRAP, vec![RuntimeValue::I32(7), RuntimeValue::I32(2)]),
         (DIV_TRAP, vec![RuntimeValue::I32(7), RuntimeValue::I32(0)]),
         (INDEX_TRAP, vec![RuntimeValue::I32(5)]),
+        (ENUM_COLLECTION, vec![RuntimeValue::I32(2)]),
     ];
     // Small slices force many fuel suspensions, so safepoint placement and
     // per-slice settlement are compared, not just the end state.
@@ -407,7 +421,7 @@ fn assert_static_leaf_case(
         executable,
     )
     .expect("static leaf executes")
-    .expect("function is certified");
+    .unwrap_or_else(|| panic!("function {function} is certified"));
     let leaf_value = leaf
         .result
         .as_ref()
@@ -504,7 +518,6 @@ fn certified_static_leaves_match_full_execution_exactly() {
     for (function, arguments) in [
         (0, vec![RuntimeValue::I32(41)]),
         (1, vec![]),
-        (2, vec![RuntimeValue::I32(9)]),
         (3, vec![]),
         (5, vec![]),
         (9, vec![]),
@@ -512,6 +525,21 @@ fn certified_static_leaves_match_full_execution_exactly() {
     ] {
         assert_static_leaf_case(&module, &executable, function, &arguments);
     }
+    let mut aggregate_heap = Heap::new_with_limits(64, 4_096, 64);
+    assert!(
+        CheckedInterpreter::try_run_static_leaf(
+            &module,
+            2,
+            &[RuntimeValue::I32(9)],
+            FuelState::new(1_000_000, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            &mut aggregate_heap,
+            &executable,
+        )
+        .expect("aggregate leaf admission is checked")
+        .is_none(),
+        "aggregate results deliberately fall back to transactional materialization"
+    );
     assert_static_buffer_leaf_case(&module, &executable);
 }
 

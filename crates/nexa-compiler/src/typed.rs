@@ -594,6 +594,8 @@ struct InlineArrayPlan {
 #[derive(Clone, Copy)]
 struct InlineArrayState {
     slots_base: u16,
+    element_type: ValueType,
+    element_slots: u16,
     capacity: u16,
     length: u16,
 }
@@ -2328,6 +2330,7 @@ fn inline_array_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId,
 
 fn allocate_inline_array_states(
     package: &TypedPackageIr,
+    layouts: &TypedLayoutContext,
     function: &TypedFunctionIr,
     function_span: SourceSpan,
     register_types: &mut Vec<Option<ValueType>>,
@@ -2337,11 +2340,24 @@ fn allocate_inline_array_states(
         let slots_base = u16::try_from(register_types.len())
             .map_err(|_| CompileError::too_many_registers(function_span))?;
         let element_type = lower_type(package, &plan.element_type, function_span)?;
-        register_types.extend((0..plan.capacity).map(|_| Some(element_type)));
+        let element_slots = layouts.physical_slots(element_type, function_span)?;
+        let physical_capacity = plan
+            .capacity
+            .checked_mul(element_slots)
+            .ok_or_else(|| CompileError::too_many_registers(function_span))?;
+        if physical_capacity > MAX_INLINE_ARRAY_SLOTS {
+            continue;
+        }
+        for _ in 0..plan.capacity {
+            register_types.push(Some(element_type));
+            register_types.extend((1..element_slots).map(|_| None));
+        }
         states.insert(
             definition,
             InlineArrayState {
                 slots_base,
+                element_type,
+                element_slots,
                 capacity: plan.capacity,
                 length: 0,
             },
@@ -3068,7 +3084,10 @@ impl<'a> FunctionEmitter<'a> {
             for (definition, plan) in inline_map_candidates(function) {
                 let value_register = u16::try_from(register_types.len())
                     .map_err(|_| CompileError::too_many_registers(function_span))?;
-                register_types.push(Some(lower_type(package, &plan.value_type, function_span)?));
+                let value_type = lower_type(package, &plan.value_type, function_span)?;
+                let value_slots = layouts.physical_slots(value_type, function_span)?;
+                register_types.push(Some(value_type));
+                register_types.extend((1..value_slots).map(|_| None));
                 inline_maps.insert(
                     definition,
                     InlineMapState {
@@ -3079,6 +3098,7 @@ impl<'a> FunctionEmitter<'a> {
             }
             inline_arrays = allocate_inline_array_states(
                 package,
+                layouts,
                 function,
                 function_span,
                 &mut register_types,
@@ -4667,8 +4687,9 @@ impl<'a> FunctionEmitter<'a> {
         };
         let slot = |index: u16| {
             state
-                .slots_base
-                .checked_add(index)
+                .element_slots
+                .checked_mul(index)
+                .and_then(|offset| state.slots_base.checked_add(offset))
                 .ok_or_else(|| CompileError::too_many_registers(span))
         };
         let literal_index = |argument: &TypedExpressionIr| {
@@ -4714,13 +4735,10 @@ impl<'a> FunctionEmitter<'a> {
                 if index >= state.length {
                     return Err(CompileError::type_mismatch(None, None, span));
                 }
-                self.push(
-                    Instruction::Move {
-                        dst: destination,
-                        source: slot(index)?,
-                    },
-                    span,
-                );
+                let source = slot(index)?;
+                let instruction =
+                    self.copy_value_instruction(state.element_type, destination, source, span)?;
+                self.push(instruction, span);
             }
             BuiltinOperationIr::ArrayLen if arguments.len() == 1 => {
                 self.push(

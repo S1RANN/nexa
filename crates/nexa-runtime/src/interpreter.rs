@@ -1113,14 +1113,18 @@ fn execute_static_leaf_array(
         }
         Instruction::ArrayPush { source, value } => {
             let array = crate::trusted::read_static_leaf(registers, source);
-            let (_element, element_slots, row_slots) =
+            let (element, element_slots, row_slots) =
                 resolved_array_value(module, row.resolved_nominal)?;
+            let physical = crate::trusted::read_static_leaf_window(registers, value, element_slots);
             if row_slots.is_some() {
-                let value =
-                    crate::trusted::read_static_leaf_window(registers, value, element_slots);
-                heap.array_push_row(array, value)?;
+                heap.array_push_row(array, physical)?;
             } else {
-                let value = crate::trusted::read_static_leaf(registers, value);
+                let value = materialize_physical_value_range(
+                    physical,
+                    element,
+                    module.layout_table(),
+                    Some(heap),
+                )?;
                 heap.array_push(array, value)?;
             }
         }
@@ -1135,14 +1139,18 @@ fn execute_static_leaf_array(
                 return Err(InterpreterError::TypeMismatch);
             };
             let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
-            let (_element, element_slots, row_slots) =
+            let (element, element_slots, row_slots) =
                 resolved_array_value(module, row.resolved_nominal)?;
+            let physical = crate::trusted::read_static_leaf_window(registers, value, element_slots);
             if row_slots.is_some() {
-                let replacement =
-                    crate::trusted::read_static_leaf_window(registers, value, element_slots);
-                heap.array_set_row(array, index, replacement)?;
+                heap.array_set_row(array, index, physical)?;
             } else {
-                let replacement = crate::trusted::read_static_leaf(registers, value);
+                let replacement = materialize_physical_value_range(
+                    physical,
+                    element,
+                    module.layout_table(),
+                    Some(heap),
+                )?;
                 heap.array_set(array, index, replacement)?;
             }
         }
@@ -1153,10 +1161,18 @@ fn execute_static_leaf_array(
                 return Err(InterpreterError::TypeMismatch);
             };
             let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
-            let (_element, element_slots, _row_slots) =
+            let (element, element_slots, _row_slots) =
                 resolved_array_value(module, row.resolved_nominal)?;
             let value = heap.array_value_range(array, index)?;
-            crate::trusted::write_static_leaf_values(registers, dst, element_slots, value.iter())?;
+            write_static_leaf_array_element(
+                registers,
+                dst,
+                element,
+                element_slots,
+                value,
+                module.layout_table(),
+                heap,
+            )?;
         }
         Instruction::ArrayLen { source, dst } => {
             let array = crate::trusted::read_static_leaf(registers, source);
@@ -1167,6 +1183,36 @@ fn execute_static_leaf_array(
         _ => unreachable!("array leaf helper receives only array instructions"),
     }
     Ok(())
+}
+
+fn write_static_leaf_array_element(
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    destination: u16,
+    element: ValueType,
+    element_slots: u16,
+    value: crate::CollectionView<'_>,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+) -> Result<(), InterpreterError> {
+    if value.len() == usize::from(element_slots) {
+        return crate::trusted::write_static_leaf_values(
+            registers,
+            destination,
+            element_slots,
+            value.iter(),
+        );
+    }
+    let mut physical = [RuntimeValue::Unit; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+    let physical = physical
+        .get_mut(..usize::from(element_slots))
+        .ok_or(InterpreterError::TypeMismatch)?;
+    write_collection_element_physical(value, physical, element, layouts, heap)?;
+    crate::trusted::write_static_leaf_values(
+        registers,
+        destination,
+        element_slots,
+        physical.iter().copied(),
+    )
 }
 
 fn execute_static_leaf_map(
@@ -3249,6 +3295,7 @@ impl CheckedInterpreter {
                         dst,
                         &mut continuation.arena,
                         heap.as_deref_mut(),
+                        module.layout_table(),
                         resolved_nominal,
                     )? {
                         PhysicalStandardIntrinsicOutcome::Returned => {
@@ -4165,7 +4212,7 @@ impl CheckedInterpreter {
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayGet { source, index, dst } => {
-                    let (_element, element_slots, _row_slots) =
+                    let (element, element_slots, _row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
                     let array = register(&continuation.arena, source)?;
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
@@ -4177,9 +4224,14 @@ impl CheckedInterpreter {
                             .ok_or(InterpreterError::HeapUnavailable)?
                             .array_value_range(array, index)
                     );
-                    continuation
-                        .arena
-                        .write_register_values(dst, element_slots, values.iter())?;
+                    let destination = continuation.arena.register_range_mut(dst, element_slots)?;
+                    write_collection_element_physical(
+                        values,
+                        destination,
+                        element,
+                        module.layout_table(),
+                        heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?,
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayFieldGet {
@@ -4219,47 +4271,57 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let (_element, element_slots, row_slots) =
+                    let (element, element_slots, row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
+                    let physical = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        value,
+                        element_slots,
+                    )?;
                     if row_slots.is_some() {
-                        let replacement = crate::trusted::read_register_window(
-                            &continuation.arena,
-                            value,
-                            element_slots,
-                        )?;
                         array_operation!(
                             heap.as_deref_mut()
                                 .ok_or(InterpreterError::HeapUnavailable)?
-                                .array_set_row(array, index, replacement)
+                                .array_set_row(array, index, physical)
                         );
                     } else {
-                        let replacement = register(&continuation.arena, value)?;
-                        array_operation!(
-                            heap.as_deref_mut()
-                                .ok_or(InterpreterError::HeapUnavailable)?
-                                .array_set(array, index, replacement)
-                        );
+                        let heap = heap
+                            .as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?;
+                        let replacement = materialize_physical_value_range(
+                            physical,
+                            element,
+                            module.layout_table(),
+                            Some(heap),
+                        )?;
+                        array_operation!(heap.array_set(array, index, replacement));
                     }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayPush { source, value } => {
                     let array = register(&continuation.arena, source)?;
-                    let (_element, element_slots, row_slots) =
+                    let (element, element_slots, row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
+                    let physical = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        value,
+                        element_slots,
+                    )?;
                     if row_slots.is_some() {
-                        let value = crate::trusted::read_register_window(
-                            &continuation.arena,
-                            value,
-                            element_slots,
-                        )?;
                         heap.as_deref_mut()
                             .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_push_row(array, value)?;
+                            .array_push_row(array, physical)?;
                     } else {
-                        let value = register(&continuation.arena, value)?;
-                        heap.as_deref_mut()
-                            .ok_or(InterpreterError::HeapUnavailable)?
-                            .array_push(array, value)?;
+                        let heap = heap
+                            .as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?;
+                        let value = materialize_physical_value_range(
+                            physical,
+                            element,
+                            module.layout_table(),
+                            Some(heap),
+                        )?;
+                        heap.array_push(array, value)?;
                     }
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -4286,7 +4348,7 @@ impl CheckedInterpreter {
                 }
                 Instruction::ArrayPop { source, dst } => {
                     let array = register(&continuation.arena, source)?;
-                    let (_element, element_slots, row_slots) =
+                    let (element, element_slots, row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
                     if row_slots.is_some() {
                         let heap_ref = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
@@ -4308,7 +4370,14 @@ impl CheckedInterpreter {
                                 .ok_or(InterpreterError::HeapUnavailable)?
                                 .array_pop(array)
                         );
-                        set_register(&mut continuation.arena, dst, value)?;
+                        write_materialized_value_range(
+                            &mut continuation.arena,
+                            dst,
+                            element,
+                            value,
+                            module.layout_table(),
+                            heap.as_deref(),
+                        )?;
                     }
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -4322,26 +4391,30 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let (_element, element_slots, row_slots) =
+                    let (element, element_slots, row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
+                    let physical = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        value,
+                        element_slots,
+                    )?;
                     if row_slots.is_some() {
-                        let value = crate::trusted::read_register_window(
-                            &continuation.arena,
-                            value,
-                            element_slots,
-                        )?;
                         array_operation!(
                             heap.as_deref_mut()
                                 .ok_or(InterpreterError::HeapUnavailable)?
-                                .array_insert_row(array, index, value)
+                                .array_insert_row(array, index, physical)
                         );
                     } else {
-                        let value = register(&continuation.arena, value)?;
-                        array_operation!(
-                            heap.as_deref_mut()
-                                .ok_or(InterpreterError::HeapUnavailable)?
-                                .array_insert(array, index, value)
-                        );
+                        let heap = heap
+                            .as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?;
+                        let value = materialize_physical_value_range(
+                            physical,
+                            element,
+                            module.layout_table(),
+                            Some(heap),
+                        )?;
+                        array_operation!(heap.array_insert(array, index, value));
                     }
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -4351,7 +4424,7 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = array_index!(index);
-                    let (_element, element_slots, row_slots) =
+                    let (element, element_slots, row_slots) =
                         resolved_array_value(module, resolved_nominal)?;
                     if row_slots.is_some() {
                         let values = array_operation!(
@@ -4375,7 +4448,14 @@ impl CheckedInterpreter {
                                 .ok_or(InterpreterError::HeapUnavailable)?
                                 .array_remove(array, index)
                         );
-                        set_register(&mut continuation.arena, dst, value)?;
+                        write_materialized_value_range(
+                            &mut continuation.arena,
+                            dst,
+                            element,
+                            value,
+                            module.layout_table(),
+                            heap.as_deref(),
+                        )?;
                     }
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -5798,6 +5878,7 @@ fn run_physical_standard_intrinsic(
     dst: u16,
     arena: &mut FrameArena,
     mut heap: Option<&mut Heap>,
+    layouts: &nexa_bytecode::layout::LayoutTable,
     resolved: ExecutableNominalOperand,
 ) -> Result<PhysicalStandardIntrinsicOutcome, InterpreterError> {
     use StandardIntrinsic as Intrinsic;
@@ -5837,7 +5918,7 @@ fn run_physical_standard_intrinsic(
             arena.copy_register_range(source, dst, abi.result_slots)?;
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
-        Intrinsic::ArrayGet { .. } => {
+        Intrinsic::ArrayGet { element } => {
             let array = argument(arena, 0)?;
             let RuntimeValue::I32(index) = argument(arena, 1)? else {
                 return Err(InterpreterError::TypeMismatch);
@@ -5856,14 +5937,12 @@ fn run_physical_standard_intrinsic(
                         .result_slots
                         .checked_sub(PHYSICAL_ENUM_PAYLOAD_OFFSET)
                         .ok_or(InterpreterError::TypeMismatch)?;
-                    if value.len() != usize::from(payload_slots) {
-                        return Err(InterpreterError::TypeMismatch);
-                    }
-                    set_register(arena, dst, RuntimeValue::I32(1))?;
                     let payload = dst
                         .checked_add(PHYSICAL_ENUM_PAYLOAD_OFFSET)
                         .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-                    arena.write_register_values(payload, payload_slots, value.iter())?;
+                    let destination = arena.register_range_mut(payload, payload_slots)?;
+                    write_collection_element_physical(value, destination, element, layouts, heap)?;
+                    set_register(arena, dst, RuntimeValue::I32(1))?;
                 }
                 Ok(None) | Err(HeapError::IndexOutOfBounds { .. }) => {
                     set_register(arena, dst, RuntimeValue::I32(0))?;
@@ -5872,18 +5951,24 @@ fn run_physical_standard_intrinsic(
             }
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
-        Intrinsic::ArrayPush { .. } => {
+        Intrinsic::ArrayPush { element } => {
             let array = argument(arena, 0)?;
             let value_base = argument_base(1)?;
             let value =
                 crate::trusted::read_register_window(arena, value_base, abi.argument_slots[1])?;
-            heap.as_deref_mut()
-                .ok_or(InterpreterError::HeapUnavailable)?
-                .array_push_value_range(array, value)?;
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            if heap.array_rows(array)?.is_some() || value.len() == 1 {
+                heap.array_push_value_range(array, value)?;
+            } else {
+                let value = materialize_physical_value_range(value, element, layouts, Some(heap))?;
+                heap.array_push(array, value)?;
+            }
             set_register(arena, dst, RuntimeValue::Bool(true))?;
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
-        Intrinsic::ArrayPop { .. } => {
+        Intrinsic::ArrayPop { element } => {
             let array = argument(arena, 0)?;
             let heap = heap
                 .as_deref_mut()
@@ -5896,10 +5981,8 @@ fn run_physical_standard_intrinsic(
             }
             {
                 let value = heap.array_value_range(array, length - 1)?;
-                if value.len() != usize::from(abi.result_slots) {
-                    return Err(InterpreterError::TypeMismatch);
-                }
-                arena.write_register_values(dst, abi.result_slots, value.iter())?;
+                let destination = arena.register_range_mut(dst, abi.result_slots)?;
+                write_collection_element_physical(value, destination, element, layouts, heap)?;
             }
             heap.array_pop_value_discard(array)?;
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
@@ -6880,6 +6963,26 @@ fn physical_scalar_value(
         return Err(InterpreterError::TypeMismatch);
     }
     Ok(*value)
+}
+
+fn write_collection_element_physical(
+    values: crate::CollectionView<'_>,
+    destination: &mut [RuntimeValue],
+    expected: ValueType,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+) -> Result<(), InterpreterError> {
+    if values.len() == destination.len() {
+        for (destination, value) in destination.iter_mut().zip(values.iter()) {
+            *destination = value;
+        }
+        return Ok(());
+    }
+    if values.len() != 1 {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let value = values.get(0).ok_or(InterpreterError::TypeMismatch)?;
+    flatten_materialized_value(destination, expected, value, layouts, Some(heap))
 }
 
 fn physical_enum_tag(
