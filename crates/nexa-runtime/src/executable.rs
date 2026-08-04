@@ -214,6 +214,12 @@ pub struct PooledStringConstant {
     pub hash: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct ExecutableStringPool {
+    constants: Box<[PooledStringConstant]>,
+    id: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ExecutableExport {
     stable_id: StableId,
@@ -304,16 +310,22 @@ pub(crate) struct ExecutableProfileRow {
 
 #[derive(Clone, Debug)]
 pub struct ExecutableFunction {
+    shared: Arc<ExecutableFunctionAssets>,
+    /// Process-local identity of the verifier-owned instruction backing for
+    /// this module. The heavy predecoded assets may be shared with another
+    /// content-identical function, but this guard is always rebound to the
+    /// candidate's own portable code.
+    code_identity: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutableFunctionAssets {
     /// Cold, verifier-derived physical calling convention. The hot Call
     /// path reads slot counts and offsets from this authority instead of
     /// rebuilding layouts from logical signatures.
     abi: nexa_bytecode::layout::FunctionAbi,
     rows: Vec<ExecutableInstruction>,
     profile_rows: Vec<ExecutableProfileRow>,
-    /// Process-local identity of the verifier-owned instruction backing used
-    /// to build these rows. It prevents a direct caller from pairing a valid
-    /// certificate with a different same-shaped module.
-    code_identity: usize,
     /// Load-time proof for the bounded static leaf executor.
     /// `None` keeps the full continuation interpreter as the only path.
     static_leaf: Option<StaticLeafCertificate>,
@@ -376,51 +388,97 @@ impl ExecutableFunction {
         constant_leaf: Option<StaticLeafConstantKernel>,
     ) -> Self {
         Self {
-            abi,
-            rows,
-            profile_rows,
             code_identity: function.code.as_ptr() as usize,
-            static_leaf,
-            constant_leaf,
+            shared: Arc::new(ExecutableFunctionAssets {
+                abi,
+                rows,
+                profile_rows,
+                static_leaf,
+                constant_leaf,
+            }),
+        }
+    }
+
+    fn reuse(function: &nexa_bytecode::Function, shared: Arc<ExecutableFunctionAssets>) -> Self {
+        Self {
+            shared,
+            code_identity: function.code.as_ptr() as usize,
         }
     }
 
     #[must_use]
     pub fn rows(&self) -> &[ExecutableInstruction] {
-        &self.rows
+        &self.shared.rows
     }
 
     #[must_use]
-    pub const fn abi(&self) -> &nexa_bytecode::layout::FunctionAbi {
-        &self.abi
+    pub fn abi(&self) -> &nexa_bytecode::layout::FunctionAbi {
+        &self.shared.abi
     }
 
     pub(crate) fn profile_rows(&self) -> &[ExecutableProfileRow] {
-        &self.profile_rows
+        &self.shared.profile_rows
     }
 
     pub(crate) fn root_map_index(&self, pc: u32) -> Option<usize> {
-        self.rows.get(pc as usize)?.root_map_index()
+        self.shared.rows.get(pc as usize)?.root_map_index()
     }
 
     #[must_use]
-    pub const fn static_leaf_fuel(&self) -> Option<u64> {
-        match self.static_leaf {
-            Some(certificate) => Some(certificate.fixed_fuel),
-            None => None,
-        }
+    pub fn static_leaf_fuel(&self) -> Option<u64> {
+        self.shared
+            .static_leaf
+            .map(|certificate| certificate.fixed_fuel)
     }
 
-    pub(crate) const fn static_leaf_certificate(&self) -> Option<StaticLeafCertificate> {
-        self.static_leaf
+    pub(crate) fn static_leaf_certificate(&self) -> Option<StaticLeafCertificate> {
+        self.shared.static_leaf
     }
 
-    pub(crate) const fn static_leaf_constant_kernel(&self) -> Option<StaticLeafConstantKernel> {
-        self.constant_leaf
+    pub(crate) fn static_leaf_constant_kernel(&self) -> Option<StaticLeafConstantKernel> {
+        self.shared.constant_leaf
     }
 
     pub(crate) const fn code_identity(&self) -> usize {
         self.code_identity
+    }
+
+    fn shared_assets(&self) -> Arc<ExecutableFunctionAssets> {
+        Arc::clone(&self.shared)
+    }
+}
+
+impl ExecutableFunctionAssets {
+    fn retained_payload_bytes(&self) -> usize {
+        let abi = &self.abi;
+        let parameter_bytes = abi
+            .parameters
+            .iter()
+            .map(|parameter| parameter.gc_bitmap.capacity())
+            .sum::<usize>()
+            .saturating_add(
+                abi.parameters
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<nexa_bytecode::layout::ParameterAbi>()),
+            );
+        let result_bytes = abi
+            .result
+            .as_ref()
+            .map_or(0, |result| result.gc_bitmap.capacity());
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ExecutableInstruction>()),
+            )
+            .saturating_add(
+                self.profile_rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ExecutableProfileRow>()),
+            )
+            .saturating_add(parameter_bytes)
+            .saturating_add(abi.parameter_gc_bitmap.capacity())
+            .saturating_add(result_bytes)
     }
 }
 
@@ -499,8 +557,7 @@ impl std::error::Error for ExecutableBuildError {}
 pub struct ExecutableModule {
     functions: Vec<ExecutableFunction>,
     exports: Vec<ExecutableExport>,
-    string_pool: Vec<PooledStringConstant>,
-    string_pool_id: u64,
+    string_pool: Arc<ExecutableStringPool>,
     cost_table_version: u32,
 }
 
@@ -515,6 +572,15 @@ impl ExecutableModule {
         module: &VerifiedModule,
         costs: &OpcodeCostTable,
     ) -> Result<Self, ExecutableBuildError> {
+        Self::build_reusing(module, costs, &[], None)
+    }
+
+    pub(crate) fn build_reusing(
+        module: &VerifiedModule,
+        costs: &OpcodeCostTable,
+        reused_functions: &[Option<Arc<ExecutableFunctionAssets>>],
+        reused_string_pool: Option<Arc<ExecutableStringPool>>,
+    ) -> Result<Self, ExecutableBuildError> {
         if costs.version != nexa_core::OPCODE_COST_TABLE_VERSION {
             return Err(ExecutableBuildError::CostTableVersionMismatch {
                 supported: nexa_core::OPCODE_COST_TABLE_VERSION,
@@ -523,22 +589,31 @@ impl ExecutableModule {
         }
         let nominal_shape = module.nominal_index_shape();
         let bytecode = module.module();
-        let string_pool = bytecode
-            .strings
-            .iter()
-            .map(|value| PooledStringConstant {
-                value: Arc::<str>::from(value.as_str()),
-                hash: crate::heap::fnv_content_hash(value),
+        let string_pool = reused_string_pool.unwrap_or_else(|| {
+            Arc::new(ExecutableStringPool {
+                constants: bytecode
+                    .strings
+                    .iter()
+                    .map(|value| PooledStringConstant {
+                        value: Arc::<str>::from(value.as_str()),
+                        hash: crate::heap::fnv_content_hash(value),
+                    })
+                    .collect(),
+                id: NEXT_STRING_POOL_ID.fetch_add(1, Ordering::Relaxed),
             })
-            .collect();
+        });
         let mut functions = Vec::with_capacity(bytecode.functions.len());
         for function_index in 0..bytecode.functions.len() {
-            functions.push(build_executable_function(
-                module,
-                nominal_shape,
-                function_index,
-                costs,
-            )?);
+            let reused = reused_functions
+                .get(function_index)
+                .and_then(|function| function.as_ref())
+                .cloned();
+            functions.push(match reused {
+                Some(shared) => {
+                    ExecutableFunction::reuse(&bytecode.functions[function_index], shared)
+                }
+                None => build_executable_function(module, nominal_shape, function_index, costs)?,
+            });
         }
         let mut exports = bytecode
             .exports
@@ -554,7 +629,6 @@ impl ExecutableModule {
             functions,
             exports,
             string_pool,
-            string_pool_id: NEXT_STRING_POOL_ID.fetch_add(1, Ordering::Relaxed),
             cost_table_version: costs.version,
         })
     }
@@ -580,8 +654,105 @@ impl ExecutableModule {
     #[must_use]
     pub fn pooled_string(&self, index: u32) -> Option<(u64, &PooledStringConstant)> {
         self.string_pool
+            .constants
             .get(index as usize)
-            .map(|constant| (self.string_pool_id, constant))
+            .map(|constant| (self.string_pool.id, constant))
+    }
+
+    pub(crate) fn reusable_string_pool(
+        &self,
+        source: &VerifiedModule,
+        candidate: &VerifiedModule,
+    ) -> Option<Arc<ExecutableStringPool>> {
+        (source.module().strings == candidate.module().strings)
+            .then(|| Arc::clone(&self.string_pool))
+    }
+
+    /// Returns the shared predecoded body only when every input that can
+    /// affect it is structurally identical. Function position is deliberately
+    /// not part of the identity: dense call operands live in the bytecode and
+    /// therefore already participate in `Function` equality.
+    pub(crate) fn reusable_function_assets(
+        &self,
+        source: &VerifiedModule,
+        source_function: usize,
+        candidate: &VerifiedModule,
+        candidate_function: usize,
+        costs: &OpcodeCostTable,
+    ) -> Option<Arc<ExecutableFunctionAssets>> {
+        if self.cost_table_version != costs.version
+            || source.nominal_index_shape() != candidate.nominal_index_shape()
+            || source.module().strings != candidate.module().strings
+            || source.module().host_imports != candidate.module().host_imports
+        {
+            return None;
+        }
+        let source_code = source.module().functions.get(source_function)?;
+        let candidate_code = candidate.module().functions.get(candidate_function)?;
+        if source_code != candidate_code
+            || source.module_abi().function(source_function)
+                != candidate.module_abi().function(candidate_function)
+        {
+            return None;
+        }
+        for pc in 0..source_code.code.len() {
+            if source.resolved_operand(source_function, pc)
+                != candidate.resolved_operand(candidate_function, pc)
+            {
+                return None;
+            }
+            let source_pc = u32::try_from(pc).ok()?;
+            if source
+                .module()
+                .source_span(u32::try_from(source_function).ok()?, source_pc)
+                != candidate
+                    .module()
+                    .source_span(u32::try_from(candidate_function).ok()?, source_pc)
+            {
+                return None;
+            }
+        }
+        self.functions
+            .get(source_function)
+            .map(ExecutableFunction::shared_assets)
+    }
+
+    pub(crate) fn retained_wrapper_payload_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.functions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ExecutableFunction>()),
+            )
+            .saturating_add(
+                self.exports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ExecutableExport>()),
+            )
+    }
+
+    pub(crate) fn visit_shared_asset_payloads(&self, mut visit: impl FnMut(usize, usize)) {
+        for function in &self.functions {
+            visit(
+                Arc::as_ptr(&function.shared) as usize,
+                function.shared.retained_payload_bytes(),
+            );
+        }
+        let string_bytes = std::mem::size_of::<ExecutableStringPool>()
+            .saturating_add(
+                self.string_pool
+                    .constants
+                    .len()
+                    .saturating_mul(std::mem::size_of::<PooledStringConstant>()),
+            )
+            .saturating_add(
+                self.string_pool
+                    .constants
+                    .iter()
+                    .map(|constant| constant.value.len())
+                    .sum::<usize>(),
+            );
+        visit(Arc::as_ptr(&self.string_pool) as usize, string_bytes);
     }
 
     /// Share of instruction rows whose whole charge is settled at load
@@ -591,9 +762,9 @@ impl ExecutableModule {
         let mut static_rows = 0;
         let mut total = 0;
         for function in &self.functions {
-            total += function.rows.len();
+            total += function.rows().len();
             static_rows += function
-                .rows
+                .rows()
                 .iter()
                 .filter(|row| !row.dynamic_fuel())
                 .count();

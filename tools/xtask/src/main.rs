@@ -420,6 +420,7 @@ fn main() -> Result<(), DynError> {
         "test-artifact-cache" => test_artifact_cache(),
         "test-runtime-fast-paths" => test_runtime_fast_paths(),
         "test-host-engine-performance" => test_host_engine_performance(),
+        "m5-reload-peak-report" => m5_reload_peak_report(),
         "m5-cold-start-report" => m5_cold_start_report(),
         "m5-product-corpus" => m5_product_corpus(),
         "m5-final-report" => m5_final_report(),
@@ -460,7 +461,8 @@ fn main() -> Result<(), DynError> {
                  test-ir-optimizations|test-optimization-differential|\
                  test-executable-parity|test-executable-module|test-gc-v1|test-source-cache|\
                  test-artifact-cache|test-runtime-fast-paths|test-host-engine-performance|\
-                 m5-cold-start-report|m5-product-corpus|m5-final-report|m5-v8-comparison|\
+                 m5-reload-peak-report|m5-cold-start-report|m5-product-corpus|\
+                 m5-final-report|m5-v8-comparison|\
                  m5-performance-regression|finalize-m5"
             );
             Err("unknown xtask command".into())
@@ -557,6 +559,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_artifact_cache()?;
     test_runtime_fast_paths()?;
     test_host_engine_performance()?;
+    m5_reload_peak_report()?;
     m5_cold_start_report()?;
     m5_product_corpus()?;
     cargo(&[
@@ -1800,6 +1803,119 @@ fn test_artifact_cache() -> Result<(), DynError> {
     ])
 }
 
+/// M5 WP97: measures the complete overlapping reload lifetime and proves
+/// that content-addressed immutable sharing lowers retained executable
+/// payload while every required peak-memory surface is live.
+const M5_RELOAD_PEAK_SAMPLES: usize = 7;
+
+fn m5_reload_peak_report() -> Result<(), DynError> {
+    let root = workspace_root();
+    let output = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
+    fs::create_dir_all(output.parent().ok_or("reload-peak report has no parent")?)?;
+    let samples = M5_RELOAD_PEAK_SAMPLES.to_string();
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--reload-peak-report",
+        "--samples",
+        &samples,
+        "--output",
+        output.to_str().ok_or("non-UTF-8 reload-peak report path")?,
+    ])?;
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let report = reload_peak_report_at(&output, &head)
+        .ok_or("WP97 reload peak report is stale, incomplete, or malformed")?;
+    println!(
+        "m5-reload-peak-report: {} samples, peak {} bytes, shared executable payload {} bytes",
+        report["samples"],
+        report["system_allocator"]["peak_outstanding_bytes_max"],
+        report["executable_images"]["shared_payload_bytes"],
+    );
+    Ok(())
+}
+
+fn reload_peak_report_at(path: &Path, implementation_commit: &str) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let surfaces = report["simultaneous_surfaces"].as_object()?;
+    if report["schema"] != 1
+        || report["benchmark_version"] != 7
+        || report["report"] != "Nexa M5 WP97 Reload Peak Memory"
+        || report["implementation_commit"].as_str() != Some(implementation_commit)
+        || report["samples"] != M5_RELOAD_PEAK_SAMPLES
+        || report["status"] != "PASS"
+        || report["build_profile"] != "release"
+        || report["benchmark_source_hash"]
+            .as_str()
+            .is_none_or(|hash| hash.len() != 64)
+        || ["p50_ns", "p95_ns", "p99_ns"].iter().any(|field| {
+            report["duration"][field]
+                .as_u64()
+                .is_none_or(|duration| duration == 0)
+        })
+        || surfaces.len() != 7
+        || surfaces.values().any(|value| value != true)
+        || report["system_allocator"]["allocations_max"]
+            .as_u64()
+            .is_none_or(|allocations| allocations == 0)
+        || report["system_allocator"]["allocated_bytes_max"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["system_allocator"]["peak_outstanding_bytes_max"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["portable_artifacts"]["old_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["portable_artifacts"]["candidate_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["executable_images"]["entries"]
+            .as_u64()
+            .is_none_or(|entries| entries < 2)
+        || report["executable_images"]["shared_payload_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["executable_images"]["unique_payload_bytes"]
+            .as_u64()
+            .zip(report["executable_images"]["logical_payload_bytes"].as_u64())
+            .is_none_or(|(unique, logical)| unique >= logical)
+        || report["migration_staging"]["object_peak"]
+            .as_u64()
+            .is_none_or(|peak| peak == 0)
+        || report["migration_staging"]["payload_byte_peak"]
+            .as_u64()
+            .is_none_or(|peak| peak == 0)
+        || report["incremental_gc"]["active_before_reload"] != true
+        || report["incremental_gc"]["active_after_reload"] != true
+        || report["vm_storage"]["string_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["vm_storage"]["collection_bytes"]
+            .as_u64()
+            .is_none_or(|bytes| bytes == 0)
+        || report["reuse"]["layout_tables"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || report["reuse"]["unchanged_functions"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || report["reuse"]["string_pools"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || report["reuse"]["host_import_plans"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+    {
+        return None;
+    }
+    Some(report)
+}
+
 /// M5 WP98: records every required cold-start surface independently.
 ///
 /// This intentionally uses a bounded one-process protocol instead of adding
@@ -2061,6 +2177,15 @@ fn m5_final_report() -> Result<(), DynError> {
     let head = git_output(&["rev-parse", "HEAD"])?;
     let final_dir = root.join("target/nexa-artifacts/m5/final");
     fs::create_dir_all(&final_dir)?;
+    let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
+    let reload_peak = if let Some(report) = reload_peak_report_at(&reload_peak_path, &head) {
+        eprintln!("final report: reusing same-HEAD WP97 reload peak report");
+        report
+    } else {
+        m5_reload_peak_report()?;
+        reload_peak_report_at(&reload_peak_path, &head)
+            .ok_or("new WP97 reload peak report is not a same-HEAD Benchmark v7 receipt")?
+    };
     let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
     let cold_start = if let Some(report) = cold_start_report_at(&cold_start_path, &head) {
         eprintln!("final report: reusing same-HEAD WP98 cold-start report");
@@ -2195,6 +2320,7 @@ fn m5_final_report() -> Result<(), DynError> {
         "conditions": conditions,
         "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
         "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
+        "reload_peak_artifact": "target/nexa-artifacts/m5/reload-peak/report.json",
         "cold_start_artifact": "target/nexa-artifacts/m5/cold-start/report.json",
         "implementation_commit": aggregate["implementation_commit"],
     });
@@ -2205,6 +2331,7 @@ fn m5_final_report() -> Result<(), DynError> {
     let report = serde_json::json!({
         "schema": 1,
         "aggregate": aggregate,
+        "reload_peak": reload_peak,
         "cold_start": cold_start,
         "profiler": profile["profiler"],
         "decision": decision,
@@ -2233,6 +2360,17 @@ fn m5_final_report() -> Result<(), DynError> {
             )?;
         }
     }
+    markdown.push_str(
+        "\nWP97 reload peak retains both artifacts/images with migration, active GC, and VM storage:\n\n",
+    );
+    writeln!(
+        markdown,
+        "- system peak: {} bytes; executable payload: {} logical / {} unique / {} shared bytes",
+        report["reload_peak"]["system_allocator"]["peak_outstanding_bytes_max"],
+        report["reload_peak"]["executable_images"]["logical_payload_bytes"],
+        report["reload_peak"]["executable_images"]["unique_payload_bytes"],
+        report["reload_peak"]["executable_images"]["shared_payload_bytes"],
+    )?;
     markdown.push_str(
         "\nWP98 cold-start cases are recorded separately with one isolated process and 15 samples:\n\n",
     );
@@ -2914,12 +3052,15 @@ fn finalize_m5() -> Result<(), DynError> {
     let comparison_path = root.join("target/nexa-artifacts/m5/regression/comparison.json");
     let profiler_path = root.join("target/nexa-artifacts/m5/profiler-overhead/formal-7x1000.json");
     let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+    let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
     let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
     let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
     let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
     let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
     let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
     let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
+    let reload_peak = reload_peak_report_at(&reload_peak_path, &head)
+        .ok_or("WP97 reload peak receipt is stale or malformed")?;
     let cold_start = cold_start_report_at(&cold_start_path, &head)
         .ok_or("WP98 cold-start receipt is stale or malformed")?;
     let decision: Value = serde_json::from_slice(&fs::read(&decision_path)?)?;
@@ -2949,6 +3090,10 @@ fn finalize_m5() -> Result<(), DynError> {
         || profiler["status"] != "PASS"
         || product["implementation_commit"] != head
         || product["status"] != "PASS"
+        || reload_peak["implementation_commit"] != head
+        || reload_peak["status"] != "PASS"
+        || performance["reload_peak"]["implementation_commit"] != head
+        || performance["reload_peak"]["status"] != "PASS"
         || cold_start["implementation_commit"] != head
         || performance["cold_start"]["implementation_commit"] != head
         || performance["cold_start"]["status"] != "PASS"
@@ -2993,6 +3138,7 @@ fn finalize_m5() -> Result<(), DynError> {
         "hostTaskEngineGeomeanSpeedup": geomean("host_task_engine")?,
         "coldStartGeomeanSpeedup": geomean("cold_start")?,
         "coldStartScenarios": cold_start["cases"],
+        "reloadPeak": reload_peak,
         "structGcAllocations": 0,
         "enumGcAllocations": 0,
         "gcSystemAllocations": 0,

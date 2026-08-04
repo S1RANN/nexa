@@ -25,10 +25,12 @@ use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
 
 mod cold_start;
+mod reload_peak;
 
 const DEFAULT_SAMPLES: usize = 1_000;
 const SMOKE_SAMPLES: usize = 20;
 const COLD_START_SAMPLES: usize = 15;
+const RELOAD_PEAK_SAMPLES: usize = 7;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
 const BENCH_TASK_EXPORT: StableId = StableId(0x4245_4e43_4854_4153);
@@ -585,11 +587,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cold_start_report = arguments
         .iter()
         .any(|argument| argument == "--cold-start-report");
+    let reload_peak_report = arguments
+        .iter()
+        .any(|argument| argument == "--reload-peak-report");
     let samples = argument_value(&arguments, "--samples")
         .map(str::parse)
         .transpose()?
         .unwrap_or(if cold_start_report {
             COLD_START_SAMPLES
+        } else if reload_peak_report {
+            RELOAD_PEAK_SAMPLES
         } else if smoke {
             SMOKE_SAMPLES
         } else {
@@ -611,6 +618,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("the WP98 cold-start report uses one isolated process".into());
         }
         return cold_start::run(samples, argument_value(&arguments, "--output"));
+    }
+    if reload_peak_report {
+        if processes != 1 {
+            return Err("the WP97 reload peak report uses one isolated process".into());
+        }
+        return reload_peak::run(samples, argument_value(&arguments, "--output"));
     }
     let profiler_enabled = arguments.iter().any(|argument| argument == "--profile");
     let profiler_control = arguments
@@ -2589,6 +2602,8 @@ fn benchmark_source_hash() -> String {
     hasher.update(include_bytes!("main.rs"));
     hasher.update(b"\0cold_start.rs\0");
     hasher.update(include_bytes!("cold_start.rs"));
+    hasher.update(b"\0reload_peak.rs\0");
+    hasher.update(include_bytes!("reload_peak.rs"));
     hasher.finalize().to_hex().to_string()
 }
 

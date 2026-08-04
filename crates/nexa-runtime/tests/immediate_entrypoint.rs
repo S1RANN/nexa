@@ -1,4 +1,5 @@
-//! WP89 gate: `call_export_immediate` settles `@immediate` exports with
+//! WP85/WP89 gate: quiescent single-runnable ticks bypass generic queue
+//! rotation, and `call_export_immediate` settles `@immediate` exports with
 //! no Task, scheduler token, or tombstone - the resource ledger stays
 //! flat across steady-state calls while fuel, traps, results, and the
 //! charge match the metered Task path exactly. Non-immediate exports are
@@ -12,7 +13,7 @@ use nexa_core::StableId;
 use nexa_runtime::{
     MustCompletePolicy, RealmConfig, RealmRuntime, RuntimeValue, ScriptArgumentRequirements,
     ScriptArguments, ScriptCallError, ScriptCallWriter, ScriptExport, ScriptOutputReader,
-    ScriptSignature,
+    ScriptSignature, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -190,6 +191,91 @@ fn immediate_module() -> VerifiedModule {
         effect: FunctionEffect::Immediate,
     });
     verify(module.finish(), VerifierLimits::default()).expect("immediate gate module")
+}
+
+fn task_config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
+    StepConfig {
+        owner,
+        priority: 1,
+        fuel_slice: 64,
+        cumulative_budget: 1_024,
+        limits: TaskLimits::default(),
+    }
+}
+
+#[test]
+fn quiescent_single_runnable_tick_bypasses_general_queue_rotation() {
+    let verified = immediate_module();
+    let schema = verified.module().state_schema_fingerprint;
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
+    let module = realm.load_module(verified, HOST, schema).expect("load");
+    let scope = realm.create_scope(None).expect("scope");
+
+    realm
+        .spawn_task(
+            module,
+            TASK_EXPORT,
+            &[RuntimeValue::I32(1)],
+            task_config(scope),
+        )
+        .expect("single task");
+    let report = realm
+        .tick(TickBudget {
+            max_tasks: 1,
+            frame_fuel_budget: 64,
+            collect_garbage: false,
+        })
+        .expect("single task tick");
+    assert_eq!((report.polled, report.completed), (1, 1));
+    assert_eq!(
+        realm.scheduler_fast_path_inspection(),
+        nexa_runtime::SchedulerFastPathInspection {
+            single_task_ticks: 1,
+            general_ticks: 0,
+        }
+    );
+
+    for value in [2, 3] {
+        realm
+            .spawn_task(
+                module,
+                TASK_EXPORT,
+                &[RuntimeValue::I32(value)],
+                task_config(scope),
+            )
+            .expect("general-queue task");
+    }
+    let report = realm
+        .tick(TickBudget {
+            max_tasks: 1,
+            frame_fuel_budget: 64,
+            collect_garbage: false,
+        })
+        .expect("general task tick");
+    assert_eq!((report.polled, report.completed), (1, 1));
+    assert_eq!(
+        realm.scheduler_fast_path_inspection(),
+        nexa_runtime::SchedulerFastPathInspection {
+            single_task_ticks: 1,
+            general_ticks: 1,
+        }
+    );
+
+    let report = realm
+        .tick(TickBudget {
+            max_tasks: 1,
+            frame_fuel_budget: 64,
+            collect_garbage: false,
+        })
+        .expect("remaining single task tick");
+    assert_eq!((report.polled, report.completed), (1, 1));
+    assert_eq!(
+        realm.scheduler_fast_path_inspection(),
+        nexa_runtime::SchedulerFastPathInspection {
+            single_task_ticks: 2,
+            general_ticks: 1,
+        }
+    );
 }
 
 #[test]

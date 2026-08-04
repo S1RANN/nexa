@@ -87,7 +87,7 @@ pub struct ModuleEpochRoot {
     /// consumes them instead of recomputing static fuel and safepoints.
     pub executable: Arc<crate::executable::ExecutableModule>,
     pub host_contract_id: StableId,
-    host_function_slots: Box<[HostFunctionSlot]>,
+    host_function_slots: Arc<[HostFunctionSlot]>,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
     state: Arc<StatefulRegistry>,
@@ -106,21 +106,26 @@ struct ExecutionImageEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutionImageCacheInspection {
+pub struct HostImportPlanCacheInspection {
     pub entries: usize,
     pub capacity: usize,
     pub hits: u64,
     pub misses: u64,
 }
 
-struct ExecutionImageCache {
-    entries: VecDeque<ExecutionImageEntry>,
+struct HostImportPlanEntry {
+    imports: Arc<[HostImport]>,
+    slots: Arc<[HostFunctionSlot]>,
+}
+
+struct HostImportPlanCache {
+    entries: VecDeque<HostImportPlanEntry>,
     capacity: usize,
     hits: u64,
     misses: u64,
 }
 
-impl ExecutionImageCache {
+impl HostImportPlanCache {
     fn new(capacity: usize) -> Self {
         Self {
             entries: VecDeque::with_capacity(capacity),
@@ -130,9 +135,97 @@ impl ExecutionImageCache {
         }
     }
 
+    fn lookup(&mut self, imports: &[HostImport]) -> Option<Arc<[HostFunctionSlot]>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.imports.as_ref() == imports)?;
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("the located Host import plan exists");
+        let slots = Arc::clone(&entry.slots);
+        self.entries.push_back(entry);
+        self.hits = self.hits.saturating_add(1);
+        Some(slots)
+    }
+
+    fn insert(
+        &mut self,
+        imports: &[HostImport],
+        slots: Arc<[HostFunctionSlot]>,
+    ) -> Arc<[HostFunctionSlot]> {
+        self.misses = self.misses.saturating_add(1);
+        if self.capacity != 0 {
+            if self.entries.len() == self.capacity {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(HostImportPlanEntry {
+                imports: Arc::from(imports),
+                slots: Arc::clone(&slots),
+            });
+        }
+        slots
+    }
+
+    fn inspection(&self) -> HostImportPlanCacheInspection {
+        HostImportPlanCacheInspection {
+            entries: self.entries.len(),
+            capacity: self.capacity,
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionImageCacheInspection {
+    pub entries: usize,
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub layout_reuses: u64,
+    pub module_abi_reuses: u64,
+    pub profile_metadata_reuses: u64,
+    pub function_reuses: u64,
+    pub string_pool_reuses: u64,
+    /// Per-image payload sum as if every executable asset were private.
+    pub logical_executable_payload_bytes: u64,
+    /// Actual unique payload retained after Arc sharing.
+    pub unique_executable_payload_bytes: u64,
+    pub shared_executable_payload_bytes: u64,
+}
+
+struct ExecutionImageCache {
+    entries: VecDeque<ExecutionImageEntry>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    layout_reuses: u64,
+    module_abi_reuses: u64,
+    profile_metadata_reuses: u64,
+    function_reuses: u64,
+    string_pool_reuses: u64,
+}
+
+impl ExecutionImageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+            hits: 0,
+            misses: 0,
+            layout_reuses: 0,
+            module_abi_reuses: 0,
+            profile_metadata_reuses: 0,
+            function_reuses: 0,
+            string_pool_reuses: 0,
+        }
+    }
+
     fn resolve(
         &mut self,
-        verified: VerifiedModule,
+        mut verified: VerifiedModule,
         costs: &OpcodeCostTable,
     ) -> Result<ExecutionImage, crate::ExecutableBuildError> {
         let key = execution_image_key(&verified, costs);
@@ -141,14 +234,75 @@ impl ExecutionImageCache {
                 .entries
                 .remove(index)
                 .expect("the located execution image entry exists");
-            let image = entry.image.clone();
+            let reused = verified.reuse_immutable_from(&entry.image.verified);
+            self.record_verified_reuse(reused);
+            self.function_reuses = self.function_reuses.saturating_add(
+                u64::try_from(entry.image.executable.functions().len()).unwrap_or(u64::MAX),
+            );
+            self.string_pool_reuses = self.string_pool_reuses.saturating_add(1);
+            // Portable code can be identical while Package/source profiler
+            // metadata differs. Reuse the executable image in both cases,
+            // but never substitute a different semantic profiler identity.
+            let verified =
+                if verified.profile_fingerprint() == entry.image.verified.profile_fingerprint() {
+                    Arc::clone(&entry.image.verified)
+                } else {
+                    Arc::new(verified)
+                };
+            let image = ExecutionImage {
+                verified,
+                executable: Arc::clone(&entry.image.executable),
+            };
             self.entries.push_back(entry);
             self.hits = self.hits.saturating_add(1);
             return Ok(image);
         }
 
         self.misses = self.misses.saturating_add(1);
-        let executable = crate::executable::ExecutableModule::build(&verified, costs)?;
+        let mut verified_reuse = nexa_verifier::VerifiedImmutableReuse::default();
+        for entry in &self.entries {
+            let reused = verified.reuse_immutable_from(&entry.image.verified);
+            verified_reuse.layout_table |= reused.layout_table;
+            verified_reuse.module_abi |= reused.module_abi;
+            verified_reuse.profile_metadata |= reused.profile_metadata;
+        }
+
+        let reused_string_pool = self.entries.iter().find_map(|entry| {
+            entry
+                .image
+                .executable
+                .reusable_string_pool(&entry.image.verified, &verified)
+        });
+        let mut function_reuse_count = 0_u64;
+        let mut reused_functions = Vec::with_capacity(verified.module().functions.len());
+        for candidate_function in 0..verified.module().functions.len() {
+            let reused = self.entries.iter().find_map(|entry| {
+                (0..entry.image.verified.module().functions.len()).find_map(|source_function| {
+                    entry.image.executable.reusable_function_assets(
+                        &entry.image.verified,
+                        source_function,
+                        &verified,
+                        candidate_function,
+                        costs,
+                    )
+                })
+            });
+            if reused.is_some() {
+                function_reuse_count = function_reuse_count.saturating_add(1);
+            }
+            reused_functions.push(reused);
+        }
+        let executable = crate::executable::ExecutableModule::build_reusing(
+            &verified,
+            costs,
+            &reused_functions,
+            reused_string_pool.clone(),
+        )?;
+        self.record_verified_reuse(verified_reuse);
+        self.function_reuses = self.function_reuses.saturating_add(function_reuse_count);
+        if reused_string_pool.is_some() {
+            self.string_pool_reuses = self.string_pool_reuses.saturating_add(1);
+        }
         let image = ExecutionImage {
             verified: Arc::new(verified),
             executable: Arc::new(executable),
@@ -165,12 +319,52 @@ impl ExecutionImageCache {
         Ok(image)
     }
 
+    fn record_verified_reuse(&mut self, reused: nexa_verifier::VerifiedImmutableReuse) {
+        self.layout_reuses = self
+            .layout_reuses
+            .saturating_add(u64::from(reused.layout_table));
+        self.module_abi_reuses = self
+            .module_abi_reuses
+            .saturating_add(u64::from(reused.module_abi));
+        self.profile_metadata_reuses = self
+            .profile_metadata_reuses
+            .saturating_add(u64::from(reused.profile_metadata));
+    }
+
     fn inspection(&self) -> ExecutionImageCacheInspection {
+        let mut logical_payload_bytes = 0_u64;
+        let mut unique_payload_bytes = 0_u64;
+        let mut unique_assets = BTreeSet::new();
+        for entry in &self.entries {
+            let wrapper = u64::try_from(entry.image.executable.retained_wrapper_payload_bytes())
+                .unwrap_or(u64::MAX);
+            logical_payload_bytes = logical_payload_bytes.saturating_add(wrapper);
+            unique_payload_bytes = unique_payload_bytes.saturating_add(wrapper);
+            entry
+                .image
+                .executable
+                .visit_shared_asset_payloads(|identity, bytes| {
+                    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+                    logical_payload_bytes = logical_payload_bytes.saturating_add(bytes);
+                    if unique_assets.insert(identity) {
+                        unique_payload_bytes = unique_payload_bytes.saturating_add(bytes);
+                    }
+                });
+        }
         ExecutionImageCacheInspection {
             entries: self.entries.len(),
             capacity: self.capacity,
             hits: self.hits,
             misses: self.misses,
+            layout_reuses: self.layout_reuses,
+            module_abi_reuses: self.module_abi_reuses,
+            profile_metadata_reuses: self.profile_metadata_reuses,
+            function_reuses: self.function_reuses,
+            string_pool_reuses: self.string_pool_reuses,
+            logical_executable_payload_bytes: logical_payload_bytes,
+            unique_executable_payload_bytes: unique_payload_bytes,
+            shared_executable_payload_bytes: logical_payload_bytes
+                .saturating_sub(unique_payload_bytes),
         }
     }
 }
@@ -1106,6 +1300,15 @@ pub struct TickReport {
     pub collection: Option<CollectionStats>,
 }
 
+/// WP85 scheduler-path counters. A single-task tick is admitted only when
+/// there is exactly one runnable task and both Host completion and release
+/// queues are quiescent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerFastPathInspection {
+    pub single_task_ticks: u64,
+    pub general_ticks: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeCapacityReport {
     pub module_slots: usize,
@@ -1402,6 +1605,10 @@ pub struct RealmRuntime {
     /// identity. The cache is realm-bounded and never serializes dense slots
     /// or runtime pointers.
     execution_images: ExecutionImageCache,
+    /// WP86/WP96: immutable registry-local dense Host call plans. The Host
+    /// registry is fixed for a Realm, so equal portable import authorities
+    /// can safely share one validated slot table across epochs.
+    host_import_plans: HostImportPlanCache,
     /// G2 trigger baseline: cumulative object allocations at the moment
     /// the last incremental cycle completed.
     gc_cycle_baseline: u64,
@@ -1412,6 +1619,9 @@ pub struct RealmRuntime {
     /// reservation; terminal polls push the storage back. Bounded so idle
     /// realms never retain more than a few task stacks worth of memory.
     continuation_pool: Vec<crate::FrameArena>,
+    /// WP85: cumulative proof that quiescent single-runnable ticks bypass
+    /// the generic priority-queue rotation.
+    scheduler_fast_paths: SchedulerFastPathInspection,
 }
 
 impl RealmRuntime {
@@ -1469,11 +1679,13 @@ impl RealmRuntime {
             runtime_host: None,
             failure_injector,
             execution_images: ExecutionImageCache::new(execution_image_cache_capacity),
+            host_import_plans: HostImportPlanCache::new(execution_image_cache_capacity),
             gc_cycle_baseline: 0,
             gc_last_survival_per_mille: None,
             // H1: preallocated so terminal-path pushes never allocate; the
             // allocation-observer gates pin task terminals at zero.
             continuation_pool: Vec::with_capacity(Self::CONTINUATION_POOL_LIMIT),
+            scheduler_fast_paths: SchedulerFastPathInspection::default(),
         }
     }
 
@@ -1729,85 +1941,93 @@ impl RealmRuntime {
     }
 
     fn resolve_host_functions(
-        &self,
+        &mut self,
         imports: &[HostImport],
-    ) -> Result<Box<[HostFunctionSlot]>, RealmError> {
+    ) -> Result<Arc<[HostFunctionSlot]>, RealmError> {
+        if let Some(slots) = self.host_import_plans.lookup(imports) {
+            return Ok(slots);
+        }
         if imports.is_empty() {
-            return Ok(Box::new([]));
+            return Ok(self
+                .host_import_plans
+                .insert(imports, Arc::<[HostFunctionSlot]>::from([])));
         }
-        let registry = self
-            .host_registry
-            .as_deref()
-            .ok_or(RealmError::HostCapabilitiesUnavailable)?;
-        let mut slots = Vec::with_capacity(imports.len());
-        for import in imports {
-            let resolved = registry
-                .resolve_function(import.stable_id)
-                .ok_or(RealmError::MissingHostFunctionAuthority(import.stable_id))?;
-            let contract = resolved.authority();
-            let mismatch = |field| RealmError::HostFunctionAuthorityMismatch {
-                stable_id: import.stable_id,
-                field,
-            };
-            if contract.stable_id() != import.stable_id {
-                return Err(mismatch(HostFunctionAuthorityField::StableId));
-            }
-            if contract.declaration_fingerprint() != import.declaration_fingerprint {
-                return Err(mismatch(HostFunctionAuthorityField::DeclarationFingerprint));
-            }
-            let capabilities = contract.capabilities();
-            if capabilities.len() != import.capabilities.len()
-                || capabilities
-                    .iter()
-                    .zip(&import.capabilities)
-                    .any(|(expected, actual)| expected != actual)
-            {
-                return Err(mismatch(HostFunctionAuthorityField::Capabilities));
-            }
-            if contract.parameters() != import.parameters.as_slice() {
-                return Err(mismatch(HostFunctionAuthorityField::Parameters));
-            }
-            if contract.result() != import.result {
-                return Err(mismatch(HostFunctionAuthorityField::Result));
-            }
-            if contract.mode() != import.mode {
-                return Err(mismatch(HostFunctionAuthorityField::Mode));
-            }
-            if contract.fuel_cost() != import.fuel_cost {
-                return Err(mismatch(HostFunctionAuthorityField::FuelCost));
-            }
-            match (contract.async_result(), import.async_result) {
-                (None, None) => {}
-                (Some(_), None) | (None, Some(_)) => {
-                    return Err(mismatch(HostFunctionAuthorityField::AsyncResultPresence));
+        let slots = {
+            let registry = self
+                .host_registry
+                .as_deref()
+                .ok_or(RealmError::HostCapabilitiesUnavailable)?;
+            let mut slots = Vec::with_capacity(imports.len());
+            for import in imports {
+                let resolved = registry
+                    .resolve_function(import.stable_id)
+                    .ok_or(RealmError::MissingHostFunctionAuthority(import.stable_id))?;
+                let contract = resolved.authority();
+                let mismatch = |field| RealmError::HostFunctionAuthorityMismatch {
+                    stable_id: import.stable_id,
+                    field,
+                };
+                if contract.stable_id() != import.stable_id {
+                    return Err(mismatch(HostFunctionAuthorityField::StableId));
                 }
-                (Some(expected), Some(actual)) => {
-                    if expected.result_type != actual.result_type {
-                        return Err(mismatch(HostFunctionAuthorityField::AsyncResultType));
+                if contract.declaration_fingerprint() != import.declaration_fingerprint {
+                    return Err(mismatch(HostFunctionAuthorityField::DeclarationFingerprint));
+                }
+                let capabilities = contract.capabilities();
+                if capabilities.len() != import.capabilities.len()
+                    || capabilities
+                        .iter()
+                        .zip(&import.capabilities)
+                        .any(|(expected, actual)| expected != actual)
+                {
+                    return Err(mismatch(HostFunctionAuthorityField::Capabilities));
+                }
+                if contract.parameters() != import.parameters.as_slice() {
+                    return Err(mismatch(HostFunctionAuthorityField::Parameters));
+                }
+                if contract.result() != import.result {
+                    return Err(mismatch(HostFunctionAuthorityField::Result));
+                }
+                if contract.mode() != import.mode {
+                    return Err(mismatch(HostFunctionAuthorityField::Mode));
+                }
+                if contract.fuel_cost() != import.fuel_cost {
+                    return Err(mismatch(HostFunctionAuthorityField::FuelCost));
+                }
+                match (contract.async_result(), import.async_result) {
+                    (None, None) => {}
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(mismatch(HostFunctionAuthorityField::AsyncResultPresence));
                     }
-                    if expected.success != actual.success {
-                        return Err(mismatch(HostFunctionAuthorityField::AsyncSuccessType));
-                    }
-                    if expected.error != actual.error {
-                        return Err(mismatch(HostFunctionAuthorityField::AsyncErrorType));
-                    }
-                    if expected.cancel_policy != actual.cancel_policy {
-                        return Err(mismatch(HostFunctionAuthorityField::CancelPolicy));
-                    }
-                    if expected.abandon_policy != actual.abandon_policy {
-                        return Err(mismatch(HostFunctionAuthorityField::AbandonPolicy));
-                    }
-                    if expected.cancel_error != actual.cancel_error {
-                        return Err(mismatch(HostFunctionAuthorityField::CancelErrorVariant));
-                    }
-                    if expected.abandon_error != actual.abandon_error {
-                        return Err(mismatch(HostFunctionAuthorityField::AbandonErrorVariant));
+                    (Some(expected), Some(actual)) => {
+                        if expected.result_type != actual.result_type {
+                            return Err(mismatch(HostFunctionAuthorityField::AsyncResultType));
+                        }
+                        if expected.success != actual.success {
+                            return Err(mismatch(HostFunctionAuthorityField::AsyncSuccessType));
+                        }
+                        if expected.error != actual.error {
+                            return Err(mismatch(HostFunctionAuthorityField::AsyncErrorType));
+                        }
+                        if expected.cancel_policy != actual.cancel_policy {
+                            return Err(mismatch(HostFunctionAuthorityField::CancelPolicy));
+                        }
+                        if expected.abandon_policy != actual.abandon_policy {
+                            return Err(mismatch(HostFunctionAuthorityField::AbandonPolicy));
+                        }
+                        if expected.cancel_error != actual.cancel_error {
+                            return Err(mismatch(HostFunctionAuthorityField::CancelErrorVariant));
+                        }
+                        if expected.abandon_error != actual.abandon_error {
+                            return Err(mismatch(HostFunctionAuthorityField::AbandonErrorVariant));
+                        }
                     }
                 }
+                slots.push(resolved.slot());
             }
-            slots.push(resolved.slot());
-        }
-        Ok(slots.into_boxed_slice())
+            Arc::<[HostFunctionSlot]>::from(slots)
+        };
+        Ok(self.host_import_plans.insert(imports, slots))
     }
 
     pub fn load_module(
@@ -1885,6 +2105,16 @@ impl RealmRuntime {
         self.execution_images.inspection()
     }
 
+    #[must_use]
+    pub fn host_import_plan_cache_inspection(&self) -> HostImportPlanCacheInspection {
+        self.host_import_plans.inspection()
+    }
+
+    #[must_use]
+    pub const fn scheduler_fast_path_inspection(&self) -> SchedulerFastPathInspection {
+        self.scheduler_fast_paths
+    }
+
     pub(crate) fn prepare_reload(
         &mut self,
         old_module: ModuleHandle,
@@ -1904,7 +2134,6 @@ impl RealmRuntime {
         if old.verified.module().host_contract_id != Some(host_contract_id) {
             return Err(RealmError::HostContractIdMismatch);
         }
-        self.resolve_host_functions(&candidate.module().host_imports)?;
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
@@ -1970,7 +2199,6 @@ impl RealmRuntime {
             candidate.module(),
             extension.environment(),
         )?;
-        self.resolve_host_functions(&candidate.module().host_imports)?;
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
@@ -3730,26 +3958,49 @@ impl RealmRuntime {
     pub fn tick(&mut self, budget: TickBudget) -> Result<TickReport, RealmError> {
         let completions = self.drain_host_completions()?;
         let mut report = TickReport::default();
-        for _ in 0..budget.max_tasks {
-            let Some(task) = self.scheduler.pop_ready() else {
-                break;
-            };
-            match self.poll_task_raw(task, budget.frame_fuel_budget) {
-                Ok(PollResult::Completed { .. }) => report.completed += 1,
-                Ok(PollResult::Cancelled(_)) => report.cancelled += 1,
-                Ok(PollResult::Trapped(_)) => report.trapped += 1,
-                Ok(PollResult::Pending(_))
-                | Err(RealmError::TerminalTask | RealmError::TaskWaiting) => {}
-                Err(error) => return Err(error),
+        let release_backlog = self.resources.model_snapshot().release_records;
+        let single_task = (budget.max_tasks != 0 && completions == 0 && release_backlog == 0)
+            .then(|| self.scheduler.pop_only_ready())
+            .flatten();
+        if let Some(task) = single_task {
+            self.scheduler_fast_paths.single_task_ticks = self
+                .scheduler_fast_paths
+                .single_task_ticks
+                .saturating_add(1);
+            self.poll_tick_task(task, budget.frame_fuel_budget, &mut report)?;
+        } else {
+            self.scheduler_fast_paths.general_ticks =
+                self.scheduler_fast_paths.general_ticks.saturating_add(1);
+            for _ in 0..budget.max_tasks {
+                let Some(task) = self.scheduler.pop_ready() else {
+                    break;
+                };
+                self.poll_tick_task(task, budget.frame_fuel_budget, &mut report)?;
             }
-            report.polled += 1;
         }
         report.releases = self.flush_releases();
         if budget.collect_garbage {
             report.collection = Some(self.collect_garbage()?);
         }
-        let _ = completions;
         Ok(report)
+    }
+
+    fn poll_tick_task(
+        &mut self,
+        task: TaskHandle,
+        fuel_budget: u64,
+        report: &mut TickReport,
+    ) -> Result<(), RealmError> {
+        match self.poll_task_raw(task, fuel_budget) {
+            Ok(PollResult::Completed { .. }) => report.completed += 1,
+            Ok(PollResult::Cancelled(_)) => report.cancelled += 1,
+            Ok(PollResult::Trapped(_)) => report.trapped += 1,
+            Ok(PollResult::Pending(_))
+            | Err(RealmError::TerminalTask | RealmError::TaskWaiting) => {}
+            Err(error) => return Err(error),
+        }
+        report.polled += 1;
+        Ok(())
     }
 
     pub fn collect_garbage(&mut self) -> Result<CollectionStats, RealmError> {

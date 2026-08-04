@@ -254,6 +254,45 @@ fn assert_authority_mismatch_with_enums(
     );
 }
 
+fn verified_dispatch_module(import: StableId) -> VerifiedModule {
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: Some(ValueType::I32),
+    };
+    let mut entrypoint = FunctionBuilder::new(signature.clone(), 1);
+    entrypoint
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::HostCall {
+            import: 0,
+            args_base: 0,
+            args_count: 0,
+            dst: 0,
+        })
+        .emit(Instruction::Return { source: 0 });
+
+    let schema = nexa_bytecode::StateSchema::default().fingerprint();
+    let mut module = ModuleBuilder::new();
+    module.metadata(HOST_CONTRACT_ID, schema);
+    module.host_import(HostImport {
+        stable_id: import,
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
+        parameters: Vec::new(),
+        result: Some(ValueType::I32),
+        mode: HostCallMode::Immediate,
+        fuel_cost: 1,
+        async_result: None,
+    });
+    let function = module.function(entrypoint.finish().expect("host dispatch entrypoint"));
+    module.script_export(ScriptExport {
+        stable_id: DISPATCH_EXPORT_ID,
+        function,
+        effect: FunctionEffect::Task,
+        signature,
+    });
+    verify(module.finish(), VerifierLimits::default()).expect("verified module")
+}
+
 #[test]
 fn module_local_host_import_resolves_to_registry_dense_slot() {
     let contract_functions = [
@@ -275,47 +314,14 @@ fn module_local_host_import_resolves_to_registry_dense_slot() {
         )
     });
 
-    let signature = Signature {
-        parameters: Vec::new(),
-        result: Some(ValueType::I32),
-    };
-    let mut entrypoint = FunctionBuilder::new(signature.clone(), 1);
-    entrypoint
-        .effect(FunctionEffect::Task)
-        .emit(Instruction::HostCall {
-            import: 0,
-            args_base: 0,
-            args_count: 0,
-            dst: 0,
-        })
-        .emit(Instruction::Return { source: 0 });
-
     let schema = nexa_bytecode::StateSchema::default().fingerprint();
-    let mut module = ModuleBuilder::new();
-    module.metadata(HOST_CONTRACT_ID, schema);
-    module.host_import(HostImport {
-        stable_id: contract_functions[2],
-        declaration_fingerprint: [0; 32],
-        capabilities: Vec::new(),
-        parameters: Vec::new(),
-        result: Some(ValueType::I32),
-        mode: HostCallMode::Immediate,
-        fuel_cost: 1,
-        async_result: None,
-    });
-    let function = module.function(entrypoint.finish().expect("host dispatch entrypoint"));
-    module.script_export(ScriptExport {
-        stable_id: DISPATCH_EXPORT_ID,
-        function,
-        effect: FunctionEffect::Task,
-        signature,
-    });
-    let verified = verify(module.finish(), VerifierLimits::default()).expect("verified module");
+    let verified = verified_dispatch_module(contract_functions[2]);
     assert_eq!(verified.module().host_imports.len(), 1);
     assert_eq!(
         verified.module().host_imports[0].stable_id,
         contract_functions[2]
     );
+    let identical_candidate = verified.clone();
 
     let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
@@ -355,6 +361,18 @@ fn module_local_host_import_resolves_to_registry_dense_slot() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         vec![2]
+    );
+    realm
+        .load_module(identical_candidate, HOST_CONTRACT_ID, schema)
+        .expect("identical candidate reuses the validated dense Host plan");
+    assert_eq!(
+        realm.host_import_plan_cache_inspection(),
+        nexa_runtime::HostImportPlanCacheInspection {
+            entries: 1,
+            capacity: 8,
+            hits: 1,
+            misses: 1,
+        }
     );
 }
 

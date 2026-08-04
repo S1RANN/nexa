@@ -34,6 +34,10 @@ impl PartialOrd for ScheduledTask {
 
 #[derive(Debug, Default)]
 pub struct Scheduler {
+    /// WP85: the common one-runnable case never enters the priority heap.
+    /// A second runnable promotes both tokens into `ready`; draining the
+    /// heap back to one demotes the survivor here.
+    only_ready: Option<ScheduledTask>,
     ready: BinaryHeap<ScheduledTask>,
     waiting: Vec<(HostRequestHandle, TaskHandle)>,
     sequence: u64,
@@ -43,6 +47,7 @@ impl Scheduler {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            only_ready: None,
             ready: BinaryHeap::with_capacity(capacity),
             waiting: Vec::with_capacity(capacity),
             sequence: 0,
@@ -52,15 +57,34 @@ impl Scheduler {
     pub fn schedule(&mut self, task: TaskHandle, priority: u32) {
         let sequence = self.sequence;
         self.sequence = self.sequence.saturating_add(1);
-        self.ready.push(ScheduledTask {
+        let scheduled = ScheduledTask {
             task,
             priority,
             sequence,
-        });
+        };
+        if self.ready.is_empty() {
+            if let Some(existing) = self.only_ready.take() {
+                self.ready.push(existing);
+                self.ready.push(scheduled);
+            } else {
+                self.only_ready = Some(scheduled);
+            }
+        } else {
+            debug_assert!(self.only_ready.is_none());
+            self.ready.push(scheduled);
+        }
     }
 
     pub fn deschedule(&mut self, task: TaskHandle) {
+        if self
+            .only_ready
+            .is_some_and(|scheduled| scheduled.task == task)
+        {
+            self.only_ready = None;
+            return;
+        }
         self.ready.retain(|scheduled| scheduled.task != task);
+        self.demote_single_runnable();
     }
 
     pub fn wait_for(&mut self, request: HostRequestHandle, task: TaskHandle) {
@@ -99,6 +123,11 @@ impl Scheduler {
     #[cfg(any(test, feature = "model-adapter"))]
     #[must_use]
     pub(crate) fn checkpoint(&self, task: TaskHandle) -> SchedulerCheckpoint {
+        if let Some(scheduled) = self.only_ready.filter(|scheduled| scheduled.task == task) {
+            return SchedulerCheckpoint::Ready {
+                sequence: scheduled.sequence,
+            };
+        }
         if let Some(scheduled) = self.ready.iter().find(|scheduled| scheduled.task == task) {
             return SchedulerCheckpoint::Ready {
                 sequence: scheduled.sequence,
@@ -113,7 +142,22 @@ impl Scheduler {
     }
 
     pub fn pop_ready(&mut self) -> Option<TaskHandle> {
-        self.ready.pop().map(|scheduled| scheduled.task)
+        if let Some(scheduled) = self.only_ready.take() {
+            return Some(scheduled.task);
+        }
+        let scheduled = self.ready.pop()?;
+        self.demote_single_runnable();
+        Some(scheduled.task)
+    }
+
+    /// WP85 single-runnable fast-path admission.
+    ///
+    /// The caller is responsible for proving that Host completion and
+    /// release queues are quiescent. This method only consumes the queue
+    /// when exactly one runnable token exists, leaving the generic priority
+    /// rotation completely untouched otherwise.
+    pub(crate) fn pop_only_ready(&mut self) -> Option<TaskHandle> {
+        self.only_ready.take().map(|scheduled| scheduled.task)
     }
 
     #[must_use]
@@ -123,7 +167,17 @@ impl Scheduler {
 
     #[must_use]
     pub(crate) fn token_count(&self) -> usize {
-        self.ready.len().saturating_add(self.waiting.len())
+        self.ready
+            .len()
+            .saturating_add(usize::from(self.only_ready.is_some()))
+            .saturating_add(self.waiting.len())
+    }
+
+    fn demote_single_runnable(&mut self) {
+        if self.ready.len() == 1 {
+            debug_assert!(self.only_ready.is_none());
+            self.only_ready = self.ready.pop();
+        }
     }
 }
 
@@ -144,5 +198,19 @@ mod tests {
         assert_eq!(scheduler.pop_ready(), Some(task(1)));
         assert_eq!(scheduler.pop_ready(), Some(task(2)));
         assert_eq!(scheduler.pop_ready(), Some(task(0)));
+    }
+
+    #[test]
+    fn only_ready_never_consumes_a_general_queue() {
+        let task = |index| TaskHandle::from_raw(RawHandle::new(1, index, 0));
+        let mut scheduler = Scheduler::default();
+        assert_eq!(scheduler.pop_only_ready(), None);
+        scheduler.schedule(task(0), 1);
+        assert_eq!(scheduler.pop_only_ready(), Some(task(0)));
+        scheduler.schedule(task(1), 1);
+        scheduler.schedule(task(2), 1);
+        assert_eq!(scheduler.pop_only_ready(), None);
+        assert_eq!(scheduler.pop_ready(), Some(task(1)));
+        assert_eq!(scheduler.pop_ready(), Some(task(2)));
     }
 }

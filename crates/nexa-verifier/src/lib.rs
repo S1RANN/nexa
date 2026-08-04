@@ -105,14 +105,28 @@ impl std::error::Error for VerifyError {}
 
 #[derive(Clone, Debug)]
 pub struct VerifiedModule {
-    module: Module,
+    module: Arc<Module>,
     layout_table: Arc<nexa_bytecode::layout::LayoutTable>,
     module_abi: Arc<nexa_bytecode::layout::ModuleAbi>,
-    nominal_indexes: NominalIndexes,
-    resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
+    nominal_indexes: Arc<NominalIndexes>,
+    resolved_operands: Arc<Vec<Vec<ResolvedNominalOperand>>>,
     portable_fingerprint: [u8; 32],
     profile_fingerprint: [u8; 32],
     profile_metadata: Option<Arc<ModuleProfileMetadata>>,
+}
+
+/// Process-local immutable verifier authorities reused across reload
+/// candidates with equal content.
+///
+/// None of these flags weaken verification: both modules were admitted
+/// independently, and sharing happens only after exact structural equality.
+/// The result exists so Runtime can expose evidence that reload retained one
+/// copy instead of merely rebuilding equal allocations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifiedImmutableReuse {
+    pub layout_table: bool,
+    pub module_abi: bool,
+    pub profile_metadata: bool,
 }
 
 /// Cold semantic identity catalog used by the bounded Runtime profiler.
@@ -398,11 +412,11 @@ impl VerifiedModule {
         fingerprint.field_bytes("module", &module.encode());
         let portable_fingerprint = fingerprint.finish_bytes();
         Self {
-            module,
+            module: Arc::new(module),
             layout_table: Arc::new(layout_table),
             module_abi: Arc::new(module_abi),
-            nominal_indexes,
-            resolved_operands,
+            nominal_indexes: Arc::new(nominal_indexes),
+            resolved_operands: Arc::new(resolved_operands),
             portable_fingerprint,
             profile_fingerprint: portable_fingerprint,
             profile_metadata: None,
@@ -410,7 +424,7 @@ impl VerifiedModule {
     }
 
     #[must_use]
-    pub const fn module(&self) -> &Module {
+    pub fn module(&self) -> &Module {
         &self.module
     }
 
@@ -479,9 +493,31 @@ impl VerifiedModule {
         self.profile_metadata.as_ref()
     }
 
+    /// Rebind equal, immutable verifier products to the already resident
+    /// allocations owned by `other`.
+    ///
+    /// Portable bytecode, epoch/state identity, and profiler identity remain
+    /// those of `self`. Only content-equal derived authorities are shared.
+    pub fn reuse_immutable_from(&mut self, other: &Self) -> VerifiedImmutableReuse {
+        let mut reused = VerifiedImmutableReuse::default();
+        if self.layout_table == other.layout_table {
+            self.layout_table = Arc::clone(&other.layout_table);
+            reused.layout_table = true;
+        }
+        if self.module_abi == other.module_abi {
+            self.module_abi = Arc::clone(&other.module_abi);
+            reused.module_abi = true;
+        }
+        if self.profile_metadata == other.profile_metadata {
+            self.profile_metadata.clone_from(&other.profile_metadata);
+            reused.profile_metadata = self.profile_metadata.is_some();
+        }
+        reused
+    }
+
     #[must_use]
     pub fn into_module(self) -> Module {
-        self.module
+        Arc::try_unwrap(self.module).unwrap_or_else(|module| (*module).clone())
     }
 
     #[must_use]
