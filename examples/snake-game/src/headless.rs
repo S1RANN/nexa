@@ -13,6 +13,84 @@ pub struct BenchReport {
     pub p99: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct StressReport {
+    schema: u32,
+    steady_ticks: usize,
+    disable_enable_cycles: usize,
+    reload_cycles: usize,
+    entitlement_cycles: usize,
+    post_shutdown: ResourceSnapshot,
+    resource_leaks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct ResourceSnapshot {
+    enabled_packages: u64,
+    tasks: u64,
+    scopes: u64,
+    continuations: u64,
+    scheduler_tokens: u64,
+    requests: u64,
+    completion_reservations: u64,
+    tokens: u64,
+    snapshots: u64,
+    release_reservations: u64,
+    queued_releases: u64,
+    heap_objects: u64,
+    state_objects: u64,
+    retired_modules: u64,
+    host_pending_completions: u64,
+    host_pending_releases: u64,
+}
+
+impl ResourceSnapshot {
+    fn from_health(health: nexa_embed::EngineHealth) -> Self {
+        Self {
+            enabled_packages: u64::try_from(health.enabled_packages).unwrap_or(u64::MAX),
+            tasks: health.tasks,
+            scopes: health.scopes,
+            continuations: health.continuations,
+            scheduler_tokens: health.scheduler_tokens,
+            requests: health.requests,
+            completion_reservations: health.completion_reservations,
+            tokens: health.tokens,
+            snapshots: health.snapshots,
+            release_reservations: health.release_reservations,
+            queued_releases: health.queued_releases,
+            heap_objects: health.heap_objects,
+            state_objects: health.state_objects,
+            retired_modules: health.retired_modules,
+            host_pending_completions: u64::try_from(health.host_pending_completions)
+                .unwrap_or(u64::MAX),
+            host_pending_releases: u64::try_from(health.host_pending_releases).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn total(self) -> u64 {
+        [
+            self.enabled_packages,
+            self.tasks,
+            self.scopes,
+            self.continuations,
+            self.scheduler_tokens,
+            self.requests,
+            self.completion_reservations,
+            self.tokens,
+            self.snapshots,
+            self.release_reservations,
+            self.queued_releases,
+            self.heap_objects,
+            self.state_objects,
+            self.retired_modules,
+            self.host_pending_completions,
+            self.host_pending_releases,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+}
+
 pub fn smoke() -> Result<(), Box<dyn std::error::Error>> {
     let (mut game, mut extensions) = all_packages("smoke", true)?;
     for _ in 0..512 {
@@ -33,8 +111,9 @@ pub fn smoke() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
+pub fn stress() -> Result<StressReport, Box<dyn std::error::Error>> {
     const STEADY_TICKS: usize = 1_024;
+    const LIFECYCLE_CYCLES: usize = 100;
 
     let (mut game, mut extensions) = all_packages("stress", true)?;
     for _ in 0..128 {
@@ -61,7 +140,7 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let neon = package_id("community.neon-skin")?;
-    for _ in 0..100 {
+    for _ in 0..LIFECYCLE_CYCLES {
         extensions.queue_disable(neon.clone());
         extensions.apply_pending_actions(&mut game)?;
         extensions.queue_enable(neon.clone());
@@ -70,7 +149,7 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let overlay = package_id("community.score-overlay")?;
-    for _ in 0..100 {
+    for _ in 0..LIFECYCLE_CYCLES {
         extensions.queue_reload(overlay.clone());
         extensions.apply_pending_actions(&mut game)?;
         extensions.tick(&mut game)?;
@@ -86,7 +165,7 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
 
     let entitlement = EntitlementId::new("official.food-chaos")?;
     let dlc = package_id("official.food-chaos")?;
-    for _ in 0..100 {
+    for _ in 0..LIFECYCLE_CYCLES {
         extensions.set_entitlements([])?;
         if extensions
             .packages()
@@ -112,7 +191,20 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("registry leak or loss after stress: {view:?}").into());
     }
     extensions.shutdown(game.total_plays())?;
-    Ok(())
+    let post_shutdown = ResourceSnapshot::from_health(extensions.health());
+    let resource_leaks = post_shutdown.total();
+    if resource_leaks != 0 {
+        return Err(format!("shutdown left runtime resources: {post_shutdown:?}").into());
+    }
+    Ok(StressReport {
+        schema: 1,
+        steady_ticks: STEADY_TICKS,
+        disable_enable_cycles: LIFECYCLE_CYCLES,
+        reload_cycles: LIFECYCLE_CYCLES,
+        entitlement_cycles: LIFECYCLE_CYCLES,
+        post_shutdown,
+        resource_leaks,
+    })
 }
 
 pub fn bench() -> Result<BenchReport, Box<dyn std::error::Error>> {
@@ -192,6 +284,7 @@ fn assert_transient_resources(
         || health.snapshots != 0
         || health.release_reservations != 0
         || health.queued_releases != 0
+        || health.retired_modules != 0
         || health.host_pending_completions != 0
         || health.host_pending_releases != 0
     {

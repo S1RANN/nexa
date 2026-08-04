@@ -2232,11 +2232,63 @@ fn test_host_engine_performance() -> Result<(), DynError> {
 /// M5 WP99 product gate. Every command below executes a real canonical
 /// package/build/runtime path; the receipt is written only after the entire
 /// corpus succeeds and is pinned to the current implementation commit.
+fn valid_snake_stress_report(report: &Value) -> bool {
+    const RESOURCE_FIELDS: [&str; 16] = [
+        "enabled_packages",
+        "tasks",
+        "scopes",
+        "continuations",
+        "scheduler_tokens",
+        "requests",
+        "completion_reservations",
+        "tokens",
+        "snapshots",
+        "release_reservations",
+        "queued_releases",
+        "heap_objects",
+        "state_objects",
+        "retired_modules",
+        "host_pending_completions",
+        "host_pending_releases",
+    ];
+    report["schema"] == 1
+        && report["steady_ticks"] == 1_024
+        && report["disable_enable_cycles"] == 100
+        && report["reload_cycles"] == 100
+        && report["entitlement_cycles"] == 100
+        && report["resource_leaks"].as_u64() == Some(0)
+        && report["post_shutdown"]
+            .as_object()
+            .is_some_and(|resources| {
+                resources.len() == RESOURCE_FIELDS.len()
+                    && RESOURCE_FIELDS
+                        .iter()
+                        .all(|field| resources.get(*field).and_then(Value::as_u64) == Some(0))
+            })
+}
+
 fn m5_product_corpus() -> Result<(), DynError> {
     let root = workspace_root();
     cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])?;
     test_snake()?;
-    snake_headless("stress")?;
+    let snake_stress: Value = serde_json::from_str(&captured_stdout(
+        Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "-p",
+                "snake-game",
+                "--bin",
+                "snake-headless",
+                "--",
+                "stress",
+            ])
+            .current_dir(&root),
+        "snake-headless stress",
+    )?)?;
+    if !valid_snake_stress_report(&snake_stress) {
+        return Err("Snake stress omitted exact post-shutdown resource evidence".into());
+    }
     cargo(&["run", "-p", "combat-runtime"])?;
     cargo(&[
         "test",
@@ -2284,6 +2336,7 @@ fn m5_product_corpus() -> Result<(), DynError> {
             "engine_package_scales": [0, 9, 20, 50],
             "enable_disable_reload": "PASS",
             "required_and_optional_dispatch": "PASS",
+            "stress_receipt": snake_stress,
         },
         "combat": {
             "canonical_package_pipeline": "PASS",
@@ -2912,10 +2965,14 @@ fn v8_gap_condition(final_dir: &Path, aggregate: &Value) -> Value {
         .and_then(|value| usize::try_from(value).ok());
     let satisfied = comparison["c4_v8_gap_satisfied"].as_bool();
     let malformed = comparison["schema"].as_u64() != Some(1)
+        || comparison["status"] != "PASS"
         || comparison["protocol"]
             != "7 processes x 1000 samples per side; median across process medians; per-process warmup"
         || comparison["result_parity"]
             != "all workloads returned identical results in both runtimes"
+        || comparison["semantic_mismatches"]
+            .as_array()
+            .is_none_or(|mismatches| !mismatches.is_empty())
         || comparison["processes"].as_u64() != Some(7)
         || comparison["samples_per_process"].as_u64() != Some(1_000)
         || comparison["warmup_per_process"].as_u64() != Some(100)
@@ -3183,6 +3240,7 @@ fn m5_v8_comparison() -> Result<(), DynError> {
 
     let comparison = serde_json::json!({
         "schema": 1,
+        "status": "PASS",
         "protocol": "7 processes x 1000 samples per side; median across process medians; per-process warmup",
         "discipline": "warm V8 JIT-compiled code measured against the Nexa interpreter (JIT_DECISION_V1.md)",
         "node_version": node_version,
@@ -3204,6 +3262,7 @@ fn m5_v8_comparison() -> Result<(), DynError> {
             "thermal_policy": aggregate["thermal_policy"],
         },
         "result_parity": "all workloads returned identical results in both runtimes",
+        "semantic_mismatches": parity_failures,
         "workloads": workloads,
         "workloads_with_v8_lead_at_least_1_5x": leads,
         "c4_v8_gap_satisfied": leads >= 3,
@@ -3784,11 +3843,13 @@ fn finalize_m5() -> Result<(), DynError> {
     let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
     let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
     let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
+    let v8_path = root.join("target/nexa-artifacts/m5/final/v8-comparison.json");
     let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
     let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
     let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
     let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
     let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
+    let v8: Value = serde_json::from_slice(&fs::read(&v8_path)?)?;
     let reload_peak = reload_peak_report_at(&reload_peak_path, &head)
         .ok_or("WP97 reload peak receipt is stale or malformed")?;
     let cold_start = cold_start_report_at(&cold_start_path, &head)
@@ -3825,6 +3886,14 @@ fn finalize_m5() -> Result<(), DynError> {
     let steady_state_dispatch_system_allocations = steady_state_dispatch["max_system_allocations"]
         .as_u64()
         .ok_or("WP92 allocation receipt omitted its maximum")?;
+    let snake_stress = &product["snake"]["stress_receipt"];
+    let resource_leaks = snake_stress["resource_leaks"]
+        .as_u64()
+        .ok_or("Snake stress receipt omitted its post-shutdown leak count")?;
+    let semantic_mismatches = v8["semantic_mismatches"]
+        .as_array()
+        .ok_or("V8 comparison omitted its semantic mismatch evidence")?
+        .clone();
     for bucket in [
         "product_cpu",
         "value_collection",
@@ -3854,6 +3923,13 @@ fn finalize_m5() -> Result<(), DynError> {
         || product["schema"].as_u64() != Some(1)
         || product["implementation_commit"] != head
         || product["status"] != "PASS"
+        || !valid_snake_stress_report(snake_stress)
+        || resource_leaks != 0
+        || v8["schema"] != 1
+        || v8["status"] != "PASS"
+        || v8["nexa_implementation_commit"] != head
+        || v8["result_parity"] != "all workloads returned identical results in both runtimes"
+        || !semantic_mismatches.is_empty()
         || reload_peak["implementation_commit"] != head
         || reload_peak["status"] != "PASS"
         || performance["reload_peak"]["implementation_commit"] != head
@@ -3922,8 +3998,10 @@ fn finalize_m5() -> Result<(), DynError> {
         "steadyStateDispatchSystemAllocations": steady_state_dispatch_system_allocations,
         "steadyStateDispatchReceipt": steady_state_dispatch,
         "unexplainedRegressions": unexplained_regressions,
-        "semanticMismatches": [],
-        "resourceLeaks": 0,
+        "semanticMismatches": semantic_mismatches,
+        "semanticParityReceipt": v8,
+        "resourceLeaks": resource_leaks,
+        "resourceLeakReceipt": snake_stress,
         "jitDecision": jit_decision,
         "workspace": {
             "fmt": "PASS",
@@ -6354,6 +6432,7 @@ mod audit_tests {
             .collect::<Vec<_>>();
         let mut comparison = serde_json::json!({
             "schema": 1,
+            "status": "PASS",
             "protocol": "7 processes x 1000 samples per side; median across process medians; per-process warmup",
             "node_version": "v24.0.0",
             "v8_version": "13.0",
@@ -6364,6 +6443,7 @@ mod audit_tests {
             "nexa_implementation_commit": "head",
             "qualification_machine": qualification_machine,
             "result_parity": "all workloads returned identical results in both runtimes",
+            "semantic_mismatches": [],
             "workloads": workloads,
             "workloads_with_v8_lead_at_least_1_5x": 3,
             "c4_v8_gap_satisfied": true,
@@ -6402,5 +6482,38 @@ mod audit_tests {
             "malformed"
         );
         fs::remove_dir_all(directory).expect("fixture cleans up");
+    }
+
+    #[test]
+    fn snake_stress_receipt_requires_zero_post_shutdown_resources() {
+        let mut report = serde_json::json!({
+            "schema": 1,
+            "steady_ticks": 1_024,
+            "disable_enable_cycles": 100,
+            "reload_cycles": 100,
+            "entitlement_cycles": 100,
+            "post_shutdown": {
+                "enabled_packages": 0,
+                "tasks": 0,
+                "scopes": 0,
+                "continuations": 0,
+                "scheduler_tokens": 0,
+                "requests": 0,
+                "completion_reservations": 0,
+                "tokens": 0,
+                "snapshots": 0,
+                "release_reservations": 0,
+                "queued_releases": 0,
+                "heap_objects": 0,
+                "state_objects": 0,
+                "retired_modules": 0,
+                "host_pending_completions": 0,
+                "host_pending_releases": 0,
+            },
+            "resource_leaks": 0,
+        });
+        assert!(super::valid_snake_stress_report(&report));
+        report["post_shutdown"]["retired_modules"] = serde_json::Value::from(1);
+        assert!(!super::valid_snake_stress_report(&report));
     }
 }

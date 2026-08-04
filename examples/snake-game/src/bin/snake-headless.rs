@@ -5,8 +5,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("snake headless smoke: PASS");
         }
         Some("stress") => {
-            snake_game::headless::stress()?;
-            println!("snake stress: PASS");
+            let report = snake_game::headless::stress()?;
+            println!("{}", serde_json::to_string(&report)?);
         }
         Some("bench") => {
             let report = snake_game::headless::bench()?;
