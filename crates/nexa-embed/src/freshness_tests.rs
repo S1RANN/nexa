@@ -109,6 +109,7 @@ impl ScriptExport for Run {
 
     const STABLE_ID: StableId = RUN_ID;
     const NAME: &'static str = "run";
+    const CONTRACT_SLOT: usize = 0;
     const SIGNATURE: ScriptSignature =
         ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
     const EFFECT: FunctionEffect = FunctionEffect::Ordinary;

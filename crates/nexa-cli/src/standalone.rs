@@ -58,6 +58,7 @@ impl nexa::ScriptExport for StandaloneMain {
 
     const STABLE_ID: nexa::StableId = nexa::STANDALONE_MAIN_STABLE_ID;
     const NAME: &'static str = "main";
+    const CONTRACT_SLOT: usize = 0;
     const SIGNATURE: nexa::ScriptSignature = nexa::ScriptSignature::new(
         &[nexa::prelude::ValueType::Named(
             nexa::prelude::ArrayType::new(nexa::prelude::ValueType::String).type_id,

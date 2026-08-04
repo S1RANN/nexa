@@ -38,6 +38,36 @@ impl ModuleHandle {
     }
 }
 
+/// Load-time-resolved call plan for one script export.
+///
+/// Its fields are deliberately private: only [`RealmRuntime`] may create a
+/// plan after validating the portable export, verified function metadata,
+/// declaration signature, and declaration effect. Steady-state typed calls
+/// can therefore dispatch by function index without repeating a Stable ID
+/// lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedScriptExport {
+    module: ModuleHandle,
+    stable_id: StableId,
+    signature: Signature,
+    declared_effect: FunctionEffect,
+    function: u32,
+    effect: FunctionEffect,
+    portable_export_index: usize,
+}
+
+impl PreparedScriptExport {
+    #[must_use]
+    pub const fn portable_export_index(&self) -> usize {
+        self.portable_export_index
+    }
+
+    #[must_use]
+    pub const fn effect(&self) -> FunctionEffect {
+        self.effect
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModuleLifecycle {
     Active,
@@ -2929,6 +2959,69 @@ impl RealmRuntime {
         Ok(export.function)
     }
 
+    /// Resolves and validates one declared export while admitting a module.
+    ///
+    /// Absence is represented as `Ok(None)` so optional NIDL entrypoints can
+    /// share the same dense contract-slot table as required entrypoints.
+    /// Every metadata mismatch is rejected before the plan becomes usable.
+    pub fn prepare_script_export(
+        &self,
+        module: ModuleHandle,
+        stable_id: StableId,
+        signature: &Signature,
+        declared_effect: FunctionEffect,
+    ) -> Result<Option<PreparedScriptExport>, RealmError> {
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        if loaded.lifecycle != ModuleLifecycle::Active {
+            return Err(RealmError::ModuleNotCallable);
+        }
+        let Some(portable_export_index) = loaded.executable.export_index(stable_id) else {
+            return Ok(None);
+        };
+        let export = loaded
+            .verified
+            .module()
+            .exports
+            .get(portable_export_index)
+            .ok_or(RealmError::ScriptExportMetadataMismatch(stable_id))?;
+        if export.stable_id != stable_id
+            || &export.signature != signature
+            || !export_effect_satisfies(export.effect, declared_effect)
+        {
+            return Err(RealmError::ScriptExportMetadataMismatch(stable_id));
+        }
+        let function = loaded
+            .verified
+            .module()
+            .functions
+            .get(
+                usize::try_from(export.function)
+                    .map_err(|_| RealmError::ScriptExportMetadataMismatch(stable_id))?,
+            )
+            .ok_or(RealmError::ScriptExportMetadataMismatch(stable_id))?;
+        if function.signature != export.signature || function.effect != export.effect {
+            return Err(RealmError::ScriptExportMetadataMismatch(stable_id));
+        }
+        if matches!(
+            function.effect,
+            FunctionEffect::Migration | FunctionEffect::Cleanup
+        ) {
+            return Err(RealmError::ScriptExportNotCallable(stable_id));
+        }
+        Ok(Some(PreparedScriptExport {
+            module,
+            stable_id,
+            signature: signature.clone(),
+            declared_effect,
+            function: export.function,
+            effect: function.effect,
+            portable_export_index,
+        }))
+    }
+
     fn resolve_export_index<E: crate::ScriptExport>(
         &self,
         module: ModuleHandle,
@@ -2987,6 +3080,40 @@ impl RealmRuntime {
         Ok((export.function, function.effect))
     }
 
+    fn validate_prepared_export<E: crate::ScriptExport>(
+        prepared: &PreparedScriptExport,
+    ) -> Result<(), crate::ScriptCallError> {
+        if prepared.stable_id != E::STABLE_ID {
+            return Err(crate::ScriptCallError::MissingExport {
+                name: E::NAME,
+                stable_id: E::STABLE_ID,
+            });
+        }
+        if !E::SIGNATURE.matches(&prepared.signature) {
+            return Err(crate::ScriptCallError::SignatureMismatch { name: E::NAME });
+        }
+        if prepared.declared_effect != E::EFFECT
+            || !export_effect_satisfies(prepared.effect, E::EFFECT)
+        {
+            return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
+        }
+        Ok(())
+    }
+
+    fn encode_export_arguments<E: crate::ScriptExport>(
+        &mut self,
+        args: &E::Args,
+    ) -> Result<crate::ScriptArguments, crate::ScriptCallError> {
+        let requirements = E::argument_requirements(args)?;
+        let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
+            .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+        let values = E::encode_args(&mut writer, args)?;
+        writer
+            .commit_arguments()
+            .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+        Ok(values)
+    }
+
     pub fn spawn_export<E: crate::ScriptExport>(
         &mut self,
         module: ModuleHandle,
@@ -2994,18 +3121,27 @@ impl RealmRuntime {
         config: StepConfig,
     ) -> Result<TaskHandle, crate::ScriptCallError> {
         let function = self.resolve_export_index::<E>(module)?;
-        let requirements = E::argument_requirements(args)?;
-        let values = {
-            let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
-            let values = E::encode_args(&mut writer, args)?;
-            writer
-                .commit_arguments()
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
-            values
-        };
+        let values = self.encode_export_arguments::<E>(args)?;
         self.spawn_task_inner(module, function, values.as_slice(), config)
             .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))
+    }
+
+    /// Starts a typed call through a load-time-resolved export plan.
+    pub fn spawn_prepared_export<E: crate::ScriptExport>(
+        &mut self,
+        prepared: &PreparedScriptExport,
+        args: &E::Args,
+        config: StepConfig,
+    ) -> Result<TaskHandle, crate::ScriptCallError> {
+        Self::validate_prepared_export::<E>(prepared)?;
+        let values = self.encode_export_arguments::<E>(args)?;
+        self.spawn_task_inner(
+            prepared.module,
+            prepared.function,
+            values.as_slice(),
+            config,
+        )
+        .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))
     }
 
     pub fn call_export<E: crate::ScriptExport>(
@@ -3037,7 +3173,38 @@ impl RealmRuntime {
                 limits: crate::TaskLimits::default(),
             },
         )?;
-        match self.poll_task(task, policy.fuel) {
+        self.settle_export_task::<E>(task, policy.fuel)
+    }
+
+    /// Calls a typed export through a load-time-resolved plan and returns
+    /// its deterministic execution charge.
+    pub fn call_prepared_export_metered<E: crate::ScriptExport>(
+        &mut self,
+        prepared: &PreparedScriptExport,
+        owner: ScopeHandle,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
+        let task = self.spawn_prepared_export::<E>(
+            prepared,
+            args,
+            StepConfig {
+                owner,
+                priority: 1,
+                fuel_slice: policy.fuel,
+                cumulative_budget: policy.cumulative_budget,
+                limits: crate::TaskLimits::default(),
+            },
+        )?;
+        self.settle_export_task::<E>(task, policy.fuel)
+    }
+
+    fn settle_export_task<E: crate::ScriptExport>(
+        &mut self,
+        task: TaskHandle,
+        fuel: u64,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
+        match self.poll_task(task, fuel) {
             Ok(TaskPoll::Completed(value)) => {
                 let reader = crate::ScriptOutputReader::new(&self.heap);
                 let output = E::decode_output(&reader, value);
@@ -3093,16 +3260,31 @@ impl RealmRuntime {
         if effect != FunctionEffect::Immediate {
             return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
         }
-        let requirements = E::argument_requirements(args)?;
-        let values = {
-            let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
-            let values = E::encode_args(&mut writer, args)?;
-            writer
-                .commit_arguments()
-                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
-            values
-        };
+        self.call_export_immediate_function::<E>(module, function, args, policy)
+    }
+
+    /// Calls an immediate export through a load-time-resolved plan.
+    pub fn call_prepared_export_immediate<E: crate::ScriptExport>(
+        &mut self,
+        prepared: &PreparedScriptExport,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
+        Self::validate_prepared_export::<E>(prepared)?;
+        if prepared.effect != FunctionEffect::Immediate {
+            return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
+        }
+        self.call_export_immediate_function::<E>(prepared.module, prepared.function, args, policy)
+    }
+
+    fn call_export_immediate_function<E: crate::ScriptExport>(
+        &mut self,
+        module: ModuleHandle,
+        function: u32,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
+        let values = self.encode_export_arguments::<E>(args)?;
         let loaded = self
             .modules
             .resolve(module.raw())

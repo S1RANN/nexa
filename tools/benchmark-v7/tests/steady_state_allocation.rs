@@ -73,7 +73,7 @@ const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints {
 }";
 
 macro_rules! i32_entrypoint {
-    ($marker:ident, $name:literal, $stable_id:literal, $effect:ident) => {
+    ($marker:ident, $name:literal, $stable_id:literal, $contract_slot:expr, $effect:ident) => {
         struct $marker;
 
         impl ScriptExport for $marker {
@@ -82,6 +82,7 @@ macro_rules! i32_entrypoint {
 
             const STABLE_ID: StableId = StableId($stable_id);
             const NAME: &'static str = $name;
+            const CONTRACT_SLOT: usize = $contract_slot;
             const SIGNATURE: ScriptSignature =
                 ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
             const EFFECT: FunctionEffect = FunctionEffect::$effect;
@@ -118,17 +119,19 @@ macro_rules! i32_entrypoint {
 // for a sync contract function. The packages strengthen
 // `calculate_food_effect` to `@immediate`, so the engine's module-effect
 // routing (WP89) must send it down the task-free path on its own.
-i32_entrypoint!(OnEvent, "on_event", 0xefff_24e2_9dbd_2cb4, Ordinary);
+i32_entrypoint!(OnEvent, "on_event", 0xefff_24e2_9dbd_2cb4, 2, Ordinary);
 i32_entrypoint!(
     ChooseFoodSpawn,
     "choose_food_spawn",
     0x0418_ea07_84bf_08cf,
+    1,
     Ordinary
 );
 i32_entrypoint!(
     CalculateFoodEffect,
     "calculate_food_effect",
     0xe9ac_e9e4_2957_0132,
+    0,
     Ordinary
 );
 

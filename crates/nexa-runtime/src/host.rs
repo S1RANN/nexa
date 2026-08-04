@@ -2885,6 +2885,7 @@ pub trait ScriptExport {
 
     const STABLE_ID: StableId;
     const NAME: &'static str;
+    const CONTRACT_SLOT: usize;
     const SIGNATURE: ScriptSignature;
     const EFFECT: nexa_bytecode::FunctionEffect;
 

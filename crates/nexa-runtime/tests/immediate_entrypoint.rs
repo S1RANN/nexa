@@ -29,6 +29,7 @@ impl ScriptExport for ImmediateAdd {
 
     const STABLE_ID: StableId = IMMEDIATE_EXPORT;
     const NAME: &'static str = "immediate_add";
+    const CONTRACT_SLOT: usize = 0;
     const SIGNATURE: ScriptSignature =
         ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
     const EFFECT: FunctionEffect = FunctionEffect::Immediate;
@@ -65,6 +66,7 @@ impl ScriptExport for ImmediateTrap {
 
     const STABLE_ID: StableId = TRAP_EXPORT;
     const NAME: &'static str = "immediate_trap";
+    const CONTRACT_SLOT: usize = 1;
     const SIGNATURE: ScriptSignature =
         ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
     const EFFECT: FunctionEffect = FunctionEffect::Immediate;
@@ -101,6 +103,7 @@ impl ScriptExport for TaskAdd {
 
     const STABLE_ID: StableId = TASK_EXPORT;
     const NAME: &'static str = "task_add";
+    const CONTRACT_SLOT: usize = 2;
     const SIGNATURE: ScriptSignature =
         ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
     const EFFECT: FunctionEffect = FunctionEffect::Task;
@@ -199,19 +202,49 @@ fn immediate_calls_build_no_task_lifecycle_and_match_the_metered_charge() {
         fuel: 256,
         cumulative_budget: 1_024,
     };
+    let immediate_plan = realm
+        .prepare_script_export(
+            module,
+            ImmediateAdd::STABLE_ID,
+            &ImmediateAdd::SIGNATURE.into_owned(),
+            ImmediateAdd::EFFECT,
+        )
+        .expect("prepare immediate export")
+        .expect("immediate export exists");
+    let task_plan = realm
+        .prepare_script_export(
+            module,
+            TaskAdd::STABLE_ID,
+            &TaskAdd::SIGNATURE.into_owned(),
+            TaskAdd::EFFECT,
+        )
+        .expect("prepare task export")
+        .expect("task export exists");
+    assert!(
+        realm
+            .prepare_script_export(
+                module,
+                StableId(u64::MAX),
+                &ImmediateAdd::SIGNATURE.into_owned(),
+                ImmediateAdd::EFFECT,
+            )
+            .expect("optional export lookup")
+            .is_none(),
+        "absent optional exports prepare as None"
+    );
 
     // The metered Task path over an identical function body pins the
     // expected result and fuel charge.
     let scope = realm.create_scope(None).expect("scope");
     let (task_value, task_charge) = realm
-        .call_export_metered::<TaskAdd>(module, scope, &41, policy)
+        .call_prepared_export_metered::<TaskAdd>(&task_plan, scope, &41, policy)
         .expect("metered call");
     assert_eq!(task_value, 42);
     let after_task = realm.resource_ledger();
 
     for round in 0..16_i32 {
         let (value, charge) = realm
-            .call_export_immediate::<ImmediateAdd>(module, &round, policy)
+            .call_prepared_export_immediate::<ImmediateAdd>(&immediate_plan, &round, policy)
             .expect("immediate call");
         assert_eq!(value, round + 1, "immediate result (round {round})");
         assert_eq!(
@@ -229,6 +262,12 @@ fn immediate_calls_build_no_task_lifecycle_and_match_the_metered_charge() {
             "no Task, token, or continuation entry appears (round {round})"
         );
     }
+    assert!(matches!(
+        realm
+            .call_prepared_export_immediate::<ImmediateTrap>(&immediate_plan, &1, policy)
+            .expect_err("a prepared plan cannot be used with another marker"),
+        ScriptCallError::MissingExport { .. }
+    ));
     // The continuation storage cycles through the H1 pool instead of
     // accumulating anywhere.
     assert!(realm.continuation_pool_depth() >= 1);

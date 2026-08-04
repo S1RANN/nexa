@@ -140,6 +140,24 @@ pub(crate) fn effect_satisfies_declaration(
             && found == nexa_runtime::FunctionEffect::Immediate)
 }
 
+fn prepare_entrypoint_plans(
+    realm: &nexa_runtime::RealmRuntime,
+    module: nexa_runtime::ModuleHandle,
+    declared_entrypoints: &[EntrypointSignature],
+) -> Result<Vec<Option<nexa_runtime::PreparedScriptExport>>, nexa_runtime::RealmError> {
+    declared_entrypoints
+        .iter()
+        .map(|declared| {
+            realm.prepare_script_export(
+                module,
+                declared.stable_id,
+                &declared.signature,
+                declared.effect,
+            )
+        })
+        .collect()
+}
+
 pub struct NexaEngine {
     contract: HostContract,
     idl: nexa_idl::ValidatedContract,
@@ -160,7 +178,6 @@ pub struct NexaEngine {
     diagnostics: BoundedDiagnosticLog,
     required_exports: Vec<ExportRequirement>,
     declared_entrypoints: Vec<EntrypointSignature>,
-    declared_entrypoint_slots: BTreeMap<nexa::StableId, usize>,
     optional_dispatch_plans: Vec<Vec<usize>>,
     persisted: BTreeMap<PackageId, bool>,
     development: DevelopmentConfig,
@@ -202,7 +219,7 @@ impl NexaEngine {
                 "generated Host Contract descriptor mismatch".into(),
             ));
         }
-        let declared_entrypoints = idl
+        let mut declared_entrypoints = idl
             .nexa_functions
             .iter()
             .map(|entrypoint| EntrypointSignature {
@@ -216,6 +233,15 @@ impl NexaEngine {
                 },
             })
             .collect::<Vec<_>>();
+        // Contract slots are canonical ABI positions, not source-order
+        // positions. This matches generated marker ordering and keeps a
+        // declaration-only source reorder from retargeting every hot call.
+        declared_entrypoints.sort_by(|left, right| {
+            left.name
+                .as_bytes()
+                .cmp(right.name.as_bytes())
+                .then_with(|| left.stable_id.cmp(&right.stable_id))
+        });
         for required in &builder.required_exports {
             let Some(declared) = declared_entrypoints
                 .iter()
@@ -310,7 +336,6 @@ impl NexaEngine {
             diagnostics: BoundedDiagnosticLog::default(),
             required_exports,
             declared_entrypoints,
-            declared_entrypoint_slots,
             optional_dispatch_plans,
             persisted,
             development: builder.development,
@@ -709,23 +734,14 @@ impl NexaEngine {
         let root_scope = realm
             .create_scope(None)
             .map_err(|error| EngineError::Load(manifest.id.clone(), error.to_string()))?;
-        let entrypoint_exports = self
-            .declared_entrypoints
-            .iter()
-            .map(|declared| {
-                artifact
-                    .module()
-                    .exports
-                    .iter()
-                    .position(|export| export.stable_id == declared.stable_id)
-            })
-            .collect();
+        let entrypoints = prepare_entrypoint_plans(&realm, module, &self.declared_entrypoints)
+            .map_err(|error| EngineError::Load(manifest.id.clone(), error.to_string()))?;
         Ok(PackageRuntime {
             realm,
             module,
             root_scope,
             artifact,
-            entrypoint_exports,
+            entrypoints,
         })
     }
 
@@ -1301,9 +1317,48 @@ impl NexaEngine {
             .unwrap_or_default();
         match outcome {
             Ok(nexa_runtime::RestartReloadOutcome::Committed(module)) => {
+                let entrypoints = self.packages[index].runtime.as_ref().map_or_else(
+                    || {
+                        Err(EngineError::InvalidState(
+                            id.clone(),
+                            PackageStatus::Reloading,
+                        ))
+                    },
+                    |runtime| {
+                        prepare_entrypoint_plans(&runtime.realm, module, &self.declared_entrypoints)
+                            .map_err(|error| EngineError::Load(id.clone(), error.to_string()))
+                    },
+                );
+                let entrypoints = match entrypoints {
+                    Ok(entrypoints) => entrypoints,
+                    Err(error) => {
+                        self.packages[index].runtime = None;
+                        let _ = self.packages[index]
+                            .lifecycle
+                            .transition(PackageStatus::Faulted);
+                        let summary = self.record_error(index, &error);
+                        self.packages[index].last_diagnostic = Some(summary);
+                        self.drain_releases();
+                        return Err(ReloadFailure::new(
+                            reload_report(
+                                identity,
+                                old_epoch,
+                                None,
+                                compile_duration,
+                                verify_duration,
+                                reload_metrics,
+                                ReloadReportOutcome::ActivationFaulted,
+                                accounting.cancelled_tasks,
+                                accounting.detached_requests,
+                            ),
+                            error,
+                        ));
+                    }
+                };
                 let new_epoch = if let Some(runtime) = self.packages[index].runtime.as_mut() {
                     runtime.module = module;
                     runtime.artifact = artifact.clone();
+                    runtime.entrypoints = entrypoints;
                     runtime.realm.active_module_epoch(module).ok()
                 } else {
                     None
@@ -2899,7 +2954,10 @@ impl NexaEngine {
         let Ok(index) = self.unique_index(id) else {
             return false;
         };
-        self.package_entrypoint(index, E::STABLE_ID)
+        let Some(slot) = self.typed_entrypoint_slot::<E>() else {
+            return false;
+        };
+        self.package_entrypoint_at(index, slot)
             .is_some_and(|(signature, effect)| {
                 E::SIGNATURE.matches(signature) && effect_satisfies_declaration(effect, E::EFFECT)
             })
@@ -2918,7 +2976,8 @@ impl NexaEngine {
             Ok(index) => index,
             Err(error) => return Some(Err(error)),
         };
-        let (signature, effect) = self.package_entrypoint(index, E::STABLE_ID)?;
+        let slot = self.typed_entrypoint_slot::<E>()?;
+        let (signature, effect) = self.package_entrypoint_at(index, slot)?;
         if !E::SIGNATURE.matches(signature) || !effect_satisfies_declaration(effect, E::EFFECT) {
             return Some(Err(EngineError::ExportSignature(
                 id.clone(),
@@ -2947,7 +3006,7 @@ impl NexaEngine {
         outputs: &'a mut Vec<PackageCallResult<E::Output>>,
     ) -> DispatchSlice<'a, E::Output> {
         outputs.clear();
-        let Some(&slot) = self.declared_entrypoint_slots.get(&E::STABLE_ID) else {
+        let Some(slot) = self.typed_entrypoint_slot::<E>() else {
             return Ok(outputs);
         };
         let mut plan = std::mem::take(&mut self.optional_dispatch_plans[slot]);
@@ -2983,11 +3042,14 @@ impl NexaEngine {
     }
 
     fn package_matches_optional_export<E: nexa_runtime::ScriptExport>(&self, index: usize) -> bool {
+        let Some(slot) = self.typed_entrypoint_slot::<E>() else {
+            return false;
+        };
         self.packages
             .get(index)
             .is_some_and(|record| record.lifecycle.status() == PackageStatus::Enabled)
             && self
-                .package_entrypoint(index, E::STABLE_ID)
+                .package_entrypoint_at(index, slot)
                 .is_some_and(|(signature, effect)| {
                     E::SIGNATURE.matches(signature)
                         && effect_satisfies_declaration(effect, E::EFFECT)
@@ -3027,25 +3089,37 @@ impl NexaEngine {
         true
     }
 
-    fn package_entrypoint(
+    fn typed_entrypoint_slot<E: nexa_runtime::ScriptExport>(&self) -> Option<usize> {
+        let declared = self.declared_entrypoints.get(E::CONTRACT_SLOT)?;
+        (declared.stable_id == E::STABLE_ID
+            && E::SIGNATURE.matches(&declared.signature)
+            && declared.effect == E::EFFECT)
+            .then_some(E::CONTRACT_SLOT)
+    }
+
+    fn package_entrypoint_at(
         &self,
         index: usize,
-        stable_id: nexa::StableId,
+        slot: usize,
     ) -> Option<(&nexa_runtime::Signature, nexa_runtime::FunctionEffect)> {
-        let record = &self.packages[index];
-        let slot = *self.declared_entrypoint_slots.get(&stable_id)?;
+        let record = self.packages.get(index)?;
         let (artifact, export_index) = if let Some(runtime) = &record.runtime {
             (
                 &runtime.artifact,
-                *runtime.entrypoint_exports.get(slot)?.as_ref()?,
+                runtime
+                    .entrypoints
+                    .get(slot)?
+                    .as_ref()?
+                    .portable_export_index(),
             )
         } else {
+            let declared = self.declared_entrypoints.get(slot)?;
             let artifact = &record.last_known_good.as_ref()?.artifact;
             let export_index = artifact
                 .module()
                 .exports
                 .iter()
-                .position(|entrypoint| entrypoint.stable_id == stable_id)?;
+                .position(|entrypoint| entrypoint.stable_id == declared.stable_id)?;
             (artifact, export_index)
         };
         let entrypoint = artifact.module().exports.get(export_index)?;
@@ -3061,6 +3135,12 @@ impl NexaEngine {
         index: usize,
         args: &E::Args,
     ) -> Result<PackageOutput<E::Output>, EngineError> {
+        let slot = self.typed_entrypoint_slot::<E>().ok_or_else(|| {
+            EngineError::UndeclaredEntrypoint(
+                self.packages[index].candidate.manifest.id.clone(),
+                E::STABLE_ID,
+            )
+        })?;
         let record = &mut self.packages[index];
         if record.lifecycle.status() != PackageStatus::Enabled {
             return Err(EngineError::InvalidState(
@@ -3076,6 +3156,11 @@ impl NexaEngine {
         let runtime = record.runtime.as_mut().ok_or_else(|| {
             EngineError::InvalidState(manifest.id.clone(), PackageStatus::Enabled)
         })?;
+        let prepared = runtime
+            .entrypoints
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| EngineError::MissingExport(manifest.id.clone(), E::NAME.to_owned()))?;
         record.handler_calls_this_tick = record.handler_calls_this_tick.saturating_add(1);
         // WP89: exports whose module function is `@immediate` skip the
         // Task/scheduler/tombstone lifecycle entirely (the realm settles
@@ -3084,21 +3169,17 @@ impl NexaEngine {
         // strengthen an Ordinary declaration to `@immediate` and every
         // Ordinary caller must still benefit. All other effects keep the
         // metered Task path.
-        let immediate = runtime
-            .artifact
-            .module()
-            .exports
-            .iter()
-            .find(|export| export.stable_id == E::STABLE_ID)
-            .is_some_and(|export| export.effect == nexa_runtime::FunctionEffect::Immediate);
-        let called = if immediate {
+        let called = if prepared.effect() == nexa_runtime::FunctionEffect::Immediate {
             runtime
                 .realm
-                .call_export_immediate::<E>(runtime.module, args, policy)
+                .call_prepared_export_immediate::<E>(prepared, args, policy)
         } else {
-            runtime
-                .realm
-                .call_export_metered::<E>(runtime.module, runtime.root_scope, args, policy)
+            runtime.realm.call_prepared_export_metered::<E>(
+                prepared,
+                runtime.root_scope,
+                args,
+                policy,
+            )
         };
         match called {
             Ok((value, charge)) => {

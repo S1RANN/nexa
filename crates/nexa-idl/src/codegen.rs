@@ -3229,7 +3229,8 @@ fn generate_nexa_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
     let markers = model
         .nexa_functions
         .iter()
-        .map(|function| generate_nexa_marker(model, function))
+        .enumerate()
+        .map(|(contract_slot, function)| generate_nexa_marker(model, function, contract_slot))
         .collect::<Result<Vec<_>, CodegenError>>()?;
     Ok(quote!(#(#markers)*))
 }
@@ -3237,6 +3238,7 @@ fn generate_nexa_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
 fn generate_nexa_marker(
     model: &BindingModel,
     function: &BindingFunction,
+    contract_slot: usize,
 ) -> Result<TokenStream, CodegenError> {
     let marker_ident = &function.marker_ident;
     let args_ident = &function.args_ident;
@@ -3345,6 +3347,7 @@ fn generate_nexa_marker(
             const STABLE_ID: nexa_runtime::StableId =
                 nexa_runtime::StableId(#stable_id);
             const NAME: &'static str = #name;
+            const CONTRACT_SLOT: usize = #contract_slot;
             const SIGNATURE: nexa_runtime::ScriptSignature =
                 nexa_runtime::ScriptSignature::new(
                     &[#(#parameter_types),*],

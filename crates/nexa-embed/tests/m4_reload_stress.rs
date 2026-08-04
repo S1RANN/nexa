@@ -320,6 +320,7 @@ impl ScriptExport for Run {
 
     const STABLE_ID: StableId = RUN_ID;
     const NAME: &'static str = "run";
+    const CONTRACT_SLOT: usize = 1;
     const SIGNATURE: ScriptSignature =
         ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
     const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
@@ -356,6 +357,7 @@ impl ScriptExport for ResourceProbe {
 
     const STABLE_ID: StableId = RESOURCE_PROBE_ID;
     const NAME: &'static str = "resource_probe";
+    const CONTRACT_SLOT: usize = 0;
     const SIGNATURE: ScriptSignature = Run::SIGNATURE;
     const EFFECT: FunctionEffect = FunctionEffect::Task;
 

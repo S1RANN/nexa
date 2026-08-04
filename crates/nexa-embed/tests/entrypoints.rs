@@ -24,7 +24,7 @@ const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints {
 }";
 
 macro_rules! i32_entrypoint {
-    ($marker:ident, $name:literal, $stable_id:literal) => {
+    ($marker:ident, $name:literal, $stable_id:literal, $contract_slot:expr) => {
         struct $marker;
 
         impl ScriptExport for $marker {
@@ -33,6 +33,7 @@ macro_rules! i32_entrypoint {
 
             const STABLE_ID: StableId = StableId($stable_id);
             const NAME: &'static str = $name;
+            const CONTRACT_SLOT: usize = $contract_slot;
             const SIGNATURE: ScriptSignature =
                 ScriptSignature::new(&[ValueType::I32], Some(ValueType::I32));
             const EFFECT: FunctionEffect = FunctionEffect::Ordinary;
@@ -64,14 +65,25 @@ macro_rules! i32_entrypoint {
 }
 
 // NIDL v2 declaration identities for the validated `SnakeEntrypoints` Contract.
-i32_entrypoint!(OnEvent, "on_event", 0xefff_24e2_9dbd_2cb4);
-i32_entrypoint!(ChooseFoodSpawn, "choose_food_spawn", 0x0418_ea07_84bf_08cf);
+i32_entrypoint!(OnEvent, "on_event", 0xefff_24e2_9dbd_2cb4, 2);
+i32_entrypoint!(
+    ChooseFoodSpawn,
+    "choose_food_spawn",
+    0x0418_ea07_84bf_08cf,
+    1
+);
 i32_entrypoint!(
     CalculateFoodEffect,
     "calculate_food_effect",
-    0xe9ac_e9e4_2957_0132
+    0xe9ac_e9e4_2957_0132,
+    0
 );
-i32_entrypoint!(NotDeclared, "not_declared", 0x1111_2222_3333_4444);
+i32_entrypoint!(
+    NotDeclared,
+    "not_declared",
+    0x1111_2222_3333_4444,
+    usize::MAX
+);
 
 struct EmptyRegistry(StableId);
 
@@ -189,7 +201,10 @@ fn engine(packages: impl IntoIterator<Item = MemoryPackage>) -> NexaEngine {
 fn broadcast_count(engine: &mut NexaEngine, expected: usize) {
     let results = engine.dispatch::<OnEvent>(&10);
     assert_eq!(results.len(), expected);
-    assert!(results.into_iter().all(|result| result.is_ok()));
+    assert!(
+        results.iter().all(Result::is_ok),
+        "broadcast failures: {results:#?}"
+    );
 }
 
 #[test]
@@ -328,7 +343,7 @@ fn snake_packages_use_required_broadcast_and_typed_optional_routing() {
         .expect("spawn inspection");
     assert_eq!(
         spawn.implemented_entrypoints,
-        ["on_event", "choose_food_spawn"]
+        ["choose_food_spawn", "on_event"]
     );
     assert_eq!(spawn.required_entrypoints, ["on_event"]);
     assert!(spawn.missing_required_entrypoints.is_empty());
