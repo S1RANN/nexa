@@ -783,25 +783,9 @@ fn compile_typed_package_with_profile(
                     let definition = package
                         .definition(declaration.definition)
                         .expect("TypedPackageIr validates declaration IDs");
-                    // M5 WP37/WP38: optimization passes run on an owned copy
-                    // immediately before lowering; analyzer snapshots and
-                    // their fingerprints stay untouched. The WP36 reference
-                    // pipeline lowers the analyzer snapshot verbatim.
-                    let function = if optimize {
-                        let mut optimized = function.clone();
-                        let reports = nexa_analysis::passes::PassManager::standard()
-                            .optimize_function(&mut optimized);
-                        if reports.iter().all(|report| report.rewrites == 0) {
-                            std::borrow::Cow::Borrowed(function)
-                        } else {
-                            std::borrow::Cow::Owned(optimized)
-                        }
-                    } else {
-                        std::borrow::Cow::Borrowed(function)
-                    };
                     function_plans.push(TypedFunctionPlan {
                         definition,
-                        function,
+                        function: std::borrow::Cow::Borrowed(function),
                         index: next_function,
                     });
                     next_function = next_function.saturating_add(1);
@@ -811,6 +795,27 @@ fn compile_typed_package_with_profile(
                 }
                 TypedDeclarationBody::TypeLayout { .. } | TypedDeclarationBody::External => {}
             }
+        }
+    }
+    if optimize {
+        // M5 WP37-WP45: optimize one owned package view so cross-function
+        // passes can use real call counts while analyzer snapshots and their
+        // fingerprints remain immutable. Every pass is structurally
+        // revalidated before its result reaches lowering.
+        let invariant = nexa_analysis::passes::PassInvariant::for_package(package);
+        let mut optimized_functions = function_plans
+            .iter()
+            .map(|plan| (plan.definition.id, plan.function.as_ref().clone()))
+            .collect::<BTreeMap<_, _>>();
+        let _optimization_report = nexa_analysis::passes::PassManager::standard()
+            .optimize_functions(&mut optimized_functions, &invariant)
+            .map_err(|error| CompileError::verify(error.to_string(), fallback_span))?;
+        for plan in &mut function_plans {
+            plan.function = std::borrow::Cow::Owned(
+                optimized_functions
+                    .remove(&plan.definition.id)
+                    .expect("every function plan participates in package optimization"),
+            );
         }
     }
     let provisional_function_indices = function_plans

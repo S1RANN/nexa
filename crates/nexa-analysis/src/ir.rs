@@ -1748,6 +1748,30 @@ fn validate_declaration(
     }
 }
 
+/// Revalidates one owned function after a Typed IR optimization pass.
+///
+/// Package construction validates the analyzer snapshot once. M5 passes operate
+/// on cloned function bodies immediately before lowering, so they need the same
+/// structural checks without rebuilding an entire [`TypedPackageIr`]. Semantic
+/// facts that a pass cannot change (definition kinds, visibility, standard
+/// bindings, and migration schemas) remain owned by the already-validated
+/// package snapshot.
+pub(crate) fn validate_function_for_pass(
+    function: &TypedFunctionIr,
+    definition_limit: usize,
+    constants: &BTreeMap<DefinitionId, TypedExpressionIr>,
+) -> Result<(), TypedIrError> {
+    for id in function.parameters.iter().chain(&function.locals) {
+        validate_id(*id, definition_limit)?;
+    }
+    validate_type(&function.return_type, definition_limit)?;
+    let constants = constants
+        .iter()
+        .map(|(definition, expression)| (*definition, expression))
+        .collect::<BTreeMap<_, _>>();
+    validate_block(&function.body, definition_limit, &constants)
+}
+
 fn cleanup_block_is_synchronous(block: &TypedBlockIr, definitions: &[Definition]) -> bool {
     let statements_are_sync = block.statements.iter().all(|statement| match statement {
         TypedStatementIr::Let { value, .. } => value
