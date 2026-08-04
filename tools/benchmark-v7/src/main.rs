@@ -43,6 +43,9 @@ const PRODUCT_GRID_SCORE_FUNCTION: u32 = 13;
 const PRODUCT_DATA_SWEEP_FUEL: u64 = 2_000_000;
 const PRODUCT_COMBAT_TICK_FUEL: u64 = 4_000_000;
 const PRODUCT_GRID_SCORE_FUEL: u64 = 4_000_000;
+const PRODUCT_DATA_SWEEP_RESULT: i32 = 32_640;
+const PRODUCT_COMBAT_TICK_RESULT: i32 = 633;
+const PRODUCT_GRID_SCORE_RESULT: i32 = 157_992;
 
 struct CountingAllocator;
 
@@ -173,6 +176,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Observation {
+    result: Option<RuntimeValue>,
     fuel: u64,
     instructions: u64,
     heap_slots: u64,
@@ -678,6 +682,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let language = nexa_compiler::compile(&full_language_source())?;
     // Stage F: rows are built once at load, exactly like realm admission.
     let language_rows = ExecutableModule::build(&language, OpcodeCostTable::canonical())?;
+    // WP10: correctness is asserted outside every timed region. A runtime
+    // that computes the wrong product answer is never allowed to emit a
+    // performance receipt.
+    verify_product_results(&language, &language_rows)?;
     // Stage H: one pooled continuation arena serves every steady-state case;
     // cold-start cases pass a fresh empty pool on purpose.
     let mut continuation_pool: Option<nexa_runtime::FrameArena> = None;
@@ -686,10 +694,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let mut cases = Vec::new();
 
-    cases.push(bench(
+    cases.push(bench_checked(
         "immediate_call",
         "micro",
         samples,
+        RuntimeValue::I32(42),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -730,25 +739,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             combine(first, second, heap.live_len())
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "fuel_resume",
         "micro",
         samples,
+        RuntimeValue::I32(10),
         || (),
         |()| run_two_slices(&language, 3, false, &mut continuation_pool),
     ));
     let explicit = explicit_resume_module();
-    cases.push(bench(
+    cases.push(bench_checked(
         "explicit_resume",
         "micro",
         samples,
+        RuntimeValue::I32(7),
         || (),
         |()| run_two_slices(&explicit, 0, true, &mut continuation_pool),
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "string_concat",
         "micro",
         samples,
+        RuntimeValue::I32(14),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -762,10 +774,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "struct_construction",
         "micro",
         samples,
+        RuntimeValue::I32(7),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -779,10 +792,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "class_allocation",
         "micro",
         samples,
+        RuntimeValue::I32(8),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -796,10 +810,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "enum_construction_match",
         "micro",
         samples,
+        RuntimeValue::I32(7),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -813,10 +828,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "array_operations",
         "micro",
         samples,
+        RuntimeValue::I32(5),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -830,10 +846,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "map_operations",
         "micro",
         samples,
+        RuntimeValue::I32(3),
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
             run_returned_case(
@@ -848,10 +865,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
     let buffer_type = language.module().buffer_types[0];
-    cases.push(bench(
+    cases.push(bench_checked(
         "buffer_copy",
         "micro",
         samples,
+        RuntimeValue::I32(9),
         || {
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
             let destination = heap
@@ -890,10 +908,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_data_sweep",
         "product",
         samples,
+        RuntimeValue::I32(PRODUCT_DATA_SWEEP_RESULT),
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
             run_returned_case(
@@ -909,10 +928,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // J corpus: eight combat rounds over 128 units - array-heavy reads,
     // in-place writes, and branchy damage clamping per tick.
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_combat_tick",
         "product",
         samples,
+        RuntimeValue::I32(PRODUCT_COMBAT_TICK_RESULT),
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
             run_returned_case(
@@ -928,10 +948,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // J corpus: 64x64 pure-computation grid scoring - no heap objects at
     // all, the closest shape to a JIT-favorable inner loop.
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_grid_score",
         "product",
         samples,
+        RuntimeValue::I32(PRODUCT_GRID_SCORE_RESULT),
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
             run_returned_case(
@@ -947,10 +968,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // WP52 corpus: 128 struct pushes into flattened rows plus a field
     // reduction sweep - the Array<Struct> shape the structural gate pins.
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_struct_rows",
         "product",
         samples,
+        RuntimeValue::I32(8_128),
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
             run_returned_case(
@@ -964,10 +986,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_standalone_pipeline",
         "product",
         samples,
+        RuntimeValue::I32(42),
         || (),
         |()| {
             // Full frontend + verifier + predecode + execution per sample:
@@ -997,10 +1020,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sample is one key hash + one shared-module hit + predecode + run -
     // the warm REPL/reload cost shape the cache exists for.
     let source_cache = nexa_compiler::cache::SourceCache::new(8);
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_cached_pipeline",
         "product",
         samples,
+        RuntimeValue::I32(42),
         || (),
         |()| {
             let verified = source_cache
@@ -1036,10 +1060,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&artifact_directory);
     let artifact_cache = nexa_compiler::cache::ArtifactCache::new(&artifact_directory, u64::MAX)
         .expect("benchmark artifact cache opens");
-    cases.push(bench(
+    cases.push(bench_checked(
         "product_disk_cached_pipeline",
         "product",
         samples,
+        RuntimeValue::I32(42),
         || (),
         |()| {
             let verified = artifact_cache
@@ -1158,6 +1183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tick(TickBudget::default())
                 .expect("async completion tick");
             Observation {
+                result: None,
                 fuel: async_instructions,
                 instructions: async_instructions,
                 heap_slots: async_realm.resource_ledger().heap_objects,
@@ -1187,6 +1213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("offline migration");
             black_box(result.final_state_hash);
             Observation {
+                result: None,
                 fuel: result.usage.fuel_used,
                 instructions: result.usage.fuel_used,
                 heap_slots: result.usage.object_peak as u64,
@@ -1227,6 +1254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut resources = before;
             resources.merge(PeakResources::from_ledger(after));
             Observation {
+                result: None,
                 fuel: 1,
                 instructions: 1,
                 heap_slots: after.heap_objects,
@@ -2059,28 +2087,60 @@ fn full_language_source() -> String {
 fn verify_products() -> Result<(), Box<dyn std::error::Error>> {
     let language = nexa_compiler::compile(&full_language_source())?;
     let rows = ExecutableModule::build(&language, OpcodeCostTable::canonical())?;
-    let report = serde_json::json!({
-        "product_data_sweep": returned_i32(
-            &language,
-            &rows,
-            PRODUCT_DATA_SWEEP_FUNCTION,
-            PRODUCT_DATA_SWEEP_FUEL,
-        ),
-        "product_combat_tick": returned_i32(
-            &language,
-            &rows,
-            PRODUCT_COMBAT_TICK_FUNCTION,
-            PRODUCT_COMBAT_TICK_FUEL,
-        ),
-        "product_grid_score": returned_i32(
-            &language,
-            &rows,
-            PRODUCT_GRID_SCORE_FUNCTION,
-            PRODUCT_GRID_SCORE_FUEL,
-        ),
-    });
+    let report = verify_product_results(&language, &rows)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn verify_product_results(
+    language: &VerifiedModule,
+    rows: &ExecutableModule,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let observed = [
+        (
+            "product_data_sweep",
+            returned_i32(
+                language,
+                rows,
+                PRODUCT_DATA_SWEEP_FUNCTION,
+                PRODUCT_DATA_SWEEP_FUEL,
+            ),
+            PRODUCT_DATA_SWEEP_RESULT,
+        ),
+        (
+            "product_combat_tick",
+            returned_i32(
+                language,
+                rows,
+                PRODUCT_COMBAT_TICK_FUNCTION,
+                PRODUCT_COMBAT_TICK_FUEL,
+            ),
+            PRODUCT_COMBAT_TICK_RESULT,
+        ),
+        (
+            "product_grid_score",
+            returned_i32(
+                language,
+                rows,
+                PRODUCT_GRID_SCORE_FUNCTION,
+                PRODUCT_GRID_SCORE_FUEL,
+            ),
+            PRODUCT_GRID_SCORE_RESULT,
+        ),
+    ];
+    for (name, actual, expected) in observed {
+        if actual != expected {
+            return Err(format!(
+                "{name} returned {actual}, but the frozen Benchmark v7 result is {expected}"
+            )
+            .into());
+        }
+    }
+    Ok(serde_json::json!({
+        "product_data_sweep": PRODUCT_DATA_SWEEP_RESULT,
+        "product_combat_tick": PRODUCT_COMBAT_TICK_RESULT,
+        "product_grid_score": PRODUCT_GRID_SCORE_RESULT,
+    }))
 }
 
 /// K20 diagnostic: isolates the certified leaf executor from the pooled
@@ -2352,12 +2412,12 @@ fn run_returned_mode<const PROFILING: bool>(
         )
     };
     if let Some(outcome) = static_outcome.expect("verified static benchmark leaf") {
-        black_box(
-            outcome
-                .result
-                .expect("static benchmark leaf must return rather than trap"),
-        );
-        return observation(outcome.charge, heap);
+        let result = outcome
+            .result
+            .expect("static benchmark leaf must return rather than trap")
+            .expect("static benchmark leaf must return a value");
+        black_box(result);
+        return observation(outcome.charge, heap, Some(result));
     }
     run_returned_full::<PROFILING>(module, executable, function, arguments, heap, fuel, pool)
 }
@@ -2408,7 +2468,7 @@ fn run_returned_full<const PROFILING: bool>(
         panic!("benchmark function did not return");
     };
     black_box(value);
-    observation(charge, heap)
+    observation(charge, heap, value)
 }
 
 fn run_two_slices(
@@ -2467,6 +2527,7 @@ fn run_two_slices(
     };
     black_box(value);
     Observation {
+        result: value,
         fuel: first_charge
             .fuel_used
             .saturating_add(second_charge.fuel_used),
@@ -2477,8 +2538,9 @@ fn run_two_slices(
     }
 }
 
-fn observation(charge: ExecutionCharge, heap: &Heap) -> Observation {
+fn observation(charge: ExecutionCharge, heap: &Heap, result: Option<RuntimeValue>) -> Observation {
     Observation {
+        result,
         fuel: charge.fuel_used,
         instructions: charge.instructions,
         heap_slots: u64::try_from(heap.live_len()).unwrap_or(u64::MAX),
@@ -2492,6 +2554,7 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
     let mut resources = first.resources;
     resources.merge(second.resources);
     Observation {
+        result: None,
         fuel: first.fuel.saturating_add(second.fuel),
         instructions: first.instructions.saturating_add(second.instructions),
         heap_slots: u64::try_from(heap_slots).unwrap_or(u64::MAX),
@@ -2555,7 +2618,10 @@ fn async_module() -> VerifiedModule {
         parameters: vec![ValueType::I32],
         result: Some(ValueType::I32),
     };
-    let mut function = FunctionBuilder::new(signature.clone(), 3);
+    // Register 0 is the scalar parameter, 1..3 is the two-slot
+    // `Result<i32, i32>`, and register 3 receives its extracted payload.
+    // The payload destination must not overlap the verified aggregate range.
+    let mut function = FunctionBuilder::new(signature.clone(), 4);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -2567,9 +2633,9 @@ fn async_module() -> VerifiedModule {
         .emit(Instruction::EnumPayload {
             source: 1,
             variant: StableId::from_parts(&["Result", "::Ok"]),
-            dst: 2,
+            dst: 3,
         })
-        .emit(Instruction::Return { source: 2 });
+        .emit(Instruction::Return { source: 3 });
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
     let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
@@ -2594,20 +2660,19 @@ fn async_module() -> VerifiedModule {
         async_result: Some(async_result),
     });
     let mut function = function.finish().expect("async function");
-    function.root_bitmap[1] = true;
     function.safepoints = vec![0, 1, 2];
     function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false, false, false],
+            bitmap: vec![false, false, false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![false, true, false],
+            bitmap: vec![false, false, false, false],
         },
         RootMap {
             pc: 2,
-            bitmap: vec![false, false, false],
+            bitmap: vec![false, false, false, false],
         },
     ];
     let function = module.function(function);
@@ -2883,17 +2948,49 @@ fn bench<T>(
     bench_with_warmup(name, tier, samples, WARMUP.min(samples), prepare, operation)
 }
 
+fn bench_checked<T>(
+    name: &'static str,
+    tier: &'static str,
+    samples: usize,
+    expected: RuntimeValue,
+    prepare: impl FnMut() -> T,
+    operation: impl FnMut(T) -> Observation,
+) -> CaseStats {
+    bench_with_warmup_expected(
+        name,
+        tier,
+        samples,
+        WARMUP.min(samples),
+        Some(expected),
+        prepare,
+        operation,
+    )
+}
+
 fn bench_with_warmup<T>(
     name: &'static str,
     tier: &'static str,
     samples: usize,
     warmup: usize,
+    prepare: impl FnMut() -> T,
+    operation: impl FnMut(T) -> Observation,
+) -> CaseStats {
+    bench_with_warmup_expected(name, tier, samples, warmup, None, prepare, operation)
+}
+
+fn bench_with_warmup_expected<T>(
+    name: &'static str,
+    tier: &'static str,
+    samples: usize,
+    warmup: usize,
+    expected: Option<RuntimeValue>,
     mut prepare: impl FnMut() -> T,
     mut operation: impl FnMut(T) -> Observation,
 ) -> CaseStats {
     for _ in 0..warmup {
         let input = prepare();
-        black_box(operation(input));
+        let observation = black_box(operation(input));
+        assert_benchmark_result(name, expected, observation.result);
     }
     let mut durations = Vec::with_capacity(samples);
     let mut allocation_totals = AllocationDelta::default();
@@ -2910,6 +3007,8 @@ fn bench_with_warmup<T>(
         let started = Instant::now();
         let observation = black_box(operation(input));
         let elapsed = started.elapsed();
+        // The result check is intentionally outside the timed boundary.
+        assert_benchmark_result(name, expected, observation.result);
         allocation_totals.accumulate(region.end());
         durations.push(elapsed);
         fuel = fuel.saturating_add(observation.fuel);
@@ -2992,6 +3091,20 @@ fn bench_with_warmup<T>(
         stats.system_allocated_bytes
     );
     stats
+}
+
+fn assert_benchmark_result(
+    name: &str,
+    expected: Option<RuntimeValue>,
+    actual: Option<RuntimeValue>,
+) {
+    if let Some(expected) = expected {
+        assert_eq!(
+            actual,
+            Some(expected),
+            "Benchmark v7 case {name} returned the wrong value"
+        );
+    }
 }
 
 fn percentile(samples: &[Duration], percentile: usize) -> u128 {

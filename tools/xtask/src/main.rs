@@ -2197,13 +2197,13 @@ fn m5_product_corpus() -> Result<(), DynError> {
         "nexa-benchmark-v7 --verify-products",
     )?;
     let product_results: Value = serde_json::from_str(&verification_stdout)?;
-    for workload in [
-        "product_combat_tick",
-        "product_data_sweep",
-        "product_grid_score",
-    ] {
-        if !product_results[workload].is_number() {
-            return Err(format!("product verification omitted numeric result {workload}").into());
+    for &(workload, expected) in &PRODUCT_CPU_RESULTS {
+        if product_results[workload].as_i64() != Some(expected) {
+            return Err(format!(
+                "product verification returned {} for {workload}; expected {expected}",
+                product_results[workload]
+            )
+            .into());
         }
     }
 
