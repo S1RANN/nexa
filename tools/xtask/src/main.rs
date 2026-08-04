@@ -1790,9 +1790,10 @@ fn test_source_cache() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-compiler", "--test", "source_cache"])
 }
 
-/// M5 WP93-95 gate: the on-disk artifact cache round-trips hash-verified
-/// portable artifacts, discards corruption, stores atomically, and
-/// enforces its byte budget.
+/// M5 WP93-95 gate: the on-disk artifact cache keys every canonical build
+/// authority (including the complete 32-byte Contract fingerprint),
+/// round-trips versioned/key-bound portable artifacts, discards corruption,
+/// stores atomically, and enforces a strict byte budget.
 fn test_artifact_cache() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-compiler", "--test", "artifact_cache"])?;
     cargo(&[

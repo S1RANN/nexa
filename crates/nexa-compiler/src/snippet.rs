@@ -60,10 +60,7 @@ pub(super) fn compile_module(
     contract: Option<&ValidatedContract>,
     optimize: bool,
 ) -> Result<Module, CompileError> {
-    let compilation_options = CompilationOptions::default();
-    let module = infer_snippet_module(source, compilation_options.limits.source_file_bytes)
-        .map_err(|error| snippet_module_error(error, file))?;
-    let input = resolved_snippet(source, file, &module, contract, compilation_options)?;
+    let input = resolved_snippet_for_cache(source, file, contract)?;
     let environment = contract.map_or_else(
         || Ok(AnalysisEnvironment::default()),
         |contract| {
@@ -105,6 +102,22 @@ pub(super) fn compile_module(
         }
     }
     Ok(module)
+}
+
+/// Constructs the exact virtual-package authority used by the single-source
+/// compiler without running semantic analysis or code generation.
+///
+/// The disk artifact cache uses this to address a hit by the same
+/// `BuildFingerprint` as a fresh compilation.
+pub(super) fn resolved_snippet_for_cache(
+    source: &str,
+    file: FileId,
+    contract: Option<&ValidatedContract>,
+) -> Result<ResolvedBuildInput, CompileError> {
+    let compilation_options = CompilationOptions::default();
+    let module = infer_snippet_module(source, compilation_options.limits.source_file_bytes)
+        .map_err(|error| snippet_module_error(error, file))?;
+    resolved_snippet(source, file, &module, contract, compilation_options)
 }
 
 fn snippet_module_error(error: SnippetModuleInferenceError, file: FileId) -> CompileError {
