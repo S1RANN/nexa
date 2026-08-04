@@ -6,6 +6,7 @@ use nexa_analysis::{
     ResolvedBuildInput, ResolvedDependencyGraph, ResolvedPackage, SourceId, SourceRole,
     SourceSetBuilder,
 };
+use nexa_bytecode::layout::{FunctionAbi, LayoutTable};
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, FunctionBuilder,
     FunctionEffect, HostCallMode, HostImport, Instruction, MigrationLimitRequirements, Module,
@@ -1799,35 +1800,7 @@ fn async_module(host: StableId, typed_error: bool) -> VerifiedModule {
         cancel_error: Some(1),
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: Some(ValueType::Named(result.type_id)),
-        },
-        1,
-    );
-    function
-        .effect(FunctionEffect::Task)
-        .emit(Instruction::HostCall {
-            import: 0,
-            args_base: 0,
-            args_count: 0,
-            dst: 0,
-        })
-        .emit(Instruction::Return { source: 0 });
-    let mut function = function.finish().expect("async diagnostic function");
-    function.root_bitmap[0] = true;
-    function.safepoints = vec![0, 1];
-    function.root_maps = vec![
-        RootMap {
-            pc: 0,
-            bitmap: vec![false],
-        },
-        RootMap {
-            pc: 1,
-            bitmap: vec![true],
-        },
-    ];
+    let result_type = ValueType::Named(result.type_id);
     let mut module = ModuleBuilder::new();
     module.metadata(host, StateSchema::default().fingerprint());
     module.enum_type(error);
@@ -1842,14 +1815,61 @@ fn async_module(host: StableId, typed_error: bool) -> VerifiedModule {
         fuel_cost: 1,
         async_result: Some(async_result),
     });
-    module.script_export(ScriptExport {
+    let mut module = module.finish();
+    add_async_diagnostic_function(&mut module, result_type);
+    verify_round_trip(module)
+}
+
+fn add_async_diagnostic_function(module: &mut Module, result_type: ValueType) {
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: Some(result_type),
+    };
+    let layouts = LayoutTable::for_module(module).expect("async diagnostic module layout");
+    let abi = FunctionAbi::for_signature(&layouts, &signature)
+        .expect("async diagnostic function physical ABI");
+    let result_abi = abi.result.expect("async diagnostic function result");
+    let mut function = FunctionBuilder::new(signature, result_abi.slot_count);
+    function.parameter_slots(abi.parameter_slots);
+    for register in result_abi
+        .gc_bitmap
+        .iter()
+        .enumerate()
+        .filter_map(|(register, is_root)| is_root.then_some(register))
+    {
+        function
+            .set_root(u16::try_from(register).expect("small async diagnostic root"))
+            .expect("async diagnostic root register");
+    }
+    function
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::HostCall {
+            import: 0,
+            args_base: 0,
+            args_count: 0,
+            dst: 0,
+        })
+        .emit(Instruction::Return { source: 0 });
+    let mut function = function.finish().expect("async diagnostic function");
+    function.safepoints = vec![0, 1];
+    function.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: vec![false; usize::from(result_abi.slot_count)],
+        },
+        RootMap {
+            pc: 1,
+            bitmap: result_abi.gc_bitmap,
+        },
+    ];
+    module.exports.push(ScriptExport {
         stable_id: StableId::from_name("runtime-diagnostics::async"),
         function: 0,
         signature: function.signature.clone(),
         effect: function.effect,
     });
-    module.function(function);
-    module.source_map([
+    module.functions.push(function);
+    module.source_map.extend([
         SourceMapEntry {
             function: 0,
             pc_start: 0,
@@ -1863,7 +1883,6 @@ fn async_module(host: StableId, typed_error: bool) -> VerifiedModule {
             span: SourceSpan::new(FileId(72), 13, 19),
         },
     ]);
-    verify_round_trip(module.finish())
 }
 
 fn migration_module(
@@ -1973,6 +1992,7 @@ fn migration_graph_module(host: StableId, fault: GraphFault) -> VerifiedModule {
         GraphFault::IllegalStrongReference => ValueType::Ref,
         _ => ValueType::Named(handle.type_id),
     };
+    let input_is_gc_root = matches!(field_type, ValueType::Ref);
     let mut migration = FunctionBuilder::new(
         Signature {
             parameters: vec![field_type],
@@ -1980,12 +2000,13 @@ fn migration_graph_module(host: StableId, fault: GraphFault) -> VerifiedModule {
         },
         2,
     );
+    migration.effect(FunctionEffect::Migration);
+    if input_is_gc_root {
+        migration
+            .set_root(0)
+            .expect("strong-reference graph input is a root");
+    }
     migration
-        .effect(FunctionEffect::Migration)
-        .set_root(0)
-        .expect("graph input is a root")
-        .set_root(1)
-        .expect("graph object is a root")
         .emit(Instruction::StateNewCreate {
             stable_id: root_id,
             type_id: root_type,
@@ -2003,7 +2024,7 @@ fn migration_graph_module(host: StableId, fault: GraphFault) -> VerifiedModule {
     migration.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![true, false],
+            bitmap: vec![input_is_gc_root, false],
         },
         RootMap {
             pc: 3,
@@ -2079,8 +2100,9 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
         fuel_cost: 1,
         async_result: None,
     });
+    let mut direct = direct.finish();
     add_void_function(&mut direct, Vec::new());
-    modules.push(verify_round_trip(direct.finish()));
+    modules.push(verify_round_trip(direct));
 
     let request_type = ValueType::Named(StableId::from_name("HostRequest"));
     let option = option_type(request_type);
@@ -2088,8 +2110,9 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     option_module
         .metadata(host, StateSchema::default().fingerprint())
         .enum_type(option.clone());
+    let mut option_module = option_module.finish();
     add_void_function(&mut option_module, vec![ValueType::Named(option.type_id)]);
-    modules.push(verify_round_trip(option_module.finish()));
+    modules.push(verify_round_trip(option_module));
 
     let host_error = ValueType::Named(StableId::from_name("HostError"));
     let result = result_type(ValueType::I32, host_error);
@@ -2097,8 +2120,9 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     result_module
         .metadata(host, StateSchema::default().fingerprint())
         .enum_type(result.clone());
+    let mut result_module = result_module.finish();
     add_void_function(&mut result_module, vec![ValueType::Named(result.type_id)]);
-    modules.push(verify_round_trip(result_module.finish()));
+    modules.push(verify_round_trip(result_module));
 
     let content = StableId::from_name("R3SnapshotContent");
     let snapshot = SnapshotType::new(content);
@@ -2119,11 +2143,12 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
         .struct_type(snapshot_content)
         .snapshot_type(snapshot)
         .struct_type(structure.clone());
+    let mut struct_module = struct_module.finish();
     add_void_function(
         &mut struct_module,
         vec![ValueType::Named(structure.type_id)],
     );
-    modules.push(verify_round_trip(struct_module.finish()));
+    modules.push(verify_round_trip(struct_module));
 
     let resource_content = StableId::from_name("R3DiagnosticResource");
     let resource_token = ResourceTokenType::new(resource_content);
@@ -2141,11 +2166,12 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
         .metadata(host, StateSchema::default().fingerprint())
         .resource_token_type(resource_token)
         .enum_type(enumeration.clone());
+    let mut enum_module = enum_module.finish();
     add_void_function(
         &mut enum_module,
         vec![ValueType::Named(enumeration.type_id)],
     );
-    modules.push(verify_round_trip(enum_module.finish()));
+    modules.push(verify_round_trip(enum_module));
 
     if modules.len() != 5 {
         return Err("host capability matrix is incomplete".into());
@@ -2153,21 +2179,23 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     Ok(modules)
 }
 
-fn add_void_function(module: &mut ModuleBuilder, parameters: Vec<ValueType>) {
-    let registers = u16::try_from(parameters.len()).expect("small capability function");
-    let root_registers = parameters
+fn add_void_function(module: &mut Module, parameters: Vec<ValueType>) {
+    let signature = Signature {
+        parameters,
+        result: None,
+    };
+    let layouts = LayoutTable::for_module(module).expect("capability module layout");
+    let abi =
+        FunctionAbi::for_signature(&layouts, &signature).expect("capability function physical ABI");
+    let registers = abi.parameter_slots;
+    let mut function = FunctionBuilder::new(signature, registers);
+    function.parameter_slots(abi.parameter_slots);
+    for register in abi
+        .parameter_gc_bitmap
         .iter()
         .enumerate()
-        .filter_map(|(index, ty)| matches!(ty, ValueType::Named(_)).then_some(index))
-        .collect::<Vec<_>>();
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters,
-            result: None,
-        },
-        registers,
-    );
-    for register in root_registers {
+        .filter_map(|(register, is_root)| is_root.then_some(register))
+    {
         function
             .set_root(u16::try_from(register).expect("small capability root"))
             .expect("capability root register");
@@ -2184,7 +2212,7 @@ fn add_void_function(module: &mut ModuleBuilder, parameters: Vec<ValueType>) {
         // contain no live roots at the entry/return safepoint.
         bitmap: vec![false; usize::from(registers)],
     }];
-    module.function(function);
+    module.functions.push(function);
 }
 
 #[allow(clippy::needless_pass_by_value)]
