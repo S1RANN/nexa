@@ -2257,28 +2257,142 @@ fn formal_aggregate_at(path: &Path, implementation_commit: &str) -> Option<Value
     formal_aggregate(report, implementation_commit)
 }
 
+const FORMAL_CASE_U64_FIELDS: [&str; 10] = [
+    "max_frame_1000_calls_ns",
+    "max_system_allocations",
+    "max_system_reallocations",
+    "max_system_allocated_bytes",
+    "max_system_reallocated_bytes",
+    "max_system_peak_outstanding_bytes",
+    "fuel_total",
+    "fuel_per_operation",
+    "instructions_total",
+    "instructions_per_operation",
+];
+const FORMAL_VM_OPTIONAL_U64_FIELDS: [&str; 13] = [
+    "allocations",
+    "string_allocations",
+    "class_allocations",
+    "collection_storage_allocations",
+    "map_slot_allocations",
+    "struct_materializations",
+    "enum_materializations",
+    "allocated_bytes",
+    "live_bytes",
+    "collection_relocation_bytes",
+    "string_copy_bytes",
+    "host_codec_copy_bytes",
+    "bytes_copied",
+];
+const FORMAL_GC_OPTIONAL_U64_FIELDS: [&str; 4] = [
+    "cycles",
+    "pause_ns_max",
+    "objects_reclaimed",
+    "bytes_reclaimed",
+];
+const FORMAL_RESOURCE_U64_FIELDS: [&str; 7] = [
+    "tasks",
+    "requests",
+    "tokens",
+    "snapshots",
+    "state_objects",
+    "retired_modules",
+    "total",
+];
+
+fn has_optional_u64_fields(value: &Value, fields: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        fields.iter().all(|field| {
+            object
+                .get(*field)
+                .is_some_and(|value| value.is_null() || value.as_u64().is_some())
+        })
+    })
+}
+
+fn has_u64_fields(value: &Value, fields: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        fields
+            .iter()
+            .all(|field| object.get(*field).and_then(Value::as_u64).is_some())
+    })
+}
+
+fn formal_aggregate_case_name(case: &Value) -> Option<&str> {
+    let name = case["case"].as_str().filter(|name| !name.is_empty())?;
+    let minimum = case["min_ns"].as_u64()?;
+    let mean = case["median_mean_ns"].as_u64()?;
+    let p50 = case["median_p50_ns"].as_u64()?;
+    let p90 = case["median_p90_ns"].as_u64()?;
+    let p95 = case["median_p95_ns"].as_u64()?;
+    let p99 = case["median_p99_ns"].as_u64()?;
+    let maximum = case["max_ns"].as_u64()?;
+    let standard_deviation = case["median_standard_deviation_ns"].as_f64()?;
+    let coefficient = case["median_coefficient_of_variation"].as_f64()?;
+    (case["tier"].as_str().is_some_and(|tier| !tier.is_empty())
+        && minimum > 0
+        && mean > 0
+        && p50 > 0
+        && minimum <= p50
+        && minimum <= mean
+        && mean <= maximum
+        && p50 <= p90
+        && p90 <= p95
+        && p95 <= p99
+        && p99 <= maximum
+        && standard_deviation.is_finite()
+        && standard_deviation >= 0.0
+        && coefficient.is_finite()
+        && coefficient >= 0.0
+        && case["median_throughput_ops_per_second"]
+            .as_u64()
+            .is_some_and(|throughput| throughput > 0)
+        && FORMAL_CASE_U64_FIELDS
+            .iter()
+            .all(|field| case[*field].as_u64().is_some())
+        && case["max_vm"]["live_heap_slots_peak"].as_u64().is_some()
+        && has_optional_u64_fields(&case["max_vm"], &FORMAL_VM_OPTIONAL_U64_FIELDS)
+        && has_optional_u64_fields(&case["max_gc"], &FORMAL_GC_OPTIONAL_U64_FIELDS)
+        && has_u64_fields(&case["peak_resources"], &FORMAL_RESOURCE_U64_FIELDS))
+    .then_some(name)
+}
+
+fn formal_aggregate_has_structural_evidence(cases: &[Value]) -> bool {
+    let case_named = |name: &str| cases.iter().find(|case| case["case"] == name);
+    let (Some(struct_case), Some(enum_case), Some(gc_case), Some(immediate_case)) = (
+        case_named("struct_construction"),
+        case_named("enum_construction_match"),
+        case_named("gc_incremental_step"),
+        case_named("immediate_call"),
+    ) else {
+        return false;
+    };
+    struct_case["max_vm"]["struct_materializations"].as_u64() == Some(0)
+        && enum_case["max_vm"]["enum_materializations"].as_u64() == Some(0)
+        && gc_case["max_system_allocations"].as_u64() == Some(0)
+        && gc_case["max_system_reallocations"].as_u64() == Some(0)
+        && gc_case["max_system_allocated_bytes"].as_u64() == Some(0)
+        && gc_case["max_system_reallocated_bytes"].as_u64() == Some(0)
+        && gc_case["max_gc"]["cycles"]
+            .as_u64()
+            .is_some_and(|cycles| cycles > 0)
+        && gc_case["max_gc"]["objects_reclaimed"]
+            .as_u64()
+            .is_some_and(|objects| objects > 0)
+        && gc_case["max_gc"]["bytes_reclaimed"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+        && immediate_case["peak_resources"]["tasks"].as_u64() == Some(0)
+}
+
 fn formal_aggregate(report: Value, implementation_commit: &str) -> Option<Value> {
     let cases = report["cases"].as_array()?;
-    let mut names = BTreeSet::new();
-    for case in cases {
-        let name = case["case"].as_str().filter(|name| !name.is_empty())?;
-        if !names.insert(name) || case["tier"].as_str().is_none_or(str::is_empty) {
-            return None;
-        }
-        let p50 = case["median_p50_ns"].as_u64()?;
-        let p95 = case["median_p95_ns"].as_u64()?;
-        let p99 = case["median_p99_ns"].as_u64()?;
-        if p50 == 0
-            || p50 > p95
-            || p95 > p99
-            || case["median_throughput_ops_per_second"]
-                .as_u64()
-                .is_none_or(|throughput| throughput == 0)
-            || case["max_system_allocations"].as_u64().is_none()
-            || case["max_system_allocated_bytes"].as_u64().is_none()
-        {
-            return None;
-        }
+    let names = cases
+        .iter()
+        .map(formal_aggregate_case_name)
+        .collect::<Option<BTreeSet<_>>>()?;
+    if names.len() != cases.len() || !formal_aggregate_has_structural_evidence(cases) {
+        return None;
     }
     let mandatory_cases = VALUE_COLLECTION_CASES
         .iter()
@@ -2293,6 +2407,9 @@ fn formal_aggregate(report: Value, implementation_commit: &str) -> Option<Value>
         && report["process_count"].as_u64() == Some(7)
         && report["samples_per_process"].as_u64() == Some(1_000)
         && report["warmup_per_process"].as_u64() == Some(100)
+        && report["started_at_unix_ms"]
+            .as_u64()
+            .is_some_and(|started| started > 0)
         && report["build_profile"] == "release"
         && report["profiler_enabled"] == false
         && report["profiler_mode"] == "disabled"
@@ -3607,6 +3724,25 @@ fn finalize_m5() -> Result<(), DynError> {
             .as_f64()
             .ok_or_else(|| format!("comparison omitted numeric {bucket} geomean").into())
     };
+    let aggregate_case = |name: &str| -> Result<&Value, DynError> {
+        performance["aggregate"]["cases"]
+            .as_array()
+            .and_then(|cases| cases.iter().find(|case| case["case"] == name))
+            .ok_or_else(|| format!("formal aggregate omitted case {name}").into())
+    };
+    let struct_gc_allocations =
+        aggregate_case("struct_construction")?["max_vm"]["struct_materializations"]
+            .as_u64()
+            .ok_or("formal aggregate omitted Struct materialization count")?;
+    let enum_gc_allocations =
+        aggregate_case("enum_construction_match")?["max_vm"]["enum_materializations"]
+            .as_u64()
+            .ok_or("formal aggregate omitted Enum materialization count")?;
+    let gc_case = aggregate_case("gc_incremental_step")?;
+    let gc_system_allocations = gc_case["max_system_allocations"]
+        .as_u64()
+        .ok_or("formal aggregate omitted GC system allocation count")?;
+    let steady_state_dispatch_system_allocations = 0_u64;
     for bucket in [
         "product_cpu",
         "value_collection",
@@ -3652,6 +3788,9 @@ fn finalize_m5() -> Result<(), DynError> {
         || performance["aggregate"]["process_count"] != 7
         || performance["aggregate"]["samples_per_process"] != 1_000
         || performance["aggregate"]["warmup_per_process"] != 100
+        || struct_gc_allocations != 0
+        || enum_gc_allocations != 0
+        || gc_system_allocations != 0
         || decision["schema"].as_u64() != Some(1)
         || decision["implementation_commit"] != head
         || performance["decision"] != decision
@@ -3694,10 +3833,12 @@ fn finalize_m5() -> Result<(), DynError> {
         "coldStartGeomeanSpeedup": geomean("cold_start")?,
         "coldStartScenarios": cold_start["cases"],
         "reloadPeak": reload_peak,
-        "structGcAllocations": 0,
-        "enumGcAllocations": 0,
-        "gcSystemAllocations": 0,
-        "steadyStateDispatchSystemAllocations": 0,
+        "structGcAllocations": struct_gc_allocations,
+        "enumGcAllocations": enum_gc_allocations,
+        "gcSystemAllocations": gc_system_allocations,
+        // `test-host-engine-performance` immediately above measures this
+        // exact counter and fails before the report is reachable if nonzero.
+        "steadyStateDispatchSystemAllocations": steady_state_dispatch_system_allocations,
         "unexplainedRegressions": unexplained_regressions,
         "semanticMismatches": [],
         "resourceLeaks": 0,
@@ -5786,28 +5927,86 @@ mod audit_tests {
     use std::collections::BTreeSet;
     use std::fs;
 
+    fn formal_aggregate_case_fixture(name: &str) -> serde_json::Value {
+        let gc = if name == "gc_incremental_step" {
+            serde_json::json!({
+                "cycles": 1,
+                "pause_ns_max": 140,
+                "objects_reclaimed": 32,
+                "bytes_reclaimed": 256,
+            })
+        } else {
+            serde_json::json!({
+                "cycles": null,
+                "pause_ns_max": null,
+                "objects_reclaimed": null,
+                "bytes_reclaimed": null,
+            })
+        };
+        serde_json::json!({
+            "case": name,
+            "tier": "product",
+            "median_throughput_ops_per_second": 10_000,
+            "median_mean_ns": 102,
+            "median_p50_ns": 100,
+            "median_p90_ns": 110,
+            "median_p95_ns": 120,
+            "median_p99_ns": 140,
+            "min_ns": 90,
+            "max_ns": 150,
+            "median_standard_deviation_ns": 5.0,
+            "median_coefficient_of_variation": 0.05,
+            "max_frame_1000_calls_ns": 102_000,
+            "max_system_allocations": 0,
+            "max_system_reallocations": 0,
+            "max_system_allocated_bytes": 0,
+            "max_system_reallocated_bytes": 0,
+            "max_system_peak_outstanding_bytes": 0,
+            "max_vm": {
+                "live_heap_slots_peak": 0,
+                "allocations": 0,
+                "string_allocations": 0,
+                "class_allocations": 0,
+                "collection_storage_allocations": 0,
+                "map_slot_allocations": 0,
+                "struct_materializations": 0,
+                "enum_materializations": 0,
+                "allocated_bytes": 0,
+                "live_bytes": 0,
+                "collection_relocation_bytes": 0,
+                "string_copy_bytes": 0,
+                "host_codec_copy_bytes": 0,
+                "bytes_copied": 0,
+            },
+            "max_gc": gc,
+            "fuel_total": 1_000,
+            "fuel_per_operation": 1,
+            "instructions_total": 1_000,
+            "instructions_per_operation": 1,
+            "peak_resources": {
+                "tasks": 0,
+                "requests": 0,
+                "tokens": 0,
+                "snapshots": 0,
+                "state_objects": 0,
+                "retired_modules": 0,
+                "total": 0,
+            },
+        })
+    }
+
     fn formal_aggregate_fixture(commit: &str) -> serde_json::Value {
         let names = super::VALUE_COLLECTION_CASES
             .iter()
             .chain(super::PRODUCT_CPU_CASES)
             .chain(super::HOST_TASK_ENGINE_CASES)
             .chain(super::COLD_START_CASES)
+            .chain(["gc_incremental_step"].iter())
             .copied()
             .collect::<BTreeSet<_>>();
         let cases = names
             .into_iter()
-            .map(|name| {
-                serde_json::json!({
-                    "case": name,
-                    "tier": "product",
-                    "median_throughput_ops_per_second": 10_000,
-                    "median_p50_ns": 100,
-                    "median_p95_ns": 120,
-                    "median_p99_ns": 140,
-                    "max_system_allocations": 0,
-                    "max_system_allocated_bytes": 0,
-                })
-            })
+            .map(formal_aggregate_case_fixture)
             .collect::<Vec<_>>();
         serde_json::json!({
             "schema": 2,
@@ -5833,6 +6032,7 @@ mod audit_tests {
             "process_count": 7,
             "samples_per_process": 1_000,
             "warmup_per_process": 100,
+            "started_at_unix_ms": 1_800_000_000_000_u64,
             "cases": cases,
         })
     }
@@ -5916,6 +6116,33 @@ mod audit_tests {
         .expect("fixture writes");
         assert!(super::formal_aggregate_at(&path, "head").is_some());
         assert!(super::formal_aggregate_at(&path, "other").is_none());
+
+        report["cases"]
+            .as_array_mut()
+            .expect("fixture cases")
+            .iter_mut()
+            .find(|case| case["case"] == "struct_construction")
+            .expect("Struct case")["max_vm"]["struct_materializations"] =
+            serde_json::Value::from(1);
+        fs::write(
+            &path,
+            serde_json::to_vec(&report).expect("fixture serializes"),
+        )
+        .expect("fixture rewrites");
+        assert!(super::formal_aggregate_at(&path, "head").is_none());
+        report = formal_aggregate_fixture("head");
+
+        report["cases"].as_array_mut().expect("fixture cases")[0]["max_vm"]
+            .as_object_mut()
+            .expect("VM counters object")
+            .remove("allocated_bytes");
+        fs::write(
+            &path,
+            serde_json::to_vec(&report).expect("fixture serializes"),
+        )
+        .expect("fixture rewrites");
+        assert!(super::formal_aggregate_at(&path, "head").is_none());
+        report = formal_aggregate_fixture("head");
 
         report["samples_per_process"] = serde_json::Value::from(999);
         fs::write(

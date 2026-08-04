@@ -24,6 +24,7 @@ use nexa_runtime::{
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
+use serde_json::Value;
 
 mod cold_start;
 mod reload_peak;
@@ -565,6 +566,7 @@ struct AggregateReport {
     process_count: usize,
     samples_per_process: usize,
     warmup_per_process: usize,
+    started_at_unix_ms: u128,
     implementation_commit: String,
     benchmark_source_hash: String,
     bytecode_hash: String,
@@ -589,11 +591,28 @@ struct AggregateCase {
     case: String,
     tier: String,
     median_throughput_ops_per_second: u64,
+    median_mean_ns: u128,
     median_p50_ns: u128,
+    median_p90_ns: u128,
     median_p95_ns: u128,
     median_p99_ns: u128,
+    min_ns: u128,
+    max_ns: u128,
+    median_standard_deviation_ns: f64,
+    median_coefficient_of_variation: f64,
+    max_frame_1000_calls_ns: u128,
     max_system_allocations: u64,
+    max_system_reallocations: u64,
     max_system_allocated_bytes: u64,
+    max_system_reallocated_bytes: u64,
+    max_system_peak_outstanding_bytes: u64,
+    max_vm: VmCounters,
+    max_gc: GcCounters,
+    fuel_total: u64,
+    fuel_per_operation: u64,
+    instructions_total: u64,
+    instructions_per_operation: u64,
+    peak_resources: PeakResources,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1591,17 +1610,107 @@ fn aggregate_reports(
                 })
             };
             let throughput = numeric("throughput_ops_per_second");
+            let mean = numeric("mean_ns");
+            let minimum = numeric("min_ns");
             let p50 = numeric("p50_ns");
+            let p90 = numeric("p90_ns");
             let p95 = numeric("p95_ns");
             let p99 = numeric("p99_ns");
+            let maximum = numeric("max_ns");
+            let standard_deviation = actual["standard_deviation_ns"].as_f64();
+            let coefficient = actual["coefficient_of_variation"].as_f64();
+            let vm = &actual["vm"];
+            let gc = &actual["gc"];
+            let peak_resources = &actual["peak_resources"];
             if throughput.is_none_or(|value| value == 0)
+                || mean.is_none_or(|value| value == 0)
+                || minimum.is_none_or(|value| value == 0)
                 || p50.is_none_or(|value| value == 0)
+                || p90.is_none_or(|value| value == 0)
                 || p95.is_none_or(|value| value == 0)
                 || p99.is_none_or(|value| value == 0)
-                || p50.zip(p95).is_none_or(|(p50, p95)| p50 > p95)
+                || maximum.is_none_or(|value| value == 0)
+                || minimum.zip(p50).is_none_or(|(minimum, p50)| minimum > p50)
+                || minimum
+                    .zip(mean)
+                    .is_none_or(|(minimum, mean)| minimum > mean)
+                || mean
+                    .zip(maximum)
+                    .is_none_or(|(mean, maximum)| mean > maximum)
+                || p50.zip(p90).is_none_or(|(p50, p90)| p50 > p90)
+                || p90.zip(p95).is_none_or(|(p90, p95)| p90 > p95)
                 || p95.zip(p99).is_none_or(|(p95, p99)| p95 > p99)
-                || numeric("system_allocations").is_none()
-                || numeric("system_allocated_bytes").is_none()
+                || p99.zip(maximum).is_none_or(|(p99, maximum)| p99 > maximum)
+                || standard_deviation.is_none_or(|value| !value.is_finite() || value < 0.0)
+                || coefficient.is_none_or(|value| !value.is_finite() || value < 0.0)
+                || [
+                    "frame_1000_calls_ns",
+                    "system_allocations",
+                    "system_reallocations",
+                    "system_allocated_bytes",
+                    "system_reallocated_bytes",
+                    "system_peak_outstanding_bytes",
+                    "fuel_total",
+                    "fuel_per_operation",
+                    "instructions_total",
+                    "instructions_per_operation",
+                ]
+                .into_iter()
+                .any(|field| numeric(field).is_none())
+                || vm.as_object().is_none_or(|object| {
+                    object
+                        .get("live_heap_slots_peak")
+                        .and_then(Value::as_u64)
+                        .is_none()
+                        || [
+                            "allocations",
+                            "string_allocations",
+                            "class_allocations",
+                            "collection_storage_allocations",
+                            "map_slot_allocations",
+                            "struct_materializations",
+                            "enum_materializations",
+                            "allocated_bytes",
+                            "live_bytes",
+                            "collection_relocation_bytes",
+                            "string_copy_bytes",
+                            "host_codec_copy_bytes",
+                            "bytes_copied",
+                        ]
+                        .into_iter()
+                        .any(|field| {
+                            object
+                                .get(field)
+                                .is_none_or(|value| !value.is_null() && value.as_u64().is_none())
+                        })
+                })
+                || gc.as_object().is_none_or(|object| {
+                    [
+                        "cycles",
+                        "pause_ns_max",
+                        "objects_reclaimed",
+                        "bytes_reclaimed",
+                    ]
+                    .into_iter()
+                    .any(|field| {
+                        object
+                            .get(field)
+                            .is_none_or(|value| !value.is_null() && value.as_u64().is_none())
+                    })
+                })
+                || peak_resources.as_object().is_none_or(|object| {
+                    [
+                        "tasks",
+                        "requests",
+                        "tokens",
+                        "snapshots",
+                        "state_objects",
+                        "retired_modules",
+                        "total",
+                    ]
+                    .into_iter()
+                    .any(|field| object.get(field).and_then(Value::as_u64).is_none())
+                })
             {
                 return Err(format!(
                     "benchmark process report {report_number} has invalid case {case_index} measurements"
@@ -1610,16 +1719,18 @@ fn aggregate_reports(
             }
         }
     }
-    for (field, expected_length) in [("benchmark_source_hash", 64), ("bytecode_hash", 64)] {
-        if first[field]
-            .as_str()
-            .is_none_or(|value| value.len() != expected_length)
-        {
+    for (field, expected_length) in [
+        ("implementation_commit", 40),
+        ("benchmark_source_hash", 64),
+        ("bytecode_hash", 64),
+    ] {
+        if first[field].as_str().is_none_or(|value| {
+            value.len() != expected_length || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
             return Err(format!("benchmark process report has an invalid {field}").into());
         }
     }
     for field in [
-        "implementation_commit",
         "toolchain",
         "os",
         "os_version",
@@ -1640,8 +1751,13 @@ fn aggregate_reports(
         .as_u64()
         .is_none_or(|count| count == 0)
         || first["profiler_enabled"].as_bool().is_none()
+        || reports.iter().any(|report| {
+            report["started_at_unix_ms"]
+                .as_u64()
+                .is_none_or(|started| started == 0)
+        })
     {
-        return Err("benchmark process report has invalid machine/profiler metadata".into());
+        return Err("benchmark process report has invalid machine/profiler/time metadata".into());
     }
 
     let mut cases = Vec::with_capacity(first_cases.len());
@@ -1663,25 +1779,154 @@ fn aggregate_reports(
             values.sort_unstable();
             Ok(values)
         };
+        let collect_f64 = |field: &str| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            let mut values = Vec::with_capacity(reports.len());
+            for report in reports {
+                let value = report["cases"][case_index][field]
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| format!("case {name} missing finite numeric {field}"))?;
+                values.push(value);
+            }
+            values.sort_by(f64::total_cmp);
+            Ok(values)
+        };
+        let nested_max = |object: &str, field: &str| -> Result<u64, Box<dyn std::error::Error>> {
+            reports
+                .iter()
+                .map(|report| {
+                    report["cases"][case_index][object][field]
+                        .as_u64()
+                        .ok_or_else(|| {
+                            format!("case {name} missing numeric {object}.{field}").into()
+                        })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+                .map(|values| values.into_iter().max().unwrap_or(0))
+        };
+        let nested_optional_max = |object: &str,
+                                   field: &str|
+         -> Result<Option<u64>, Box<dyn std::error::Error>> {
+            let mut values = Vec::with_capacity(reports.len());
+            let mut nulls = 0_usize;
+            for report in reports {
+                let value = &report["cases"][case_index][object][field];
+                if value.is_null() {
+                    nulls += 1;
+                } else {
+                    values.push(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| format!("case {name} has invalid {object}.{field}"))?,
+                    );
+                }
+            }
+            if nulls != 0 && nulls != reports.len() {
+                return Err(
+                    format!("case {name} disagrees on optional {object}.{field} presence").into(),
+                );
+            }
+            Ok(values.into_iter().max())
+        };
+        let invariant = |field: &str| -> Result<u64, Box<dyn std::error::Error>> {
+            let expected = reports[0]["cases"][case_index][field]
+                .as_u64()
+                .ok_or_else(|| format!("case {name} missing invariant {field}"))?;
+            if reports
+                .iter()
+                .skip(1)
+                .any(|report| report["cases"][case_index][field].as_u64() != Some(expected))
+            {
+                return Err(format!("case {name} disagrees on invariant {field}").into());
+            }
+            Ok(expected)
+        };
         let median = |values: &[u128]| values[values.len() / 2];
+        let median_f64 = |values: &[f64]| values[values.len() / 2];
         let throughput = collect("throughput_ops_per_second")?;
+        let mean = collect("mean_ns")?;
+        let minimum = collect("min_ns")?;
         let p50 = collect("p50_ns")?;
+        let p90 = collect("p90_ns")?;
         let p95 = collect("p95_ns")?;
         let p99 = collect("p99_ns")?;
+        let maximum = collect("max_ns")?;
+        let standard_deviation = collect_f64("standard_deviation_ns")?;
+        let coefficient = collect_f64("coefficient_of_variation")?;
+        let frame_1000_calls = collect("frame_1000_calls_ns")?;
         let allocations = collect("system_allocations")?;
+        let reallocations = collect("system_reallocations")?;
         let allocated_bytes = collect("system_allocated_bytes")?;
+        let reallocated_bytes = collect("system_reallocated_bytes")?;
+        let peak_outstanding_bytes = collect("system_peak_outstanding_bytes")?;
         cases.push(AggregateCase {
-            case: name,
+            case: name.clone(),
             tier,
             median_throughput_ops_per_second: u64::try_from(median(&throughput))
                 .unwrap_or(u64::MAX),
+            median_mean_ns: median(&mean),
             median_p50_ns: median(&p50),
+            median_p90_ns: median(&p90),
             median_p95_ns: median(&p95),
             median_p99_ns: median(&p99),
+            min_ns: *minimum.first().unwrap_or(&0),
+            max_ns: *maximum.last().unwrap_or(&0),
+            median_standard_deviation_ns: median_f64(&standard_deviation),
+            median_coefficient_of_variation: median_f64(&coefficient),
+            max_frame_1000_calls_ns: *frame_1000_calls.last().unwrap_or(&0),
             max_system_allocations: u64::try_from(*allocations.last().unwrap_or(&0))
+                .unwrap_or(u64::MAX),
+            max_system_reallocations: u64::try_from(*reallocations.last().unwrap_or(&0))
                 .unwrap_or(u64::MAX),
             max_system_allocated_bytes: u64::try_from(*allocated_bytes.last().unwrap_or(&0))
                 .unwrap_or(u64::MAX),
+            max_system_reallocated_bytes: u64::try_from(*reallocated_bytes.last().unwrap_or(&0))
+                .unwrap_or(u64::MAX),
+            max_system_peak_outstanding_bytes: u64::try_from(
+                *peak_outstanding_bytes.last().unwrap_or(&0),
+            )
+            .unwrap_or(u64::MAX),
+            max_vm: VmCounters {
+                live_heap_slots_peak: nested_max("vm", "live_heap_slots_peak")?,
+                allocations: nested_optional_max("vm", "allocations")?,
+                string_allocations: nested_optional_max("vm", "string_allocations")?,
+                class_allocations: nested_optional_max("vm", "class_allocations")?,
+                collection_storage_allocations: nested_optional_max(
+                    "vm",
+                    "collection_storage_allocations",
+                )?,
+                map_slot_allocations: nested_optional_max("vm", "map_slot_allocations")?,
+                struct_materializations: nested_optional_max("vm", "struct_materializations")?,
+                enum_materializations: nested_optional_max("vm", "enum_materializations")?,
+                allocated_bytes: nested_optional_max("vm", "allocated_bytes")?,
+                live_bytes: nested_optional_max("vm", "live_bytes")?,
+                collection_relocation_bytes: nested_optional_max(
+                    "vm",
+                    "collection_relocation_bytes",
+                )?,
+                string_copy_bytes: nested_optional_max("vm", "string_copy_bytes")?,
+                host_codec_copy_bytes: nested_optional_max("vm", "host_codec_copy_bytes")?,
+                bytes_copied: nested_optional_max("vm", "bytes_copied")?,
+            },
+            max_gc: GcCounters {
+                cycles: nested_optional_max("gc", "cycles")?,
+                pause_ns_max: nested_optional_max("gc", "pause_ns_max")?,
+                objects_reclaimed: nested_optional_max("gc", "objects_reclaimed")?,
+                bytes_reclaimed: nested_optional_max("gc", "bytes_reclaimed")?,
+            },
+            fuel_total: invariant("fuel_total")?,
+            fuel_per_operation: invariant("fuel_per_operation")?,
+            instructions_total: invariant("instructions_total")?,
+            instructions_per_operation: invariant("instructions_per_operation")?,
+            peak_resources: PeakResources {
+                tasks: nested_max("peak_resources", "tasks")?,
+                requests: nested_max("peak_resources", "requests")?,
+                tokens: nested_max("peak_resources", "tokens")?,
+                snapshots: nested_max("peak_resources", "snapshots")?,
+                state_objects: nested_max("peak_resources", "state_objects")?,
+                retired_modules: nested_max("peak_resources", "retired_modules")?,
+                total: nested_max("peak_resources", "total")?,
+            },
         });
     }
     Ok(AggregateReport {
@@ -1692,6 +1937,12 @@ fn aggregate_reports(
         process_count: processes,
         samples_per_process: samples,
         warmup_per_process: WARMUP.min(samples),
+        started_at_unix_ms: reports
+            .iter()
+            .filter_map(|report| report["started_at_unix_ms"].as_u64())
+            .map(u128::from)
+            .min()
+            .expect("validated process start times"),
         implementation_commit: first["implementation_commit"]
             .as_str()
             .expect("validated implementation commit")
@@ -1760,6 +2011,65 @@ mod aggregate_report_tests {
     use super::aggregate_reports;
 
     fn report(process_index: usize) -> Value {
+        let vm = json!({
+            "live_heap_slots_peak": 0,
+            "allocations": 0,
+            "string_allocations": 0,
+            "class_allocations": 0,
+            "collection_storage_allocations": 0,
+            "map_slot_allocations": 0,
+            "struct_materializations": 0,
+            "enum_materializations": 0,
+            "allocated_bytes": 0,
+            "live_bytes": 0,
+            "collection_relocation_bytes": 0,
+            "string_copy_bytes": 0,
+            "host_codec_copy_bytes": 0,
+            "bytes_copied": 0,
+        });
+        let gc = json!({
+            "cycles": null,
+            "pause_ns_max": null,
+            "objects_reclaimed": null,
+            "bytes_reclaimed": null,
+        });
+        let peak_resources = json!({
+            "tasks": 0,
+            "requests": 0,
+            "tokens": 0,
+            "snapshots": 0,
+            "state_objects": 0,
+            "retired_modules": 0,
+            "total": 0,
+        });
+        let case = json!({
+            "case": "qualified_case",
+            "tier": "product",
+            "samples": 1_000,
+            "throughput_ops_per_second": 10_000,
+            "mean_ns": 102,
+            "p50_ns": 100,
+            "p90_ns": 115,
+            "p95_ns": 120,
+            "p99_ns": 140,
+            "min_ns": 90,
+            "max_ns": 150,
+            "standard_deviation_ns": 5.0,
+            "coefficient_of_variation": 0.05,
+            "frame_1000_calls_ns": 102_000,
+            "system_allocations": 0,
+            "system_reallocations": 0,
+            "system_allocated_bytes": 0,
+            "system_reallocated_bytes": 0,
+            "system_peak_outstanding_bytes": 0,
+            "vm": vm,
+            "gc": gc,
+            "fuel_total": 1_000,
+            "fuel_per_operation": 1,
+            "instructions_total": 1_000,
+            "instructions_per_operation": 1,
+            "peak_resources": peak_resources,
+        });
         json!({
             "schema": 1,
             "benchmark_version": 7,
@@ -1779,20 +2089,12 @@ mod aggregate_report_tests {
             "samples": 1_000,
             "warmup": 100,
             "process_index": process_index,
+            "started_at_unix_ms": 1_800_000_000_000_u64
+                + u64::try_from(process_index).expect("test process index fits u64"),
             "profiler_enabled": false,
             "profiler_mode": "disabled",
             "allocation_scope": "timed operation only; per-sample setup and result storage excluded",
-            "cases": [{
-                "case": "qualified_case",
-                "tier": "product",
-                "samples": 1_000,
-                "throughput_ops_per_second": 10_000,
-                "p50_ns": 100,
-                "p95_ns": 120,
-                "p99_ns": 140,
-                "system_allocations": 0,
-                "system_allocated_bytes": 0,
-            }],
+            "cases": [case],
         })
     }
 
@@ -1806,11 +2108,16 @@ mod aggregate_report_tests {
         assert_eq!(aggregate.machine_model, "Mac16,7");
         assert_eq!(aggregate.cpu_model, "qualification-cpu");
         assert_eq!(aggregate.logical_cpu_count, 10);
+        assert_eq!(aggregate.started_at_unix_ms, 1_800_000_000_000);
         assert_eq!(
             aggregate.allocation_scope,
             "timed operation only; per-sample setup and result storage excluded"
         );
         assert_eq!(aggregate.cases.len(), 1);
+        assert_eq!(aggregate.cases[0].median_mean_ns, 102);
+        assert_eq!(aggregate.cases[0].median_p90_ns, 115);
+        assert_eq!(aggregate.cases[0].max_vm.struct_materializations, Some(0));
+        assert_eq!(aggregate.cases[0].fuel_per_operation, 1);
     }
 
     #[test]
@@ -1824,6 +2131,17 @@ mod aggregate_report_tests {
         let mut case_drift = report(1);
         case_drift["cases"][0]["case"] = Value::from("different_case");
         assert!(aggregate_reports(&[first.clone(), case_drift], 2, 1_000).is_err());
+
+        let mut counter_presence_drift = report(1);
+        counter_presence_drift["cases"][0]["vm"]["allocations"] = Value::Null;
+        assert!(aggregate_reports(&[first.clone(), counter_presence_drift], 2, 1_000).is_err());
+
+        let mut missing_counter = report(1);
+        missing_counter["cases"][0]["vm"]
+            .as_object_mut()
+            .expect("VM counters object")
+            .remove("allocated_bytes");
+        assert!(aggregate_reports(&[first.clone(), missing_counter], 2, 1_000).is_err());
 
         assert!(aggregate_reports(&[first.clone(), report(0)], 2, 1_000).is_err());
         assert!(aggregate_reports(&[first], 2, 1_000).is_err());
