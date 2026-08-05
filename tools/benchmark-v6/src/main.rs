@@ -661,7 +661,10 @@ fn async_module() -> VerifiedModule {
         parameters: vec![ValueType::I32],
         result: Some(ValueType::I32),
     };
-    let mut function = FunctionBuilder::new(signature.clone(), 3);
+    // Register 0 is the scalar parameter, 1..3 is the two-slot
+    // `Result<i32, i32>`, and register 3 receives its extracted payload.
+    // The payload destination must not overlap the verified aggregate range.
+    let mut function = FunctionBuilder::new(signature.clone(), 4);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -673,9 +676,9 @@ fn async_module() -> VerifiedModule {
         .emit(Instruction::EnumPayload {
             source: 1,
             variant: StableId::from_parts(&["Result", "::Ok"]),
-            dst: 2,
+            dst: 3,
         })
-        .emit(Instruction::Return { source: 2 });
+        .emit(Instruction::Return { source: 3 });
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
     let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
@@ -700,20 +703,19 @@ fn async_module() -> VerifiedModule {
         async_result: Some(async_result),
     });
     let mut function = function.finish().expect("async function");
-    function.root_bitmap[1] = true;
     function.safepoints = vec![0, 1, 2];
     function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![false, false, false],
+            bitmap: vec![false, false, false, false],
         },
         RootMap {
             pc: 1,
-            bitmap: vec![false, true, false],
+            bitmap: vec![false, false, false, false],
         },
         RootMap {
             pc: 2,
-            bitmap: vec![false, false, false],
+            bitmap: vec![false, false, false, false],
         },
     ];
     let function = module.function(function);

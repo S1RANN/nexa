@@ -11,10 +11,10 @@ use nexa_bytecode::{
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    CancelReason, CollectionView, CopyBuffer, EncodeHostReturn, Heap, HeapError, HostCallOutcome,
+    CancelReason, CollectionView, CopyBuffer, EncodeHostReturn, Heap, HostCallOutcome,
     HostErrorPayload, HostFunctionAuthority, HostFunctionSlot, HostPayload, HostRegistry,
     HostReturnRequirements, HostTrap, MigrationAllocationPhase, ModuleHandle, PendingHostRequest,
-    RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResolvedHostFunction,
+    RealmConfig, RealmRuntime, ReleaseKind, ReleaseRecord, ResolvedHostFunction,
     ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost,
     RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeValue, StateObject,
     StateValue, StepConfig, TaskLimits, TaskPoll, TaskRuntime, TaskState, TickBudget, YieldReason,
@@ -270,18 +270,13 @@ enum ObservedCompletion {
     Error(u32),
     Cancelled,
     Abandoned,
-    HeapFullSuccess,
 }
 
 fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompletion) -> u64 {
     let host = RuntimeHost::new(8);
     let pending = Arc::new(Mutex::new(None));
     let config = RealmConfig {
-        max_heap_objects: if matches!(completion, ObservedCompletion::HeapFullSuccess) {
-            0
-        } else {
-            8
-        },
+        max_heap_objects: 8,
         ..RealmConfig::default()
     };
     let (mut realm, module) =
@@ -317,32 +312,16 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
         ObservedCompletion::Abandoned => {
             ticket.abandon().unwrap();
         }
-        ObservedCompletion::HeapFullSuccess => {
-            ticket.complete(HostPayload::I32(12)).unwrap();
-        }
     }
     let allocations = observed(|| {
-        let tick = realm.tick(TickBudget {
-            max_tasks: 1,
-            frame_fuel_budget: 64,
-            collect_garbage: false,
-        });
-        if matches!(completion, ObservedCompletion::HeapFullSuccess) {
-            assert_eq!(tick, Err(RealmError::Heap(HeapError::CapacityExhausted)));
-        } else {
-            tick.unwrap();
-        }
-    });
-    if matches!(completion, ObservedCompletion::HeapFullSuccess) {
-        assert_eq!(realm.task_snapshot(task).unwrap().state, TaskState::Waiting);
-        assert!(realm.resource_invariants_hold());
-        let ledger = realm.resource_ledger();
-        assert_eq!(ledger.requests, 1);
-        assert_eq!(ledger.completion_reservations, 1);
         realm
-            .cancel_task(task, CancelReason::ScopeCancelled)
+            .tick(TickBudget {
+                max_tasks: 1,
+                frame_fuel_budget: 64,
+                collect_garbage: false,
+            })
             .unwrap();
-    }
+    });
     drop(realm);
     let _ = host.drain_releases();
     let _ = host.begin_close();
@@ -908,7 +887,11 @@ fn complex_host_allocation_matrix() {
         nexa_bytecode::array_type(ValueType::Named(record_type))
     );
     let array = heap
-        .allocate_array(array_type, ValueType::Named(record_type))
+        .allocate_value_row_array(
+            array_type,
+            ValueType::Named(record_type),
+            std::num::NonZeroU16::new(2).expect("record row width"),
+        )
         .unwrap();
     heap.array_push(array, record).unwrap();
     let ValueType::Named(buffer_type) = inspect_authority.parameters()[6] else {
@@ -1714,11 +1697,6 @@ fn main() {
             },
             ObservedCompletion::Abandoned,
         );
-        let heap_full_writeback = observe_typed_writeback(
-            AsyncObserverSpec::default(),
-            ObservedCompletion::HeapFullSuccess,
-        );
-
         let host = RuntimeHost::new(4);
         let pending = Arc::new(Mutex::new(None));
         let config = RealmConfig {
@@ -2072,7 +2050,6 @@ fn main() {
             error_enum_writeback,
             cancel_return_error,
             abandon_return_error,
-            heap_full_writeback,
             token_release,
             snapshot_release,
             detached_request_release,
@@ -2105,7 +2082,6 @@ fn main() {
             error_enum_writeback,
             cancel_return_error,
             abandon_return_error,
-            heap_full_writeback,
             token_release,
             snapshot_release,
             detached_request_release,
@@ -2133,7 +2109,6 @@ fn main() {
                 + *error_enum_writeback
                 + *cancel_return_error
                 + *abandon_return_error
-                + *heap_full_writeback
                 + *token_release
                 + *snapshot_release
                 + *detached_request_release
@@ -2166,7 +2141,6 @@ fn main() {
             error_enum_writeback,
             cancel_return_error,
             abandon_return_error,
-            heap_full_writeback,
             token_release,
             snapshot_release,
             detached_request_release,
@@ -2194,7 +2168,6 @@ fn main() {
                 + *error_enum_writeback
                 + *cancel_return_error
                 + *abandon_return_error
-                + *heap_full_writeback
                 + *token_release
                 + *snapshot_release
                 + *detached_request_release
@@ -2234,8 +2207,8 @@ fn main() {
     println!(
         "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
-            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, token_release, snapshot_release, detached_request_release, runtime_host_drain, released_module_final_transfer, realm_drop_transfer)| format!(
-                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"token_release\":{token_release},\"snapshot_release\":{snapshot_release},\"detached_request_release\":{detached_request_release},\"runtime_host_drain\":{runtime_host_drain},\"released_module_final_transfer\":{released_module_final_transfer},\"realm_drop_transfer\":{realm_drop_transfer}}}"
+            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, token_release, snapshot_release, detached_request_release, runtime_host_drain, released_module_final_transfer, realm_drop_transfer)| format!(
+                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"token_release\":{token_release},\"snapshot_release\":{snapshot_release},\"detached_request_release\":{detached_request_release},\"runtime_host_drain\":{runtime_host_drain},\"released_module_final_transfer\":{released_module_final_transfer},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
             .join(","),
@@ -2348,7 +2321,7 @@ fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::Verifie
         .emit(Instruction::StateFinish)
         .emit(Instruction::Return { source: 0 });
     let mut migration = migration.finish().unwrap();
-    migration.root_bitmap = vec![false, true];
+    migration.root_bitmap = vec![false, false];
     migration.root_maps = vec![
         RootMap {
             pc: 0,
@@ -2467,17 +2440,17 @@ fn make_async_host_realm_with_spec(
             result: Some(ValueType::Named(result.type_id)),
         },
         parameter_slots: 1,
-        registers: 2,
-        frame_bytes: 16,
-        root_bitmap: vec![false, true],
+        registers: 3,
+        frame_bytes: 24,
+        root_bitmap: vec![false, false, false],
         root_maps: vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![false, false],
+                bitmap: vec![false, false, false],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, true],
+                bitmap: vec![false, false, false],
             },
         ],
         safepoints: vec![0, 1],

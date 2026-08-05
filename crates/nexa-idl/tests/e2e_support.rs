@@ -290,7 +290,7 @@ impl MutationProbe {
         );
         assert_eq!(Reset::NAME, "reset");
         assert_eq!(
-            <Reset as nexa_runtime::ScriptExport>::effect(),
+            <Reset as nexa_runtime::ScriptExport>::EFFECT,
             nexa_runtime::FunctionEffect::Ordinary
         );
         binding_entrypoint.identity.stable_id
