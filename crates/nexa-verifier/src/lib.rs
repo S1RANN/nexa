@@ -6035,7 +6035,7 @@ mod tests {
                 parameters: Vec::new(),
                 result: None,
             },
-            0,
+            1,
         );
         migration
             .effect(FunctionEffect::Migration)
@@ -6196,7 +6196,7 @@ mod tests {
                     parameters: Vec::new(),
                     result: None,
                 },
-                0,
+                1,
             );
             migration
                 .effect(FunctionEffect::Migration)
