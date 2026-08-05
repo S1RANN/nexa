@@ -1,5 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -582,6 +582,7 @@ struct AggregateReport {
     build_profile: String,
     profiler_enabled: bool,
     profiler_mode: String,
+    profiler: Option<Value>,
     allocation_scope: String,
     cases: Vec<AggregateCase>,
 }
@@ -1512,6 +1513,229 @@ fn run_multi_process(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn aggregate_profiler(
+    reports: &[serde_json::Value],
+    enabled: bool,
+) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    if !enabled {
+        if reports.iter().any(|report| !report["profiler"].is_null()) {
+            return Err("profiler-disabled process report carried profiler evidence".into());
+        }
+        return Ok(None);
+    }
+
+    let summaries = reports
+        .iter()
+        .enumerate()
+        .map(|(index, report)| {
+            report["profiler"]
+                .as_object()
+                .ok_or_else(|| format!("profiled process report {index} omitted profiler evidence"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sum = |field: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        summaries.iter().try_fold(0_u64, |total, summary| {
+            let value = summary
+                .get(field)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("profiler summary omitted numeric {field}"))?;
+            Ok(total.saturating_add(value))
+        })
+    };
+    let maximum = |field: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        summaries
+            .iter()
+            .map(|summary| {
+                summary
+                    .get(field)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("profiler summary omitted numeric {field}").into())
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+            .map(|values| values.into_iter().max().unwrap_or(0))
+    };
+    if summaries
+        .iter()
+        .any(|summary| summary.get("schema").and_then(Value::as_u64) != Some(1))
+    {
+        return Err("profiled process report has an unsupported profiler schema".into());
+    }
+
+    let mut opcodes = BTreeMap::<String, u64>::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        let entries = summary
+            .get("top_opcodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("profiler summary {index} omitted top_opcodes"))?;
+        for entry in entries {
+            let entry = entry
+                .as_array()
+                .filter(|entry| entry.len() == 2)
+                .ok_or_else(|| format!("profiler summary {index} has an invalid opcode row"))?;
+            let name = entry[0]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("profiler summary {index} has an invalid opcode name"))?;
+            let executions = entry[1]
+                .as_u64()
+                .ok_or_else(|| format!("profiler summary {index} has an invalid opcode count"))?;
+            opcodes
+                .entry(name.to_owned())
+                .and_modify(|total| *total = total.saturating_add(executions))
+                .or_insert(executions);
+        }
+    }
+    let mut top_opcodes = opcodes.into_iter().collect::<Vec<_>>();
+    top_opcodes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    top_opcodes.truncate(5);
+
+    let mut allocation_sites = BTreeMap::<String, (Value, u64)>::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        let sites = summary
+            .get("top_allocation_sites")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("profiler summary {index} omitted top_allocation_sites"))?;
+        for site in sites {
+            let mut identity = site.as_object().cloned().ok_or_else(|| {
+                format!("profiler summary {index} has an invalid allocation site")
+            })?;
+            let count = identity
+                .remove("count")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    format!("profiler summary {index} has an invalid allocation site count")
+                })?;
+            let key = serde_json::to_string(&identity)?;
+            allocation_sites
+                .entry(key)
+                .and_modify(|(_, total)| *total = total.saturating_add(count))
+                .or_insert((Value::Object(identity), count));
+        }
+    }
+    let mut top_allocation_sites = allocation_sites
+        .into_values()
+        .map(|(mut site, count)| {
+            site["count"] = Value::from(count);
+            site
+        })
+        .collect::<Vec<_>>();
+    top_allocation_sites.sort_by(|left, right| {
+        right["count"]
+            .as_u64()
+            .cmp(&left["count"].as_u64())
+            .then_with(|| left.to_string().cmp(&right.to_string()))
+    });
+    top_allocation_sites.truncate(5);
+
+    let nested = |object: &str,
+                  summed: &[&str],
+                  maximized: &[&str]|
+     -> Result<serde_json::Map<String, Value>, Box<dyn std::error::Error>> {
+        let objects = summaries
+            .iter()
+            .map(|summary| {
+                summary
+                    .get(object)
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("profiler summary omitted {object}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result = serde_json::Map::new();
+        for field in summed {
+            let value = objects.iter().try_fold(0_u64, |total, object| {
+                let value = object
+                    .get(*field)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("profiler {object:?} omitted numeric {field}"))?;
+                Ok::<_, Box<dyn std::error::Error>>(total.saturating_add(value))
+            })?;
+            result.insert((*field).to_owned(), Value::from(value));
+        }
+        for field in maximized {
+            let value = objects
+                .iter()
+                .map(|object| object.get(*field).and_then(Value::as_u64))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("profiler {object} omitted numeric {field}"))?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            result.insert((*field).to_owned(), Value::from(value));
+        }
+        Ok(result)
+    };
+    let mut gc = nested(
+        "gc",
+        &[
+            "full_collections",
+            "incremental_steps",
+            "completed_cycles",
+            "roots_scanned",
+            "roots_seeded",
+            "objects_marked",
+            "bytes_marked",
+            "slots_swept",
+            "objects_reclaimed",
+            "bytes_reclaimed",
+            "barrier_writes",
+            "barrier_shades",
+            "work_objects",
+            "work_bytes",
+            "object_budget_overrun",
+            "byte_budget_overrun",
+            "duration_budget_overrun_ns",
+            "incremental_work_time_ns",
+        ],
+        &[
+            "last_cycle",
+            "max_pause_time_ns",
+            "live_bytes",
+            "fragmentation_per_mille",
+        ],
+    )?;
+    let last_phase = summaries[0]["gc"]["last_phase"]
+        .as_str()
+        .ok_or("profiler GC summary omitted last_phase")?;
+    if summaries
+        .iter()
+        .any(|summary| summary["gc"]["last_phase"].as_str() != Some(last_phase))
+    {
+        return Err("profiled process reports disagree on the terminal GC phase".into());
+    }
+    gc.insert("last_phase".to_owned(), Value::from(last_phase));
+    let tasks = nested(
+        "tasks",
+        &[
+            "polls",
+            "completed",
+            "yielded_fuel",
+            "yielded_explicit",
+            "waiting_host",
+            "cancelled",
+            "trapped",
+        ],
+        &[],
+    )?;
+
+    Ok(Some(serde_json::json!({
+        "schema": 1,
+        "host_calls": sum("host_calls")?,
+        "host_function_count": maximum("host_function_count")?,
+        "function_count": maximum("function_count")?,
+        "allocation_site_count": maximum("allocation_site_count")?,
+        "dropped_modules": sum("dropped_modules")?,
+        "dropped_functions": sum("dropped_functions")?,
+        "dropped_sites": sum("dropped_sites")?,
+        "dropped_host_calls": sum("dropped_host_calls")?,
+        "gc": gc,
+        "tasks": tasks,
+        "total_opcode_executions": sum("total_opcode_executions")?,
+        "top_opcodes": top_opcodes,
+        "top_allocation_sites": top_allocation_sites,
+    })))
+}
+
 fn aggregate_reports(
     reports: &[serde_json::Value],
     processes: usize,
@@ -1929,6 +2153,10 @@ fn aggregate_reports(
             },
         });
     }
+    let profiler_enabled = first["profiler_enabled"]
+        .as_bool()
+        .expect("validated profiler flag");
+    let profiler = aggregate_profiler(reports, profiler_enabled)?;
     Ok(AggregateReport {
         schema: 2,
         benchmark_version: 7,
@@ -1989,13 +2217,12 @@ fn aggregate_reports(
             .as_str()
             .expect("validated build profile")
             .to_owned(),
-        profiler_enabled: first["profiler_enabled"]
-            .as_bool()
-            .expect("validated profiler flag"),
+        profiler_enabled,
         profiler_mode: first["profiler_mode"]
             .as_str()
             .expect("validated profiler mode")
             .to_owned(),
+        profiler,
         allocation_scope: first["allocation_scope"]
             .as_str()
             .expect("validated allocation scope")
@@ -2098,6 +2325,57 @@ mod aggregate_report_tests {
         })
     }
 
+    fn profiler(executions: u64) -> Value {
+        json!({
+            "schema": 1,
+            "host_calls": executions,
+            "host_function_count": 2,
+            "function_count": 4,
+            "allocation_site_count": 1,
+            "dropped_modules": 0,
+            "dropped_functions": 0,
+            "dropped_sites": 0,
+            "dropped_host_calls": 0,
+            "gc": {
+                "full_collections": executions,
+                "incremental_steps": executions,
+                "completed_cycles": executions,
+                "last_cycle": executions,
+                "last_phase": "idle",
+                "roots_scanned": executions,
+                "roots_seeded": executions,
+                "objects_marked": executions,
+                "bytes_marked": executions,
+                "slots_swept": executions,
+                "objects_reclaimed": executions,
+                "bytes_reclaimed": executions,
+                "barrier_writes": executions,
+                "barrier_shades": executions,
+                "work_objects": executions,
+                "work_bytes": executions,
+                "object_budget_overrun": 0,
+                "byte_budget_overrun": 0,
+                "duration_budget_overrun_ns": 0,
+                "max_pause_time_ns": executions,
+                "incremental_work_time_ns": executions,
+                "live_bytes": executions,
+                "fragmentation_per_mille": 0,
+            },
+            "tasks": {
+                "polls": executions,
+                "completed": executions,
+                "yielded_fuel": 0,
+                "yielded_explicit": 0,
+                "waiting_host": 0,
+                "cancelled": 0,
+                "trapped": 0,
+            },
+            "total_opcode_executions": executions,
+            "top_opcodes": [["add_i32", executions]],
+            "top_allocation_sites": [],
+        })
+    }
+
     #[test]
     fn aggregate_retains_and_validates_process_qualification_metadata() {
         let reports = [report(0), report(1)];
@@ -2145,6 +2423,27 @@ mod aggregate_report_tests {
 
         assert!(aggregate_reports(&[first.clone(), report(0)], 2, 1_000).is_err());
         assert!(aggregate_reports(&[first], 2, 1_000).is_err());
+    }
+
+    #[test]
+    fn aggregate_sums_profiler_evidence_across_every_process() {
+        let mut first = report(0);
+        first["profiler_enabled"] = Value::Bool(true);
+        first["profiler_mode"] = Value::from("enabled");
+        first["profiler"] = profiler(10);
+        let mut second = report(1);
+        second["profiler_enabled"] = Value::Bool(true);
+        second["profiler_mode"] = Value::from("enabled");
+        second["profiler"] = profiler(20);
+
+        let aggregate =
+            aggregate_reports(&[first, second], 2, 1_000).expect("profile reports aggregate");
+        let profiler = aggregate.profiler.expect("aggregate profiler");
+        assert_eq!(profiler["total_opcode_executions"], 30);
+        assert_eq!(profiler["host_calls"], 30);
+        assert_eq!(profiler["gc"]["completed_cycles"], 30);
+        assert_eq!(profiler["tasks"]["polls"], 30);
+        assert_eq!(profiler["top_opcodes"][0], json!(["add_i32", 30]));
     }
 }
 

@@ -567,6 +567,57 @@ pub(super) fn record_regression_pass() -> Result<(), DynError> {
     }
 }
 
+pub(super) fn finalize_after_workspace() -> Result<(), DynError> {
+    let head = git_optional(&["rev-parse", "HEAD"]);
+    let branch = current_branch();
+    let started_clean = worktree_clean();
+    if head == "missing" || branch == "missing" || !started_clean {
+        return Err("M4R1 post-workspace evidence requires a clean attached checkout".into());
+    }
+    for spec in TEST_GATES {
+        require_test_target(spec.source)?;
+    }
+
+    let started = Instant::now();
+    let mut runner = CommandRunner::default();
+    run_editor_gate(&mut runner)?;
+    let nidl_report = run_nidl_mutation_gate(&mut runner)?;
+    run_structured_codegen_cargo_check(&mut runner)?;
+    let scale = execute_scale_stress_gate();
+    write_gate_receipt(&scale)?;
+    receipt_result(&scale)?;
+
+    let completed_head = git_optional(&["rev-parse", "HEAD"]);
+    let completed_branch = current_branch();
+    let completed_clean = worktree_clean();
+    if completed_head != head || completed_branch != branch || !completed_clean {
+        return Err("M4R1 post-workspace evidence changed or dirtied the checkout".into());
+    }
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "gate": "finalize-m4r1-post-workspace",
+        "head": head,
+        "branch": branch,
+        "durationMs": elapsed_millis(started),
+        "workspaceCoverage": TEST_GATES.map(|spec| spec.name),
+        "commands": runner.evidence,
+        "machineReports": [
+            workspace_root().join(EDITOR_REPORT_PATH).display().to_string(),
+            nidl_report.display().to_string(),
+            workspace_root().join(ANALYSIS_SCALE_REPORT_PATH).display().to_string(),
+            workspace_root().join(FACADE_SCALE_REPORT_PATH).display().to_string(),
+            workspace_root().join(RELOAD_STRESS_REPORT_PATH).display().to_string(),
+        ],
+        "scaleReceipt": scale,
+        "status": "PASS",
+    });
+    let output =
+        workspace_root().join("target/nexa-artifacts/m4r1-finalize/post-workspace-receipt.json");
+    write_json_atomic(&output, &receipt, "M4R1 post-workspace receipt")?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn finalize_m4r1() -> Result<(), DynError> {
     let root = workspace_root();

@@ -10,19 +10,43 @@ The repository pins Rust 1.97.1 with Clippy and rustfmt in `rust-toolchain.toml`
 rustup installation selects and installs that toolchain automatically when commands run from the
 repository.
 
-## Required checks
+## Development gate
 
-Run these commands before proposing a change:
+Run the fast development gate while iterating:
 
 ```sh
 cargo fmt --check
-cargo check --workspace --all-targets
+cargo xtask check
+```
+
+`xtask check` is intended to finish in under five minutes. It may run focused
+checks directly, but it does not manufacture milestone evidence.
+
+## Finalization gate
+
+Milestone finalization runs once on the clean candidate commit:
+
+```sh
+cargo xtask finalize-m5
+```
+
+The finalizer performs the workspace build/test/doc suite once, writes a
+HEAD/tree/toolchain-bound receipt, and lets downstream M4, M4R1, and M5 gates
+validate that receipt instead of rerunning the same tests. Formal benchmark
+artifacts are likewise reused only when their provenance matches exactly.
+Use `cargo xtask finalize-m5 --dry-run` to inspect the step plan,
+`--force-bench` to refresh current-HEAD performance evidence, and
+`--refresh-baseline` to rebuild the immutable baseline cache.
+
+The underlying commands remain available for focused diagnosis:
+
+```sh
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
-cargo run -p nexa-cli -- baseline check
-cargo run -p nexa-cli -- machine check
+cargo run -p nexa-cli -- qa baseline
+cargo run -p nexa-cli -- qa machines
 cargo run -p nexa-machine -- check-generated
-cargo run -p nexa-cli -- model check
+cargo run -p nexa-cli -- qa models
 ```
 
 Linux CI is required. Windows and macOS run the same suite as observational jobs until their

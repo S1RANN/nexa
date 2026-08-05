@@ -5,8 +5,11 @@ Version: **1.0.0**
 Status: **COMPLETE**
 
 All targets are measured on the qualification machine with the frozen
-Benchmark v7 harness and multi-process protocol, comparing HEAD against the
-`performance-m5-baseline` tag live in a temporary worktree.
+Benchmark v7 harness and multi-process protocol, comparing HEAD against either
+a live `performance-m5-baseline` worktree run or its exact cache entry. The
+cache key binds the baseline tag commit, Benchmark v7 source tree, complete
+`rustc -Vv`, and hostname; the report must still match HEAD's qualified machine
+identity.
 
 ## Throughput targets (geometric mean over corpus)
 

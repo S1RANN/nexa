@@ -1,6 +1,6 @@
 # Benchmark Protocol v1
 
-Version: **1.0.1**
+Version: **1.0.2**
 
 Status: **COMPLETE**
 
@@ -46,18 +46,20 @@ provenance. This is an evidence-envelope correction only; it does not change
 the frozen timing, warmup, corpus, or median-of-medians protocol.
 
 The immutable baseline tag predates that aggregate envelope and emits schema
-1. It is accepted only when the finalizer has synchronously rebuilt and run
-the tag in a temporary worktree and bound it to the immediately preceding
-live HEAD qualification from that same finalizer call. Prerecorded baseline
-aggregates are never accepted.
+1. On a cache miss, the finalizer synchronously rebuilds and runs the tag in a
+temporary worktree and binds it to the same-machine HEAD qualification. That
+result may be reused only when its cache key exactly matches the baseline tag
+commit, Benchmark v7 source tree, complete `rustc -Vv`, and hostname, and its
+qualified machine fields match the current HEAD aggregate. Arbitrary
+prerecorded baseline aggregates are never accepted.
 
 ## Baseline discipline
 
 The `performance-m5-baseline` annotated tag is created only after the v7
 harness, report schema, counters, and this protocol are final and before any
-runtime hot-path optimization lands. The finalizer re-runs baseline and HEAD
-live on the same machine in a temporary worktree; prerecorded reports are not
-comparison inputs.
+runtime hot-path optimization lands. The finalizer runs HEAD live and either
+runs the baseline tag on the same machine or accepts the exact cache entry
+defined above.
 
 ## Fuel ruling
 

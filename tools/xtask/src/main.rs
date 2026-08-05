@@ -7,8 +7,15 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod bench;
+mod evidence;
+mod finalize;
+mod gates;
 mod m4;
 mod m4r1;
+
+use evidence::{validate_workspace_test_receipt, write_workspace_test_receipt};
+use finalize::{FinalizeM5Options, FinalizeTimings};
 
 type DynError = Box<dyn std::error::Error>;
 
@@ -383,7 +390,8 @@ impl CheckSummary {
 }
 
 fn main() -> Result<(), DynError> {
-    let command = std::env::args().nth(1).unwrap_or_else(|| "help".into());
+    let mut arguments = std::env::args().skip(1);
+    let command = arguments.next().unwrap_or_else(|| "help".into());
     match command.as_str() {
         "check" => check(),
         "test-core" => test_core(),
@@ -433,7 +441,7 @@ fn main() -> Result<(), DynError> {
         "m5-final-report" => m5_final_report(),
         "m5-v8-comparison" => m5_v8_comparison(),
         "m5-performance-regression" => m5_performance_regression(),
-        "finalize-m5" => finalize_m5(),
+        "finalize-m5" => finalize_m5(FinalizeM5Options::parse(arguments)?),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -542,17 +550,6 @@ fn check() -> Result<(), DynError> {
     check_m5_gates()
 }
 
-/// Runs the stacked milestone gates after the caller has already completed
-/// the full workspace fmt/check/clippy/test/doc sequence at this exact HEAD.
-/// This is the terminal-finalizer path and prevents a second full workspace
-/// compilation/test sweep.
-fn check_after_workspace() -> Result<(), DynError> {
-    check_through_m3_after_workspace()?;
-    m4::run_m4_gates().ensure_passed()?;
-    m4r1::record_regression_pass()?;
-    check_m5_gates()
-}
-
 /// M5 stage-A/B/C/D gates landed so far; the finalize-m5 protocol adds the
 /// multi-process benchmark comparison on top of these.
 fn check_m5_gates() -> Result<(), DynError> {
@@ -582,12 +579,48 @@ fn check_m5_gates() -> Result<(), DynError> {
     ])
 }
 
-fn check_through_m3() -> Result<(), DynError> {
-    check_through_m3_with_summary(run_check_summary())
+fn check_m5_gates_after_workspace(force_bench: bool) -> Result<(), DynError> {
+    let root = workspace_root();
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let steady_path = root.join("target/nexa-artifacts/m5/steady-state-dispatch/report.json");
+    if force_bench || steady_state_dispatch_receipt_at(&steady_path, &head).is_none() {
+        test_host_engine_performance_after_workspace()?;
+    } else {
+        eprintln!("M5 gates: reusing same-HEAD steady-state allocation receipt");
+    }
+    let reload_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
+    if force_bench || reload_peak_report_at(&reload_path, &head).is_none() {
+        m5_reload_peak_report()?;
+    } else {
+        eprintln!("M5 gates: reusing same-HEAD reload-peak receipt");
+    }
+    let cold_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
+    if force_bench || cold_start_report_at(&cold_path, &head).is_none() {
+        m5_cold_start_report()?;
+    } else {
+        eprintln!("M5 gates: reusing same-HEAD cold-start receipt");
+    }
+    let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+    if force_bench || product_corpus_report_at(&product_path, &head).is_none() {
+        m5_product_corpus_after_workspace()?;
+    } else {
+        eprintln!("M5 gates: reusing same-HEAD product-corpus receipt");
+    }
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--smoke",
+        "--output",
+        "target/nexa-artifacts/m5/check-smoke.json",
+    ])
 }
 
-fn check_through_m3_after_workspace() -> Result<(), DynError> {
-    check_through_m3_with_summary(run_check_summary_after_workspace())
+fn check_through_m3() -> Result<(), DynError> {
+    check_through_m3_with_summary(run_check_summary())
 }
 
 fn check_through_m3_with_summary(summary: CheckSummary) -> Result<(), DynError> {
@@ -626,12 +659,20 @@ fn test_diagnostics() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-embed", "--test", "m3", "diagnostic"])
 }
 
+fn test_diagnostics_after_workspace() -> Result<(), DynError> {
+    real_engine_diagnostic_gate().map(|_| ())
+}
+
 fn test_dev_loop() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-embed", "--test", "m3"])
 }
 
 fn test_cli() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-cli"])?;
+    test_cli_commands()
+}
+
+fn test_cli_commands() -> Result<(), DynError> {
     for format in ["human", "json", "ndjson"] {
         cargo(&[
             "run",
@@ -1493,13 +1534,17 @@ fn test_performance_counters() -> Result<(), DynError> {
 /// production disabled path, and the enabled path. Seven independent
 /// processes with 1,000 samples each remove scheduler/order noise; every hot
 /// product case must independently meet the 2%/15% ceilings.
+fn test_profiler_overhead() -> Result<(), DynError> {
+    test_profiler_overhead_with_force(false)
+}
+
 #[allow(
     clippy::too_many_lines,
     // Ratios are presentation and threshold values; integer precision above
     // the f64 mantissa is irrelevant for nanosecond-scale samples.
     clippy::cast_precision_loss
 )]
-fn test_profiler_overhead() -> Result<(), DynError> {
+fn test_profiler_overhead_with_force(force_bench: bool) -> Result<(), DynError> {
     const SAMPLES: usize = 1_000;
     const PROCESSES: usize = 7;
     const DISABLED_LIMIT: f64 = 1.02;
@@ -1511,6 +1556,31 @@ fn test_profiler_overhead() -> Result<(), DynError> {
     let control_path = output_dir.join("control-7x1000.json");
     let disabled_path = output_dir.join("disabled-7x1000.json");
     let enabled_path = output_dir.join("enabled-7x1000.json");
+    let report_path = output_dir.join("formal-7x1000.json");
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    if !force_bench
+        && let Some(disabled) = formal_aggregate_at(&disabled_path, &head)
+        && formal_profile_at(&enabled_path, &head, &disabled).is_some()
+        && let Ok(control_bytes) = fs::read(&control_path)
+        && let Ok(control) = serde_json::from_slice::<Value>(&control_bytes)
+        && control["schema"] == 2
+        && control["implementation_commit"] == head
+        && control["process_count"] == 7
+        && control["samples_per_process"] == 1_000
+        && control["profiler_enabled"] == false
+        && control["profiler_mode"] == "compiled-out-control"
+        && same_benchmark_machine(&control, &disabled)
+        && let Ok(report_bytes) = fs::read(&report_path)
+        && let Ok(report) = serde_json::from_slice::<Value>(&report_bytes)
+        && report["schema"] == 1
+        && report["implementation_commit"] == head
+        && report["processes"] == 7
+        && report["samples_per_process"] == 1_000
+        && report["status"] == "PASS"
+    {
+        eprintln!("profiler overhead: reusing exact same-HEAD formal receipts");
+        return Ok(());
+    }
 
     let run = |mode: Option<&str>, output: &Path| -> Result<(), DynError> {
         let mut arguments = vec![
@@ -1539,7 +1609,6 @@ fn test_profiler_overhead() -> Result<(), DynError> {
     let control: Value = serde_json::from_slice(&fs::read(&control_path)?)?;
     let disabled: Value = serde_json::from_slice(&fs::read(&disabled_path)?)?;
     let enabled: Value = serde_json::from_slice(&fs::read(&enabled_path)?)?;
-    let head = git_output(&["rev-parse", "HEAD"])?;
     for (name, report, profiler_enabled, profiler_mode) in [
         ("control", &control, false, "compiled-out-control"),
         ("disabled", &disabled, false, "disabled"),
@@ -1660,7 +1729,6 @@ fn test_profiler_overhead() -> Result<(), DynError> {
         "failures": failures,
         "status": if passed { "PASS" } else { "FAIL" },
     });
-    let report_path = output_dir.join("formal-7x1000.json");
     fs::write(
         &report_path,
         format!("{}\n", serde_json::to_string_pretty(&report)?),
@@ -2236,6 +2304,45 @@ fn test_host_engine_performance() -> Result<(), DynError> {
     Ok(())
 }
 
+fn test_host_engine_performance_after_workspace() -> Result<(), DynError> {
+    let root = workspace_root();
+    let receipt_path = root.join("target/nexa-artifacts/m5/steady-state-dispatch/report.json");
+    fs::create_dir_all(
+        receipt_path
+            .parent()
+            .ok_or("steady-state receipt has no parent")?,
+    )?;
+    if receipt_path.exists() {
+        fs::remove_file(&receipt_path)?;
+    }
+    let implementation_commit = git_output(&["rev-parse", "HEAD"])?;
+    let test_source_hash = steady_state_dispatch_source_hash()?;
+    let receipt_path_text = receipt_path
+        .to_str()
+        .ok_or("non-UTF-8 steady-state receipt path")?;
+    cargo_with_environment(
+        &[
+            "test",
+            "-p",
+            "nexa-benchmark-v7",
+            "--test",
+            "steady_state_allocation",
+        ],
+        &[
+            ("NEXA_M5_STEADY_STATE_RECEIPT", receipt_path_text),
+            ("NEXA_M5_IMPLEMENTATION_COMMIT", &implementation_commit),
+            ("NEXA_M5_STEADY_STATE_SOURCE_HASH", &test_source_hash),
+        ],
+    )?;
+    let receipt = steady_state_dispatch_receipt_at(&receipt_path, &implementation_commit)
+        .ok_or("WP92 steady-state dispatch receipt is stale, malformed, or nonzero")?;
+    println!(
+        "test-host-engine-performance: reused workspace coverage and recorded {} allocation paths",
+        receipt["cases"].as_object().map_or(0, serde_json::Map::len),
+    );
+    Ok(())
+}
+
 /// M5 WP99 product gate. Every command below executes a real canonical
 /// package/build/runtime path; the receipt is written only after the entire
 /// corpus succeeds and is pinned to the current implementation commit.
@@ -2275,9 +2382,19 @@ fn valid_snake_stress_report(report: &Value) -> bool {
 }
 
 fn m5_product_corpus() -> Result<(), DynError> {
+    m5_product_corpus_impl(false)
+}
+
+fn m5_product_corpus_after_workspace() -> Result<(), DynError> {
+    m5_product_corpus_impl(true)
+}
+
+fn m5_product_corpus_impl(workspace_covered: bool) -> Result<(), DynError> {
     let root = workspace_root();
-    cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])?;
-    test_snake()?;
+    if !workspace_covered {
+        cargo(&["test", "-p", "nexa-embed", "--test", "entrypoints"])?;
+        test_snake()?;
+    }
     let snake_stress: Value = serde_json::from_str(&captured_stdout(
         Command::new("cargo")
             .args([
@@ -2297,15 +2414,17 @@ fn m5_product_corpus() -> Result<(), DynError> {
         return Err("Snake stress omitted exact post-shutdown resource evidence".into());
     }
     cargo(&["run", "-p", "combat-runtime"])?;
-    cargo(&[
-        "test",
-        "-p",
-        "nexa-runtime",
-        "--test",
-        "collection_string_stress",
-    ])?;
-    cargo(&["test", "-p", "nexa-cli", "--test", "standalone"])?;
-    cargo(&["test", "-p", "nexa-cli", "--test", "repl"])?;
+    if !workspace_covered {
+        cargo(&[
+            "test",
+            "-p",
+            "nexa-runtime",
+            "--test",
+            "collection_string_stress",
+        ])?;
+        cargo(&["test", "-p", "nexa-cli", "--test", "standalone"])?;
+        cargo(&["test", "-p", "nexa-cli", "--test", "repl"])?;
+    }
 
     let verification_stdout = captured_stdout(
         Command::new("cargo")
@@ -2372,6 +2491,33 @@ fn m5_product_corpus() -> Result<(), DynError> {
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn product_corpus_report_at(path: &Path, implementation_commit: &str) -> Option<Value> {
+    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let stress = &report["snake"]["stress_receipt"];
+    (report["schema"] == 1
+        && report["implementation_commit"].as_str() == Some(implementation_commit)
+        && report["status"] == "PASS"
+        && report["snake"]["canonical_package_tests"] == "PASS"
+        && report["snake"]["headless_stress"] == "PASS"
+        && report["snake"]["engine_package_scales"] == serde_json::json!([0, 9, 20, 50])
+        && report["snake"]["enable_disable_reload"] == "PASS"
+        && report["snake"]["required_and_optional_dispatch"] == "PASS"
+        && report["combat"]["canonical_package_pipeline"] == "PASS"
+        && report["combat"]["deep_calls_struct_enum_class_async_resources_migration_reload"]
+            == "PASS"
+        && report["data_intensive"]["ten_thousand_struct_rows"] == "PASS"
+        && report["data_intensive"]["typed_array_map_gc_string_state"] == "PASS"
+        && report["standalone"]["single_file_package_async_trap"] == "PASS"
+        && report["repl"]["one_hundred_cells"] == "PASS"
+        && report["repl"]["failed_cell_rollback"] == "PASS"
+        && report["repl"]["async_cell_and_resource_recovery"] == "PASS"
+        && valid_snake_stress_report(stress)
+        && PRODUCT_CPU_RESULTS.iter().all(|(name, expected)| {
+            report["data_intensive"]["verified_results"][name].as_i64() == Some(*expected)
+        }))
+    .then_some(report)
 }
 
 /// M5 stage-J: produces the decision artifacts named by
@@ -2615,12 +2761,12 @@ fn formal_profile_at(path: &Path, implementation_commit: &str, aggregate: &Value
         .map(|case| case["case"].as_str())
         .collect::<Option<Vec<_>>>()?;
     let profiler = &report["profiler"];
-    (report["schema"].as_u64() == Some(1)
+    (report["schema"].as_u64() == Some(2)
         && report["implementation_commit"].as_str() == Some(implementation_commit)
         && report["benchmark_version"].as_u64() == Some(7)
-        && report["samples"].as_u64() == Some(200)
-        && report["warmup"].as_u64() == Some(100)
-        && report["process_index"].as_u64() == Some(0)
+        && report["process_count"].as_u64() == Some(7)
+        && report["samples_per_process"].as_u64() == Some(1_000)
+        && report["warmup_per_process"].as_u64() == Some(100)
         && report["build_profile"] == "release"
         && report["profiler_enabled"].as_bool() == Some(true)
         && report["profiler_mode"] == "enabled"
@@ -2651,13 +2797,12 @@ fn formal_profile_at(path: &Path, implementation_commit: &str, aggregate: &Value
         && profiler["tasks"].is_object()
         && case_names == aggregate_names
         && cases.iter().all(|case| {
-            let p50 = case["p50_ns"].as_u64();
-            let p95 = case["p95_ns"].as_u64();
-            let p99 = case["p99_ns"].as_u64();
-            case["samples"].as_u64() == Some(200)
-                && case["throughput_ops_per_second"]
-                    .as_u64()
-                    .is_some_and(|throughput| throughput > 0)
+            let p50 = case["median_p50_ns"].as_u64();
+            let p95 = case["median_p95_ns"].as_u64();
+            let p99 = case["median_p99_ns"].as_u64();
+            case["median_throughput_ops_per_second"]
+                .as_u64()
+                .is_some_and(|throughput| throughput > 0)
                 && p50.is_some_and(|value| value > 0)
                 && p50.zip(p95).is_some_and(|(p50, p95)| p50 <= p95)
                 && p95.zip(p99).is_some_and(|(p95, p99)| p95 <= p99)
@@ -2705,29 +2850,17 @@ fn m5_final_report() -> Result<(), DynError> {
         cold_start_report_at(&cold_start_path, &head)
             .ok_or("new WP98 cold-start report is not a same-HEAD Benchmark v7 receipt")?
     };
-    let aggregate_path = final_dir.join("aggregate-7x1000.json");
-    let profile_path = final_dir.join("profile-1x200.json");
-    let aggregate = if let Some(report) = formal_aggregate_at(&aggregate_path, &head) {
-        eprintln!("final report: reusing same-HEAD formal aggregate");
-        report
-    } else {
-        cargo(&[
-            "run",
-            "--release",
-            "--quiet",
-            "-p",
-            "nexa-benchmark-v7",
-            "--",
-            "--samples",
-            "1000",
-            "--processes",
-            "7",
-            "--output",
-            aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
-        ])?;
-        formal_aggregate_at(&aggregate_path, &head)
-            .ok_or("new M5 aggregate is not a same-HEAD formal 7x1000 report")?
-    };
+    let profiler_dir = root.join("target/nexa-artifacts/m5/profiler-overhead");
+    let aggregate_path = profiler_dir.join("disabled-7x1000.json");
+    let profile_path = profiler_dir.join("enabled-7x1000.json");
+    let reusable_profiler_evidence = formal_aggregate_at(&aggregate_path, &head)
+        .is_some_and(|aggregate| formal_profile_at(&profile_path, &head, &aggregate).is_some());
+    if !reusable_profiler_evidence {
+        test_profiler_overhead()?;
+    }
+    let aggregate = formal_aggregate_at(&aggregate_path, &head)
+        .ok_or("profiler gate omitted the canonical same-HEAD disabled 7x1000 aggregate")?;
+    eprintln!("final report: reusing profiler-disabled same-HEAD formal aggregate");
     if !same_benchmark_machine(&reload_peak, &aggregate)
         || !same_benchmark_machine(&cold_start, &aggregate)
     {
@@ -2736,26 +2869,13 @@ fn m5_final_report() -> Result<(), DynError> {
                 .into(),
         );
     }
-    let profile = if let Some(report) = formal_profile_at(&profile_path, &head, &aggregate) {
-        eprintln!("final report: reusing same-HEAD 1x200 profile");
-        report
-    } else {
-        cargo(&[
-            "run",
-            "--release",
-            "--quiet",
-            "-p",
-            "nexa-benchmark-v7",
-            "--",
-            "--samples",
-            "200",
-            "--profile",
-            "--output",
-            profile_path.to_str().ok_or("non-UTF-8 artifact path")?,
-        ])?;
-        formal_profile_at(&profile_path, &head, &aggregate)
-            .ok_or("new M5 profile is not a same-machine, same-HEAD 1x200 report")?
-    };
+    let profile = formal_profile_at(&profile_path, &head, &aggregate)
+        .ok_or("profiler gate omitted the same-machine, same-HEAD enabled 7x1000 profile")?;
+    eprintln!("final report: reusing profiler-enabled same-HEAD formal profile");
+    fs::write(
+        final_dir.join("profile-7x1000.json"),
+        format!("{}\n", serde_json::to_string_pretty(&profile)?),
+    )?;
     let profiler = &profile["profiler"];
     let total_opcodes = profiler["total_opcode_executions"].as_u64().unwrap_or(0);
     let top_share = profiler["top_opcodes"].as_array().map_or(0, |entries| {
@@ -2837,7 +2957,7 @@ fn m5_final_report() -> Result<(), DynError> {
         "failed_go_conditions": failed_go_conditions,
         "conditions": conditions,
         "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
-        "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
+        "profile_artifact": "target/nexa-artifacts/m5/final/profile-7x1000.json",
         "reload_peak_artifact": "target/nexa-artifacts/m5/reload-peak/report.json",
         "cold_start_artifact": "target/nexa-artifacts/m5/cold-start/report.json",
         "implementation_commit": aggregate["implementation_commit"],
@@ -3162,7 +3282,13 @@ fn m5_v8_comparison() -> Result<(), DynError> {
     // Nexa side: reuse the formal aggregate when it was produced at this
     // commit; otherwise regenerate it through the measurement authority.
     let head = git_output(&["rev-parse", "HEAD"])?;
-    let aggregate_path = final_dir.join("aggregate-7x1000.json");
+    let aggregate_path =
+        root.join("target/nexa-artifacts/m5/profiler-overhead/disabled-7x1000.json");
+    fs::create_dir_all(
+        aggregate_path
+            .parent()
+            .ok_or("Nexa aggregate path has no parent")?,
+    )?;
     let (aggregate, aggregate_provenance) =
         if let Some(aggregate) = formal_aggregate_at(&aggregate_path, &head) {
             (aggregate, "reused: same-HEAD formal 7x1000 receipt")
@@ -3385,6 +3511,8 @@ fn formal_baseline_aggregate(
         && report["samples_per_process"].as_u64() == Some(1_000)
         && report["build_profile"] == "release"
         && report["status"] == "PASS"
+        && report["cache_key"].is_object()
+        && report["cache_provenance"] == "generated-live"
         && report["machine_identity_provenance"]
             == "bound by the same xtask process to its live HEAD receipt while synchronously running the baseline worktree"
         && is_hex_digest(&report["benchmark_source_hash"], 32)
@@ -3416,24 +3544,26 @@ const REGRESSION_NOISE_FLOOR_NS: u128 = 100;
 /// `PERFORMANCE_TARGETS_V1.md` - HEAD versus the immutable
 /// `performance-m5-baseline` tag, both measured on this machine under the
 /// formal 7x1000 protocol. The baseline side runs its own frozen harness
-/// inside a temporary worktree (never a saved report from another
-/// session); its live artifact is reused only while pinned to the
-/// immutable tag commit. The command fails on unexplained shared-case
+/// inside a temporary worktree on a cache miss; the artifact is reusable
+/// only under the exact immutable tag, harness tree, rustc, hostname, and
+/// same-machine qualification. The command fails on unexplained shared-case
 /// p95/p99 regressions beyond 10% or on a missed frozen throughput target.
 fn m5_performance_regression() -> Result<(), DynError> {
-    m5_performance_regression_with_live_head(None)
+    m5_performance_regression_with_live_head(None, false)
 }
 
-/// `live_head` is accepted only from the finalizer's immediately preceding
-/// profiler-disabled 7x1000 run. Standalone invocations pass `None` and
-/// always measure HEAD again, so a saved JSON file can never masquerade as
-/// the live side of the required baseline comparison.
+/// `live_head` is accepted only from the finalizer's validated same-HEAD
+/// profiler-disabled 7x1000 authority. Standalone invocations pass `None`
+/// and measure HEAD in this call.
 #[allow(
     clippy::too_many_lines,
     // Ratio reporting only; the f64 mantissa bound is irrelevant here.
     clippy::cast_precision_loss
 )]
-fn m5_performance_regression_with_live_head(live_head: Option<Value>) -> Result<(), DynError> {
+fn m5_performance_regression_with_live_head(
+    live_head: Option<Value>,
+    refresh_baseline: bool,
+) -> Result<(), DynError> {
     let root = workspace_root();
     let regression_dir = root.join("target/nexa-artifacts/m5/regression");
     fs::create_dir_all(&regression_dir)?;
@@ -3485,16 +3615,31 @@ fn m5_performance_regression_with_live_head(live_head: Option<Value>) -> Result<
         format!("{}\n", serde_json::to_string_pretty(&head)?),
     )?;
 
-    // Baseline is never reused. The immutable tag's own harness runs now in
-    // a detached temporary worktree, then its schema-1 aggregate is
-    // qualified by this same process and validated before comparison.
     let baseline_path = regression_dir.join("baseline-live-7x1000.json");
-    let baseline = formal_baseline_aggregate(
-        generate_baseline_live(&root, &baseline_path, &head)?,
-        &baseline_commit,
-        &head,
-    )
-    .ok_or("new baseline benchmark is not a live qualified 7x1000 report")?;
+    let baseline_cache_key = bench::BaselineCacheKey::load()?;
+    let baseline = if refresh_baseline {
+        None
+    } else {
+        fs::read(&baseline_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|report| baseline_cache_key.matches_report(report))
+            .and_then(|report| formal_baseline_aggregate(report, &baseline_commit, &head))
+    };
+    let baseline = if let Some(report) = baseline {
+        eprintln!("baseline: reusing exact host/toolchain/source/tag cache entry");
+        report
+    } else {
+        let mut report = generate_baseline_live(&root, &baseline_path, &head)?;
+        report["cache_key"] = serde_json::to_value(&baseline_cache_key)?;
+        report["cache_provenance"] = Value::from("generated-live");
+        fs::write(
+            &baseline_path,
+            format!("{}\n", serde_json::to_string_pretty(&report)?),
+        )?;
+        formal_baseline_aggregate(report, &baseline_commit, &head)
+            .ok_or("new baseline benchmark is not a live qualified 7x1000 report")?
+    };
 
     let case_map = |report: &Value| -> BTreeMap<String, (u128, u128, u128)> {
         report["cases"]
@@ -3894,8 +4039,26 @@ fn validate_m5_release_authority(root: &Path) -> Result<M5ReleaseAuthority, DynE
 /// M5 terminal gate. It is intentionally runnable only from the published,
 /// clean, annotated completion checkout; all expensive correctness and
 /// performance evidence is then regenerated or validated at that exact HEAD.
+fn finalize_m5(options: FinalizeM5Options) -> Result<(), DynError> {
+    if options.dry_run {
+        options.print_plan();
+        return Ok(());
+    }
+
+    let root = workspace_root();
+    let implementation_commit = git_output(&["rev-parse", "HEAD"])?;
+    let mut timings = FinalizeTimings::new(&root, implementation_commit);
+    let result = finalize_m5_inner(options, &mut timings);
+    let timing_result = timings.write(result.is_ok());
+    timing_result?;
+    result
+}
+
 #[allow(clippy::too_many_lines)]
-fn finalize_m5() -> Result<(), DynError> {
+fn finalize_m5_inner(
+    options: FinalizeM5Options,
+    timings: &mut FinalizeTimings,
+) -> Result<(), DynError> {
     const HISTORICAL_TAGS: [(&str, &str, &str); 11] = [
         (
             "gate1-v2.9-stop",
@@ -3955,374 +4118,419 @@ fn finalize_m5() -> Result<(), DynError> {
     ];
 
     let root = workspace_root();
-    let head = git_output(&["rev-parse", "HEAD"])?;
-    let branch = git_output(&["branch", "--show-current"])?;
-    let worktree_status = git_output(&["status", "--porcelain"])?;
-    if branch != "main" || !worktree_status.is_empty() {
-        return Err(format!(
-            "finalize-m5 requires a clean attached main checkout; branch={branch:?}, \
-             status={worktree_status:?}"
-        )
-        .into());
-    }
-    let release_authority = validate_m5_release_authority(&root)?;
-    let final_report_path = root.join("target/nexa-artifacts/m5-finalize/final-report.json");
-    if final_report_path.exists() {
-        fs::remove_file(&final_report_path)?;
-    }
-    let completion_tag_type = git_output(&["cat-file", "-t", "performance-m5-complete"])?;
-    let completion_tag_object = git_output(&["rev-parse", "performance-m5-complete"])?;
-    let completion_tag_target = git_output(&["rev-parse", "performance-m5-complete^{}"])?;
-    if completion_tag_type != "tag" || completion_tag_target != head {
-        return Err("performance-m5-complete must be an annotated tag targeting HEAD".into());
-    }
-
-    let mut remote_references = vec![
-        "refs/heads/main".to_owned(),
-        "refs/heads/codex/performance-m5".to_owned(),
-        "refs/tags/performance-m5-complete".to_owned(),
-        "refs/tags/performance-m5-complete^{}".to_owned(),
-    ];
-    for (name, _, _) in HISTORICAL_TAGS {
-        remote_references.push(format!("refs/tags/{name}"));
-        remote_references.push(format!("refs/tags/{name}^{{}}"));
-    }
-    let mut remote_command = Command::new("git");
-    remote_command.args(["ls-remote", "origin"]);
-    remote_command.args(&remote_references);
-    remote_command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .current_dir(&root);
-    let remote_output = captured_stdout(&mut remote_command, "git ls-remote origin")?;
-    let remote = remote_output
-        .lines()
-        .filter_map(|line| {
-            let (object, reference) = line.split_once('\t')?;
-            Some((reference.to_owned(), object.to_owned()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    for reference in ["refs/heads/main", "refs/heads/codex/performance-m5"] {
-        if remote.get(reference).map(String::as_str) != Some(head.as_str()) {
-            return Err(format!("remote {reference} does not target final HEAD {head}").into());
-        }
-    }
-    if remote
-        .get("refs/tags/performance-m5-complete")
-        .map(String::as_str)
-        != Some(completion_tag_object.as_str())
-        || remote
-            .get("refs/tags/performance-m5-complete^{}")
-            .map(String::as_str)
-            != Some(head.as_str())
-    {
-        return Err(
-            "remote performance-m5-complete tag differs from the local annotated tag".into(),
-        );
-    }
-    let mut historical_tags = Vec::with_capacity(HISTORICAL_TAGS.len());
-    for (name, expected_object, expected_target) in HISTORICAL_TAGS {
-        let object_type = git_output(&["cat-file", "-t", name])?;
-        let object = git_output(&["rev-parse", name])?;
-        let target = git_output(&["rev-parse", &format!("{name}^{{}}")])?;
-        let remote_object = remote
-            .get(&format!("refs/tags/{name}"))
-            .cloned()
-            .unwrap_or_else(|| "missing".into());
-        let remote_target = remote
-            .get(&format!("refs/tags/{name}^{{}}"))
-            .cloned()
-            .unwrap_or_else(|| "missing".into());
-        if object_type != "tag"
-            || object != expected_object
-            || target != expected_target
-            || remote_object != expected_object
-            || remote_target != expected_target
-        {
+    let (
+        head,
+        release_authority,
+        final_report_path,
+        completion_tag_type,
+        completion_tag_object,
+        completion_tag_target,
+        remote,
+        historical_tags,
+    ) = timings.run("release authority and publication preflight", || {
+        let head = git_output(&["rev-parse", "HEAD"])?;
+        let branch = git_output(&["branch", "--show-current"])?;
+        let worktree_status = git_output(&["status", "--porcelain"])?;
+        if branch != "main" || !worktree_status.is_empty() {
             return Err(format!(
-                "historical annotated tag {name} changed locally or remotely: \
-                 type={object_type}, object={object}, target={target}, \
-                 remote_object={remote_object}, remote_target={remote_target}"
+                "finalize-m5 requires a clean attached main checkout; branch={branch:?}, \
+             status={worktree_status:?}"
             )
             .into());
         }
-        historical_tags.push(serde_json::json!({
-            "name": name,
-            "object": object,
-            "target": target,
-            "status": "PASS",
-        }));
-    }
+        let release_authority = validate_m5_release_authority(&root)?;
+        let final_report_path = root.join("target/nexa-artifacts/m5-finalize/final-report.json");
+        if final_report_path.exists() {
+            fs::remove_file(&final_report_path)?;
+        }
+        let completion_tag_type = git_output(&["cat-file", "-t", "performance-m5-complete"])?;
+        let completion_tag_object = git_output(&["rev-parse", "performance-m5-complete"])?;
+        let completion_tag_target = git_output(&["rev-parse", "performance-m5-complete^{}"])?;
+        if completion_tag_type != "tag" || completion_tag_target != head {
+            return Err("performance-m5-complete must be an annotated tag targeting HEAD".into());
+        }
 
-    cargo(&["fmt", "--all", "--", "--check"])?;
-    cargo(&["check", "--workspace", "--all-targets"])?;
-    cargo(&[
-        "clippy",
-        "--workspace",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ])?;
-    cargo(&["test", "--workspace", "--all-targets"])?;
-    cargo(&["test", "--doc", "--workspace"])?;
-    cargo_with_environment(
-        &["doc", "--workspace", "--no-deps"],
-        &[("RUSTDOCFLAGS", "-D warnings")],
-    )?;
+        let mut remote_references = vec![
+            "refs/heads/main".to_owned(),
+            "refs/heads/codex/performance-m5".to_owned(),
+            "refs/tags/performance-m5-complete".to_owned(),
+            "refs/tags/performance-m5-complete^{}".to_owned(),
+        ];
+        for (name, _, _) in HISTORICAL_TAGS {
+            remote_references.push(format!("refs/tags/{name}"));
+            remote_references.push(format!("refs/tags/{name}^{{}}"));
+        }
+        let mut remote_command = Command::new("git");
+        remote_command.args(["ls-remote", "origin"]);
+        remote_command.args(&remote_references);
+        remote_command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(&root);
+        let remote_output = captured_stdout(&mut remote_command, "git ls-remote origin")?;
+        let remote = remote_output
+            .lines()
+            .filter_map(|line| {
+                let (object, reference) = line.split_once('\t')?;
+                Some((reference.to_owned(), object.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for reference in ["refs/heads/main", "refs/heads/codex/performance-m5"] {
+            if remote.get(reference).map(String::as_str) != Some(head.as_str()) {
+                return Err(format!("remote {reference} does not target final HEAD {head}").into());
+            }
+        }
+        if remote
+            .get("refs/tags/performance-m5-complete")
+            .map(String::as_str)
+            != Some(completion_tag_object.as_str())
+            || remote
+                .get("refs/tags/performance-m5-complete^{}")
+                .map(String::as_str)
+                != Some(head.as_str())
+        {
+            return Err(
+                "remote performance-m5-complete tag differs from the local annotated tag".into(),
+            );
+        }
+        let mut historical_tags = Vec::with_capacity(HISTORICAL_TAGS.len());
+        for (name, expected_object, expected_target) in HISTORICAL_TAGS {
+            let object_type = git_output(&["cat-file", "-t", name])?;
+            let object = git_output(&["rev-parse", name])?;
+            let target = git_output(&["rev-parse", &format!("{name}^{{}}")])?;
+            let remote_object = remote
+                .get(&format!("refs/tags/{name}"))
+                .cloned()
+                .unwrap_or_else(|| "missing".into());
+            let remote_target = remote
+                .get(&format!("refs/tags/{name}^{{}}"))
+                .cloned()
+                .unwrap_or_else(|| "missing".into());
+            if object_type != "tag"
+                || object != expected_object
+                || target != expected_target
+                || remote_object != expected_object
+                || remote_target != expected_target
+            {
+                return Err(format!(
+                    "historical annotated tag {name} changed locally or remotely: \
+                 type={object_type}, object={object}, target={target}, \
+                 remote_object={remote_object}, remote_target={remote_target}"
+                )
+                .into());
+            }
+            historical_tags.push(serde_json::json!({
+                "name": name,
+                "object": object,
+                "target": target,
+                "status": "PASS",
+            }));
+        }
+        Ok((
+            head,
+            release_authority,
+            final_report_path,
+            completion_tag_type,
+            completion_tag_object,
+            completion_tag_target,
+            remote,
+            historical_tags,
+        ))
+    })?;
 
-    check_after_workspace()?;
-    m4r1::test_language_v2()?;
-    m4r1::test_object_model_v2()?;
-    m4r1::test_async_v2()?;
-    m4r1::test_nidl_v2()?;
-    m4r1::test_structured_codegen()?;
-    m4r1::test_standalone()?;
-    m4r1::test_repl()?;
-    m4r1::test_entrypoints()?;
-    m4r1::m4r1_scale_stress()?;
-    test_profiler_overhead()?;
+    timings.run("cargo fmt", || cargo(&["fmt", "--all", "--", "--check"]))?;
+    timings.run("workspace clippy", || {
+        cargo(&[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+    })?;
+    timings.run("workspace tests and receipt", || {
+        cargo(&["test", "--workspace", "--all-targets"])?;
+        write_workspace_test_receipt(&root)?;
+        Ok(())
+    })?;
+    timings.run("workspace doc tests", || {
+        cargo(&["test", "--doc", "--workspace"])
+    })?;
+    timings.run("workspace documentation", || {
+        cargo_with_environment(
+            &["doc", "--workspace", "--no-deps"],
+            &[("RUSTDOCFLAGS", "-D warnings")],
+        )
+    })?;
+
+    timings.run("workspace test receipt validation", || {
+        validate_workspace_test_receipt(&root, &head).map(|_| ())
+    })?;
+    timings.run("non-workspace correctness evidence", || {
+        gates::legacy_after_workspace(&root, &head)
+    })?;
+    timings.run("M4 and M4R1 specialized evidence", || {
+        gates::language_scale_after_workspace(&root, &head)
+    })?;
+    timings.run("M5 feature-specific evidence", || {
+        gates::m5_after_workspace(&root, &head, options.force_bench)
+    })?;
+    timings.run("profiler overhead", || {
+        test_profiler_overhead_with_force(options.force_bench)
+    })?;
     let live_head_path =
         root.join("target/nexa-artifacts/m5/profiler-overhead/disabled-7x1000.json");
     let live_head = formal_aggregate_at(&live_head_path, &head)
         .ok_or("profiler gate did not leave a valid live profiler-disabled HEAD aggregate")?;
-    m5_performance_regression_with_live_head(Some(live_head))?;
-    m5_v8_comparison()?;
-    m5_final_report()?;
-    repo_audit()?;
+    timings.run("live baseline comparison", || {
+        m5_performance_regression_with_live_head(Some(live_head), options.refresh_baseline)
+    })?;
+    timings.run("V8 comparison", m5_v8_comparison)?;
+    timings.run("M5 final performance report", m5_final_report)?;
+    timings.run("repository audit", repo_audit)?;
 
-    let comparison_path = root.join("target/nexa-artifacts/m5/regression/comparison.json");
-    let profiler_path = root.join("target/nexa-artifacts/m5/profiler-overhead/formal-7x1000.json");
-    let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
-    let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
-    let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
-    let v8_path = root.join("target/nexa-artifacts/m5/final/v8-comparison.json");
-    let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
-    let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
-    let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
-    let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
-    let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
-    let v8: Value = serde_json::from_slice(&fs::read(&v8_path)?)?;
-    let reload_peak = reload_peak_report_at(&reload_peak_path, &head)
-        .ok_or("WP97 reload peak receipt is stale or malformed")?;
-    let cold_start = cold_start_report_at(&cold_start_path, &head)
-        .ok_or("WP98 cold-start receipt is stale or malformed")?;
-    let decision: Value = serde_json::from_slice(&fs::read(&decision_path)?)?;
-    let performance: Value = serde_json::from_slice(&fs::read(&performance_path)?)?;
+    timings.run("terminal receipt validation and publication", || {
+        let comparison_path = root.join("target/nexa-artifacts/m5/regression/comparison.json");
+        let profiler_path =
+            root.join("target/nexa-artifacts/m5/profiler-overhead/formal-7x1000.json");
+        let product_path = root.join("target/nexa-artifacts/m5/product-corpus/report.json");
+        let reload_peak_path = root.join("target/nexa-artifacts/m5/reload-peak/report.json");
+        let cold_start_path = root.join("target/nexa-artifacts/m5/cold-start/report.json");
+        let v8_path = root.join("target/nexa-artifacts/m5/final/v8-comparison.json");
+        let decision_path = root.join("target/nexa-artifacts/m5/final/jit-decision.json");
+        let performance_path = root.join("target/nexa-artifacts/m5/final/performance-report.json");
+        let comparison: Value = serde_json::from_slice(&fs::read(&comparison_path)?)?;
+        let profiler: Value = serde_json::from_slice(&fs::read(&profiler_path)?)?;
+        let product: Value = serde_json::from_slice(&fs::read(&product_path)?)?;
+        let v8: Value = serde_json::from_slice(&fs::read(&v8_path)?)?;
+        let reload_peak = reload_peak_report_at(&reload_peak_path, &head)
+            .ok_or("WP97 reload peak receipt is stale or malformed")?;
+        let cold_start = cold_start_report_at(&cold_start_path, &head)
+            .ok_or("WP98 cold-start receipt is stale or malformed")?;
+        let decision: Value = serde_json::from_slice(&fs::read(&decision_path)?)?;
+        let performance: Value = serde_json::from_slice(&fs::read(&performance_path)?)?;
 
-    let geomean = |bucket: &str| -> Result<f64, DynError> {
-        comparison["buckets"][bucket]["geomean"]
-            .as_f64()
-            .ok_or_else(|| format!("comparison omitted numeric {bucket} geomean").into())
-    };
-    let aggregate_case = |name: &str| -> Result<&Value, DynError> {
-        performance["aggregate"]["cases"]
+        let geomean = |bucket: &str| -> Result<f64, DynError> {
+            comparison["buckets"][bucket]["geomean"]
+                .as_f64()
+                .ok_or_else(|| format!("comparison omitted numeric {bucket} geomean").into())
+        };
+        let aggregate_case = |name: &str| -> Result<&Value, DynError> {
+            performance["aggregate"]["cases"]
+                .as_array()
+                .and_then(|cases| cases.iter().find(|case| case["case"] == name))
+                .ok_or_else(|| format!("formal aggregate omitted case {name}").into())
+        };
+        let struct_gc_allocations =
+            aggregate_case("struct_construction")?["max_vm"]["struct_materializations"]
+                .as_u64()
+                .ok_or("formal aggregate omitted Struct materialization count")?;
+        let enum_gc_allocations =
+            aggregate_case("enum_construction_match")?["max_vm"]["enum_materializations"]
+                .as_u64()
+                .ok_or("formal aggregate omitted Enum materialization count")?;
+        let gc_case = aggregate_case("gc_incremental_step")?;
+        let gc_system_allocations = gc_case["max_system_allocations"]
+            .as_u64()
+            .ok_or("formal aggregate omitted GC system allocation count")?;
+        let steady_state_dispatch =
+            steady_state_dispatch_receipt(performance["steady_state_dispatch"].clone(), &head)
+                .ok_or("performance report omitted valid same-HEAD WP92 allocation evidence")?;
+        let steady_state_dispatch_system_allocations =
+            steady_state_dispatch["max_system_allocations"]
+                .as_u64()
+                .ok_or("WP92 allocation receipt omitted its maximum")?;
+        let snake_stress = &product["snake"]["stress_receipt"];
+        let resource_leaks = snake_stress["resource_leaks"]
+            .as_u64()
+            .ok_or("Snake stress receipt omitted its post-shutdown leak count")?;
+        let semantic_mismatches = v8["semantic_mismatches"]
             .as_array()
-            .and_then(|cases| cases.iter().find(|case| case["case"] == name))
-            .ok_or_else(|| format!("formal aggregate omitted case {name}").into())
-    };
-    let struct_gc_allocations =
-        aggregate_case("struct_construction")?["max_vm"]["struct_materializations"]
-            .as_u64()
-            .ok_or("formal aggregate omitted Struct materialization count")?;
-    let enum_gc_allocations =
-        aggregate_case("enum_construction_match")?["max_vm"]["enum_materializations"]
-            .as_u64()
-            .ok_or("formal aggregate omitted Enum materialization count")?;
-    let gc_case = aggregate_case("gc_incremental_step")?;
-    let gc_system_allocations = gc_case["max_system_allocations"]
-        .as_u64()
-        .ok_or("formal aggregate omitted GC system allocation count")?;
-    let steady_state_dispatch =
-        steady_state_dispatch_receipt(performance["steady_state_dispatch"].clone(), &head)
-            .ok_or("performance report omitted valid same-HEAD WP92 allocation evidence")?;
-    let steady_state_dispatch_system_allocations = steady_state_dispatch["max_system_allocations"]
-        .as_u64()
-        .ok_or("WP92 allocation receipt omitted its maximum")?;
-    let snake_stress = &product["snake"]["stress_receipt"];
-    let resource_leaks = snake_stress["resource_leaks"]
-        .as_u64()
-        .ok_or("Snake stress receipt omitted its post-shutdown leak count")?;
-    let semantic_mismatches = v8["semantic_mismatches"]
-        .as_array()
-        .ok_or("V8 comparison omitted its semantic mismatch evidence")?
-        .clone();
-    let release_summary = &release_authority.summary;
-    let release_targets = &release_summary["targets"];
-    let release_protocol = &release_summary["protocol"];
-    let release_structural = &release_summary["structuralEvidence"];
-    let release_correctness = &release_summary["correctnessEvidence"];
-    let steady_state_dispatch_paths = steady_state_dispatch["cases"]
-        .as_object()
-        .map_or(0, serde_json::Map::len);
-    for bucket in [
-        "product_cpu",
-        "value_collection",
-        "host_task_engine",
-        "cold_start",
-    ] {
-        if comparison["buckets"][bucket]["met"] != true {
-            return Err(format!("M5 performance bucket {bucket} did not meet its target").into());
+            .ok_or("V8 comparison omitted its semantic mismatch evidence")?
+            .clone();
+        let release_summary = &release_authority.summary;
+        let release_targets = &release_summary["targets"];
+        let release_protocol = &release_summary["protocol"];
+        let release_structural = &release_summary["structuralEvidence"];
+        let release_correctness = &release_summary["correctnessEvidence"];
+        let steady_state_dispatch_paths = steady_state_dispatch["cases"]
+            .as_object()
+            .map_or(0, serde_json::Map::len);
+        for bucket in [
+            "product_cpu",
+            "value_collection",
+            "host_task_engine",
+            "cold_start",
+        ] {
+            if comparison["buckets"][bucket]["met"] != true {
+                return Err(
+                    format!("M5 performance bucket {bucket} did not meet its target").into(),
+                );
+            }
         }
-    }
-    let unexplained_regressions = comparison["regressions"]
-        .as_array()
-        .ok_or("comparison regressions is not an array")?;
-    if comparison["schema"].as_u64() != Some(1)
-        || comparison["status"] != "PASS"
-        || comparison["head_commit"] != head
-        || comparison["head_authority"]["schema"].as_u64() != Some(2)
-        || comparison["head_authority"]["build_profile"] != "release"
-        || !is_hex_digest(&comparison["head_authority"]["benchmark_source_hash"], 32)
-        || !is_hex_digest(&comparison["head_authority"]["bytecode_hash"], 32)
-        || !unexplained_regressions.is_empty()
-        || profiler["schema"].as_u64() != Some(1)
-        || profiler["implementation_commit"] != head
-        || profiler["status"] != "PASS"
-        || profiler["processes"].as_u64() != Some(7)
-        || profiler["samples_per_process"].as_u64() != Some(1_000)
-        || product["schema"].as_u64() != Some(1)
-        || product["implementation_commit"] != head
-        || product["status"] != "PASS"
-        || !valid_snake_stress_report(snake_stress)
-        || resource_leaks != 0
-        || v8["schema"] != 1
-        || v8["status"] != "PASS"
-        || v8["nexa_implementation_commit"] != head
-        || v8["result_parity"] != "all workloads returned identical results in both runtimes"
-        || !semantic_mismatches.is_empty()
-        || reload_peak["implementation_commit"] != head
-        || reload_peak["status"] != "PASS"
-        || performance["reload_peak"]["implementation_commit"] != head
-        || performance["reload_peak"]["status"] != "PASS"
-        || cold_start["implementation_commit"] != head
-        || performance["cold_start"]["implementation_commit"] != head
-        || performance["cold_start"]["status"] != "PASS"
-        || performance["schema"].as_u64() != Some(1)
-        || performance["aggregate"]["implementation_commit"] != head
-        || performance["aggregate"]["benchmark_version"] != 7
-        || performance["aggregate"]["schema"] != 2
-        || performance["aggregate"]["status"] != "PASS"
-        || performance["aggregate"]["build_profile"] != "release"
-        || performance["aggregate"]["process_count"] != 7
-        || performance["aggregate"]["samples_per_process"] != 1_000
-        || performance["aggregate"]["warmup_per_process"] != 100
-        || struct_gc_allocations != 0
-        || enum_gc_allocations != 0
-        || gc_system_allocations != 0
-        || steady_state_dispatch_system_allocations != 0
-        || decision["schema"].as_u64() != Some(1)
-        || decision["implementation_commit"] != head
-        || performance["decision"] != decision
-        || !matches!(decision["decision"].as_str(), Some("GO" | "DEFER"))
-        || release_summary["baseline"]["commit"] != comparison["baseline_commit"]
-        || release_protocol["benchmarkVersion"] != performance["aggregate"]["benchmark_version"]
-        || release_protocol["aggregateSchema"] != performance["aggregate"]["schema"]
-        || release_protocol["processes"] != performance["aggregate"]["process_count"]
-        || release_protocol["samplesPerProcess"] != performance["aggregate"]["samples_per_process"]
-        || release_protocol["warmupPerProcess"] != performance["aggregate"]["warmup_per_process"]
-        || release_protocol["buildProfile"] != performance["aggregate"]["build_profile"]
-        || release_targets["productCpuGeomeanSpeedup"]
-            != comparison["buckets"]["product_cpu"]["target"]
-        || release_targets["valueCollectionGeomeanSpeedup"]
-            != comparison["buckets"]["value_collection"]["target"]
-        || release_targets["hostTaskEngineGeomeanSpeedup"]
-            != comparison["buckets"]["host_task_engine"]["target"]
-        || release_targets["coldStartGeomeanSpeedup"]
-            != comparison["buckets"]["cold_start"]["target"]
-        || release_structural["structGcAllocations"].as_u64() != Some(struct_gc_allocations)
-        || release_structural["enumGcAllocations"].as_u64() != Some(enum_gc_allocations)
-        || release_structural["gcSystemAllocations"].as_u64() != Some(gc_system_allocations)
-        || release_structural["steadyStateDispatchPaths"].as_u64()
-            != u64::try_from(steady_state_dispatch_paths).ok()
-        || release_structural["steadyStateDispatchSystemAllocations"].as_u64()
-            != Some(steady_state_dispatch_system_allocations)
-        || release_correctness["unexplainedRegressions"].as_u64()
-            != u64::try_from(unexplained_regressions.len()).ok()
-        || release_correctness["semanticMismatches"].as_u64()
-            != u64::try_from(semantic_mismatches.len()).ok()
-        || release_correctness["resourceLeaks"].as_u64() != Some(resource_leaks)
-    {
-        return Err("one or more M5 machine receipts are stale, malformed, or failing".into());
-    }
-    let jit_decision = decision["decision"]
-        .as_str()
-        .ok_or("JIT decision is not a string")?;
-    if release_summary["jitDecision"] != jit_decision {
-        return Err("M5 release summary does not match the terminal JIT decision".into());
-    }
-    let decision_document =
-        fs::read_to_string(root.join("baseline/performance/JIT_DECISION_V1.md"))?;
-    if !decision_document.contains(&format!("Status: **{jit_decision}**"))
-        || !decision_document.contains(&format!("M6 LLVM JIT = {jit_decision}"))
-    {
-        return Err("JIT_DECISION_V1.md does not match the terminal machine decision".into());
-    }
-    if !git_output(&["status", "--porcelain"])?.is_empty()
-        || git_output(&["rev-parse", "HEAD"])? != head
-    {
-        return Err("checkout changed or became dirty while finalizing M5".into());
-    }
+        let unexplained_regressions = comparison["regressions"]
+            .as_array()
+            .ok_or("comparison regressions is not an array")?;
+        if comparison["schema"].as_u64() != Some(1)
+            || comparison["status"] != "PASS"
+            || comparison["head_commit"] != head
+            || comparison["head_authority"]["schema"].as_u64() != Some(2)
+            || comparison["head_authority"]["build_profile"] != "release"
+            || !is_hex_digest(&comparison["head_authority"]["benchmark_source_hash"], 32)
+            || !is_hex_digest(&comparison["head_authority"]["bytecode_hash"], 32)
+            || !unexplained_regressions.is_empty()
+            || profiler["schema"].as_u64() != Some(1)
+            || profiler["implementation_commit"] != head
+            || profiler["status"] != "PASS"
+            || profiler["processes"].as_u64() != Some(7)
+            || profiler["samples_per_process"].as_u64() != Some(1_000)
+            || product["schema"].as_u64() != Some(1)
+            || product["implementation_commit"] != head
+            || product["status"] != "PASS"
+            || !valid_snake_stress_report(snake_stress)
+            || resource_leaks != 0
+            || v8["schema"] != 1
+            || v8["status"] != "PASS"
+            || v8["nexa_implementation_commit"] != head
+            || v8["result_parity"] != "all workloads returned identical results in both runtimes"
+            || !semantic_mismatches.is_empty()
+            || reload_peak["implementation_commit"] != head
+            || reload_peak["status"] != "PASS"
+            || performance["reload_peak"]["implementation_commit"] != head
+            || performance["reload_peak"]["status"] != "PASS"
+            || cold_start["implementation_commit"] != head
+            || performance["cold_start"]["implementation_commit"] != head
+            || performance["cold_start"]["status"] != "PASS"
+            || performance["schema"].as_u64() != Some(1)
+            || performance["aggregate"]["implementation_commit"] != head
+            || performance["aggregate"]["benchmark_version"] != 7
+            || performance["aggregate"]["schema"] != 2
+            || performance["aggregate"]["status"] != "PASS"
+            || performance["aggregate"]["build_profile"] != "release"
+            || performance["aggregate"]["process_count"] != 7
+            || performance["aggregate"]["samples_per_process"] != 1_000
+            || performance["aggregate"]["warmup_per_process"] != 100
+            || struct_gc_allocations != 0
+            || enum_gc_allocations != 0
+            || gc_system_allocations != 0
+            || steady_state_dispatch_system_allocations != 0
+            || decision["schema"].as_u64() != Some(1)
+            || decision["implementation_commit"] != head
+            || performance["decision"] != decision
+            || !matches!(decision["decision"].as_str(), Some("GO" | "DEFER"))
+            || release_summary["baseline"]["commit"] != comparison["baseline_commit"]
+            || release_protocol["benchmarkVersion"] != performance["aggregate"]["benchmark_version"]
+            || release_protocol["aggregateSchema"] != performance["aggregate"]["schema"]
+            || release_protocol["processes"] != performance["aggregate"]["process_count"]
+            || release_protocol["samplesPerProcess"]
+                != performance["aggregate"]["samples_per_process"]
+            || release_protocol["warmupPerProcess"]
+                != performance["aggregate"]["warmup_per_process"]
+            || release_protocol["buildProfile"] != performance["aggregate"]["build_profile"]
+            || release_targets["productCpuGeomeanSpeedup"]
+                != comparison["buckets"]["product_cpu"]["target"]
+            || release_targets["valueCollectionGeomeanSpeedup"]
+                != comparison["buckets"]["value_collection"]["target"]
+            || release_targets["hostTaskEngineGeomeanSpeedup"]
+                != comparison["buckets"]["host_task_engine"]["target"]
+            || release_targets["coldStartGeomeanSpeedup"]
+                != comparison["buckets"]["cold_start"]["target"]
+            || release_structural["structGcAllocations"].as_u64() != Some(struct_gc_allocations)
+            || release_structural["enumGcAllocations"].as_u64() != Some(enum_gc_allocations)
+            || release_structural["gcSystemAllocations"].as_u64() != Some(gc_system_allocations)
+            || release_structural["steadyStateDispatchPaths"].as_u64()
+                != u64::try_from(steady_state_dispatch_paths).ok()
+            || release_structural["steadyStateDispatchSystemAllocations"].as_u64()
+                != Some(steady_state_dispatch_system_allocations)
+            || release_correctness["unexplainedRegressions"].as_u64()
+                != u64::try_from(unexplained_regressions.len()).ok()
+            || release_correctness["semanticMismatches"].as_u64()
+                != u64::try_from(semantic_mismatches.len()).ok()
+            || release_correctness["resourceLeaks"].as_u64() != Some(resource_leaks)
+        {
+            return Err("one or more M5 machine receipts are stale, malformed, or failing".into());
+        }
+        let jit_decision = decision["decision"]
+            .as_str()
+            .ok_or("JIT decision is not a string")?;
+        if release_summary["jitDecision"] != jit_decision {
+            return Err("M5 release summary does not match the terminal JIT decision".into());
+        }
+        let decision_document =
+            fs::read_to_string(root.join("baseline/performance/JIT_DECISION_V1.md"))?;
+        if !decision_document.contains(&format!("Status: **{jit_decision}**"))
+            || !decision_document.contains(&format!("M6 LLVM JIT = {jit_decision}"))
+        {
+            return Err("JIT_DECISION_V1.md does not match the terminal machine decision".into());
+        }
+        if !git_output(&["status", "--porcelain"])?.is_empty()
+            || git_output(&["rev-parse", "HEAD"])? != head
+        {
+            return Err("checkout changed or became dirty while finalizing M5".into());
+        }
 
-    let report = serde_json::json!({
-        "schema": 2,
-        "milestone": "Nexa M5 Deep Performance Optimization",
-        "baselineTag": "performance-m5-baseline",
-        "baselineCommit": comparison["baseline_commit"],
-        "implementationCommit": head,
-        "productGeomeanSpeedup": geomean("product_cpu")?,
-        "valueCollectionGeomeanSpeedup": geomean("value_collection")?,
-        "hostTaskEngineGeomeanSpeedup": geomean("host_task_engine")?,
-        "coldStartGeomeanSpeedup": geomean("cold_start")?,
-        "coldStartScenarios": cold_start["cases"],
-        "reloadPeak": reload_peak,
-        "structGcAllocations": struct_gc_allocations,
-        "enumGcAllocations": enum_gc_allocations,
-        "gcSystemAllocations": gc_system_allocations,
-        "steadyStateDispatchSystemAllocations": steady_state_dispatch_system_allocations,
-        "steadyStateDispatchReceipt": steady_state_dispatch,
-        "unexplainedRegressions": unexplained_regressions,
-        "semanticMismatches": semantic_mismatches,
-        "semanticParityReceipt": v8,
-        "resourceLeaks": resource_leaks,
-        "resourceLeakReceipt": snake_stress,
-        "jitDecision": jit_decision,
-        "releaseAuthority": {
-            "path": "baseline/performance/M5_RELEASE_SUMMARY.json",
-            "blake3": release_authority.summary_blake3,
-            "bytecodeVersion": release_authority.bytecode_version,
-            "opcodeCostTableVersion": release_authority.opcode_cost_table_version,
-            "summary": release_authority.summary,
-        },
-        "workspace": {
-            "fmt": "PASS",
-            "check": "PASS",
-            "clippy": "PASS",
-            "test": "PASS",
-            "doc": "PASS",
-        },
-        "historicalTags": historical_tags,
-        "completionTag": {
-            "type": completion_tag_type,
-            "object": completion_tag_object,
-            "target": completion_tag_target,
-        },
-        "remotePublication": {
-            "main": remote["refs/heads/main"],
-            "milestoneBranch": remote["refs/heads/codex/performance-m5"],
-            "completionTagObject": remote["refs/tags/performance-m5-complete"],
-            "completionTagTarget": remote["refs/tags/performance-m5-complete^{}"],
-        },
-        "status": "PASS",
-    });
-    let output = final_report_path;
-    fs::create_dir_all(output.parent().ok_or("M5 final report has no parent")?)?;
-    let temporary = output.with_extension("json.tmp");
-    fs::write(
-        &temporary,
-        format!("{}\n", serde_json::to_string_pretty(&report)?),
-    )?;
-    fs::rename(&temporary, &output)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+        let report = serde_json::json!({
+            "schema": 2,
+            "milestone": "Nexa M5 Deep Performance Optimization",
+            "baselineTag": "performance-m5-baseline",
+            "baselineCommit": comparison["baseline_commit"],
+            "implementationCommit": head,
+            "productGeomeanSpeedup": geomean("product_cpu")?,
+            "valueCollectionGeomeanSpeedup": geomean("value_collection")?,
+            "hostTaskEngineGeomeanSpeedup": geomean("host_task_engine")?,
+            "coldStartGeomeanSpeedup": geomean("cold_start")?,
+            "coldStartScenarios": cold_start["cases"],
+            "reloadPeak": reload_peak,
+            "structGcAllocations": struct_gc_allocations,
+            "enumGcAllocations": enum_gc_allocations,
+            "gcSystemAllocations": gc_system_allocations,
+            "steadyStateDispatchSystemAllocations": steady_state_dispatch_system_allocations,
+            "steadyStateDispatchReceipt": steady_state_dispatch,
+            "unexplainedRegressions": unexplained_regressions,
+            "semanticMismatches": semantic_mismatches,
+            "semanticParityReceipt": v8,
+            "resourceLeaks": resource_leaks,
+            "resourceLeakReceipt": snake_stress,
+            "jitDecision": jit_decision,
+            "releaseAuthority": {
+                "path": "baseline/performance/M5_RELEASE_SUMMARY.json",
+                "blake3": release_authority.summary_blake3,
+                "bytecodeVersion": release_authority.bytecode_version,
+                "opcodeCostTableVersion": release_authority.opcode_cost_table_version,
+                "summary": release_authority.summary,
+            },
+            "workspace": {
+                "fmt": "PASS",
+                "check": "PASS",
+                "clippy": "PASS",
+                "test": "PASS",
+                "doc": "PASS",
+            },
+            "historicalTags": historical_tags,
+            "completionTag": {
+                "type": completion_tag_type,
+                "object": completion_tag_object,
+                "target": completion_tag_target,
+            },
+            "remotePublication": {
+                "main": remote["refs/heads/main"],
+                "milestoneBranch": remote["refs/heads/codex/performance-m5"],
+                "completionTagObject": remote["refs/tags/performance-m5-complete"],
+                "completionTagTarget": remote["refs/tags/performance-m5-complete^{}"],
+            },
+            "status": "PASS",
+        });
+        let output = final_report_path;
+        fs::create_dir_all(output.parent().ok_or("M5 final report has no parent")?)?;
+        let temporary = output.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            format!("{}\n", serde_json::to_string_pretty(&report)?),
+        )?;
+        fs::rename(&temporary, &output)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -4637,14 +4845,7 @@ fn real_engine_diagnostic_gate() -> Result<(usize, usize), DynError> {
     cargo(&["test", "-p", "nexa-embed", "--test", "diagnostic_e2e"])?;
     let output = Command::new("cargo")
         .args([
-            "run",
-            "--quiet",
-            "-p",
-            "nexa-cli",
-            "--",
-            "diagnostic-corpus-check",
-            "--format",
-            "json",
+            "run", "--quiet", "-p", "nexa-cli", "--", "qa", "corpus", "--format", "json",
         ])
         .current_dir(workspace_root())
         .output()?;
@@ -5436,10 +5637,6 @@ fn run_check_summary() -> CheckSummary {
     run_check_summary_with_workspace(workspace)
 }
 
-fn run_check_summary_after_workspace() -> CheckSummary {
-    run_check_summary_with_workspace(true)
-}
-
 fn run_check_summary_with_workspace(workspace_check: bool) -> CheckSummary {
     CheckSummary {
         workspace_check,
@@ -5476,6 +5673,10 @@ fn workspace_check() -> Result<(), DynError> {
 
 fn test_task() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"])?;
+    test_task_after_workspace()
+}
+
+fn test_task_after_workspace() -> Result<(), DynError> {
     cargo(&[
         "test",
         "-p",
@@ -5503,6 +5704,11 @@ fn test_core() -> Result<(), DynError> {
 
 fn test_binding() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-idl"])?;
+    test_binding_after_workspace()?;
+    cargo(&["test", "-p", "combat-runtime"])
+}
+
+fn test_binding_after_workspace() -> Result<(), DynError> {
     cargo(&[
         "test",
         "-p",
@@ -5520,8 +5726,7 @@ fn test_binding() -> Result<(), DynError> {
         "nidl",
         "check",
         "examples/combat-runtime/combat_api.nidl",
-    ])?;
-    cargo(&["test", "-p", "combat-runtime"])
+    ])
 }
 
 fn fuzz_smoke() -> Result<(), DynError> {
@@ -5574,13 +5779,7 @@ fn bench_smoke() -> Result<(), DynError> {
     let root = workspace_root();
     let output_dir = root.join("target/nexa-artifacts/bench-smoke");
     fs::create_dir_all(&output_dir)?;
-    cargo(&[
-        "run",
-        "--release",
-        "--quiet",
-        "--manifest-path",
-        "tools/allocation-observer/Cargo.toml",
-    ])?;
+    allocation_observer_smoke()?;
     for run in 1..=3 {
         let output = output_dir.join(format!("run-{run}.json"));
         cargo(&[
@@ -5614,6 +5813,16 @@ fn bench_smoke() -> Result<(), DynError> {
         }
     }
     Ok(())
+}
+
+fn allocation_observer_smoke() -> Result<(), DynError> {
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "--manifest-path",
+        "tools/allocation-observer/Cargo.toml",
+    ])
 }
 
 #[allow(
@@ -6499,57 +6708,22 @@ mod audit_tests {
     }
 
     fn formal_profile_fixture(aggregate: &serde_json::Value) -> serde_json::Value {
-        let cases = aggregate["cases"]
-            .as_array()
-            .expect("aggregate cases")
-            .iter()
-            .map(|case| {
-                serde_json::json!({
-                    "case": case["case"],
-                    "tier": case["tier"],
-                    "samples": 200,
-                    "throughput_ops_per_second": 10_000,
-                    "p50_ns": 100,
-                    "p95_ns": 120,
-                    "p99_ns": 140,
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::json!({
+        let mut report = aggregate.clone();
+        report["profiler_enabled"] = serde_json::Value::Bool(true);
+        report["profiler_mode"] = serde_json::Value::from("enabled");
+        report["profiler"] = serde_json::json!({
             "schema": 1,
-            "benchmark_version": 7,
-            "implementation_commit": aggregate["implementation_commit"],
-            "benchmark_source_hash": aggregate["benchmark_source_hash"],
-            "bytecode_hash": aggregate["bytecode_hash"],
-            "toolchain": aggregate["toolchain"],
-            "os": aggregate["os"],
-            "os_version": aggregate["os_version"],
-            "arch": aggregate["arch"],
-            "machine_model": aggregate["machine_model"],
-            "cpu_model": aggregate["cpu_model"],
-            "logical_cpu_count": aggregate["logical_cpu_count"],
-            "power_source": aggregate["power_source"],
-            "thermal_policy": aggregate["thermal_policy"],
-            "build_profile": "release",
-            "samples": 200,
-            "warmup": 100,
-            "process_index": 0,
-            "profiler_enabled": true,
-            "profiler_mode": "enabled",
-            "profiler": {
-                "schema": 1,
-                "total_opcode_executions": 1_000,
-                "function_count": 4,
-                "dropped_modules": 0,
-                "dropped_functions": 0,
-                "dropped_sites": 0,
-                "dropped_host_calls": 0,
-                "top_opcodes": [["add_i32", 1_000]],
-                "gc": {},
-                "tasks": {},
-            },
-            "cases": cases,
-        })
+            "total_opcode_executions": 1_000,
+            "function_count": 4,
+            "dropped_modules": 0,
+            "dropped_functions": 0,
+            "dropped_sites": 0,
+            "dropped_host_calls": 0,
+            "top_opcodes": [["add_i32", 1_000]],
+            "gc": {},
+            "tasks": {},
+        });
+        report
     }
 
     #[test]
@@ -6649,6 +6823,13 @@ mod audit_tests {
         baseline["machine_identity_provenance"] = serde_json::Value::from(
             "bound by the same xtask process to its live HEAD receipt while synchronously running the baseline worktree",
         );
+        baseline["cache_key"] = serde_json::json!({
+            "baselineCommit": "baseline",
+            "benchmarkSourceHash": "source",
+            "rustcVersion": "rustc",
+            "hostname": "host",
+        });
+        baseline["cache_provenance"] = serde_json::Value::from("generated-live");
         assert!(super::formal_baseline_aggregate(baseline.clone(), "baseline", &machine).is_some());
 
         baseline["cases"][0]["median_p50_ns"] = serde_json::Value::from(0);

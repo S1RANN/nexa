@@ -577,6 +577,59 @@ pub(super) fn m4_scale_stress() -> Result<(), DynError> {
     run_one_gate("m4-scale-stress", scale_stress_gate).map(|_| ())
 }
 
+pub(super) fn finalize_after_workspace() -> Result<(), DynError> {
+    let tested_head = git_optional_output(&["rev-parse", "HEAD"]);
+    let tested_branch = git_optional_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let started_clean = git_optional_output(&["status", "--porcelain"]).is_empty();
+    if tested_head == "missing" || tested_branch == "missing" || !started_clean {
+        return Err("M4 post-workspace evidence requires a clean attached checkout".into());
+    }
+
+    let started = Instant::now();
+    let mut context = GateContext::default();
+    let incremental = incremental_gate(&mut context)?;
+    incremental.validate()?;
+
+    let root = workspace_root();
+    let editor_report_path = root.join(EDITOR_PACKAGE_REPORT_PATH);
+    prepare_machine_report(&editor_report_path, "M4 editor package")?;
+    run_language_scale_tooling(&mut context, &root)?;
+    run_editor_packaging(&mut context, &editor_report_path)?;
+    let (_, facade, stress) = scale_stress_gate(&mut context)?;
+    facade.validate()?;
+    stress.validate()?;
+
+    let completed_head = git_optional_output(&["rev-parse", "HEAD"]);
+    let completed_branch = git_optional_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let completed_clean = git_optional_output(&["status", "--porcelain"]).is_empty();
+    if completed_head != tested_head || completed_branch != tested_branch || !completed_clean {
+        return Err("M4 post-workspace evidence changed or dirtied the checkout".into());
+    }
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "gate": "finalize-m4-post-workspace",
+        "testedHead": tested_head,
+        "testedBranch": tested_branch,
+        "completedHead": completed_head,
+        "completedBranch": completed_branch,
+        "durationMs": elapsed_millis(started),
+        "workspaceCoverage": [
+            "test-m4-source",
+            "test-m4-semantics",
+            "test-m4-tooling Rust tests",
+        ],
+        "commands": context.evidence.commands,
+        "machineReports": context.evidence.machine_reports,
+        "status": "PASS",
+    });
+    let output = root.join("target/nexa-artifacts/m4-finalize/post-workspace-receipt.json");
+    prepare_final_report(&output)?;
+    let encoded = format!("{}\n", serde_json::to_string_pretty(&receipt)?);
+    atomic_write_final_report(&output, encoded.as_bytes())?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
 fn source_gate(context: &mut GateContext) -> Result<(), DynError> {
     require_integration_test(
         "test-m4-source",
