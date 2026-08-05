@@ -43,7 +43,7 @@ derived from `H`'s Stable ID. Argument decode, Host return encode, Registry
 dispatch, and release validate that identity; a raw token for another Handle
 cannot cross the generated wrapper boundary.
 
-`HostCall.import` is a Bytecode v6 module-local index. It addresses only the
+`HostCall.import` is a Bytecode v7 module-local index. It addresses only the
 calling module's verified `HostImport` metadata and is never a Contract
 declaration ordinal or a generated Registry slot. The selected metadata
 contains the Host function Stable ID, exact parameter/result ABI, sync/async

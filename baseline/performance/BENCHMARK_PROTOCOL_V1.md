@@ -2,9 +2,11 @@
 
 Version: **1.0.1**
 
+Status: **COMPLETE**
+
 Benchmark v7 (`tools/benchmark-v7`) is the only performance measurement
-authority for M5. Benchmark v6 remains in the tree, frozen, until every v7
-output, gate, and semantic is complete; final active gates use v7 only.
+authority for M5. Benchmark v6 remains in the tree only as a retired historical
+harness; no active gate or completion receipt accepts it.
 
 ## Corpus tiers
 

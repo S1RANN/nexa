@@ -2,6 +2,8 @@
 
 Version: **1.0.0**
 
+Status: **COMPLETE**
+
 M5 GC is a non-moving, precise, incremental, budgeted Mark/Sweep collector
 with stable `GcRef` identity.
 

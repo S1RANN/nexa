@@ -80,7 +80,10 @@ Host/Task/Engine corpus     1.485x  (target 1.30x)
 Cold-start corpus           1.650x  (target 1.20x)
 ```
 
-The terminal tagged-HEAD authority is
-`target/nexa-artifacts/m5-finalize/final-report.json`; raw benchmark receipts
+The committed, independently reviewable release attestation is
+[`M5_RELEASE_SUMMARY.json`](M5_RELEASE_SUMMARY.json). The finalizer validates
+that summary against the frozen versions, targets, and live receipts and
+records its BLAKE3 digest in the terminal tagged-HEAD authority at
+`target/nexa-artifacts/m5-finalize/final-report.json`. Raw benchmark receipts
 remain uncommitted under `target/nexa-artifacts/m5/`. The resulting M6 LLVM
 JIT decision is `DEFER`, as documented in `JIT_DECISION_V1.md`.

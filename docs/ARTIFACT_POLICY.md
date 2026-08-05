@@ -29,3 +29,11 @@ tree.
 Object Model v2, Async v2, NIDL v2, structured Codegen, Standalone, REPL,
 multiple-entrypoint, scale, and repository gates. Its completion report is
 `target/nexa-artifacts/m4r1-finalize/final-report.json`.
+
+M5 keeps raw 7x1000 samples and the exact terminal report under the same
+ignored artifact root, but commits the bounded public attestation at
+`baseline/performance/M5_RELEASE_SUMMARY.json`. `finalize-m5` validates that
+summary against live same-HEAD receipts and records the summary's BLAKE3 digest
+in `target/nexa-artifacts/m5-finalize/final-report.json`; the annotated
+completion tag therefore freezes the independently reviewable claims without
+committing raw machine samples.

@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **4.2.0**
+Version: **5.0.0**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -34,13 +34,13 @@ Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
 Multiple Entrypoint Model = COMPLETE
-Nexa M5 Deep Performance Optimization = IN PROGRESS
-Performance Measurement Authority v1 = IN PROGRESS
-Value Layout v1 = IN PROGRESS
-ExecutableModule v1 = IN PROGRESS
-Incremental GC v1 = IN PROGRESS
-Runtime Fast Paths v1 = IN PROGRESS
-M6 LLVM JIT = NOT STARTED
+Nexa M5 Deep Performance Optimization = COMPLETE
+Performance Measurement Authority v1 = COMPLETE
+Value Layout v1 = COMPLETE
+ExecutableModule v1 = COMPLETE
+Incremental GC v1 = COMPLETE
+Runtime Fast Paths v1 = COMPLETE
+M6 LLVM JIT = DEFER
 ```
 
 This is the only normative entry point for the active Internal Language Pivot.
@@ -86,7 +86,7 @@ NEXA_LANGUAGE_VERSION = 2
 NIDL_SYNTAX_VERSION = 2
 HOST_CONTRACT_SCHEMA_VERSION = 2
 ABI_DESCRIPTOR_VERSION = 2
-BYTECODE_VERSION = 6
+BYTECODE_VERSION = 7
 ```
 
 These are structured protocol values, not display strings. Active products
@@ -136,6 +136,7 @@ of selecting a compatibility parser or decoder.
 - [`performance/GC_V1.md`](performance/GC_V1.md)
 - [`performance/PERFORMANCE_TARGETS_V1.md`](performance/PERFORMANCE_TARGETS_V1.md)
 - [`performance/JIT_DECISION_V1.md`](performance/JIT_DECISION_V1.md)
+- [`performance/M5_RELEASE_SUMMARY.json`](performance/M5_RELEASE_SUMMARY.json)
 - [`runtime/HANDLES.md`](runtime/HANDLES.md)
 - [`runtime/RESOURCE_MACHINE.md`](runtime/RESOURCE_MACHINE.md)
 - [`runtime/SCOPE_MACHINE.md`](runtime/SCOPE_MACHINE.md)

@@ -12,6 +12,13 @@ mod m4r1;
 
 type DynError = Box<dyn std::error::Error>;
 
+struct M5ReleaseAuthority {
+    summary: Value,
+    summary_blake3: String,
+    bytecode_version: u64,
+    opcode_cost_table_version: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct RepoHealth {
     schema_version: u32,
@@ -3644,6 +3651,246 @@ fn m5_performance_regression_with_live_head(live_head: Option<Value>) -> Result<
     Ok(())
 }
 
+fn public_rust_integer_constant(source: &str, name: &str) -> Result<u64, DynError> {
+    let prefix = format!("pub const {name}:");
+    let declaration = source
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("missing public Rust constant {name}"))?;
+    let (_, value) = declaration
+        .split_once('=')
+        .ok_or_else(|| format!("malformed public Rust constant {name}"))?;
+    value
+        .trim()
+        .strip_suffix(';')
+        .ok_or_else(|| format!("public Rust constant {name} has no terminator"))?
+        .replace('_', "")
+        .parse::<u64>()
+        .map_err(|error| format!("public Rust constant {name} is not an integer: {error}").into())
+}
+
+fn require_release_fragments(
+    document: &str,
+    source: &str,
+    fragments: &[&str],
+) -> Result<(), DynError> {
+    for fragment in fragments {
+        if !source.contains(fragment) {
+            return Err(format!(
+                "{document} is missing required M5 release authority fragment {fragment:?}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_m5_status_documents(root: &Path) -> Result<(), DynError> {
+    let baseline_index = fs::read_to_string(root.join("baseline/BASELINE_INDEX.md"))?;
+    require_release_fragments(
+        "baseline/BASELINE_INDEX.md",
+        &baseline_index,
+        &[
+            "Version: **5.0.0**",
+            "Nexa M5 Deep Performance Optimization = COMPLETE",
+            "Performance Measurement Authority v1 = COMPLETE",
+            "Value Layout v1 = COMPLETE",
+            "ExecutableModule v1 = COMPLETE",
+            "Incremental GC v1 = COMPLETE",
+            "Runtime Fast Paths v1 = COMPLETE",
+            "M6 LLVM JIT = DEFER",
+            "BYTECODE_VERSION = 7",
+            "performance/M5_RELEASE_SUMMARY.json",
+        ],
+    )?;
+
+    for (document, fragments) in [
+        (
+            "README.md",
+            &[
+                "Nexa M5 Deep Performance Optimization = COMPLETE",
+                "M6 LLVM JIT = DEFER",
+                "baseline/performance/M5_RELEASE_SUMMARY.json",
+            ][..],
+        ),
+        (
+            "ROADMAP.md",
+            &[
+                "M5 Deep Performance Optimization = COMPLETE",
+                "M6 LLVM JIT = DEFER",
+                "baseline/performance/M5_RELEASE_SUMMARY.json",
+            ][..],
+        ),
+        (
+            "baseline/performance/M5_SCOPE.md",
+            &[
+                "Status: **COMPLETE**",
+                "M5_RELEASE_SUMMARY.json",
+                "M6 LLVM",
+                "JIT decision is `DEFER`",
+            ][..],
+        ),
+        (
+            "baseline/performance/JIT_DECISION_V1.md",
+            &["Status: **DEFER**", "M6 LLVM JIT = DEFER"][..],
+        ),
+    ] {
+        let source = fs::read_to_string(root.join(document))?;
+        require_release_fragments(document, &source, fragments)?;
+    }
+    Ok(())
+}
+
+fn validate_m5_bytecode_spec(root: &Path) -> Result<(), DynError> {
+    let bytecode_spec = fs::read_to_string(root.join("baseline/abi/BYTECODE.md"))?;
+    require_release_fragments(
+        "baseline/abi/BYTECODE.md",
+        &bytecode_spec,
+        &[
+            "# Nexa Internal Language Bytecode 7",
+            "Version: **7.0.0**",
+            "Status: **COMPLETE**",
+            "BYTECODE_VERSION = 7",
+            "OPCODE_COST_TABLE_VERSION = 7",
+            "MANDATORY_SECTION_COUNT = 16",
+            "physical ABI",
+            "ValueLayout",
+            "CopyValue",
+            "Host opaque",
+            "precise roots",
+            "Bytecode 6 is retired",
+        ],
+    )?;
+    for (kind, name) in [
+        (1, "Strings"),
+        (2, "Types"),
+        (3, "Constants"),
+        (4, "Enums"),
+        (5, "Structs"),
+        (6, "Classes"),
+        (7, "HostImports"),
+        (8, "StateSchemas"),
+        (9, "Exports"),
+        (10, "Functions"),
+        (11, "Code"),
+        (12, "RootMaps"),
+        (13, "Safepoints"),
+        (14, "LoopBounds"),
+        (15, "SourceMap"),
+        (16, "ReloadMetadata"),
+    ] {
+        let row = format!("| {kind} | {name} |");
+        if !bytecode_spec.contains(&row) {
+            return Err(format!("baseline/abi/BYTECODE.md omits mandatory section {row}").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_m5_performance_specs(root: &Path) -> Result<(), DynError> {
+    for document in [
+        "baseline/performance/BENCHMARK_PROTOCOL_V1.md",
+        "baseline/performance/PERFORMANCE_COUNTERS_V1.md",
+        "baseline/performance/VALUE_LAYOUT_V1.md",
+        "baseline/performance/EXECUTABLE_MODULE_V1.md",
+        "baseline/performance/GC_V1.md",
+        "baseline/performance/PERFORMANCE_TARGETS_V1.md",
+    ] {
+        let source = fs::read_to_string(root.join(document))?;
+        require_release_fragments(document, &source, &["Status: **COMPLETE**"])?;
+    }
+    let protocol = fs::read_to_string(root.join("baseline/performance/BENCHMARK_PROTOCOL_V1.md"))?;
+    require_release_fragments(
+        "baseline/performance/BENCHMARK_PROTOCOL_V1.md",
+        &protocol,
+        &[
+            "Benchmark v7 (`tools/benchmark-v7`) is the only performance measurement",
+            "7 independent processes",
+            "1,000 formal samples",
+        ],
+    )
+}
+
+fn load_m5_release_summary(
+    root: &Path,
+    bytecode_version: u64,
+    opcode_cost_table_version: u64,
+) -> Result<(Value, Vec<u8>), DynError> {
+    const BASELINE_COMMIT: &str = "24e87e0a7df07281d2205b1ed88162c7e6617231";
+    const RELEASE_SUMMARY_PATH: &str = "baseline/performance/M5_RELEASE_SUMMARY.json";
+    let summary_bytes = fs::read(root.join(RELEASE_SUMMARY_PATH))?;
+    let summary: Value = serde_json::from_slice(&summary_bytes)?;
+    if summary["schema"].as_u64() != Some(1)
+        || summary["milestone"] != "Nexa M5 Deep Performance Optimization"
+        || summary["status"] != "COMPLETE"
+        || summary["baseline"]["tag"] != "performance-m5-baseline"
+        || summary["baseline"]["commit"] != BASELINE_COMMIT
+        || summary["protocol"]["benchmarkVersion"].as_u64() != Some(7)
+        || summary["protocol"]["aggregateSchema"].as_u64() != Some(2)
+        || summary["protocol"]["processes"].as_u64() != Some(7)
+        || summary["protocol"]["samplesPerProcess"].as_u64() != Some(1_000)
+        || summary["protocol"]["warmupPerProcess"].as_u64() != Some(100)
+        || summary["protocol"]["buildProfile"] != "release"
+        || summary["versions"]["bytecode"].as_u64() != Some(bytecode_version)
+        || summary["versions"]["opcodeCostTable"].as_u64() != Some(opcode_cost_table_version)
+        || summary["structuralEvidence"]["structGcAllocations"].as_u64() != Some(0)
+        || summary["structuralEvidence"]["enumGcAllocations"].as_u64() != Some(0)
+        || summary["structuralEvidence"]["gcSystemAllocations"].as_u64() != Some(0)
+        || summary["structuralEvidence"]["steadyStateDispatchPaths"].as_u64() != Some(6)
+        || summary["structuralEvidence"]["steadyStateDispatchSystemAllocations"].as_u64() != Some(0)
+        || summary["correctnessEvidence"]["unexplainedRegressions"].as_u64() != Some(0)
+        || summary["correctnessEvidence"]["semanticMismatches"].as_u64() != Some(0)
+        || summary["correctnessEvidence"]["resourceLeaks"].as_u64() != Some(0)
+        || summary["jitDecision"] != "DEFER"
+        || summary["terminalReceipt"] != "target/nexa-artifacts/m5-finalize/final-report.json"
+        || summary["attestation"].as_str().is_none_or(str::is_empty)
+    {
+        return Err("M5_RELEASE_SUMMARY.json is stale, malformed, or incomplete".into());
+    }
+    for (field, target, snapshot) in [
+        ("productCpuGeomeanSpeedup", 1.5, 2.397),
+        ("valueCollectionGeomeanSpeedup", 2.0, 2.444),
+        ("hostTaskEngineGeomeanSpeedup", 1.3, 1.485),
+        ("coldStartGeomeanSpeedup", 1.2, 1.650),
+    ] {
+        if summary["targets"][field].as_f64() != Some(target)
+            || summary["qualificationSnapshot"][field].as_f64() != Some(snapshot)
+        {
+            return Err(
+                format!("M5 release summary has invalid target/snapshot field {field}").into(),
+            );
+        }
+    }
+    Ok((summary, summary_bytes))
+}
+
+fn validate_m5_release_authority(root: &Path) -> Result<M5ReleaseAuthority, DynError> {
+    let core_source = fs::read_to_string(root.join("crates/nexa-core/src/lib.rs"))?;
+    let bytecode_version = public_rust_integer_constant(&core_source, "BYTECODE_VERSION")?;
+    let opcode_cost_table_version =
+        public_rust_integer_constant(&core_source, "OPCODE_COST_TABLE_VERSION")?;
+    if bytecode_version != 7 || opcode_cost_table_version != 7 {
+        return Err(format!(
+            "M5 requires BYTECODE_VERSION=7 and OPCODE_COST_TABLE_VERSION=7; \
+             code has {bytecode_version} and {opcode_cost_table_version}"
+        )
+        .into());
+    }
+    validate_m5_status_documents(root)?;
+    validate_m5_bytecode_spec(root)?;
+    validate_m5_performance_specs(root)?;
+    let (summary, summary_bytes) =
+        load_m5_release_summary(root, bytecode_version, opcode_cost_table_version)?;
+
+    Ok(M5ReleaseAuthority {
+        summary,
+        summary_blake3: blake3::hash(&summary_bytes).to_hex().to_string(),
+        bytecode_version,
+        opcode_cost_table_version,
+    })
+}
+
 /// M5 terminal gate. It is intentionally runnable only from the published,
 /// clean, annotated completion checkout; all expensive correctness and
 /// performance evidence is then regenerated or validated at that exact HEAD.
@@ -3717,6 +3964,11 @@ fn finalize_m5() -> Result<(), DynError> {
              status={worktree_status:?}"
         )
         .into());
+    }
+    let release_authority = validate_m5_release_authority(&root)?;
+    let final_report_path = root.join("target/nexa-artifacts/m5-finalize/final-report.json");
+    if final_report_path.exists() {
+        fs::remove_file(&final_report_path)?;
     }
     let completion_tag_type = git_output(&["cat-file", "-t", "performance-m5-complete"])?;
     let completion_tag_object = git_output(&["rev-parse", "performance-m5-complete"])?;
@@ -3894,6 +4146,14 @@ fn finalize_m5() -> Result<(), DynError> {
         .as_array()
         .ok_or("V8 comparison omitted its semantic mismatch evidence")?
         .clone();
+    let release_summary = &release_authority.summary;
+    let release_targets = &release_summary["targets"];
+    let release_protocol = &release_summary["protocol"];
+    let release_structural = &release_summary["structuralEvidence"];
+    let release_correctness = &release_summary["correctnessEvidence"];
+    let steady_state_dispatch_paths = steady_state_dispatch["cases"]
+        .as_object()
+        .map_or(0, serde_json::Map::len);
     for bucket in [
         "product_cpu",
         "value_collection",
@@ -3954,25 +4214,48 @@ fn finalize_m5() -> Result<(), DynError> {
         || decision["implementation_commit"] != head
         || performance["decision"] != decision
         || !matches!(decision["decision"].as_str(), Some("GO" | "DEFER"))
+        || release_summary["baseline"]["commit"] != comparison["baseline_commit"]
+        || release_protocol["benchmarkVersion"] != performance["aggregate"]["benchmark_version"]
+        || release_protocol["aggregateSchema"] != performance["aggregate"]["schema"]
+        || release_protocol["processes"] != performance["aggregate"]["process_count"]
+        || release_protocol["samplesPerProcess"] != performance["aggregate"]["samples_per_process"]
+        || release_protocol["warmupPerProcess"] != performance["aggregate"]["warmup_per_process"]
+        || release_protocol["buildProfile"] != performance["aggregate"]["build_profile"]
+        || release_targets["productCpuGeomeanSpeedup"]
+            != comparison["buckets"]["product_cpu"]["target"]
+        || release_targets["valueCollectionGeomeanSpeedup"]
+            != comparison["buckets"]["value_collection"]["target"]
+        || release_targets["hostTaskEngineGeomeanSpeedup"]
+            != comparison["buckets"]["host_task_engine"]["target"]
+        || release_targets["coldStartGeomeanSpeedup"]
+            != comparison["buckets"]["cold_start"]["target"]
+        || release_structural["structGcAllocations"].as_u64() != Some(struct_gc_allocations)
+        || release_structural["enumGcAllocations"].as_u64() != Some(enum_gc_allocations)
+        || release_structural["gcSystemAllocations"].as_u64() != Some(gc_system_allocations)
+        || release_structural["steadyStateDispatchPaths"].as_u64()
+            != u64::try_from(steady_state_dispatch_paths).ok()
+        || release_structural["steadyStateDispatchSystemAllocations"].as_u64()
+            != Some(steady_state_dispatch_system_allocations)
+        || release_correctness["unexplainedRegressions"].as_u64()
+            != u64::try_from(unexplained_regressions.len()).ok()
+        || release_correctness["semanticMismatches"].as_u64()
+            != u64::try_from(semantic_mismatches.len()).ok()
+        || release_correctness["resourceLeaks"].as_u64() != Some(resource_leaks)
     {
         return Err("one or more M5 machine receipts are stale, malformed, or failing".into());
     }
     let jit_decision = decision["decision"]
         .as_str()
         .ok_or("JIT decision is not a string")?;
+    if release_summary["jitDecision"] != jit_decision {
+        return Err("M5 release summary does not match the terminal JIT decision".into());
+    }
     let decision_document =
         fs::read_to_string(root.join("baseline/performance/JIT_DECISION_V1.md"))?;
     if !decision_document.contains(&format!("Status: **{jit_decision}**"))
         || !decision_document.contains(&format!("M6 LLVM JIT = {jit_decision}"))
     {
         return Err("JIT_DECISION_V1.md does not match the terminal machine decision".into());
-    }
-    for status_document in ["README.md", "ROADMAP.md"] {
-        if !fs::read_to_string(root.join(status_document))?
-            .contains("Nexa M5 Deep Performance Optimization = COMPLETE")
-        {
-            return Err(format!("{status_document} does not mark M5 COMPLETE").into());
-        }
     }
     if !git_output(&["status", "--porcelain"])?.is_empty()
         || git_output(&["rev-parse", "HEAD"])? != head
@@ -3981,7 +4264,7 @@ fn finalize_m5() -> Result<(), DynError> {
     }
 
     let report = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "milestone": "Nexa M5 Deep Performance Optimization",
         "baselineTag": "performance-m5-baseline",
         "baselineCommit": comparison["baseline_commit"],
@@ -4003,6 +4286,13 @@ fn finalize_m5() -> Result<(), DynError> {
         "resourceLeaks": resource_leaks,
         "resourceLeakReceipt": snake_stress,
         "jitDecision": jit_decision,
+        "releaseAuthority": {
+            "path": "baseline/performance/M5_RELEASE_SUMMARY.json",
+            "blake3": release_authority.summary_blake3,
+            "bytecodeVersion": release_authority.bytecode_version,
+            "opcodeCostTableVersion": release_authority.opcode_cost_table_version,
+            "summary": release_authority.summary,
+        },
         "workspace": {
             "fmt": "PASS",
             "check": "PASS",
@@ -4024,7 +4314,7 @@ fn finalize_m5() -> Result<(), DynError> {
         },
         "status": "PASS",
     });
-    let output = root.join("target/nexa-artifacts/m5-finalize/final-report.json");
+    let output = final_report_path;
     fs::create_dir_all(output.parent().ok_or("M5 final report has no parent")?)?;
     let temporary = output.with_extension("json.tmp");
     fs::write(
@@ -6086,6 +6376,17 @@ fn low_level_event_violations(root: &Path, tracked: &[String]) -> Vec<String> {
 mod audit_tests {
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn m5_release_authority_matches_code_and_normative_documents() {
+        let authority = super::validate_m5_release_authority(&super::workspace_root())
+            .expect("M5 release authority must be internally consistent");
+        assert_eq!(authority.bytecode_version, 7);
+        assert_eq!(authority.opcode_cost_table_version, 7);
+        assert_eq!(authority.summary["status"], "COMPLETE");
+        assert_eq!(authority.summary["jitDecision"], "DEFER");
+        assert_eq!(authority.summary_blake3.len(), 64);
+    }
 
     fn formal_aggregate_case_fixture(name: &str) -> serde_json::Value {
         let gc = if name == "gc_incremental_step" {

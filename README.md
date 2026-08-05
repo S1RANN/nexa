@@ -96,7 +96,9 @@ M5 completion is enforced by `cargo xtask finalize-m5` from the clean,
 published `performance-m5-complete` annotated tag. The finalizer reruns the
 workspace and historical gates, live same-machine baseline comparison,
 profiler overhead, product corpus, V8 parity, and structural zero-allocation
-checks. Its terminal report is written to
+checks. The committed public attestation is
+`baseline/performance/M5_RELEASE_SUMMARY.json`; its BLAKE3 digest and the
+regenerated exact results are written to
 `target/nexa-artifacts/m5-finalize/final-report.json`. The data-backed M6 LLVM
 JIT decision is **DEFER**: M5 met every frozen performance target, but neither
 per-workload CPU sampling nor a bounded LLVM compilation-cost prototype proves

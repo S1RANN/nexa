@@ -369,7 +369,7 @@ change the set, descriptor bytes, or fingerprint.
 ## Runtime Host-call identity
 
 Descriptor ordering never becomes an executable function ordinal. The
-`HostCall.import` operand in Bytecode v6 is a module-local index into that
+`HostCall.import` operand in Bytecode v7 is a module-local index into that
 module's `HostImport` metadata only. The verifier first bounds-checks the index
 and validates the selected import's Stable ID, signature, sync/async mode,
 Fuel, and asynchronous-result policy.

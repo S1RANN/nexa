@@ -14,7 +14,7 @@ pipeline.
 
 The REPL is a frontend to the real Nexa toolchain, not a second expression
 interpreter. Each submitted cell passes through the lossless syntax tree,
-analysis, Typed IR, Bytecode v6 generation, verifier, and runtime.
+analysis, Typed IR, Bytecode v7 generation, verifier, and runtime.
 
 ## Cells and persistent bindings
 

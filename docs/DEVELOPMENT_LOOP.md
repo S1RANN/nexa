@@ -71,7 +71,7 @@ declarations cannot create false invalidation while a newly used dependency
 Host call cannot escape freshness accounting.
 
 One bounded worker parses Nexa Language v2, performs analysis and Typed IR
-lowering, emits Bytecode v6, verifies the artifact, validates required
+lowering, emits Bytecode v7, verifies the artifact, validates required
 entrypoints, and constructs a candidate. It cannot access a Realm, call Host
 code, process releases, or change package state. Queue capacity applies
 backpressure: the Engine retains the job in `AwaitingQueue` and retries on a

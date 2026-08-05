@@ -35,7 +35,7 @@ For each Package:
 12. Convert NIDL to `contract` with `host {}` and `nexa {}` blocks, `handle`,
     `fn`, and `async fn`. Move async policies to attributes and remove
     source-level Request types.
-13. Regenerate Rust bindings and Bytecode v6. Descriptor v2, generated marker
+13. Regenerate Rust bindings and Bytecode v7. Descriptor v2, generated marker
     types, and stable IDs replace canonical string hashes and function indexes.
 14. Regenerate `nexa.lock` when the local dependency closure changes.
 

@@ -36,7 +36,7 @@ the production pipeline:
 lossless Syntax
 → shared Analysis
 → Typed IR
-→ Bytecode v6
+→ Bytecode v7
 → Verifier
 → Runtime
 ```

@@ -3,7 +3,7 @@
 Status: M4R1 Standalone Profile v1 COMPLETE
 
 The Standalone profile runs a Nexa program as a command-line application. It
-uses the same syntax, analysis, Typed IR, Bytecode v6, verifier, and runtime as
+uses the same syntax, analysis, Typed IR, Bytecode v7, verifier, and runtime as
 an embedded package. `nexa run` selects a source program and calls its typed
 `main`; it never asks users for a bytecode function index.
 
@@ -151,7 +151,7 @@ remapping reserved values; an operating system may expose only a
 platform-sized portion. Diagnostics still distinguish a returned value from a
 tool failure.
 
-Every program passes Syntax, Analysis, Typed IR, Bytecode v6, and Verifier stages
+Every program passes Syntax, Analysis, Typed IR, Bytecode v7, and Verifier stages
 before user code or a Console call can run. Standalone execution resolves
 finite limits for fuel, cumulative budget, heap, frames, call depth, tasks,
 Host resources, cleanup, and output. Capacity is charged before an operation

@@ -2,6 +2,8 @@
 
 Version: **1.0.0**
 
+Status: **COMPLETE**
+
 `ValueLayout` is the authoritative physical representation table:
 
 ```text
@@ -65,9 +67,9 @@ contain GC references.
 
 The verifier validates physical slot ranges, non-overlapping return ranges,
 layout IDs, field offsets, enum payload widths, root bitmap widths, call
-argument slot counts, result slot counts, and safepoint roots. Bytecode v7
-is the only accepted wire version once this layout lands; no compatibility
-decoder remains on product paths.
+argument slot counts, result slot counts, and safepoint roots. Bytecode v7 is
+the only accepted wire version; no compatibility decoder remains on product
+paths.
 
 ## Differential gate
 

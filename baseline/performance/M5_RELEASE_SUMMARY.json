@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "milestone": "Nexa M5 Deep Performance Optimization",
+  "status": "COMPLETE",
+  "baseline": {
+    "tag": "performance-m5-baseline",
+    "commit": "24e87e0a7df07281d2205b1ed88162c7e6617231"
+  },
+  "protocol": {
+    "benchmarkVersion": 7,
+    "aggregateSchema": 2,
+    "processes": 7,
+    "samplesPerProcess": 1000,
+    "warmupPerProcess": 100,
+    "buildProfile": "release"
+  },
+  "versions": {
+    "bytecode": 7,
+    "opcodeCostTable": 7
+  },
+  "targets": {
+    "productCpuGeomeanSpeedup": 1.5,
+    "valueCollectionGeomeanSpeedup": 2.0,
+    "hostTaskEngineGeomeanSpeedup": 1.3,
+    "coldStartGeomeanSpeedup": 1.2
+  },
+  "qualificationSnapshot": {
+    "date": "2026-08-04",
+    "machineModel": "Mac16,7",
+    "cpuModel": "Apple M4 Pro",
+    "productCpuGeomeanSpeedup": 2.397,
+    "valueCollectionGeomeanSpeedup": 2.444,
+    "hostTaskEngineGeomeanSpeedup": 1.485,
+    "coldStartGeomeanSpeedup": 1.65
+  },
+  "structuralEvidence": {
+    "structGcAllocations": 0,
+    "enumGcAllocations": 0,
+    "gcSystemAllocations": 0,
+    "steadyStateDispatchPaths": 6,
+    "steadyStateDispatchSystemAllocations": 0
+  },
+  "correctnessEvidence": {
+    "unexplainedRegressions": 0,
+    "semanticMismatches": 0,
+    "resourceLeaks": 0
+  },
+  "jitDecision": "DEFER",
+  "terminalReceipt": "target/nexa-artifacts/m5-finalize/final-report.json",
+  "attestation": "This committed summary is the public M5 release attestation. finalize-m5 binds its BLAKE3 digest to a clean tagged HEAD and regenerates the exact machine receipts."
+}

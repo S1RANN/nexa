@@ -2,6 +2,8 @@
 
 Version: **1.0.0**
 
+Status: **COMPLETE**
+
 ## System allocation counters
 
 The benchmark counting allocator records, per measured region:

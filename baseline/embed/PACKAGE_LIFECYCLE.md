@@ -9,7 +9,7 @@ The only package states are `Discovered`, `Locked`, `Disabled`, `Enabling`,
 transition is checked by `PackageLifecycle`.
 
 Enable revalidates the Candidate, compiles with the effective Host Contract,
-verifies Bytecode v6, validates required entrypoint stable IDs and signatures, creates
+verifies Bytecode v7, validates required entrypoint stable IDs and signatures, creates
 an independent Host registry, Realm, Module, and root Scope, then publishes
 `Enabled`. Temporary state is dropped on failure. A failed package cannot
 invalidate another package.

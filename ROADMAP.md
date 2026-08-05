@@ -220,6 +220,9 @@ Task/Host/Engine fast paths, caches, the product corpus, and final performance
 qualification. The formal same-machine comparison met all four targets with
 no unexplained p95/p99 regression. Its normative evidence and decision rules
 live under `baseline/performance/`.
+The bounded public release attestation is
+`baseline/performance/M5_RELEASE_SUMMARY.json`; exact regenerated samples stay
+under the ignored `target/nexa-artifacts/m5/` tree.
 
 M6 LLVM JIT is **DEFER**, not rejected. Warm V8 still leads all three
 comparable pure-computation workloads by more than 1.5x, but M5 has no
