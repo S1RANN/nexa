@@ -15,3 +15,5 @@ editors/**/node_modules/
 editors/tree-sitter-nexa/.tree-sitter/
 editors/tree-sitter-nexa/build/
 /editors/tree-sitter-nexa/src/parser.c
+.qoder/
+.DS_Store

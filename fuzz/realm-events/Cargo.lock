@@ -174,7 +174,6 @@ dependencies = [
 name = "nexa-compiler"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "nexa-analysis",
  "nexa-bytecode",
  "nexa-core",
@@ -266,6 +265,7 @@ name = "nexa-verifier"
 version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
+ "nexa-core",
 ]
 
 [[package]]
