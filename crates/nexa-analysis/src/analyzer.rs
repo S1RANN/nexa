@@ -5551,7 +5551,7 @@ impl<'a> Analyzer<'a> {
             if path.text().starts_with('<') {
                 return None;
             }
-            if usage == SymbolUse::Callable && self.explained_names.contains(&path.text()) {
+            if self.explained_names.contains(&path.text()) {
                 return None;
             }
             let code = match usage {
@@ -7879,7 +7879,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     actual => {
                         if contains_ir_error(actual) {
                             self.record_suppressed();
-                            self.recovery_unit_type(&span)
+                            IrType::Error
                         } else {
                             self.analyzer.diagnostics.push(
                                 Diagnostic::new(

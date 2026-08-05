@@ -1300,10 +1300,13 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let Some((precedence, kind)) = binary_operator(self.current_kind()) else {
-                // `name!(` is a Rust macro invocation; Nexa has no macros. Report it once and keep
-                // parsing the parenthesized tail as a regular call.
+                // `name!(`/`name![` is a Rust macro invocation; Nexa has no macros. Report it once
+                // and keep parsing the parenthesized/bracketed tail as a regular call/index.
                 if self.current_kind() == Some(TokenKind::Bang)
-                    && self.kind_at(self.cursor + 1) == Some(TokenKind::LParen)
+                    && matches!(
+                        self.kind_at(self.cursor + 1),
+                        Some(TokenKind::LParen | TokenKind::LBracket)
+                    )
                 {
                     let callee = self.text(left.range);
                     self.errors.push(AstError {
@@ -1317,6 +1320,26 @@ impl<'a> Parser<'a> {
                         ),
                     });
                     self.bump();
+                    if self.at(TokenKind::LBracket) {
+                        // `vec![...]` tail: skip the bracketed contents so the following
+                        // statement parses without index-recovery noise.
+                        let mut depth = 0;
+                        loop {
+                            match self.current_kind() {
+                                Some(TokenKind::LBracket) => depth += 1,
+                                Some(TokenKind::RBracket) => {
+                                    depth -= 1;
+                                    self.bump();
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                                _ => {}
+                            }
+                            self.bump();
+                        }
+                    }
                     continue;
                 }
                 break;
@@ -1331,16 +1354,19 @@ impl<'a> Parser<'a> {
             if self.current_kind() == Some(TokenKind::Equal) {
                 // `+=`/`-=`/`*=`/`/=` are lexed as an operator followed by `=`; report them as a
                 // single friendly error and keep parsing as if the compound form were explicit.
-                let operator_text = self.text(operator.range);
+                let operator_text = self.text(operator.range).to_owned();
                 let equal_range = self.current_range();
-                let left_text = self.text(left.range);
+                let left_text = self.text(left.range).to_owned();
+                self.bump();
+                let right = self.expression(precedence + 1);
+                let right_text = self.text(right.range).to_owned();
                 self.error_with_fix(
                     cover(operator.range, equal_range),
                     &format!("`{operator_text}=` is not a Nexa operator"),
-                    format!("write `{left_text} = {left_text} {operator_text} 1`"),
+                    format!(
+                        "write `{left_text} = {left_text} {operator_text} {right_text}`"
+                    ),
                 );
-                self.bump();
-                let right = self.expression(precedence + 1);
                 let range = cover(left.range, right.range);
                 left = Expression {
                     kind: ExpressionKind::Binary {
@@ -1351,6 +1377,24 @@ impl<'a> Parser<'a> {
                     range,
                 };
                 continue;
+            }
+            if matches!(kind, BinaryOperatorKind::Add | BinaryOperatorKind::Subtract)
+                && matches!(self.current_kind(), Some(TokenKind::Plus | TokenKind::Minus))
+                && operator.range.end == self.current_range().start
+            {
+                // `i++` / `i--` are Rust/C postfix increments; report one friendly error and
+                // stop so the following `;` parses normally.
+                let plus = matches!(self.current_kind(), Some(TokenKind::Plus));
+                let operator_text = if plus { "++" } else { "--" };
+                let op = if plus { "+" } else { "-" };
+                let left_text = self.text(left.range);
+                self.error_with_fix(
+                    cover(operator.range, self.current_range()),
+                    &format!("`{operator_text}` is not a Nexa operator"),
+                    format!("write `{left_text} = {left_text} {op} 1`"),
+                );
+                self.bump();
+                break;
             }
             let right = self.expression(precedence + 1);
             let range = cover(left.range, right.range);
@@ -1376,9 +1420,28 @@ impl<'a> Parser<'a> {
                     Some(TokenKind::Minus) => UnaryOperatorKind::Negate,
                     _ => UnaryOperatorKind::Not,
                 };
+                let operator_range = self.bump_range();
+                if matches!(kind, UnaryOperatorKind::Positive | UnaryOperatorKind::Negate)
+                    && matches!(self.current_kind(), Some(TokenKind::Plus | TokenKind::Minus))
+                    && operator_range.end == self.current_range().start
+                {
+                    // `++i` / `--i` are Rust/C increments; report one friendly error.
+                    let plus = matches!(self.current_kind(), Some(TokenKind::Plus));
+                    let operator_text = if plus { "++" } else { "--" };
+                    let op = if plus { "+" } else { "-" };
+                    self.bump();
+                    let operand = self.expression(7);
+                    let operand_text = self.text(operand.range);
+                    self.error_with_fix(
+                        cover(operator_range, operand.range),
+                        &format!("`{operator_text}` is not a Nexa operator"),
+                        format!("write `{operand_text} = {operand_text} {op} 1`"),
+                    );
+                    return operand;
+                }
                 let operator = UnaryOperator {
                     kind,
-                    range: self.bump_range(),
+                    range: operator_range,
                 };
                 let operand = self.expression(7);
                 Expression {
@@ -1511,6 +1574,12 @@ impl<'a> Parser<'a> {
             });
         }
         if let Some(end) = self.take(TokenKind::Question) {
+            if self.expression_starts_here() {
+                self.error(
+                    cover(start, end),
+                    "ternary `?:` is not supported; use `if`/`else` blocks",
+                );
+            }
             return Some(Expression {
                 kind: ExpressionKind::Try(Box::new(receiver)),
                 range: cover(start, end),
@@ -2214,6 +2283,33 @@ impl<'a> Parser<'a> {
             .get(self.cursor)
             .map(|index| self.tree.tokens[*index])?;
         (token.kind == TokenKind::Identifier).then(|| self.token_text(token))
+    }
+
+    /// Whether the token at the cursor can begin an expression (used to recognize ternary
+    /// `cond ? then : else` shapes after the try operator).
+    fn expression_starts_here(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            Some(
+                TokenKind::Plus
+                    | TokenKind::Minus
+                    | TokenKind::Bang
+                    | TokenKind::Integer
+                    | TokenKind::Float
+                    | TokenKind::Rune
+                    | TokenKind::StringStart
+                    | TokenKind::LParen
+                    | TokenKind::Identifier
+                    | TokenKind::Keyword(
+                        Keyword::Await
+                            | Keyword::Match
+                            | Keyword::New
+                            | Keyword::Package
+                            | Keyword::True
+                            | Keyword::False
+                    )
+            )
+        )
     }
 
     fn require_snake_case(&mut self, identifier: &Identifier, role: &str) {
