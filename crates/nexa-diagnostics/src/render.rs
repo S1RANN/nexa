@@ -13,16 +13,61 @@ pub const MACHINE_POSITION_ENCODING: &str = "utf-16-0-based";
 
 pub struct DiagnosticRenderer;
 
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_BOLD_RED: &str = "\x1b[1;31m";
+const COLOR_BOLD_YELLOW: &str = "\x1b[1;33m";
+const COLOR_BLUE: &str = "\x1b[34m";
+const COLOR_BOLD_BLUE: &str = "\x1b[1;34m";
+const COLOR_BOLD_RED_CARET: &str = "\x1b[1;31m";
+
 impl DiagnosticRenderer {
+    /// Renders one batch in the rustc-style human layout without ANSI colors.
     #[must_use]
     pub fn human(batch: &DiagnosticBatch) -> String {
-        let mut output = format!(
-            "Nexa diagnostics schema {RENDER_SCHEMA_VERSION} \
-             (positions: {HUMAN_POSITION_ENCODING})"
-        );
-        for diagnostic in batch.diagnostics() {
+        Self::render_human(batch, false)
+    }
+
+    /// Renders one batch in the rustc-style human layout with ANSI colors.
+    #[must_use]
+    pub fn human_colored(batch: &DiagnosticBatch) -> String {
+        Self::render_human(batch, true)
+    }
+
+    fn render_human(batch: &DiagnosticBatch, color: bool) -> String {
+        let mut output = String::new();
+        for (index, diagnostic) in batch.diagnostics().iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+            }
+            render_human_diagnostic(&mut output, batch.sources(), diagnostic, color);
+        }
+        if !batch.diagnostics().is_empty() {
+            let emitted = batch.diagnostics().len();
+            write!(
+                output,
+                "\nerror: {emitted} {} emitted",
+                if emitted == 1 { "error" } else { "errors" }
+            )
+            .expect("writing to String cannot fail");
+            let suppressed = batch.suppressed();
+            if suppressed.diagnostics > 0 {
+                write!(
+                    output,
+                    "; {} downstream {} suppressed ({})",
+                    suppressed.diagnostics,
+                    if suppressed.diagnostics == 1 {
+                        "error"
+                    } else {
+                        "errors"
+                    },
+                    suppressed
+                        .first_cause
+                        .as_deref()
+                        .unwrap_or("caused by a previous error"),
+                )
+                .expect("writing to String cannot fail");
+            }
             output.push('\n');
-            render_human_diagnostic(&mut output, batch.sources(), diagnostic);
         }
         let dropped = batch.dropped();
         if dropped != DroppedCounts::default() {
@@ -70,7 +115,17 @@ fn render_human_diagnostic(
     output: &mut String,
     sources: &SourceSnapshotRegistry,
     diagnostic: &Diagnostic,
+    color: bool,
 ) {
+    let severity_color = match diagnostic.severity {
+        crate::Severity::Error => COLOR_BOLD_RED,
+        crate::Severity::Warning => COLOR_BOLD_YELLOW,
+        crate::Severity::Note => COLOR_BOLD_BLUE,
+        crate::Severity::Help => COLOR_BOLD_BLUE,
+    };
+    if color {
+        write!(output, "{severity_color}").expect("writing to String cannot fail");
+    }
     write!(
         output,
         "{}[{}]: {}",
@@ -79,39 +134,165 @@ fn render_human_diagnostic(
         diagnostic.message
     )
     .expect("writing to String cannot fail");
+    if color {
+        write!(output, "{COLOR_RESET}").expect("writing to String cannot fail");
+    }
+
+    let gutter_width = diagnostic
+        .labels
+        .iter()
+        .filter_map(|label| {
+            sources
+                .get(&label.source)
+                .map(|snapshot| snapshot.human_range(label.range).start.line)
+        })
+        .map(digit_count)
+        .max()
+        .unwrap_or(1);
     for label in &diagnostic.labels {
-        let prefix = match label.style {
-            LabelStyle::Primary => "-->",
-            LabelStyle::Secondary => ":::",
-        };
-        if let Some(snapshot) = sources.get(&label.source) {
-            let range = snapshot.human_range(label.range);
-            write!(
-                output,
-                "\n{prefix} {}:{}:{}: {}",
-                label.source, range.start.line, range.start.column, label.message
-            )
-            .expect("writing to String cannot fail");
-            if let Some(line) = snapshot.line_text(range.start.line) {
-                write!(output, "\n    {line}").expect("writing to String cannot fail");
-            }
-        } else {
-            write!(
-                output,
-                "\n{prefix} {}:<source unavailable>: {}",
-                label.source, label.message
-            )
-            .expect("writing to String cannot fail");
-        }
+        render_human_label(output, sources, label, gutter_width, color);
     }
     for related in &diagnostic.related {
-        render_human_related(output, sources, related);
+        render_human_related(output, sources, related, color);
     }
     for note in &diagnostic.notes {
-        write!(output, "\nnote: {note}").expect("writing to String cannot fail");
+        write!(
+            output,
+            "\n{}= note: {note}{}",
+            if color { COLOR_BOLD_BLUE } else { "" },
+            if color { COLOR_RESET } else { "" },
+        )
+        .expect("writing to String cannot fail");
     }
     for fix in &diagnostic.fixes {
-        write!(output, "\nhelp: {}", fix.message).expect("writing to String cannot fail");
+        write!(
+            output,
+            "\n{}= help: {}{}",
+            if color { COLOR_BOLD_BLUE } else { "" },
+            fix.message,
+            if color { COLOR_RESET } else { "" },
+        )
+        .expect("writing to String cannot fail");
+    }
+}
+
+fn digit_count(mut value: u32) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Renders one source label as a `--> file:line:col` header, the gutter, the source line, and a
+/// caret line whose width matches the span (clamped to the line end, at least one column).
+fn render_human_label(
+    output: &mut String,
+    sources: &SourceSnapshotRegistry,
+    label: &Label,
+    gutter_width: usize,
+    color: bool,
+) {
+    let Some(snapshot) = sources.get(&label.source) else {
+        write!(
+            output,
+            "\n  --> {}:<source unavailable>",
+            display_source(&label.source)
+        )
+        .expect("writing to String cannot fail");
+        return;
+    };
+    let range = snapshot.human_range(label.range);
+    write!(
+        output,
+        "\n  --> {}:{}:{}",
+        display_source(&label.source),
+        range.start.line,
+        range.start.column
+    )
+    .expect("writing to String cannot fail");
+    let Some(line) = snapshot.line_text(range.start.line) else {
+        return;
+    };
+    let (expanded, columns) = expand_tabs(line);
+    let gutter = " ".repeat(gutter_width);
+    if color {
+        write!(output, "\n{COLOR_BLUE}{gutter} |{COLOR_RESET}")
+            .expect("writing to String cannot fail");
+    } else {
+        write!(output, "\n{gutter} |").expect("writing to String cannot fail");
+    }
+    if color {
+        write!(output, "\n{COLOR_BLUE}{:>gutter_width$} |{COLOR_RESET} {expanded}", range.start.line)
+            .expect("writing to String cannot fail");
+    } else {
+        write!(output, "\n{:>gutter_width$} | {expanded}", range.start.line)
+            .expect("writing to String cannot fail");
+    }
+    let caret_start = columns
+        .get(range.start.column.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(0);
+    let caret_width = if range.start.line == range.end.line {
+        columns
+            .get(range.end.column.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(caret_start + 1)
+            .saturating_sub(caret_start)
+    } else {
+        columns
+            .last()
+            .copied()
+            .unwrap_or(caret_start)
+            .saturating_sub(caret_start)
+    };
+    let caret_width = caret_width.max(1);
+    let caret = if label.style == LabelStyle::Primary { "^" } else { "-" };
+    let gutter_bar = if color {
+        format!("{COLOR_BLUE}{gutter} |{COLOR_RESET}")
+    } else {
+        format!("{gutter} |")
+    };
+    write!(
+        output,
+        "\n{gutter_bar} {}{}{} {}",
+        " ".repeat(caret_start),
+        if color { COLOR_BOLD_RED_CARET } else { "" },
+        caret.repeat(caret_width),
+        label.message
+    )
+    .expect("writing to String cannot fail");
+    if color {
+        write!(output, "{COLOR_RESET}").expect("writing to String cannot fail");
+    }
+}
+
+/// Expands tabs to four-column stops. Returns the expanded line and the display column after each
+/// original character (plus one trailing entry for the end of line).
+fn expand_tabs(line: &str) -> (String, Vec<usize>) {
+    let mut expanded = String::new();
+    let mut columns = Vec::with_capacity(line.len() + 1);
+    for character in line.chars() {
+        if character == '\t' {
+            let pad = 4 - expanded.chars().count() % 4;
+            expanded.push_str(&" ".repeat(pad));
+        } else {
+            expanded.push(character);
+        }
+        columns.push(expanded.chars().count());
+    }
+    columns.push(expanded.chars().count());
+    (expanded, columns)
+}
+
+/// Human-readable source identity. REPL cells drop their fixed `nexa.repl` package prefix so the
+/// surviving `repl::cell_N` path reads naturally.
+fn display_source(identity: &SourceIdentity) -> String {
+    if identity.package_id() == Some("nexa.repl") {
+        identity.path().to_owned()
+    } else {
+        identity.to_string()
     }
 }
 
@@ -119,20 +300,31 @@ fn render_human_related(
     output: &mut String,
     sources: &SourceSnapshotRegistry,
     related: &RelatedLocation,
+    color: bool,
 ) {
     if let Some(snapshot) = sources.get(&related.source) {
         let range = snapshot.human_range(related.range);
         write!(
             output,
-            "\nrelated: {} at {}:{}:{}",
-            related.message, related.source, range.start.line, range.start.column
+            "\n{}related: {} at {}:{}:{}",
+            if color { COLOR_BOLD_BLUE } else { "" },
+            related.message,
+            display_source(&related.source),
+            range.start.line,
+            range.start.column
         )
         .expect("writing to String cannot fail");
+        if color {
+            write!(output, "{COLOR_RESET}").expect("writing to String cannot fail");
+        }
     } else {
         write!(
             output,
-            "\nrelated: {} at {}:<source unavailable>",
-            related.message, related.source
+            "\n{}related: {} at {}:<source unavailable>{}",
+            if color { COLOR_BOLD_BLUE } else { "" },
+            related.message,
+            display_source(&related.source),
+            if color { COLOR_RESET } else { "" },
         )
         .expect("writing to String cannot fail");
     }
@@ -435,12 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn renderers_declare_schema_and_position_encoding() {
+    fn human_layout_is_rustc_style_while_machine_protocols_stay_stable() {
         let batch = batch();
         let human = DiagnosticRenderer::human(&batch);
-        assert!(human.contains(&format!("schema {RENDER_SCHEMA_VERSION}")));
-        assert!(human.contains(HUMAN_POSITION_ENCODING));
-        assert!(human.contains("src/main.nexa:2:7"));
+        assert!(human.contains("error[NX2101]: type mismatch"));
+        assert!(human.contains("--> root.app:src/main.nexa:2:7"));
+        assert!(human.contains("2 |   dep."));
+        assert!(human.contains("^ call has the wrong type"));
+        assert!(human.contains("related: callee declaration at dep.lib:src/math.nexa:1:8"));
+        assert!(human.contains("1 error emitted"));
 
         let json = DiagnosticRenderer::json(&batch).unwrap();
         let json: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -463,6 +658,73 @@ mod tests {
             assert_eq!(value["schema"], RENDER_SCHEMA_VERSION);
             assert_eq!(value["positionEncoding"], MACHINE_POSITION_ENCODING);
         }
+    }
+
+    #[test]
+    fn human_layout_renders_multi_label_caret_snapshots_and_summaries() {
+        let source = SourceIdentity::package("root.app", "src/main.nexa");
+        let mut sources = SourceSnapshotRegistry::builder();
+        sources
+            .insert(source.clone(), "fn main() {\n\tlet value = 1 + \"x\";\n\tvalue\n}\n")
+            .unwrap();
+        let mut batch = DiagnosticBatch::with_default_limits(sources.build());
+        let line_start = u32::try_from("fn main() {\n".len()).unwrap();
+        let one_start = line_start + u32::try_from("\tlet value = ".len()).unwrap();
+        let string_start = line_start + u32::try_from("\tlet value = 1 + ".len()).unwrap();
+        batch.push(
+            Diagnostic::new(ErrorCode::NX2101, Severity::Error, "type mismatch")
+                .with_label(Label::primary(
+                    source.clone(),
+                    ByteRange::new(one_start, one_start + 1),
+                    "this expression is not a number",
+                ))
+                .with_label(Label::secondary(
+                    source,
+                    ByteRange::new(string_start, string_start + 3),
+                    "string literal has type `string`",
+                ))
+                .with_note("expected `i32`, found `string`"),
+        );
+        batch.record_suppressed("caused by unknown type `u32`");
+
+        let human = DiagnosticRenderer::human(&batch);
+        assert!(human.contains("--> root.app:src/main.nexa:2:14"));
+        // The tab expands to four columns, so the caret lands after the expanded gutter.
+        assert!(human.contains("2 |     let value = 1 + \"x\";"));
+        assert!(human.contains("^ this expression is not a number"));
+        assert!(human.contains("--- string literal has type `string`"));
+        assert!(human.contains("= note: expected `i32`, found `string`"));
+        assert!(human.contains(
+            "error: 1 error emitted; 1 downstream error suppressed (caused by unknown type `u32`)"
+        ));
+
+        let colored = DiagnosticRenderer::human_colored(&batch);
+        assert!(colored.contains("\x1b[1;31m"));
+        assert!(!colored.contains("Nexa diagnostics schema"));
+    }
+
+    #[test]
+    fn human_layout_clamps_cross_line_spans_to_the_line_end() {
+        let source = SourceIdentity::standalone("multi.nexa");
+        let mut sources = SourceSnapshotRegistry::builder();
+        sources
+            .insert(source.clone(), "first\nsecond line\nthird\n")
+            .unwrap();
+        let mut batch = DiagnosticBatch::with_default_limits(sources.build());
+        let start = u32::try_from("first\ns".len()).unwrap();
+        batch.push(
+            Diagnostic::new(ErrorCode::NX2101, Severity::Error, "cross-line span")
+                .with_label(Label::primary(
+                    source,
+                    ByteRange::new(start, start + 20),
+                    "spans across lines",
+                )),
+        );
+        let human = DiagnosticRenderer::human(&batch);
+        assert!(human.contains("--> multi.nexa:2:2"));
+        assert!(human.contains("2 | second line"));
+        assert!(human.contains("spans across lines"));
+        assert!(human.contains("^"));
     }
 
     #[test]

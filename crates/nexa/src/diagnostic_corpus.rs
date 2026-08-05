@@ -865,7 +865,7 @@ fn observe_binary_rendering(
             })
     };
     let human_output = human.contains(&format!("error[{}]: {}", expected.code, expected.message))
-        && human.contains(&format!("--> {}:1:1:", expected.source_path))
+        && human.contains(&format!("--> {}:1:1", expected.source_path))
         && human.contains(expected.label_message)
         && human.contains(expected.source_text);
     let json_output = rendered_json.schema == nexa_diagnostics::RENDER_SCHEMA_VERSION

@@ -638,12 +638,24 @@ struct PackageCheckArguments {
     manifest_only: bool,
 }
 
+/// Renders a batch in the rustc-style human layout, with ANSI colors only when stderr is a TTY
+/// and `NO_COLOR` is unset.
+pub(crate) fn render_human_batch(batch: &nexa::DiagnosticBatch) -> String {
+    use std::io::IsTerminal;
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    if color {
+        nexa::LeafDiagnosticRenderer::human_colored(batch)
+    } else {
+        nexa::LeafDiagnosticRenderer::human(batch)
+    }
+}
+
 fn render_diagnostic_batch(
     batch: &nexa::DiagnosticBatch,
     format: DiagnosticFormat,
 ) -> CliResult<()> {
     let rendered = match format {
-        DiagnosticFormat::Human => nexa::LeafDiagnosticRenderer::human(batch),
+        DiagnosticFormat::Human => render_human_batch(batch),
         DiagnosticFormat::Json => nexa::LeafDiagnosticRenderer::json(batch)
             .map_err(|error| CliError::internal(error.to_string()))?,
         DiagnosticFormat::Ndjson => nexa::LeafDiagnosticRenderer::ndjson(batch)
@@ -712,6 +724,7 @@ fn diagnostics_for_build(
         }
     }
     let mut remapped = nexa::DiagnosticBatch::with_default_limits(sources.build());
+    remapped.inherit_suppressed(batch);
     for diagnostic in batch.diagnostics() {
         let mut diagnostic = diagnostic.clone();
         for label in &mut diagnostic.labels {

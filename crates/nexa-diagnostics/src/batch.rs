@@ -119,6 +119,17 @@ impl DiagnosticBatch {
         &self.suppressed
     }
 
+    /// Copies another batch's suppressed counts into this one, keeping the first cause.
+    pub fn inherit_suppressed(&mut self, other: &Self) {
+        self.suppressed.diagnostics = self
+            .suppressed
+            .diagnostics
+            .saturating_add(other.suppressed.diagnostics);
+        if self.suppressed.first_cause.is_none() {
+            self.suppressed.first_cause = other.suppressed.first_cause.clone();
+        }
+    }
+
     /// Appends a note to the first diagnostic matching the predicate. Returns whether one matched.
     pub fn push_note_to_first(
         &mut self,

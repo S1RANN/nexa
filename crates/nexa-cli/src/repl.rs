@@ -219,7 +219,7 @@ fn render_session_error(error: nexa::ReplSessionError, format: DiagnosticFormat)
         nexa::ReplSessionError::Analysis { diagnostics, .. }
         | nexa::ReplSessionError::Build(nexa::PackageBuildError::AnalysisFailed(diagnostics)) => {
             match format {
-                DiagnosticFormat::Human => nexa::LeafDiagnosticRenderer::human(&diagnostics),
+                DiagnosticFormat::Human => crate::render_human_batch(&diagnostics),
                 DiagnosticFormat::Json => nexa::LeafDiagnosticRenderer::json(&diagnostics)
                     .unwrap_or_else(|render_error| {
                         format!("could not render REPL diagnostics: {render_error}")
