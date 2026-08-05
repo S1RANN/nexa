@@ -1099,6 +1099,11 @@ impl<'a> Parser<'a> {
                 ok: Box::new(ok.clone()),
                 error: Box::new(error.clone()),
             },
+            (_, []) if matches!(name.as_str(), "Array" | "Map" | "Option" | "Result") => {
+                // Keep empty built-in generics as Generic so arity checking reports one
+                // root-cause error instead of falling back to an unknown-name lookup.
+                TypeKind::Generic { base, arguments }
+            }
             (_, []) => TypeKind::Named(base),
             _ => TypeKind::Generic { base, arguments },
         };

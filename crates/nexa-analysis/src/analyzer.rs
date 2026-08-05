@@ -1393,11 +1393,19 @@ impl<'a> Analyzer<'a> {
             match canonical_state_schema(&linked_state_types, &self.definitions) {
                 Ok(schema) => schema.fingerprint(),
                 Err(error) => {
-                    self.diagnostics.push(Diagnostic::new(
-                        ErrorCode::NX2101,
-                        Severity::Error,
-                        format!("state schema cannot be lowered: {error}"),
-                    ));
+                    let poisoned = linked_state_types.iter().any(|state| {
+                        state
+                            .fields
+                            .iter()
+                            .any(|field| contains_ir_error(&field.ty))
+                    });
+                    if !poisoned {
+                        self.diagnostics.push(Diagnostic::new(
+                            ErrorCode::NX2101,
+                            Severity::Error,
+                            format!("state schema cannot be lowered: {error}"),
+                        ));
+                    }
                     StateSchemaFingerprint::default()
                 }
             };
@@ -5335,7 +5343,7 @@ impl<'a> Analyzer<'a> {
                             "`HostRequest` is runtime-only and cannot be named or stored in Nexa source",
                             "call an async Host function and consume its result immediately with postfix `.await`",
                         );
-                        IrType::Unit
+                        IrType::Error
                     }
                     ("Token", [inner]) => {
                         IrType::ResourceToken(Some(Box::new(self.resolve_type_ref(module, inner))))
@@ -5348,7 +5356,7 @@ impl<'a> Analyzer<'a> {
                             "`ResourceToken` is not a Nexa v2 source type",
                             "write `Token<ContentType>`",
                         );
-                        IrType::Unit
+                        IrType::Error
                     }
                     ("Snapshot", [inner]) => {
                         IrType::Snapshot(Box::new(self.resolve_type_ref(module, inner)))
@@ -5371,7 +5379,7 @@ impl<'a> Analyzer<'a> {
                             format!("invalid type argument count for `{base_name}`"),
                             "container and runtime handle types require their exact declared arity",
                         );
-                        IrType::Unit
+                        IrType::Error
                     }
                     _ => {
                         self.push_source_error(
@@ -5381,7 +5389,7 @@ impl<'a> Analyzer<'a> {
                             format!("user generic type `{base_name}` is not supported"),
                             "M4 only permits the built-in generic types",
                         );
-                        IrType::Unit
+                        IrType::Error
                     }
                 }
             }
@@ -7644,11 +7652,15 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     .cloned()
                     .or_else(|| values.first().map(|value| value.ty.clone()))
                     .unwrap_or_else(|| {
-                        self.type_error(
-                            span.clone(),
-                            "empty array literal requires an expected `Array<T>` type",
-                        );
-                        IrType::Unit
+                        if expected.is_some_and(contains_ir_error) {
+                            IrType::Error
+                        } else {
+                            self.type_error(
+                                span.clone(),
+                                "empty array literal requires an expected `Array<T>` type",
+                            );
+                            IrType::Unit
+                        }
                     });
                 for value in &values {
                     self.expect_type(&value.ty, &element, &value.span);
@@ -8303,14 +8315,18 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     vec![key.as_ref().clone(), value.as_ref().clone()]
                 }
                 _ => {
-                    self.type_error(
-                        span.clone(),
-                        &format!(
-                            "cannot infer `{}` element types without an expected type",
-                            path.text()
-                        ),
-                    );
-                    vec![IrType::Unit; arity]
+                    if expected.is_some_and(contains_ir_error) {
+                        vec![IrType::Error; arity]
+                    } else {
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "cannot infer `{}` element types without an expected type",
+                                path.text()
+                            ),
+                        );
+                        vec![IrType::Unit; arity]
+                    }
                 }
             }
         } else {
@@ -10307,14 +10323,18 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     .or_else(|| payload.as_ref().map(|value| value.ty.clone()))
                     .unwrap_or(IrType::Unit);
                 let (ok, error) = expected_pair.unwrap_or_else(|| {
-                    self.type_error(
-                        span.clone(),
-                        "`Ok`/`Err` requires an expected Result<T, E> or two type arguments",
-                    );
-                    if variant == BuiltinVariantIr::ResultOk {
-                        (payload_ty.clone(), IrType::Unit)
+                    if expected.is_some_and(contains_ir_error) {
+                        (IrType::Error, IrType::Error)
                     } else {
-                        (IrType::Unit, payload_ty.clone())
+                        self.type_error(
+                            span.clone(),
+                            "`Ok`/`Err` requires an expected Result<T, E> or two type arguments",
+                        );
+                        if variant == BuiltinVariantIr::ResultOk {
+                            (payload_ty.clone(), IrType::Unit)
+                        } else {
+                            (IrType::Unit, payload_ty.clone())
+                        }
                     }
                 });
                 (payload, IrType::Result(Box::new(ok), Box::new(error)))
@@ -11548,7 +11568,7 @@ fn unknown_symbol_fix(
                 | DefinitionKind::HostFunction
         )
     };
-    let mut best: Option<(u8, usize, &str)> = None;
+    let mut best: Option<(u8, usize, usize, &str)> = None;
     for definition in definitions {
         let in_module =
             definition.package_id == module.package && definition.module == module.module;
@@ -11559,10 +11579,16 @@ fn unknown_symbol_fix(
         if relevant {
             let layer = if in_module { 0 } else { 2 };
             let distance = edit_distance(name, &definition.name, 2);
-            if distance <= 2 && best.is_none_or(|(best_layer, best_distance, _)| {
-                (layer, distance) < (best_layer, best_distance)
-            }) {
-                best = Some((layer, distance, &definition.name));
+            if distance <= 2 {
+                let prefix = common_prefix_length(name, &definition.name);
+                if best.is_none_or(|(best_layer, best_distance, best_prefix, _)| {
+                    (layer, distance) < (best_layer, best_distance)
+                        || (layer == best_layer
+                            && distance == best_distance
+                            && prefix > best_prefix)
+                }) {
+                    best = Some((layer, distance, prefix, &definition.name));
+                }
             }
         }
     }
@@ -11570,20 +11596,34 @@ fn unknown_symbol_fix(
         for candidate in builtin_types.keys().map(String::as_str).chain(PRIMITIVES.iter().copied())
         {
             let distance = edit_distance(name, candidate, 2);
-            if distance <= 2 && best.is_none_or(|(best_layer, best_distance, _)| {
-                (1, distance) < (best_layer, best_distance)
-            }) {
-                best = Some((1, distance, candidate));
+            if distance <= 2 {
+                let prefix = common_prefix_length(name, candidate);
+                if best.is_none_or(|(best_layer, best_distance, best_prefix, _)| {
+                    (1, distance) < (best_layer, best_distance)
+                        || (best_layer == 1
+                            && distance == best_distance
+                            && prefix > best_prefix)
+                }) {
+                    best = Some((1, distance, prefix, candidate));
+                }
             }
         }
     }
-    let (_, _, candidate) = best?;
+    let (_, _, _, candidate) = best?;
     Some(TextEditSuggestion::replacement(
         format!("did you mean `{candidate}`?"),
         source_identity(source),
         range,
         candidate,
     ))
+}
+
+/// Length of the shared character prefix of two names, used to break did-you-mean ties.
+fn common_prefix_length(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// Classic bounded Levenshtein distance; early-exits beyond `max_distance`.
