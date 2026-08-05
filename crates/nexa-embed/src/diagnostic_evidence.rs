@@ -362,6 +362,7 @@ pub fn run_engine_diagnostic_cases(root: &Path) -> Result<nexa::EngineDiagnostic
             && normalized(&item.diagnostic.diagnostic.message.to_string())
                 .contains(&normalized(&fixture.expected.message_contains));
         cases.push(nexa::ObservedDiagnosticCase {
+            case_id: item.code.to_string(),
             code: item.code.to_string(),
             observed: item.diagnostic.diagnostic.code.to_string(),
             pipeline: "engine".into(),

@@ -63,6 +63,10 @@ const fn first_occurrence() -> usize {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ObservedDiagnosticCase {
+    /// Fixture case id (file stem under `fixtures/diagnostics/cases`), used to
+    /// verify every fixture is executed even when several fixtures share one
+    /// diagnostic code (e.g. `NX1002_compound`, `NX1002_macro`).
+    pub case_id: String,
     pub code: String,
     pub observed: String,
     pub pipeline: String,
@@ -328,6 +332,11 @@ fn load_cases(root: &Path) -> Result<Vec<(PathBuf, DiagnosticCase)>, String> {
         .collect()
 }
 
+fn fixture_case_id(path: &Path) -> String {
+    path.file_stem()
+        .map_or_else(|| "<unknown>".to_owned(), |stem| stem.to_string_lossy().into_owned())
+}
+
 pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticReport, String> {
     let cases = load_cases(root)?;
     let end_to_end = crate::run_runtime_diagnostic_end_to_end()?;
@@ -393,6 +402,7 @@ pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticRepo
         }
         deterministic_cases += usize::from(evidence.deterministic);
         observed.push(ObservedDiagnosticCase {
+            case_id: fixture_case_id(&path),
             code: case.code.clone(),
             observed: evidence.observed.clone(),
             pipeline: case.pipeline.clone(),
@@ -465,12 +475,16 @@ pub fn run_diagnostic_corpus(
         .iter()
         .map(|case| case.observed.clone())
         .collect::<BTreeSet<_>>();
+    let observed_ids = cases
+        .iter()
+        .map(|case| case.case_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut missing_codes = registered_set
         .difference(&observed_set)
         .cloned()
         .collect::<Vec<_>>();
     missing_codes.extend(emission_set.difference(&observed_set).cloned());
-    missing_codes.extend(fixture_set.difference(&observed_set).cloned());
+    missing_codes.extend(fixture_set.difference(&observed_ids).cloned());
     missing_codes.sort();
     missing_codes.dedup();
     let mut unexpected_codes = observed_set
@@ -478,7 +492,7 @@ pub fn run_diagnostic_corpus(
         .cloned()
         .collect::<Vec<_>>();
     unexpected_codes.extend(observed_set.difference(&emission_set).cloned());
-    unexpected_codes.extend(observed_set.difference(&fixture_set).cloned());
+    unexpected_codes.extend(observed_ids.difference(&fixture_set).cloned());
     unexpected_codes.sort();
     unexpected_codes.dedup();
     let engine_cases = engine.cases.len();
@@ -739,6 +753,7 @@ fn execute_binary_case(
     }
     Ok(ExecutedBinaryCase {
         observed: ObservedDiagnosticCase {
+            case_id: fixture_case_id(case_path),
             code: case.code.clone(),
             observed: error.code().to_string(),
             pipeline: case.pipeline.clone(),
@@ -1308,6 +1323,7 @@ fn execute_analysis_case(
         && json_output;
     Ok(ExecutedAnalysisCase {
         observed: ObservedDiagnosticCase {
+            case_id: fixture_case_id(case_path),
             code: case.code.clone(),
             observed: diagnostic.code.to_string(),
             pipeline: case.pipeline.clone(),
@@ -1577,6 +1593,7 @@ fn execute_compiler_case(
         ));
     }
     Ok(ObservedDiagnosticCase {
+        case_id: fixture_case_id(case_path),
         code: case.code.clone(),
         observed: diagnostic.code.to_string(),
         pipeline: case.pipeline.clone(),

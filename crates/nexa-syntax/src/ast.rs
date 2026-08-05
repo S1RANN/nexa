@@ -853,56 +853,94 @@ impl<'a> Parser<'a> {
         let start = self.current_range();
         let is_async = self.take_keyword(Keyword::Async).is_some();
         self.expect_keyword(Keyword::Fn, "expected `fn`");
-        let name = if self.current_kind() == Some(TokenKind::Identifier) {
-            self.identifier()
-        } else {
+        let missing_name = self.current_kind() != Some(TokenKind::Identifier);
+        let name = if missing_name {
             let range = self.current_range();
             self.error(range, "expected function name after `fn`");
+            // A keyword (or EOF) cannot name a function: skip to the block so
+            // the parameter list does not cascade into more expectation errors.
+            while !self.at_end() && !self.at(TokenKind::LBrace) {
+                self.bump();
+            }
             Identifier {
                 text: "<missing>".into(),
                 range,
             }
+        } else {
+            self.identifier()
         };
         self.require_snake_case(&name, "function");
-        self.expect(TokenKind::LParen, "expected `(` after function name");
         let mut parameters = Vec::new();
         let mut parameter_error = false;
-        while !self.at_end() && !self.at(TokenKind::RParen) {
-            let parameter_start = self.current_range();
-            let parameter_name = self.identifier();
-            self.require_snake_case(&parameter_name, "parameter");
-            if self.take(TokenKind::Colon).is_none() {
-                if !parameter_error {
-                    self.error(self.current_range(), "expected `:` after parameter name");
-                    parameter_error = true;
-                }
-                // Synchronize to the next separator so a broken parameter list does not cascade
-                // into expression/block recovery errors.
-                while !self.at_end()
-                    && !self.at(TokenKind::Comma)
-                    && !self.at(TokenKind::RParen)
-                    && !self.at(TokenKind::LBrace)
-                {
-                    self.bump();
-                }
-                if self.take(TokenKind::Comma).is_some() {
-                    continue;
-                }
-                break;
+        let mut header_broken = missing_name;
+        if !missing_name {
+            if self.take(TokenKind::LParen).is_none() {
+                header_broken = true;
+                self.error(self.current_range(), "expected `(` after function name");
             }
-            let ty = self.ty();
-            parameters.push(Parameter {
-                name: parameter_name,
-                range: cover(parameter_start, ty.range),
-                ty,
-            });
-            if self.take(TokenKind::Comma).is_none() {
-                break;
+            while !self.at_end()
+                && !self.at(TokenKind::RParen)
+                && !self.at(TokenKind::LBrace)
+            {
+                let parameter_start = self.current_range();
+                let parameter_name = self.identifier();
+                self.require_snake_case(&parameter_name, "parameter");
+                if self.take(TokenKind::Colon).is_none() {
+                    if !parameter_error {
+                        self.error(
+                            self.current_range(),
+                            "expected `:` after parameter name",
+                        );
+                        parameter_error = true;
+                        header_broken = true;
+                    }
+                    // Synchronize to the next separator so a broken parameter list does not
+                    // cascade into expression/block recovery errors.
+                    while !self.at_end()
+                        && !self.at(TokenKind::Comma)
+                        && !self.at(TokenKind::RParen)
+                        && !self.at(TokenKind::LBrace)
+                    {
+                        self.bump();
+                    }
+                    if self.take(TokenKind::Comma).is_some() {
+                        continue;
+                    }
+                    break;
+                }
+                let ty = self.ty();
+                parameters.push(Parameter {
+                    name: parameter_name,
+                    range: cover(parameter_start, ty.range),
+                    ty,
+                });
+                if self.take(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            if self.take(TokenKind::RParen).is_none() {
+                header_broken = true;
+                self.error(self.current_range(), "expected `)` after parameters");
             }
         }
-        self.expect(TokenKind::RParen, "expected `)` after parameters");
-        let result = self.take(TokenKind::Arrow).map(|_| self.ty());
-        let body = self.block();
+        let result = if missing_name {
+            None
+        } else {
+            self.take(TokenKind::Arrow).map(|_| self.ty())
+        };
+        let body = if self.at(TokenKind::LBrace) {
+            self.block()
+        } else if header_broken {
+            // The declaration header was already broken; a missing `{` is a
+            // downstream consequence, so stop without reporting another error.
+            Block {
+                statements: Vec::new(),
+                tail: None,
+                range: self.previous_range(),
+            }
+        } else {
+            self.block()
+        };
         FunctionDeclaration {
             is_async,
             name,
