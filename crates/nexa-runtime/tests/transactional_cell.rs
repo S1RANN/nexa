@@ -535,7 +535,7 @@ fn state_current_get_module(code: impl IntoIterator<Item = Instruction>) -> Veri
         cell.emit(instruction);
     }
     let mut cell = cell.finish().expect("state cell");
-    cell.root_bitmap = vec![true, false, false, false];
+    cell.root_bitmap = vec![false, false, false, false];
     for root_map in &mut cell.root_maps {
         root_map.bitmap = vec![false, false, false, false];
     }
@@ -752,20 +752,10 @@ fn transactional_environment_candidate(
         cell.emit(instruction);
     }
     let mut cell = cell.finish().expect("transactional environment cell");
-    cell.root_bitmap = vec![true, false, false];
+    cell.root_bitmap = vec![false, false, false];
     add_post_yield_safepoints(&mut cell);
     for root_map in &mut cell.root_maps {
-        let pc = usize::try_from(root_map.pc).expect("fixture bytecode position fits usize");
-        let environment_is_live = matches!(cell.code.get(pc), Some(Instruction::Yield))
-            || pc
-                .checked_sub(1)
-                .and_then(|previous| cell.code.get(previous))
-                .is_some_and(|instruction| matches!(instruction, Instruction::Yield));
-        root_map.bitmap = if environment_is_live {
-            vec![true, false, false]
-        } else {
-            vec![false, false, false]
-        };
+        root_map.bitmap = vec![false, false, false];
     }
     let schema = StateSchema {
         types: vec![StateType {
