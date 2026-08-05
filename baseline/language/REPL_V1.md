@@ -13,8 +13,12 @@ expression interpreter, an Engine debugger, or a process-attachment facility.
 The command is:
 
 ```bash
+nexa
 nexa repl
 ```
+
+With no command or script, the naked command selects this same profile.
+Redirected standard input automatically disables the interactive prompt.
 
 The default session binds the Standalone Console Host and creates one hidden
 synthetic Package:

@@ -74,7 +74,7 @@ fn main(args: Array<string>) -> i32 {
 ",
     );
 
-    let output = fixture.run(&["run", path(&source), "--", "Alice", "Bob"]);
+    let output = fixture.run(&["run", path(&source), "Alice", "Bob"]);
     assert_exit(&output, 2);
     assert_eq!(text(&output.stdout), "Alice\n");
     assert_eq!(text(&output.stderr), "Bob\n");
@@ -90,7 +90,7 @@ fn async_main_and_top_level_await_use_the_runtime_task_path() {
 }
 ",
     );
-    assert_exit(&fixture.run(&["run", path(&async_main), "--", "one"]), 1);
+    assert_exit(&fixture.run(&["run", path(&async_main), "one"]), 1);
 
     let top_level = fixture.source(
         "top-level-await.nexa",
@@ -103,7 +103,7 @@ async fn announce() {
 announce().await;
 "#,
     );
-    let output = fixture.run(&["run", path(&top_level), "--"]);
+    let output = fixture.run(&["run", path(&top_level)]);
     assert_exit(&output, 0);
     assert_eq!(text(&output.stdout), "awaited\n");
     assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
@@ -119,7 +119,7 @@ fn top_level_scripts_receive_implicit_args() {
 console::write_line(args[0]);
 ",
     );
-    let output = fixture.run(&["run", path(&source), "--", "script-argument"]);
+    let output = fixture.run(&["run", path(&source), "script-argument"]);
     assert_exit(&output, 0);
     assert_eq!(text(&output.stdout), "script-argument\n");
     assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
@@ -137,7 +137,7 @@ fn standalone_rejects_main_conflicts_missing_main_and_wrong_signatures() {
 1 + 1;
 ",
     );
-    assert_exit(&fixture.run(&["run", path(&conflict), "--"]), 1);
+    assert_exit(&fixture.run(&["run", path(&conflict)]), 1);
 
     for (name, source) in [
         ("no-args.nexa", "fn main() -> i32 { return 0; }\n"),
@@ -151,7 +151,7 @@ fn standalone_rejects_main_conflicts_missing_main_and_wrong_signatures() {
         ),
     ] {
         let source = fixture.source(name, source);
-        let output = fixture.run(&["run", path(&source), "--"]);
+        let output = fixture.run(&["run", path(&source)]);
         assert_exit(&output, 1);
         assert!(
             text(&output.stderr).contains("main"),
@@ -163,7 +163,7 @@ fn standalone_rejects_main_conflicts_missing_main_and_wrong_signatures() {
     let package = write_package_fixture(&fixture.root);
     assert_exit(&fixture.run(&["lock", path(&package)]), 0);
     fs::write(package.join("src/main.nexa"), "fn helper() {}\n").expect("main-less package");
-    let output = fixture.run(&["run", path(&package), "--"]);
+    let output = fixture.run(&["run", path(&package)]);
     assert_exit(&output, 1);
     assert!(
         text(&output.stderr).contains("main"),
@@ -179,7 +179,7 @@ fn package_and_project_entrypoints_receive_arguments_without_function_indices() 
     assert_exit(&fixture.run(&["lock", path(&package)]), 0);
 
     assert_exit(
-        &fixture.run(&["run", path(&package), "--", "one", "two", "three"]),
+        &fixture.run(&["run", path(&package), "one", "two", "three"]),
         3,
     );
     let project = fixture.root.join("nexa.dev.toml");
@@ -190,7 +190,6 @@ fn package_and_project_entrypoints_receive_arguments_without_function_indices() 
             path(&project),
             "--package",
             "standalone.app",
-            "--",
             "one",
             "two",
             "three",
@@ -234,7 +233,7 @@ fn main(args: Array<string>) -> i32 {
 }
 "#,
     );
-    let output = fixture.run(&["run", path(&source), "--"]);
+    let output = fixture.run(&["run", path(&source)]);
     assert_exit(&output, 4);
     assert!(
         text(&output.stderr).contains("standalone trap"),

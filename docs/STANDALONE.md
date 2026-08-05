@@ -9,20 +9,22 @@ an embedded package. `nexa run` selects a source program and calls its typed
 
 ## Run a program
 
-Pass application arguments after `--`:
+Runtime options precede the source path. Every token after the path is an
+application argument, with no separator:
 
 ```sh
-nexa run hello.nexa -- Alice
-nexa run path/to/package -- Alice
-nexa run --project nexa.dev.toml --package example.hello -- Alice
+nexa hello.nexa Alice
+nexa run hello.nexa Alice
+nexa run path/to/package Alice
+nexa run --project nexa.dev.toml --package example.hello Alice
 ```
 
-The first form runs one source file. The second resolves an Application
-package from its directory. The third resolves a package through a schema-2
-project and package ID. Arguments after `--` become the `Array<string>` passed
-to `main`, or the implicit `args` binding in a top-level script. They remain in
-order as UTF-8 strings and do not include the executable, command, source path,
-or `--` token. When `--` is absent, `args` is empty.
+The first two forms run one source file. The third resolves an Application
+package from its directory. The fourth resolves a package through a schema-2
+project and package ID. Arguments after the selected path become the
+`Array<string>` passed to `main`, or the implicit `args` binding in a top-level
+script. They remain in order as UTF-8 strings and do not include the
+executable, command, or source path.
 
 ## Package entrypoint
 
@@ -110,7 +112,7 @@ console::write_line("hello, ${name}");
 
 The compiler lowers those statements, in source order, into a synthetic
 `main(args: Array<string>) -> i32`. The implicit `args` binding contains the
-arguments after `--`; a top-level declaration that would shadow this binding
+arguments after the script path; a top-level declaration that would shadow this binding
 is an error. Reaching the end of a top-level script returns 0. An explicit
 top-level `return` supplies the synthetic `main` result.
 

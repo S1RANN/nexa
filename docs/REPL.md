@@ -5,10 +5,12 @@ Status: M4R1 REPL v1 COMPLETE
 Start an isolated interactive session with:
 
 ```sh
+nexa
 nexa repl
 ```
 
-An interactive terminal displays the `nexa> ` prompt. Redirected standard
+With no command or script, `nexa` starts the same REPL. An interactive terminal
+displays the `nexa> ` prompt. Redirected standard
 input runs in batch mode but submits every item through the same cell
 pipeline.
 

@@ -90,7 +90,7 @@ to all Package modules, including the entry module.
 The file form:
 
 ```bash
-nexa run hello.nexa -- Alice
+nexa hello.nexa Alice
 ```
 
 uses the Script compilation profile. A script may contain the same declarations
@@ -108,8 +108,8 @@ console::write_line("hello, ${name}");
 ```
 
 `args` is an implicit immutable binding of type `Array<string>`. It contains
-only the values after the CLI `--`; it does not contain `nexa`, `run`, the
-source path, or the separator. A top-level declaration of another `args`
+only the values after the source path; it does not contain `nexa`, `run`, or
+the source path. A top-level declaration of another `args`
 binding is an error because it would hide the script ABI.
 
 When at least one executable top-level statement exists, the compiler lowers
@@ -152,16 +152,17 @@ Declarations may coexist with either entrypoint form.
 The user-facing run forms are:
 
 ```bash
-nexa run file.nexa -- args
-nexa run package-directory -- args
-nexa run --project nexa.dev.toml --package package.id -- args
+nexa file.nexa args
+nexa run file.nexa args
+nexa run package-directory args
+nexa run --project nexa.dev.toml --package package.id args
 ```
 
-Tokens before `--` belong to the `nexa` command. Tokens after `--` are passed
-verbatim, in order, as UTF-8 `string` values in `args`. With no separator,
-`args` is empty. The project form resolves the selected Package and its locked
-static dependency closure through the same canonical build pipeline used by
-check, build, Engine, and editor tooling.
+Runtime options must precede the source or package path. Every token after the
+path is passed verbatim, in order, as a UTF-8 `string` value in `args`. The
+project form resolves the selected Package and its locked static dependency
+closure through the same canonical build pipeline used by check, build,
+Engine, and editor tooling.
 
 Running verified bytecode by function index is deliberately low-level:
 

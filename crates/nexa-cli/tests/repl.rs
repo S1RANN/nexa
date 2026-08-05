@@ -243,7 +243,7 @@ fn repl_resource_failures_recover_and_limit_flags_are_validated() {
         "--heap-objects",
         "--fuel",
         "--max-cells",
-        "--diagnostic-history",
+        "--history",
         "--max-output-bytes",
     ] {
         let invalid = fixture.repl(&[option, "0"], "");

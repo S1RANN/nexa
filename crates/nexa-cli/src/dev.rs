@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -15,31 +15,8 @@ use serde_json::json;
 use crate::{CliError, CliErrorKind, CliResult, DiagnosticFormat, finish_resolved_build, project};
 
 #[allow(clippy::too_many_lines)]
-pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
-    let mut project_path = None;
-    let mut once = false;
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--project" => {
-                project_path =
-                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
-                        || CliError::usage("missing value for `--project`"),
-                    )?));
-                index += 2;
-            }
-            "--once" => {
-                once = true;
-                index += 1;
-            }
-            option => {
-                return Err(CliError::usage(format!("unknown dev option `{option}`")));
-            }
-        }
-    }
-    let project_path =
-        project_path.ok_or_else(|| CliError::usage("usage: nexa dev --project nexa.dev.toml"))?;
-    let initial_project = project::LoadedProject::load(&project_path)?;
+pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) -> CliResult<()> {
+    let initial_project = project::LoadedProject::load(project_path)?;
     let running = Arc::new(AtomicBool::new(true));
     if !once {
         let signal = Arc::clone(&running);
@@ -65,7 +42,7 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<
     let mut deferred_error = None;
 
     'watch: while running.load(Ordering::Acquire) {
-        let current_project = match project::LoadedProject::load(&project_path) {
+        let current_project = match project::LoadedProject::load(project_path) {
             Ok(project) => project,
             Err(error) => {
                 invalidate_all(
@@ -211,7 +188,7 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<
                     false,
                 );
 
-                let refreshed_project = match project::LoadedProject::load(&project_path) {
+                let refreshed_project = match project::LoadedProject::load(project_path) {
                     Ok(project) => project,
                     Err(error) => {
                         invalidate_candidate(

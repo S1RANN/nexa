@@ -196,7 +196,7 @@ Project checks always report `full-policy`.
 
 For direct execution use `nexa run`, documented in
 [STANDALONE.md](STANDALONE.md). For an isolated interactive compiler/runtime
-session use `nexa repl`, documented in [REPL.md](REPL.md).
+session use naked `nexa` or `nexa repl`, documented in [REPL.md](REPL.md).
 
 The immutable M1, M2, M3, M3R1, M3R2, M3R3, and M4 completion tags remain
 unchanged. M4 is recorded by `language-scale-m4-complete`; the M4R1 completion

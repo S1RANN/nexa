@@ -173,7 +173,8 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 cargo run -p nexa-cli -- compile examples/add.nexa
 cargo run -p nexa-cli -- check --project nexa.dev.toml
 cargo run -p nexa-cli -- dev --project nexa.dev.toml
-cargo run -p nexa-cli -- run examples/hello-runtime/hello.nexa -- Alice
+cargo run -p nexa-cli -- examples/hello-runtime/hello.nexa Alice
+cargo run -p nexa-cli -- run examples/hello-runtime/hello.nexa Alice
 cargo run -p nexa-cli -- repl
 cargo run -p hello-runtime
 cargo run -p combat-runtime
@@ -184,6 +185,7 @@ cargo xtask finalize-m3-r1
 cargo xtask finalize-m3-r2
 cargo xtask finalize-m3-r3
 cargo xtask finalize-m4-r1
+cargo xtask finalize-m5
 ```
 
 Focused commands are documented in [Testing](docs/TESTING.md). Generated

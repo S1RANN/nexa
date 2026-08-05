@@ -32,6 +32,7 @@ publish = false
 
 [workspace.dependencies]
 blake3 = "1.8"
+clap = { version = "4", features = ["derive", "wrap_help"] }
 libm = "=0.2.16"
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

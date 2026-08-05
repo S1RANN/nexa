@@ -136,9 +136,9 @@ fn source_and_project_builds_apply_custom_limits_in_the_facade_verifier() {
     assert_exit(
         &fixture.run(&[
             "run",
-            path(&fixture.source),
             "--limits-file",
             path(&fixture.limits),
+            path(&fixture.source),
         ]),
         0,
     );
@@ -169,9 +169,10 @@ fn source_and_project_builds_apply_custom_limits_in_the_facade_verifier() {
 
     let module = output.join("example.app.nxb");
     assert!(module.is_file());
-    assert_exit(&fixture.run(&["verify", path(&module)]), 1);
+    assert_exit(&fixture.run(&["qa", "verify", path(&module)]), 1);
     assert_exit(
         &fixture.run(&[
+            "qa",
             "verify",
             path(&module),
             "--limits-file",

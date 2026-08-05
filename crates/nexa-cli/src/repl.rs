@@ -261,69 +261,6 @@ pub(crate) struct ReplOptions {
     pub prompt: bool,
 }
 
-pub(crate) fn parse_repl_options(arguments: &[String]) -> CliResult<ReplOptions> {
-    let mut limits = ReplLimits::default();
-    let mut prompt = true;
-    let mut index = 0;
-    while index < arguments.len() {
-        let option = arguments[index].as_str();
-        match option {
-            "--no-prompt" => {
-                prompt = false;
-                index += 1;
-            }
-            "--heap-objects"
-            | "--fuel"
-            | "--max-cells"
-            | "--diagnostic-history"
-            | "--max-output-bytes" => {
-                let value = arguments
-                    .get(index + 1)
-                    .ok_or_else(|| CliError::usage(format!("missing value for `{option}`")))?;
-                match option {
-                    "--heap-objects" => {
-                        limits.heap_objects = parse_positive(option, value).and_then(|value| {
-                            u32::try_from(value)
-                                .map_err(|_| CliError::usage("`--heap-objects` exceeds u32 range"))
-                        })?;
-                    }
-                    "--fuel" => limits.cell_fuel = parse_positive(option, value)?,
-                    "--max-cells" => {
-                        limits.committed_cells = parse_positive_usize(option, value)?;
-                    }
-                    "--diagnostic-history" => {
-                        limits.diagnostic_history = parse_positive_usize(option, value)?;
-                    }
-                    "--max-output-bytes" => {
-                        limits.output_bytes = parse_positive_usize(option, value)?;
-                    }
-                    _ => unreachable!(),
-                }
-                index += 2;
-            }
-            _ => return Err(CliError::usage(format!("unknown repl option `{option}`"))),
-        }
-    }
-    Ok(ReplOptions { limits, prompt })
-}
-
-fn parse_positive(option: &str, value: &str) -> CliResult<u64> {
-    let value = value
-        .parse::<u64>()
-        .map_err(|_| CliError::usage(format!("`{option}` must be a positive integer")))?;
-    if value == 0 {
-        return Err(CliError::usage(format!(
-            "`{option}` must be greater than zero"
-        )));
-    }
-    Ok(value)
-}
-
-fn parse_positive_usize(option: &str, value: &str) -> CliResult<usize> {
-    usize::try_from(parse_positive(option, value)?)
-        .map_err(|_| CliError::usage(format!("`{option}` exceeds platform range")))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReplCommand {
     Type(String),
@@ -684,8 +621,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ReplAction, ReplBackend, ReplCommand, ReplDriver, ReplEvaluation, ReplLimits,
-        parse_command, parse_repl_options,
+        ReplAction, ReplBackend, ReplCommand, ReplDriver, ReplEvaluation, ReplLimits, parse_command,
     };
 
     #[derive(Default)]
@@ -760,10 +696,6 @@ mod tests {
         }
     }
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(ToString::to_string).collect()
-    }
-
     #[test]
     fn default_limits_are_frozen() {
         let limits = ReplLimits::default();
@@ -772,31 +704,6 @@ mod tests {
         assert_eq!(limits.committed_cells, 1_024);
         assert_eq!(limits.diagnostic_history, 256);
         assert_eq!(limits.output_bytes, 1024 * 1024);
-    }
-
-    #[test]
-    fn resource_flags_are_positive_and_explicit() {
-        let options = parse_repl_options(&arguments(&[
-            "--heap-objects",
-            "8",
-            "--fuel",
-            "9",
-            "--max-cells",
-            "10",
-            "--diagnostic-history",
-            "11",
-            "--max-output-bytes",
-            "12",
-            "--no-prompt",
-        ]))
-        .unwrap();
-        assert_eq!(options.limits.heap_objects, 8);
-        assert_eq!(options.limits.cell_fuel, 9);
-        assert_eq!(options.limits.committed_cells, 10);
-        assert_eq!(options.limits.diagnostic_history, 11);
-        assert_eq!(options.limits.output_bytes, 12);
-        assert!(!options.prompt);
-        assert!(parse_repl_options(&arguments(&["--fuel", "0"])).is_err());
     }
 
     #[test]

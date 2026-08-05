@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+clap.workspace = true
 nexa = { path = "../nexa" }
 nexa-analysis = { path = "../nexa-analysis" }
 nexa-embed = { path = "../nexa-embed" }
