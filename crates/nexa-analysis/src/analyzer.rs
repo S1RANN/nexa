@@ -5528,6 +5528,7 @@ impl<'a> Analyzer<'a> {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_symbol_path(
         &mut self,
         module: &ParsedModule,
@@ -11534,6 +11535,10 @@ fn unknown_symbol_fix(
     definitions: &[Definition],
     builtin_types: &BTreeMap<String, DefinitionId>,
 ) -> Option<TextEditSuggestion> {
+    const PRIMITIVES: &[&str] = &[
+        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
+        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
+    ];
     if name.chars().count() == 1 {
         return None;
     }
@@ -11542,10 +11547,6 @@ fn unknown_symbol_fix(
             "Nexa has no unsigned integer types; use `i8`, `i16`, `i32`, or `i64`",
         ));
     }
-    const PRIMITIVES: &[&str] = &[
-        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
-        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
-    ];
     let is_type_kind = |kind: DefinitionKind| {
         matches!(
             kind,

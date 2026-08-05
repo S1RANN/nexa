@@ -1292,6 +1292,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn expression(&mut self, minimum_precedence: u8) -> Expression {
         let mut left = self.prefix_expression();
         loop {
