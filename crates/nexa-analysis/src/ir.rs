@@ -163,6 +163,9 @@ pub enum BuiltinOperationIr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum IrType {
+    /// A failed type/name resolution whose true type is unknown. Downstream type checks must not
+    /// emit cascading diagnostics against this value.
+    Error,
     Unit,
     Bool,
     I32,
@@ -1180,7 +1183,9 @@ fn canonical_host_value_type(
         IrType::StateHandle(inner) => named(nexa_core::canonical_state_handle_type_id(
             canonical_host_value_type(inner, host, definitions)?,
         )),
-        IrType::Unit | IrType::TypeParameter(_) => Err(TypedIrError::NonRuntimeStateType),
+        IrType::Unit | IrType::TypeParameter(_) | IrType::Error => {
+            Err(TypedIrError::NonRuntimeStateType)
+        }
     }
 }
 
@@ -1228,7 +1233,8 @@ fn validate_standard_signature_type(
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::Named(_) => Ok(()),
+        | IrType::Named(_)
+        | IrType::Error => Ok(()),
     }
 }
 
@@ -1627,6 +1633,7 @@ fn validate_migration_type_contract(
 
 fn substitute_standard_type(ty: &IrType, arguments: &[IrType]) -> Result<IrType, TypedIrError> {
     Ok(match ty {
+        IrType::Error => IrType::Error,
         IrType::TypeParameter(index) => arguments
             .get(usize::from(*index))
             .cloned()
@@ -2427,7 +2434,8 @@ fn validate_type(ty: &IrType, limit: usize) -> Result<(), TypedIrError> {
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::TypeParameter(_) => Ok(()),
+        | IrType::TypeParameter(_)
+        | IrType::Error => Ok(()),
     }
 }
 
@@ -2480,7 +2488,8 @@ fn validate_resource_token_types(ty: &IrType) -> Result<(), TypedIrError> {
         | IrType::Rune
         | IrType::Named(_)
         | IrType::HostRequest(None)
-        | IrType::TypeParameter(_) => Ok(()),
+        | IrType::TypeParameter(_)
+        | IrType::Error => Ok(()),
     }
 }
 
@@ -2506,7 +2515,8 @@ fn contains_host_request(ty: &IrType) -> bool {
         | IrType::String
         | IrType::Rune
         | IrType::Named(_)
-        | IrType::TypeParameter(_) => false,
+        | IrType::TypeParameter(_)
+        | IrType::Error => false,
     }
 }
 
@@ -2533,7 +2543,8 @@ fn contains_type_parameter(ty: &IrType) -> bool {
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::Named(_) => false,
+        | IrType::Named(_)
+        | IrType::Error => false,
     }
 }
 
@@ -2961,7 +2972,8 @@ fn remap_type(
         | IrType::Rune
         | IrType::TypeParameter(_)
         | IrType::HostRequest(None)
-        | IrType::ResourceToken(None) => {}
+        | IrType::ResourceToken(None)
+        | IrType::Error => {}
     }
     Ok(())
 }

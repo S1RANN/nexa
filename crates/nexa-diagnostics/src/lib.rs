@@ -10,7 +10,7 @@ mod diagnostic;
 mod render;
 mod source;
 
-pub use batch::{DiagnosticBatch, DiagnosticBatchLimits, DroppedCounts};
+pub use batch::{DiagnosticBatch, DiagnosticBatchLimits, DroppedCounts, SuppressedCounts};
 pub use code::{ERROR_CODE_TABLE, ErrorCode, ErrorCodeDefinition};
 pub type DiagnosticCode = ErrorCode;
 pub use diagnostic::{

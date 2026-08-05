@@ -1458,6 +1458,7 @@ fn render_repl_value_inner(
         ))
     };
     match ty {
+        IrType::Error => renderer.push_str("<error>"),
         IrType::Unit => renderer.push_str("()"),
         IrType::Bool => renderer.push_str(&source.bool().map_err(decode)?.to_string()),
         IrType::I32 => renderer.push_str(&source.i32().map_err(decode)?.to_string()),
@@ -1994,6 +1995,9 @@ fn repl_bytecode_value_type(
         IrType::TypeParameter(index) => Err(ReplSessionError::Internal(format!(
             "REPL result retained unresolved type parameter T{index}"
         ))),
+        IrType::Error => Err(ReplSessionError::Internal(
+            "an error type escaped into the REPL reader".into(),
+        )),
     }
 }
 

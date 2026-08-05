@@ -77,6 +77,41 @@ pub enum SurfaceType {
     StateHandle(Box<Self>),
 }
 
+impl std::fmt::Display for SurfaceType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unit => formatter.write_str("unit"),
+            Self::Bool => formatter.write_str("bool"),
+            Self::I32 => formatter.write_str("i32"),
+            Self::I64 => formatter.write_str("i64"),
+            Self::F32 => formatter.write_str("f32"),
+            Self::F64 => formatter.write_str("f64"),
+            Self::String => formatter.write_str("string"),
+            Self::Rune => formatter.write_str("rune"),
+            Self::TypeParameter(name) => formatter.write_str(name),
+            Self::Named { name, .. } => formatter.write_str(name),
+            Self::Option(inner) => write!(formatter, "Option<{inner}>"),
+            Self::Result(ok, error) => write!(formatter, "Result<{ok}, {error}>"),
+            Self::Array(inner) => write!(formatter, "Array<{inner}>"),
+            Self::Map(key, value) => write!(formatter, "Map<{key}, {value}>"),
+            Self::Tuple(values) => {
+                formatter.write_str("(")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{value}")?;
+                }
+                formatter.write_str(")")
+            }
+            Self::Token(inner) => write!(formatter, "Token<{inner}>"),
+            Self::Snapshot(inner) => write!(formatter, "Snapshot<{inner}>"),
+            Self::Buffer(inner) => write!(formatter, "Buffer<{inner}>"),
+            Self::StateHandle(inner) => write!(formatter, "StateHandle<{inner}>"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HostFunctionMode {
     Sync,
@@ -550,6 +585,10 @@ struct Analyzer<'a> {
     state_records: Vec<SemanticFingerprintRecord>,
     resolved_import_edges: Vec<ResolvedImportEdge>,
     unresolved_surface_types: BTreeSet<String>,
+    /// Cause of the first unresolved type/name, used to explain downstream suppressed diagnostics.
+    poison_cause: Option<Arc<str>>,
+    /// Source ranges of unresolved type names keyed by (source, name), for aggregate notes.
+    unknown_type_uses: BTreeMap<(SourceKey, String), Vec<ByteRange>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -756,6 +795,8 @@ impl<'a> Analyzer<'a> {
             state_records: Vec::new(),
             resolved_import_edges: Vec::new(),
             unresolved_surface_types: BTreeSet::new(),
+            poison_cause: None,
+            unknown_type_uses: BTreeMap::new(),
         }
     }
 
@@ -1458,6 +1499,8 @@ impl<'a> Analyzer<'a> {
             }
         };
 
+        let unknown_type_uses = std::mem::take(&mut self.unknown_type_uses);
+        aggregate_unknown_type_notes(&mut self.diagnostics, unknown_type_uses);
         let query_report = self.db.finish_analysis();
         AnalysisOutcome {
             ir,
@@ -5230,7 +5273,7 @@ impl<'a> Analyzer<'a> {
                             IrType::Named(definition)
                         } else {
                             self.resolve_symbol_path(module, name, SymbolUse::Type)
-                                .map_or(IrType::Unit, IrType::Named)
+                                .map_or(IrType::Error, IrType::Named)
                         }
                     }
                 },
@@ -5462,16 +5505,33 @@ impl<'a> Analyzer<'a> {
             self.repl_snapshot_symbol(module, path, usage).or(current)
         };
         let Some(id) = id else {
-            self.push_source_error(
-                match usage {
-                    SymbolUse::Type => ErrorCode::NX2002,
-                    SymbolUse::Value | SymbolUse::Callable => ErrorCode::NX2001,
-                },
-                &module.source,
-                byte_range(path.range),
-                format!("unknown {} `{}`", usage.name(), path.text()),
-                "name is not declared in this module or imported namespace",
-            );
+            let code = match usage {
+                SymbolUse::Type => ErrorCode::NX2002,
+                SymbolUse::Value | SymbolUse::Callable => ErrorCode::NX2001,
+            };
+            self.poison_cause.get_or_insert_with(|| {
+                format!("caused by unknown {} `{}`", usage.name(), path.text()).into()
+            });
+            let emit = match usage {
+                SymbolUse::Type => {
+                    let uses = self
+                        .unknown_type_uses
+                        .entry((module.source.clone(), path.text()))
+                        .or_default();
+                    uses.push(byte_range(path.range));
+                    uses.len() == 1
+                }
+                SymbolUse::Value | SymbolUse::Callable => true,
+            };
+            if emit {
+                self.push_source_error(
+                    code,
+                    &module.source,
+                    byte_range(path.range),
+                    format!("unknown {} `{}`", usage.name(), path.text()),
+                    "name is not declared in this module or imported namespace",
+                );
+            }
             return None;
         };
         let definition = self.definitions[id.0 as usize].clone();
@@ -6884,6 +6944,39 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+/// Appends a `N more uses at ...` note to the first diagnostic for each repeatedly
+/// unresolved type name.
+fn aggregate_unknown_type_notes(
+    diagnostics: &mut DiagnosticBatch,
+    uses: BTreeMap<(SourceKey, String), Vec<ByteRange>>,
+) {
+    for ((source, name), positions) in uses {
+        if positions.len() <= 1 {
+            continue;
+        }
+        let mut note = format!("{} more uses at ", positions.len() - 1);
+        for (index, range) in positions.iter().skip(1).enumerate() {
+            if index > 0 {
+                note.push_str(", ");
+            }
+            match diagnostics.sources().get(&source_identity(&source)) {
+                Some(snapshot) => {
+                    let position = snapshot.human_position(range.start as usize);
+                    note.push_str(&format!("{}:{}", position.line, position.column));
+                }
+                None => note.push_str("<source unavailable>"),
+            }
+        }
+        let expected = format!("unknown type `{name}`");
+        diagnostics.push_note_to_first(
+            |diagnostic| {
+                diagnostic.code == ErrorCode::NX2002 && diagnostic.message.as_ref() == expected
+            },
+            note,
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SymbolUse {
     Type,
@@ -7522,8 +7615,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     UnaryOperator::Negate if is_numeric(&operand.ty) => operand.ty.clone(),
                     UnaryOperator::Not if operand.ty == IrType::Bool => IrType::Bool,
                     _ => {
-                        self.type_error(operand.span.clone(), "invalid unary operand type");
-                        self.recovery_unit_type(&span)
+                        if contains_ir_error(&operand.ty) {
+                            self.record_suppressed();
+                            IrType::Error
+                        } else {
+                            self.type_error(operand.span.clone(), "invalid unary operand type");
+                            self.recovery_unit_type(&span)
+                        }
                     }
                 };
                 TypedExpressionIr {
@@ -7553,6 +7651,10 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     &self.analyzer.host_types,
                 )
                 .unwrap_or_else(|| {
+                    if contains_ir_error(&left.ty) || contains_ir_error(&right.ty) {
+                        self.record_suppressed();
+                        return IrType::Error;
+                    }
                     self.type_error(span.clone(), "invalid binary operand type");
                     self.recovery_unit_type(&span)
                 });
@@ -7609,8 +7711,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     IrType::Map(key, value) => (key.as_ref().clone(), value.as_ref().clone()),
                     IrType::String => (IrType::I32, IrType::Rune),
                     _ => {
-                        self.type_error(span.clone(), "value is not indexable");
-                        (IrType::I32, self.recovery_unit_type(&span))
+                        if contains_ir_error(&receiver.ty) {
+                            self.record_suppressed();
+                            (IrType::Error, IrType::Error)
+                        } else {
+                            self.type_error(span.clone(), "value is not indexable");
+                            (IrType::I32, self.recovery_unit_type(&span))
+                        }
                     }
                 };
                 let index = self.check_expression(index, Some(&index_type));
@@ -7673,6 +7780,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     IrType::Result(ok, expression_error) => {
                         if let IrType::Result(_, function_error) = &self.return_type
                             && function_error != expression_error
+                            && !contains_ir_error(function_error)
+                            && !contains_ir_error(expression_error)
                         {
                             self.analyzer.diagnostics.push(
                                 Diagnostic::new(
@@ -7685,8 +7794,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                                     byte_range(question_range),
                                     "incompatible error propagation",
                                 ))
-                                .with_note(format!("function error type: {function_error:?}"))
-                                .with_note(format!("expression error type: {expression_error:?}")),
+                                .with_note(format!(
+                                    "function error type: `{}`",
+                                    display_ir_type(function_error, &self.analyzer.definitions)
+                                ))
+                                .with_note(format!(
+                                    "expression error type: `{}`",
+                                    display_ir_type(expression_error, &self.analyzer.definitions)
+                                )),
                             );
                             self.recovery_unit_type(&span)
                         } else {
@@ -7694,20 +7809,28 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         }
                     }
                     actual => {
-                        self.analyzer.diagnostics.push(
-                            Diagnostic::new(
-                                ErrorCode::NX2220,
-                                Severity::Error,
-                                "the try operator requires a Result value",
-                            )
-                            .with_label(Label::primary(
-                                source_identity(&self.module.source),
-                                byte_range(question_range),
-                                "this expression does not produce Result",
-                            ))
-                            .with_note(format!("actual type: {actual:?}")),
-                        );
-                        self.recovery_unit_type(&span)
+                        if contains_ir_error(actual) {
+                            self.record_suppressed();
+                            self.recovery_unit_type(&span)
+                        } else {
+                            self.analyzer.diagnostics.push(
+                                Diagnostic::new(
+                                    ErrorCode::NX2220,
+                                    Severity::Error,
+                                    "the try operator requires a Result value",
+                                )
+                                .with_label(Label::primary(
+                                    source_identity(&self.module.source),
+                                    byte_range(question_range),
+                                    "this expression does not produce Result",
+                                ))
+                                .with_note(format!(
+                                    "actual type: `{}`",
+                                    display_ir_type(actual, &self.analyzer.definitions)
+                                )),
+                            );
+                            self.recovery_unit_type(&span)
+                        }
                     }
                 };
                 TypedExpressionIr {
@@ -8801,6 +8924,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     | IrType::F32
                     | IrType::F64
                     | IrType::Rune
+                    | IrType::Error
                     | IrType::Named(_)
                     | IrType::Option(_)
                     | IrType::Result(_, _)
@@ -8831,6 +8955,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     | IrType::F64
                     | IrType::String
                     | IrType::Rune
+                    | IrType::Error
                     | IrType::Named(_)
                     | IrType::Option(_)
                     | IrType::Array(_)
@@ -10957,6 +11082,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 let index_type = match &base.ty {
                     IrType::Array(_) | IrType::Buffer(_) => IrType::I32,
                     IrType::Map(key, _) => key.as_ref().clone(),
+                    IrType::Error => return None,
                     IrType::Unit
                     | IrType::Bool
                     | IrType::I32
@@ -11031,7 +11157,20 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    fn record_suppressed(&mut self) {
+        self.analyzer.diagnostics.record_suppressed(
+            self.analyzer
+                .poison_cause
+                .as_deref()
+                .unwrap_or("caused by a previous error"),
+        );
+    }
+
     fn expect_type(&mut self, actual: &IrType, expected: &IrType, span: &SourceRange) {
+        if contains_ir_error(actual) || contains_ir_error(expected) {
+            self.record_suppressed();
+            return;
+        }
         let recovery_unit = (actual == &IrType::Unit || expected == &IrType::Unit)
             && self
                 .recovery_unit_spans
@@ -11069,8 +11208,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         "expression has an incompatible type"
                     },
                 ))
-                .with_note(format!("expected type: {expected:?}"))
-                .with_note(format!("actual type: {actual:?}")),
+                .with_note(format!(
+                    "expected type: `{}`",
+                    display_ir_type(expected, &self.analyzer.definitions)
+                ))
+                .with_note(format!(
+                    "actual type: `{}`",
+                    display_ir_type(actual, &self.analyzer.definitions)
+                )),
             );
         }
     }
@@ -11093,7 +11238,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     fn error_expression(&mut self, span: SourceRange) -> TypedExpressionIr {
         self.mark_recovery_unit(&span);
         TypedExpressionIr {
-            ty: IrType::Unit,
+            ty: IrType::Error,
             effect: IrEffect::Immediate,
             span,
             kind: TypedExpressionKind::Literal(IrLiteral::Unit),
@@ -11982,6 +12127,7 @@ fn collect_named_types(ty: &IrType, output: &mut Vec<DefinitionId>) {
         | IrType::F64
         | IrType::String
         | IrType::Rune
+        | IrType::Error
         | IrType::TypeParameter(_) => {}
     }
 }
@@ -12380,6 +12526,7 @@ fn collect_inline_value_targets(
         | IrType::Snapshot(_)
         | IrType::Buffer(_)
         | IrType::StateHandle(_)
+        | IrType::Error
         | IrType::TypeParameter(_) => {}
     }
 }

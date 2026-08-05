@@ -132,6 +132,22 @@ impl ValueType {
     }
 }
 
+impl std::fmt::Display for ValueType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::I32 => formatter.write_str("i32"),
+            Self::I64 => formatter.write_str("i64"),
+            Self::F32 => formatter.write_str("f32"),
+            Self::F64 => formatter.write_str("f64"),
+            Self::Bool => formatter.write_str("bool"),
+            Self::Rune => formatter.write_str("rune"),
+            Self::String => formatter.write_str("string"),
+            Self::Ref => formatter.write_str("ref"),
+            Self::Named(id) => write!(formatter, "type {id}"),
+        }
+    }
+}
+
 /// A versioned, typed operation supplied by Nexa's capability-free standard
 /// library.
 ///

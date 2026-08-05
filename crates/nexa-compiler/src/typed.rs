@@ -8451,7 +8451,8 @@ fn collect_ir_type_metadata(
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::Named(_) => {}
+        | IrType::Named(_)
+        | IrType::Error => {}
         IrType::TypeParameter(_) => {
             return Err(CompileError::unknown_type(
                 "uninstantiated standard-library type parameter".into(),
@@ -8864,7 +8865,8 @@ fn validate_standard_signature_type(
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::Named(_) => {}
+        | IrType::Named(_)
+        | IrType::Error => {}
     }
     Ok(())
 }
@@ -8957,7 +8959,8 @@ fn ir_type_contains_type_parameter(ty: &IrType) -> bool {
         | IrType::F64
         | IrType::String
         | IrType::Rune
-        | IrType::Named(_) => false,
+        | IrType::Named(_)
+        | IrType::Error => false,
     }
 }
 
@@ -9458,7 +9461,7 @@ fn lower_type(
         IrType::StateHandle(target) => Ok(ValueType::Named(state_handle_type(lower_type(
             package, target, span,
         )?))),
-        IrType::TypeParameter(_) => Err(CompileError::unknown_type(
+        IrType::TypeParameter(_) | IrType::Error => Err(CompileError::unknown_type(
             "uninstantiated standard-library type parameter".into(),
             span,
         )),
@@ -9594,7 +9597,8 @@ fn equality_instruction(
         | IrType::Snapshot(_)
         | IrType::Buffer(_)
         | IrType::StateHandle(_)
-        | IrType::TypeParameter(_) => Err(CompileError::type_mismatch(None, Some(ty), span)),
+        | IrType::TypeParameter(_)
+        | IrType::Error => Err(CompileError::type_mismatch(None, Some(ty), span)),
     }
 }
 

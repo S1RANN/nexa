@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2220","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2220.nexa","expected":{"primary_text":"?","secondary_count":0,"message_contains":"? requires Result","notes":["actual type: I32"]}}
+{"version":1,"code":"NX2220","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2220.nexa","expected":{"primary_text":"?","secondary_count":0,"message_contains":"? requires Result","notes":["actual type: `i32`"]}}

@@ -2166,6 +2166,11 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, range: TextRange, message: &str) {
+        // Collapse repeated errors at one token position: after the first expectation fails the
+        // parser recovers by re-parsing the same token, which would otherwise double-report.
+        if self.errors.iter().any(|error| error.range == range) {
+            return;
+        }
         self.errors.push(AstError {
             kind: AstErrorKind::InvalidSyntax,
             range,

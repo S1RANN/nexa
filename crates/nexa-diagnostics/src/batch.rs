@@ -1,6 +1,18 @@
 use std::sync::Arc;
 
-use crate::{Diagnostic, SourceSnapshotRegistry};
+use crate::{ByteRange, Diagnostic, ErrorCode, SourceIdentity, SourceSnapshotRegistry};
+
+fn diagnostic_dedup_key(
+    diagnostic: &Diagnostic,
+) -> (ErrorCode, Option<(&SourceIdentity, ByteRange)>, &str) {
+    (
+        diagnostic.code,
+        diagnostic
+            .primary_label()
+            .map(|label| (&label.source, label.range)),
+        diagnostic.message.as_ref(),
+    )
+}
 
 /// Hard limits for one analysis revision's diagnostic batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +42,14 @@ pub struct DroppedCounts {
     pub truncated_fields: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuppressedCounts {
+    /// Diagnostics not emitted because a prior error already explains them (cascades, duplicates).
+    pub diagnostics: u64,
+    /// Cause recorded for the first suppressed diagnostic.
+    pub first_cause: Option<Arc<str>>,
+}
+
 /// A bounded diagnostic collection with deterministic ordering.
 ///
 /// The retained set is the canonical sorted prefix of all diagnostics offered to the batch. This
@@ -44,6 +64,7 @@ pub struct DiagnosticBatch {
     offered_text_bytes: u64,
     retained_text_bytes: usize,
     truncated_fields: u64,
+    suppressed: SuppressedCounts,
 }
 
 impl DiagnosticBatch {
@@ -57,6 +78,7 @@ impl DiagnosticBatch {
             offered_text_bytes: 0,
             retained_text_bytes: 0,
             truncated_fields: 0,
+            suppressed: SuppressedCounts::default(),
         }
     }
 
@@ -66,6 +88,10 @@ impl DiagnosticBatch {
     }
 
     pub fn push(&mut self, mut diagnostic: Diagnostic) {
+        if self.is_duplicate(&diagnostic) {
+            self.record_suppressed("duplicate diagnostic");
+            return;
+        }
         self.truncated_fields = self
             .truncated_fields
             .saturating_add(diagnostic.truncate_fields(self.limits.max_field_bytes));
@@ -78,6 +104,40 @@ impl DiagnosticBatch {
         self.diagnostics.push(diagnostic);
         self.diagnostics.sort_by(Diagnostic::canonical_cmp);
         self.enforce_limits();
+    }
+
+    /// Records one diagnostic suppressed by cascade containment or deduplication.
+    pub fn record_suppressed(&mut self, cause: impl Into<Arc<str>>) {
+        self.suppressed.diagnostics = self.suppressed.diagnostics.saturating_add(1);
+        if self.suppressed.first_cause.is_none() {
+            self.suppressed.first_cause = Some(cause.into());
+        }
+    }
+
+    #[must_use]
+    pub fn suppressed(&self) -> &SuppressedCounts {
+        &self.suppressed
+    }
+
+    /// Appends a note to the first diagnostic matching the predicate. Returns whether one matched.
+    pub fn push_note_to_first(
+        &mut self,
+        predicate: impl Fn(&Diagnostic) -> bool,
+        note: impl Into<Arc<str>>,
+    ) -> bool {
+        let Some(diagnostic) = self.diagnostics.iter_mut().find(|diagnostic| predicate(diagnostic))
+        else {
+            return false;
+        };
+        diagnostic.notes.push(note.into());
+        true
+    }
+
+    fn is_duplicate(&self, diagnostic: &Diagnostic) -> bool {
+        let key = diagnostic_dedup_key(diagnostic);
+        self.diagnostics
+            .iter()
+            .any(|existing| diagnostic_dedup_key(existing) == key)
     }
 
     pub fn extend(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
@@ -222,5 +282,62 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.message.len() <= limits.max_field_bytes)
         );
+    }
+
+    #[test]
+    fn push_deduplicates_identical_code_primary_range_and_message() {
+        let mut batch = DiagnosticBatch::with_default_limits(Arc::new(
+            SourceSnapshotRegistry::default(),
+        ));
+        batch.push(diagnostic(ErrorCode::NX2101, "a.nexa", &[]));
+        batch.push(diagnostic(ErrorCode::NX2101, "a.nexa", &[]));
+        batch.push(Diagnostic::new(ErrorCode::NX2101, Severity::Error, "other"));
+
+        assert_eq!(batch.diagnostics().len(), 2);
+        assert_eq!(batch.suppressed().diagnostics, 1);
+        assert_eq!(
+            batch.suppressed().first_cause.as_deref(),
+            Some("duplicate diagnostic")
+        );
+    }
+
+    #[test]
+    fn record_suppressed_keeps_the_first_cause() {
+        let mut batch = DiagnosticBatch::with_default_limits(Arc::new(
+            SourceSnapshotRegistry::default(),
+        ));
+        batch.record_suppressed("caused by unknown type `u32`");
+        batch.record_suppressed("duplicate diagnostic");
+
+        assert_eq!(batch.suppressed().diagnostics, 2);
+        assert_eq!(
+            batch.suppressed().first_cause.as_deref(),
+            Some("caused by unknown type `u32`")
+        );
+    }
+
+    #[test]
+    fn push_note_to_first_appends_only_to_the_matching_diagnostic() {
+        let mut batch = DiagnosticBatch::with_default_limits(Arc::new(
+            SourceSnapshotRegistry::default(),
+        ));
+        batch.push(diagnostic(ErrorCode::NX2002, "a.nexa", &[]));
+        batch.push(Diagnostic::new(ErrorCode::NX2101, Severity::Error, "other"));
+
+        assert!(!batch.push_note_to_first(
+            |diagnostic| diagnostic.code == ErrorCode::NX1001,
+            "no match",
+        ));
+        assert!(batch.push_note_to_first(
+            |diagnostic| diagnostic.code == ErrorCode::NX2002,
+            "1 more use at 3:4",
+        ));
+        let diagnostic = batch
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == ErrorCode::NX2002)
+            .expect("NX2002 retained");
+        assert_eq!(diagnostic.notes.len(), 1);
+        assert_eq!(diagnostic.notes[0].as_ref(), "1 more use at 3:4");
     }
 }

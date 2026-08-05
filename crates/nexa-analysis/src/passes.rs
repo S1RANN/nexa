@@ -145,7 +145,8 @@ impl PassInvariant {
             | IrType::Snapshot(_)
             | IrType::Buffer(_)
             | IrType::StateHandle(_)
-            | IrType::TypeParameter(_) => false,
+            | IrType::TypeParameter(_)
+            | IrType::Error => false,
         }
     }
 }

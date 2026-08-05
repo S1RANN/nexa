@@ -156,7 +156,9 @@ pub fn canonical_value_type(
         IrType::StateHandle(inner) => named(nexa_core::canonical_state_handle_type_id(
             canonical_value_type(inner, definitions)?,
         )),
-        IrType::Unit | IrType::TypeParameter(_) => Err(TypedIrError::NonRuntimeStateType),
+        IrType::Unit | IrType::TypeParameter(_) | IrType::Error => {
+            Err(TypedIrError::NonRuntimeStateType)
+        }
     }
 }
 

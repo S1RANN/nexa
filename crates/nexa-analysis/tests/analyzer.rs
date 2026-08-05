@@ -783,8 +783,26 @@ fn type_mismatch_points_at_expression_and_carries_structured_types() {
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
-        ["expected type: I32", "actual type: Bool"]
+        ["expected type: `i32`", "actual type: `bool`"]
     );
+}
+
+#[test]
+fn poison_types_never_suppress_unrelated_real_errors() {
+    const SOURCE: &str = "pub fn run() -> i32 {\n    let value: u32 = 1;\n    return true;\n}\n";
+    let input = resolved_input(
+        root_fixture(
+            &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
+            false,
+        ),
+        &[],
+    );
+    let outcome = analyze_deterministically(&input, &AnalysisEnvironment::default());
+    let diagnostics = outcome.diagnostics.diagnostics();
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, ErrorCode::NX2002);
+    assert_eq!(diagnostics[1].code, ErrorCode::NX2101);
+    assert!(diagnostics[1].message.contains("expected i32, found bool"));
 }
 
 #[test]
@@ -925,7 +943,7 @@ fn constructor_and_try_diagnostics_are_structured_and_source_exact() {
         diagnostic
             .notes
             .iter()
-            .any(|note| note.as_ref() == "actual type: I32")
+            .any(|note| note.as_ref() == "actual type: `i32`")
     );
 
     let error_mismatch = analyze_main_source(ERROR_MISMATCH);
@@ -941,7 +959,7 @@ fn constructor_and_try_diagnostics_are_structured_and_source_exact() {
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
-        ["function error type: Bool", "expression error type: I32"]
+        ["function error type: `bool`", "expression error type: `i32`"]
     );
 }
 

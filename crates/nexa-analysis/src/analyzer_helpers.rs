@@ -68,7 +68,8 @@ fn equality_supported(
             | IrType::F32
             | IrType::F64
             | IrType::String
-            | IrType::Rune => true,
+            | IrType::Rune
+            | IrType::Error => true,
             IrType::Option(inner) => visit(
                 inner,
                 definitions,
@@ -236,7 +237,8 @@ fn const_safe_type(
         | IrType::F32
         | IrType::F64
         | IrType::String
-        | IrType::Rune => true,
+        | IrType::Rune
+        | IrType::Error => true,
         IrType::Option(inner) => const_safe_type(
             inner,
             definitions,
@@ -811,6 +813,7 @@ fn definition_fingerprint_payload(
 
 fn encode_type(ty: &IrType, definitions: &[Definition], output: &mut Vec<u8>) {
     match ty {
+        IrType::Error => output.push(20),
         IrType::Unit => output.push(0),
         IrType::Bool => output.push(1),
         IrType::I32 => output.push(2),
@@ -1016,10 +1019,42 @@ const fn effect_name(effect: IrEffect) -> &'static str {
     }
 }
 
+/// Whether the type (recursively) contains a poisoned [`IrType::Error`] from a failed
+/// type/name resolution. Such types must not trigger cascading diagnostics.
+#[must_use]
+pub fn contains_ir_error(ty: &IrType) -> bool {
+    match ty {
+        IrType::Error => true,
+        IrType::Option(inner)
+        | IrType::Array(inner)
+        | IrType::Snapshot(inner)
+        | IrType::Buffer(inner)
+        | IrType::StateHandle(inner) => contains_ir_error(inner),
+        IrType::HostRequest(inner) | IrType::ResourceToken(inner) => {
+            inner.as_deref().is_some_and(contains_ir_error)
+        }
+        IrType::Result(ok, error) | IrType::Map(ok, error) => {
+            contains_ir_error(ok) || contains_ir_error(error)
+        }
+        IrType::Tuple(items) => items.iter().any(contains_ir_error),
+        IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_)
+        | IrType::TypeParameter(_) => false,
+    }
+}
+
 /// Formats one fully resolved IR type using the canonical Nexa v2 source spelling.
 #[must_use]
 pub fn display_ir_type(ty: &IrType, definitions: &[Definition]) -> String {
     match ty {
+        IrType::Error => "<error>".into(),
         IrType::Unit => "unit".into(),
         IrType::Bool => "bool".into(),
         IrType::I32 => "i32".into(),
@@ -1072,6 +1107,7 @@ fn surface_type_from_ir(
     type_parameters: &[String],
 ) -> Option<SurfaceType> {
     match ty {
+        IrType::Error => None,
         IrType::Unit => Some(SurfaceType::Unit),
         IrType::Bool => Some(SurfaceType::Bool),
         IrType::I32 => Some(SurfaceType::I32),

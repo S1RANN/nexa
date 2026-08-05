@@ -434,13 +434,13 @@ impl Diagnostic {
             } => {
                 if let Some(expected) = expected {
                     diagnostic.notes.push(RuntimeMessage::inline(&format!(
-                        "expected type: {expected:?}"
+                        "expected type: `{expected}`"
                     )));
                 }
                 if let Some(actual) = actual {
                     diagnostic
                         .notes
-                        .push(RuntimeMessage::inline(&format!("actual type: {actual:?}")));
+                        .push(RuntimeMessage::inline(&format!("actual type: `{actual}`")));
                 }
             }
             _ => {}
