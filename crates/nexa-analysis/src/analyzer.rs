@@ -15,7 +15,7 @@ use nexa_core::{
 };
 use nexa_diagnostics::{
     ByteRange, Diagnostic, DiagnosticBatch, DiagnosticBatchLimits, ErrorCode, Label,
-    RelatedLocation, Severity, SourceIdentity, SourceSnapshotRegistry,
+    RelatedLocation, Severity, SourceIdentity, SourceSnapshotRegistry, TextEditSuggestion,
 };
 use nexa_syntax::ast::{
     self, AstErrorKind, Attribute, AttributeArgumentClassification, AttributeArgumentKind,
@@ -2171,13 +2171,20 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                     AstErrorKind::InvalidSyntax | AstErrorKind::LegacyModuleDeclaration { .. } => {
-                        self.push_source_error(
+                        let mut diagnostic = Diagnostic::new(
                             ErrorCode::NX1002,
-                            &unit.key,
-                            byte_range(error.range),
+                            Severity::Error,
                             error.message.clone(),
+                        )
+                        .with_label(Label::primary(
+                            source_identity(&unit.key),
+                            byte_range(error.range),
                             "invalid Nexa syntax",
-                        );
+                        ));
+                        if let Some(fix) = &error.fix {
+                            diagnostic = diagnostic.with_fix(TextEditSuggestion::message(fix.clone()));
+                        }
+                        self.diagnostics.push(diagnostic);
                     }
                 }
             }
@@ -2851,13 +2858,27 @@ impl<'a> Analyzer<'a> {
         rule: &str,
     ) {
         if !is_snake_case(&identifier.text) {
-            self.push_source_error(
+            let mut diagnostic = Diagnostic::new(
                 ErrorCode::NX2101,
-                &module.source,
-                byte_range(identifier.range),
+                Severity::Error,
                 format!("invalid name `{}`", identifier.text),
+            )
+            .with_label(Label::primary(
+                source_identity(&module.source),
+                byte_range(identifier.range),
                 rule,
-            );
+            ));
+            if let Some(trimmed) = identifier.text.strip_prefix('_')
+                && !trimmed.is_empty()
+            {
+                diagnostic = diagnostic.with_fix(TextEditSuggestion::replacement(
+                    "remove the leading underscore",
+                    source_identity(&module.source),
+                    byte_range(identifier.range),
+                    trimmed,
+                ));
+            }
+            self.diagnostics.push(diagnostic);
         }
     }
 
@@ -5524,13 +5545,26 @@ impl<'a> Analyzer<'a> {
                 SymbolUse::Value | SymbolUse::Callable => true,
             };
             if emit {
-                self.push_source_error(
+                let mut diagnostic = Diagnostic::new(
                     code,
+                    Severity::Error,
+                    format!("unknown {} `{}`", usage.name(), path.text()),
+                )
+                .with_label(Label::primary(
+                    source_identity(&module.source),
+                    byte_range(path.range),
+                    "name is not declared in this module or imported namespace",
+                ));
+                if let Some(fix) = unknown_symbol_fix(
+                    &path.text(),
                     &module.source,
                     byte_range(path.range),
-                    format!("unknown {} `{}`", usage.name(), path.text()),
-                    "name is not declared in this module or imported namespace",
-                );
+                    &self.definitions,
+                    &self.builtin_types,
+                ) {
+                    diagnostic = diagnostic.with_fix(fix);
+                }
+                self.diagnostics.push(diagnostic);
             }
             return None;
         };
@@ -11443,6 +11477,82 @@ fn range_from_source(range: &SourceRange) -> ByteRange {
 
 fn byte_range(range: TextRange) -> ByteRange {
     ByteRange::new(range.start.get(), range.end.get())
+}
+
+/// A did-you-mean suggestion for an unresolved symbol name, or the unsigned-integer family
+/// special case.
+fn unknown_symbol_fix(
+    name: &str,
+    source: &SourceKey,
+    range: ByteRange,
+    definitions: &[Definition],
+    builtin_types: &BTreeMap<String, DefinitionId>,
+) -> Option<TextEditSuggestion> {
+    if matches!(name, "u8" | "u16" | "u32" | "u64") {
+        return Some(TextEditSuggestion::message(
+            "Nexa has no unsigned integer types; use `i8`, `i16`, `i32`, or `i64`",
+        ));
+    }
+    const PRIMITIVES: &[&str] = &[
+        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
+        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
+    ];
+    let mut candidates = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .chain(builtin_types.keys().map(String::as_str))
+        .chain(PRIMITIVES.iter().copied())
+        .filter(|candidate| edit_distance(name, candidate, 2) <= 2)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let candidate = candidates
+        .into_iter()
+        .min_by_key(|candidate| edit_distance(name, candidate, 2))?;
+    if candidate == name {
+        return None;
+    }
+    Some(TextEditSuggestion::replacement(
+        format!("did you mean `{candidate}`?"),
+        source_identity(source),
+        range,
+        candidate,
+    ))
+}
+
+/// Classic bounded Levenshtein distance; early-exits beyond `max_distance`.
+fn edit_distance(left: &str, right: &str, max_distance: usize) -> usize {
+    if left == right {
+        return 0;
+    }
+    if left.is_empty() {
+        return right.len().min(max_distance + 1);
+    }
+    if right.is_empty() {
+        return left.len().min(max_distance + 1);
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (row, left_character) in left.chars().enumerate() {
+        current[0] = row + 1;
+        let mut row_min = current[0];
+        for (column, right_character) in right.chars().enumerate() {
+            current[column + 1] = if left_character == right_character {
+                previous[column]
+            } else {
+                previous[column]
+                    .min(previous[column + 1])
+                    .min(current[column])
+                    + 1
+            };
+            row_min = row_min.min(current[column + 1]);
+        }
+        if row_min > max_distance {
+            return max_distance + 1;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn syntax_error_code(kind: nexa_syntax::SyntaxErrorKind) -> ErrorCode {

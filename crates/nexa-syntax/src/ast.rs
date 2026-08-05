@@ -20,6 +20,8 @@ pub struct AstError {
     pub kind: AstErrorKind,
     pub range: TextRange,
     pub message: String,
+    /// Optional human suggestion rendered as a `= help:` continuation.
+    pub fix: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,6 +484,7 @@ pub fn parse_nexa_ast(tree: &SyntaxTree) -> NexaAst {
                 kind: AstErrorKind::InvalidSyntax,
                 range: tree.root.range,
                 message: "a Nexa AST requires Nexa source".into(),
+                fix: None,
             }],
         };
     }
@@ -587,6 +590,7 @@ impl<'a> Parser<'a> {
             },
             range: keyword.range,
             message: "legacy module declarations were removed in Nexa v2".into(),
+            fix: None,
         });
         self.cursor = cursor + 1;
         true
@@ -1260,6 +1264,20 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let Some((precedence, kind)) = binary_operator(self.current_kind()) else {
+                // `name!(` is a Rust macro invocation; Nexa has no macros. Report it once and keep
+                // parsing the parenthesized tail as a regular call.
+                if self.current_kind() == Some(TokenKind::Bang)
+                    && self.kind_at(self.cursor + 1) == Some(TokenKind::LParen)
+                {
+                    let callee = self.text(left.range);
+                    self.error_with_fix(
+                        left.range,
+                        &format!("`{callee}!` is a Rust macro invocation; Nexa has no macros"),
+                        "use string interpolation or the host `print` function instead".into(),
+                    );
+                    self.bump();
+                    continue;
+                }
                 break;
             };
             if precedence < minimum_precedence {
@@ -1269,6 +1287,30 @@ impl<'a> Parser<'a> {
                 kind,
                 range: self.bump_range(),
             };
+            if self.current_kind() == Some(TokenKind::Equal) {
+                // `+=`/`-=`/`*=`/`/=` are lexed as an operator followed by `=`; report them as a
+                // single friendly error and keep parsing as if the compound form were explicit.
+                let operator_text = self.text(operator.range);
+                let equal_range = self.current_range();
+                let left_text = self.text(left.range);
+                self.error_with_fix(
+                    cover(operator.range, equal_range),
+                    &format!("`{operator_text}=` is not a Nexa operator"),
+                    format!("write `{left_text} = {left_text} {operator_text} 1`"),
+                );
+                self.bump();
+                let right = self.expression(precedence + 1);
+                let range = cover(left.range, right.range);
+                left = Expression {
+                    kind: ExpressionKind::Binary {
+                        left: Box::new(left),
+                        operator,
+                        right: Box::new(right),
+                    },
+                    range,
+                };
+                continue;
+            }
             let right = self.expression(precedence + 1);
             let range = cover(left.range, right.range);
             left = Expression {
@@ -2165,6 +2207,18 @@ impl<'a> Parser<'a> {
         self.error(self.current_range(), message);
     }
 
+    fn error_with_fix(&mut self, range: TextRange, message: &str, fix: String) {
+        if self.errors.iter().any(|error| error.range == range) {
+            return;
+        }
+        self.errors.push(AstError {
+            kind: AstErrorKind::InvalidSyntax,
+            range,
+            message: message.into(),
+            fix: Some(fix),
+        });
+    }
+
     fn error(&mut self, range: TextRange, message: &str) {
         // Collapse repeated errors at one token position: after the first expectation fails the
         // parser recovers by re-parsing the same token, which would otherwise double-report.
@@ -2175,6 +2229,7 @@ impl<'a> Parser<'a> {
             kind: AstErrorKind::InvalidSyntax,
             range,
             message: message.into(),
+            fix: None,
         });
     }
 

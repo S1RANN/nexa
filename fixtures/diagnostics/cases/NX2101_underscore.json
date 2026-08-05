@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2101","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2101_underscore.nexa","expected":{"primary_text":"_hidden","secondary_count":0,"message_contains":"invalid name","notes":[]}}
