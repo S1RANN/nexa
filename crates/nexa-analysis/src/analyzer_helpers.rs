@@ -1107,7 +1107,7 @@ fn surface_type_from_ir(
     type_parameters: &[String],
 ) -> Option<SurfaceType> {
     match ty {
-        IrType::Error => None,
+        IrType::Error | IrType::HostRequest(_) | IrType::ResourceToken(None) => None,
         IrType::Unit => Some(SurfaceType::Unit),
         IrType::Bool => Some(SurfaceType::Bool),
         IrType::I32 => Some(SurfaceType::I32),
@@ -1146,7 +1146,6 @@ fn surface_type_from_ir(
             .map(|value| surface_type_from_ir(value, definitions, type_parameters))
             .collect::<Option<Vec<_>>>()
             .map(SurfaceType::Tuple),
-        IrType::HostRequest(_) | IrType::ResourceToken(None) => None,
         IrType::ResourceToken(Some(inner)) => Some(SurfaceType::Token(Box::new(
             surface_type_from_ir(inner, definitions, type_parameters)?,
         ))),

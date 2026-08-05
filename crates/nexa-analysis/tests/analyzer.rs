@@ -806,6 +806,26 @@ fn poison_types_never_suppress_unrelated_real_errors() {
 }
 
 #[test]
+fn rust_macro_shapes_suppress_downstream_unknown_function() {
+    const SOURCE: &str = "pub fn run() -> i32 {\n    println!(\"hi\");\n    return 0;\n}\n";
+    let input = resolved_input(
+        root_fixture(
+            &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
+            false,
+        ),
+        &[],
+    );
+    let outcome = analyze_deterministically(&input, &AnalysisEnvironment::default());
+    let diagnostics = outcome.diagnostics.diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, ErrorCode::NX1002);
+    assert!(diagnostics[0].message.contains("Rust macro"));
+    assert!(!diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == ErrorCode::NX2001));
+}
+
+#[test]
 fn return_statements_strictly_distinguish_unit_from_recovery_types() {
     const MISSING_VALUE: &str = "fn bad() -> i32 { return; }\n";
     const UNEXPECTED_VALUE: &str = "fn bad() -> unit { return 1; }\n";

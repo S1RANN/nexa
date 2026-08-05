@@ -120,8 +120,7 @@ fn render_human_diagnostic(
     let severity_color = match diagnostic.severity {
         crate::Severity::Error => COLOR_BOLD_RED,
         crate::Severity::Warning => COLOR_BOLD_YELLOW,
-        crate::Severity::Note => COLOR_BOLD_BLUE,
-        crate::Severity::Help => COLOR_BOLD_BLUE,
+        crate::Severity::Note | crate::Severity::Help => COLOR_BOLD_BLUE,
     };
     if color {
         write!(output, "{severity_color}").expect("writing to String cannot fail");
@@ -158,7 +157,7 @@ fn render_human_diagnostic(
     for note in &diagnostic.notes {
         write!(
             output,
-            "\n{}= note: {note}{}",
+            "\n   {}= note: {note}{}",
             if color { COLOR_BOLD_BLUE } else { "" },
             if color { COLOR_RESET } else { "" },
         )
@@ -167,7 +166,7 @@ fn render_human_diagnostic(
     for fix in &diagnostic.fixes {
         write!(
             output,
-            "\n{}= help: {}{}",
+            "\n   {}= help: {}{}",
             if color { COLOR_BOLD_BLUE } else { "" },
             fix.message,
             if color { COLOR_RESET } else { "" },

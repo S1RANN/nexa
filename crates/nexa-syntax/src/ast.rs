@@ -28,6 +28,9 @@ pub struct AstError {
 pub enum AstErrorKind {
     InvalidSyntax,
     LegacyModuleDeclaration { path: TextRange },
+    /// `name!(` looked like a Rust macro invocation; the callee is already explained by the
+    /// error message, so downstream name resolution must not re-report it.
+    RustMacroInvocation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1270,11 +1273,16 @@ impl<'a> Parser<'a> {
                     && self.kind_at(self.cursor + 1) == Some(TokenKind::LParen)
                 {
                     let callee = self.text(left.range);
-                    self.error_with_fix(
-                        left.range,
-                        &format!("`{callee}!` is a Rust macro invocation; Nexa has no macros"),
-                        "use string interpolation or the host `print` function instead".into(),
-                    );
+                    self.errors.push(AstError {
+                        kind: AstErrorKind::RustMacroInvocation,
+                        range: left.range,
+                        message: format!(
+                            "`{callee}!` is a Rust macro invocation; Nexa has no macros"
+                        ),
+                        fix: Some(
+                            "use string interpolation or the host `print` function instead".into(),
+                        ),
+                    });
                     self.bump();
                     continue;
                 }

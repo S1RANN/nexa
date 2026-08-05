@@ -439,10 +439,13 @@ pub fn run_diagnostic_corpus(
         .collect::<Vec<_>>();
     let fixture_set = loaded
         .iter()
-        .map(|(_, case)| case.code.clone())
+        .map(|(path, _)| {
+            path.file_stem()
+                .map_or_else(|| "<unknown>".to_owned(), |stem| stem.to_string_lossy().into_owned())
+        })
         .collect::<BTreeSet<_>>();
     if fixture_set.len() != loaded.len() {
-        return Err("diagnostic case codes are not unique".into());
+        return Err("diagnostic case ids are not unique".into());
     }
     let registered_set = crate::ERROR_CODE_TABLE
         .iter()

@@ -126,7 +126,7 @@ impl DiagnosticBatch {
             .diagnostics
             .saturating_add(other.suppressed.diagnostics);
         if self.suppressed.first_cause.is_none() {
-            self.suppressed.first_cause = other.suppressed.first_cause.clone();
+            self.suppressed.first_cause.clone_from(&other.suppressed.first_cause);
         }
     }
 

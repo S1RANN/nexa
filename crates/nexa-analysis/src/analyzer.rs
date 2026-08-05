@@ -6,6 +6,7 @@
 //! produces byte-for-byte equivalent semantic records regardless of filesystem or worker order.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
 
@@ -88,8 +89,7 @@ impl std::fmt::Display for SurfaceType {
             Self::F64 => formatter.write_str("f64"),
             Self::String => formatter.write_str("string"),
             Self::Rune => formatter.write_str("rune"),
-            Self::TypeParameter(name) => formatter.write_str(name),
-            Self::Named { name, .. } => formatter.write_str(name),
+            Self::TypeParameter(name) | Self::Named { name, .. } => formatter.write_str(name),
             Self::Option(inner) => write!(formatter, "Option<{inner}>"),
             Self::Result(ok, error) => write!(formatter, "Result<{ok}, {error}>"),
             Self::Array(inner) => write!(formatter, "Array<{inner}>"),
@@ -589,6 +589,9 @@ struct Analyzer<'a> {
     poison_cause: Option<Arc<str>>,
     /// Source ranges of unresolved type names keyed by (source, name), for aggregate notes.
     unknown_type_uses: BTreeMap<(SourceKey, String), Vec<ByteRange>>,
+    /// Callees already explained by parser-level suggestions (e.g. `name!(` macro shapes); name
+    /// resolution must not re-report them as unknown.
+    explained_names: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -797,6 +800,7 @@ impl<'a> Analyzer<'a> {
             unresolved_surface_types: BTreeSet::new(),
             poison_cause: None,
             unknown_type_uses: BTreeMap::new(),
+            explained_names: BTreeSet::new(),
         }
     }
 
@@ -2170,7 +2174,14 @@ impl<'a> Analyzer<'a> {
                             "module declarations were removed; module identity comes from the package-relative source path",
                         );
                     }
-                    AstErrorKind::InvalidSyntax | AstErrorKind::LegacyModuleDeclaration { .. } => {
+                    AstErrorKind::InvalidSyntax
+                    | AstErrorKind::LegacyModuleDeclaration { .. }
+                    | AstErrorKind::RustMacroInvocation => {
+                        if error.kind == AstErrorKind::RustMacroInvocation
+                            && let Some(callee) = syntax.source.slice(error.range)
+                        {
+                            self.explained_names.insert(callee.to_owned());
+                        }
                         let mut diagnostic = Diagnostic::new(
                             ErrorCode::NX1002,
                             Severity::Error,
@@ -5526,6 +5537,9 @@ impl<'a> Analyzer<'a> {
             self.repl_snapshot_symbol(module, path, usage).or(current)
         };
         let Some(id) = id else {
+            if usage == SymbolUse::Callable && self.explained_names.contains(&path.text()) {
+                return None;
+            }
             let code = match usage {
                 SymbolUse::Type => ErrorCode::NX2002,
                 SymbolUse::Value | SymbolUse::Callable => ErrorCode::NX2001,
@@ -6996,7 +7010,7 @@ fn aggregate_unknown_type_notes(
             match diagnostics.sources().get(&source_identity(&source)) {
                 Some(snapshot) => {
                     let position = snapshot.human_position(range.start as usize);
-                    note.push_str(&format!("{}:{}", position.line, position.column));
+                    let _ = write!(note, "{}:{}", position.line, position.column);
                 }
                 None => note.push_str("<source unavailable>"),
             }
@@ -11488,15 +11502,15 @@ fn unknown_symbol_fix(
     definitions: &[Definition],
     builtin_types: &BTreeMap<String, DefinitionId>,
 ) -> Option<TextEditSuggestion> {
+    const PRIMITIVES: &[&str] = &[
+        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
+        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
+    ];
     if matches!(name, "u8" | "u16" | "u32" | "u64") {
         return Some(TextEditSuggestion::message(
             "Nexa has no unsigned integer types; use `i8`, `i16`, `i32`, or `i64`",
         ));
     }
-    const PRIMITIVES: &[&str] = &[
-        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
-        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
-    ];
     let mut candidates = definitions
         .iter()
         .map(|definition| definition.name.as_str())
