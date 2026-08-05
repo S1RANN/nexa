@@ -5408,15 +5408,12 @@ fn test_snake() -> Result<(), DynError> {
 }
 
 fn snake_headless(mode: &str) -> Result<(), DynError> {
-    cargo(&[
-        "run",
-        "-p",
-        "snake-game",
-        "--bin",
-        "snake-headless",
-        "--",
-        mode,
-    ])
+    let mut args = vec!["run"];
+    if mode == "bench" {
+        args.push("--release");
+    }
+    args.extend(["-p", "snake-game", "--bin", "snake-headless", "--", mode]);
+    cargo(&args)
 }
 
 fn m2_audit() -> Result<(), DynError> {
