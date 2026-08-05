@@ -38,6 +38,7 @@ impl DiagnosticRenderer {
         for (index, diagnostic) in batch.diagnostics().iter().enumerate() {
             if index > 0 {
                 output.push('\n');
+                output.push('\n');
             }
             render_human_diagnostic(&mut output, batch.sources(), diagnostic, color);
         }
@@ -845,5 +846,70 @@ mod tests {
         let ndjson_diagnostic: serde_json::Value =
             serde_json::from_str(ndjson.lines().nth(1).unwrap()).unwrap();
         assert_eq!(ndjson_diagnostic["diagnostic"]["fixes"][0], *fix);
+    }
+
+    #[test]
+    fn full_human_output_matches_the_rustc_style_snapshot() {
+        let source = SourceIdentity::package("root.app", "src/main.nexa");
+        let mut sources = SourceSnapshotRegistry::builder();
+        sources
+            .insert(
+                source.clone(),
+                "fn main() -> i32 {\n    let value = 1 + \"x\";\n    return value;\n}\n",
+            )
+            .unwrap();
+        let mut batch = DiagnosticBatch::with_default_limits(sources.build());
+        let line_start = u32::try_from("fn main() -> i32 {\n".len()).unwrap();
+        let one_start = line_start + u32::try_from("    let value = ".len()).unwrap();
+        let string_start = line_start + u32::try_from("    let value = 1 + ".len()).unwrap();
+        let return_start = line_start
+            + u32::try_from("    let value = 1 + \"x\";\n    ".len()).unwrap();
+        batch.push(
+            Diagnostic::new(ErrorCode::NX2101, Severity::Error, "type mismatch")
+                .with_label(Label::primary(
+                    source.clone(),
+                    ByteRange::new(one_start, one_start + 1),
+                    "this expression is not a number",
+                ))
+                .with_label(Label::secondary(
+                    source.clone(),
+                    ByteRange::new(string_start, string_start + 3),
+                    "string literal has type `string`",
+                ))
+                .with_note("expected `i32`, found `string`")
+                .with_fix(TextEditSuggestion::message("write `value` as an integer")),
+        );
+        batch.push(
+            Diagnostic::new(ErrorCode::NX1002, Severity::Error, "expected `;`")
+                .with_label(Label::primary(
+                    source,
+                    ByteRange::new(return_start, return_start + 6),
+                    "invalid Nexa syntax",
+                )),
+        );
+        batch.record_suppressed("caused by unknown type `u32`");
+
+        let human = DiagnosticRenderer::human(&batch);
+        let expected = concat!(
+            "error[NX2101]: type mismatch\n",
+            "  --> root.app:src/main.nexa:2:17\n",
+            "  |\n",
+            "2 |     let value = 1 + \"x\";\n",
+            "  |                  ^ this expression is not a number\n",
+            "  --> root.app:src/main.nexa:2:21\n",
+            "  |\n",
+            "2 |     let value = 1 + \"x\";\n",
+            "  |                      --- string literal has type `string`\n",
+            "   = note: expected `i32`, found `string`\n",
+            "   = help: write `value` as an integer\n",
+            "\n",
+            "error[NX1002]: expected `;`\n",
+            "  --> root.app:src/main.nexa:3:5\n",
+            "  |\n",
+            "3 |     return value;\n",
+            "  |      ^^^^^^ invalid Nexa syntax\n",
+            "error: 2 errors emitted; 1 downstream error suppressed (caused by unknown type `u32`)\n",
+        );
+        assert_eq!(human, expected);
     }
 }
