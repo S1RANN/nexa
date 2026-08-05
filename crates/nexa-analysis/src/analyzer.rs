@@ -5573,6 +5573,8 @@ impl<'a> Analyzer<'a> {
                     &path.text(),
                     &module.source,
                     byte_range(path.range),
+                    usage,
+                    &module.key,
                     &self.definitions,
                     &self.builtin_types,
                 ) {
@@ -11494,38 +11496,82 @@ fn byte_range(range: TextRange) -> ByteRange {
 }
 
 /// A did-you-mean suggestion for an unresolved symbol name, or the unsigned-integer family
-/// special case.
+/// special case. Candidates are ranked by relevance layer (current module first, then builtins
+/// for type positions, then imported definitions) and bounded edit distance; single-character
+/// names are too ambiguous to suggest.
 fn unknown_symbol_fix(
     name: &str,
     source: &SourceKey,
     range: ByteRange,
+    usage: SymbolUse,
+    module: &SourceModuleKey,
     definitions: &[Definition],
     builtin_types: &BTreeMap<String, DefinitionId>,
 ) -> Option<TextEditSuggestion> {
-    const PRIMITIVES: &[&str] = &[
-        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
-        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
-    ];
+    if name.chars().count() == 1 {
+        return None;
+    }
     if matches!(name, "u8" | "u16" | "u32" | "u64") {
         return Some(TextEditSuggestion::message(
             "Nexa has no unsigned integer types; use `i8`, `i16`, `i32`, or `i64`",
         ));
     }
-    let mut candidates = definitions
-        .iter()
-        .map(|definition| definition.name.as_str())
-        .chain(builtin_types.keys().map(String::as_str))
-        .chain(PRIMITIVES.iter().copied())
-        .filter(|candidate| edit_distance(name, candidate, 2) <= 2)
-        .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    candidates.dedup();
-    let candidate = candidates
-        .into_iter()
-        .min_by_key(|candidate| edit_distance(name, candidate, 2))?;
-    if candidate == name {
-        return None;
+    const PRIMITIVES: &[&str] = &[
+        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
+        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
+    ];
+    let is_type_kind = |kind: DefinitionKind| {
+        matches!(
+            kind,
+            DefinitionKind::Struct
+                | DefinitionKind::Enum
+                | DefinitionKind::Class
+                | DefinitionKind::HostContract
+        )
+    };
+    let is_value_kind = |kind: DefinitionKind| {
+        matches!(
+            kind,
+            DefinitionKind::Function
+                | DefinitionKind::Task
+                | DefinitionKind::Const
+                | DefinitionKind::Field
+                | DefinitionKind::Variant
+                | DefinitionKind::Parameter
+                | DefinitionKind::Local
+                | DefinitionKind::HostFunction
+        )
+    };
+    let mut best: Option<(u8, usize, &str)> = None;
+    for definition in definitions {
+        let in_module =
+            definition.package_id == module.package && definition.module == module.module;
+        let relevant = match usage {
+            SymbolUse::Type => is_type_kind(definition.kind),
+            SymbolUse::Value | SymbolUse::Callable => is_value_kind(definition.kind),
+        };
+        if relevant {
+            let layer = if in_module { 0 } else { 2 };
+            let distance = edit_distance(name, &definition.name, 2);
+            if distance <= 2 && best.is_none_or(|(best_layer, best_distance, _)| {
+                (layer, distance) < (best_layer, best_distance)
+            }) {
+                best = Some((layer, distance, &definition.name));
+            }
+        }
     }
+    if usage == SymbolUse::Type {
+        for candidate in builtin_types.keys().map(String::as_str).chain(PRIMITIVES.iter().copied())
+        {
+            let distance = edit_distance(name, candidate, 2);
+            if distance <= 2 && best.is_none_or(|(best_layer, best_distance, _)| {
+                (1, distance) < (best_layer, best_distance)
+            }) {
+                best = Some((1, distance, candidate));
+            }
+        }
+    }
+    let (_, _, candidate) = best?;
     Some(TextEditSuggestion::replacement(
         format!("did you mean `{candidate}`?"),
         source_identity(source),

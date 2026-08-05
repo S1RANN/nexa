@@ -570,7 +570,7 @@ pub(crate) fn run<B: ReplBackend>(
                         }
                     }
                     Ok(ReplAction::Quit) => {}
-                    Err(error) => eprintln!("error: {error}"),
+                    Err(error) => print_repl_error(&error),
                 }
             }
             return Ok(());
@@ -597,10 +597,20 @@ pub(crate) fn run<B: ReplBackend>(
                 }
             }
             Ok(ReplAction::Quit) => return Ok(()),
-            Err(error) => eprintln!("error: {error}"),
+            Err(error) => print_repl_error(&error),
         }
         cancelled.store(false, Ordering::Release);
         pending.clear();
+    }
+}
+
+/// Prints one REPL error. Already-rendered diagnostic batches start with their own
+/// `error[NX...]`/`warning[NX...]` header, so they must not gain an extra `error: ` prefix.
+fn print_repl_error(error: &str) {
+    if error.starts_with("error[") || error.starts_with("warning[") {
+        eprintln!("{error}");
+    } else {
+        eprintln!("error: {error}");
     }
 }
 
