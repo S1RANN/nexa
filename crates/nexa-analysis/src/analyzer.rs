@@ -2868,7 +2868,7 @@ impl<'a> Analyzer<'a> {
         identifier: &ast::Identifier,
         rule: &str,
     ) {
-        if !is_snake_case(&identifier.text) {
+        if !identifier.text.starts_with('<') && !is_snake_case(&identifier.text) {
             let mut diagnostic = Diagnostic::new(
                 ErrorCode::NX2101,
                 Severity::Error,
@@ -2899,7 +2899,7 @@ impl<'a> Analyzer<'a> {
         identifier: &ast::Identifier,
         rule: &str,
     ) {
-        if !is_pascal_case(&identifier.text) {
+        if !identifier.text.starts_with('<') && !is_pascal_case(&identifier.text) {
             self.push_source_error(
                 ErrorCode::NX2101,
                 &module.source,
@@ -5537,6 +5537,12 @@ impl<'a> Analyzer<'a> {
             self.repl_snapshot_symbol(module, path, usage).or(current)
         };
         let Some(id) = id else {
+            // Parser-recovered placeholder names (`<missing>`/`<error>`) are already explained by
+            // a syntax diagnostic; resolve them silently to the poison type instead of adding a
+            // second name-resolution error.
+            if path.text().starts_with('<') {
+                return None;
+            }
             if usage == SymbolUse::Callable && self.explained_names.contains(&path.text()) {
                 return None;
             }
@@ -5586,7 +5592,7 @@ impl<'a> Analyzer<'a> {
         };
         let definition = self.definitions[id.0 as usize].clone();
         let kind_valid = Self::symbol_matches_usage(&definition, usage);
-        if !kind_valid {
+        if !kind_valid && !path.text().starts_with('<') {
             self.push_source_error(
                 if usage == SymbolUse::Type {
                     ErrorCode::NX2002

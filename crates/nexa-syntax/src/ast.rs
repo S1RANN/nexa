@@ -853,15 +853,43 @@ impl<'a> Parser<'a> {
         let start = self.current_range();
         let is_async = self.take_keyword(Keyword::Async).is_some();
         self.expect_keyword(Keyword::Fn, "expected `fn`");
-        let name = self.identifier();
+        let name = if self.current_kind() == Some(TokenKind::Identifier) {
+            self.identifier()
+        } else {
+            let range = self.current_range();
+            self.error(range, "expected function name after `fn`");
+            Identifier {
+                text: "<missing>".into(),
+                range,
+            }
+        };
         self.require_snake_case(&name, "function");
         self.expect(TokenKind::LParen, "expected `(` after function name");
         let mut parameters = Vec::new();
+        let mut parameter_error = false;
         while !self.at_end() && !self.at(TokenKind::RParen) {
             let parameter_start = self.current_range();
             let parameter_name = self.identifier();
             self.require_snake_case(&parameter_name, "parameter");
-            self.expect(TokenKind::Colon, "expected `:` after parameter name");
+            if self.take(TokenKind::Colon).is_none() {
+                if !parameter_error {
+                    self.error(self.current_range(), "expected `:` after parameter name");
+                    parameter_error = true;
+                }
+                // Synchronize to the next separator so a broken parameter list does not cascade
+                // into expression/block recovery errors.
+                while !self.at_end()
+                    && !self.at(TokenKind::Comma)
+                    && !self.at(TokenKind::RParen)
+                    && !self.at(TokenKind::LBrace)
+                {
+                    self.bump();
+                }
+                if self.take(TokenKind::Comma).is_some() {
+                    continue;
+                }
+                break;
+            }
             let ty = self.ty();
             parameters.push(Parameter {
                 name: parameter_name,
@@ -2184,7 +2212,9 @@ impl<'a> Parser<'a> {
     }
 
     fn require_snake_case(&mut self, identifier: &Identifier, role: &str) {
-        if !is_snake_case(&identifier.text) {
+        if !identifier.text.starts_with('<')
+            && !is_snake_case(&identifier.text)
+        {
             self.error(
                 identifier.range,
                 &format!("{role} name must use snake_case"),
@@ -2193,7 +2223,9 @@ impl<'a> Parser<'a> {
     }
 
     fn require_pascal_case(&mut self, identifier: &Identifier, role: &str) {
-        if !is_pascal_case(&identifier.text) {
+        if !identifier.text.starts_with('<')
+            && !is_pascal_case(&identifier.text)
+        {
             self.error(
                 identifier.range,
                 &format!("{role} name must use PascalCase"),
@@ -2202,7 +2234,9 @@ impl<'a> Parser<'a> {
     }
 
     fn require_screaming_snake_case(&mut self, identifier: &Identifier) {
-        if !is_screaming_snake_case(&identifier.text) {
+        if !identifier.text.starts_with('<')
+            && !is_screaming_snake_case(&identifier.text)
+        {
             self.error(identifier.range, "const name must use SCREAMING_SNAKE_CASE");
         }
     }
