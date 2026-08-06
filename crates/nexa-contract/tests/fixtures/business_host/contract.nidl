@@ -1,4 +1,4 @@
-contract Game {
+contract Game;
     handle Entity;
     handle ActionLock;
     handle MotionLock;
@@ -37,4 +37,3 @@ contract Game {
     nexa {
         fn update(entity: i32) -> i32;
     }
-}

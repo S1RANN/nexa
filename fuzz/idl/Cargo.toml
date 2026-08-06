@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-nexa-idl = { path = "../../crates/nexa-idl" }
+nexa-contract = { path = "../../crates/nexa-contract" }
 
 [[bin]]
 name = "parse"

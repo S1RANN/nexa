@@ -1,4 +1,4 @@
 fn main() {
-    nexa_idl::build::generate("host_matrix.nidl")
+    nexa_contract::build::generate("host_matrix.nidl")
         .expect("validate and generate host matrix bindings");
 }

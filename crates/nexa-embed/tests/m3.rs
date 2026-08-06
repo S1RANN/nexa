@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use nexa as nexa_idl;
+use nexa;
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateCancellation,
     CandidateTerminal, CapabilitySet, CompileJob, DevelopmentCompileRequest, DevelopmentCompiler,
@@ -35,7 +35,7 @@ fn policy() -> PackagePolicy {
 }
 
 fn candidate_build_context() -> CandidateBuildContext {
-    let contract = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let contract = nexa::parse_contract(IDL).expect("NIDL");
     CandidateBuildContext::new(IDL.as_bytes().to_vec()).requiring_entrypoints(
         contract
             .nexa_functions
@@ -85,12 +85,12 @@ capabilities = []
     .remove(0)
 }
 
-fn requirement(contract: &nexa_idl::ValidatedContract) -> ExportRequirement {
+fn requirement(contract: &nexa::ValidatedContract) -> ExportRequirement {
     let entrypoint = &contract.nexa_functions[0];
     ExportRequirement {
         name: entrypoint.name.clone(),
-        stable_id: nexa_idl::entrypoint_stable_id(entrypoint),
-        signature: nexa_idl::entrypoint_signature(entrypoint),
+        stable_id: nexa::entrypoint_stable_id(entrypoint),
+        signature: nexa::entrypoint_signature(entrypoint),
         effect: nexa::prelude::FunctionEffect::Ordinary,
     }
 }
@@ -184,7 +184,7 @@ fn source_registry_is_deterministic_bounded_and_unicode_safe() {
 
 #[test]
 fn dev_loop_only_latest_generation_becomes_ready() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
     let mut terminals = Vec::new();
     for generation in 1..=20 {
@@ -242,7 +242,7 @@ fn dev_loop_only_latest_generation_becomes_ready() {
 
 #[test]
 fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         result_queue_capacity: 1,
         ..DevelopmentConfig::default()
@@ -293,7 +293,7 @@ fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
 
 #[test]
 fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -372,7 +372,7 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
 
 fn submit_distinct_packages(
     compiler: &DevelopmentCompiler,
-    idl: &nexa_idl::ValidatedContract,
+    idl: &nexa::ValidatedContract,
     count: usize,
 ) -> (Vec<CompileJob>, Vec<CandidateTerminal>) {
     let mut backpressured = Vec::new();
@@ -433,7 +433,7 @@ fn drain_all_distinct(
 
 #[test]
 fn worker_queue_backpressure_preserves_32_distinct_packages() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -465,7 +465,7 @@ fn worker_queue_backpressure_preserves_32_distinct_packages() {
 
 #[test]
 fn worker_result_backpressure_never_discards_completed_results() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -492,7 +492,7 @@ fn worker_result_backpressure_never_discards_completed_results() {
 }
 
 fn compiler_with_saturated_result_queue(
-    idl: &nexa_idl::ValidatedContract,
+    idl: &nexa::ValidatedContract,
 ) -> (DevelopmentCompiler, PackageId) {
     let compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         result_queue_capacity: 1,
@@ -532,7 +532,7 @@ fn wait_until_in_flight(compiler: &DevelopmentCompiler, package_id: &PackageId) 
 
 #[test]
 fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let (mut compiler, buffered_package_id) = compiler_with_saturated_result_queue(&idl);
     let package_id = PackageId::new("tests.in-flight-disable").expect("package id");
     let candidate = candidate_for(package_id.as_str(), "pub fn value() -> i32 { return 2; }");
@@ -567,7 +567,7 @@ fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
 
 #[test]
 fn shutdown_accounts_for_an_in_flight_generation_without_deadlock() {
-    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let idl = nexa::parse_contract(IDL).expect("NIDL");
     let (mut compiler, buffered_package_id) = compiler_with_saturated_result_queue(&idl);
     let package_id = PackageId::new("tests.in-flight-shutdown").expect("package id");
     let candidate = candidate_for(package_id.as_str(), "pub fn value() -> i32 { return 2; }");

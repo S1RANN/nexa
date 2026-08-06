@@ -243,10 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let declared_idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
+    let declared_idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
-        nexa_idl::generate_rust(&declared_idl)?,
+        nexa_contract::generate_rust(&declared_idl)?,
         "Combat bindings must be generated without manual edits"
     );
     assert_eq!(
@@ -254,10 +254,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "update"
     );
     let _typed_export_id = <generated::Update as nexa_runtime::ScriptExport>::STABLE_ID;
-    let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
+    let idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         generated::CONTRACT_FINGERPRINT,
-        nexa_idl::contract_fingerprint(&idl).into_bytes()
+        nexa_contract::contract_fingerprint(&idl).into_bytes()
     );
     let host_contract_id = generated::CONTRACT_RUNTIME_ID;
     let host_source = Arc::<str>::from(include_str!("../combat_api.nidl"));

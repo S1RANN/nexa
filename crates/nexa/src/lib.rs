@@ -46,14 +46,14 @@ pub use nexa_diagnostics::{
     SourceSnapshot, SourceSnapshotRegistry, SourceSnapshotRegistryBuilder,
     SourceSnapshotRegistryError, TextEditSuggestion,
 };
-pub use nexa_idl::{
+pub use nexa_contract::{
     ABI_DESCRIPTOR_VERSION, AbiDescriptor, AbiFingerprint, BindingModel, CodegenError,
     EffectiveContractDescriptor, EffectiveContractSelection, EffectiveDescriptorError,
-    NIDL_SYNTAX_VERSION, NidlAst, NidlError, NidlErrorKind, ValidatedContract, ValidatedFunction,
+    CONTRACT_SYNTAX_VERSION, ContractAst, ContractError, ContractErrorKind, ValidatedContract, ValidatedFunction,
     abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
     effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
-    generate_rust as generate_rust_bindings, host_function_signature, parse as parse_nidl,
-    parse_ast as parse_nidl_ast,
+    generate_rust as generate_rust_bindings, host_function_signature, parse_contract,
+    parse_contract_ast, validate_contract,
 };
 pub use nexa_runtime::profiler;
 pub use nexa_runtime::{
@@ -93,7 +93,7 @@ pub use package_test::{
     PackageTestOptions, PackageTestRunError,
 };
 pub use repl_session::{
-    CONSOLE_HOST_NIDL, CONSOLE_HOST_SOURCE_IDENTITY, ReplCellOutcome, ReplConsoleEmission,
+    CONSOLE_HOST_CONTRACT, CONSOLE_HOST_SOURCE_IDENTITY, ReplCellOutcome, ReplConsoleEmission,
     ReplConsoleHost, ReplConsoleHostError, ReplConsoleStream, ReplGcReport, ReplMemoryReport,
     ReplResolvedCellInput, ReplSession, ReplSessionError, ReplSessionLimits,
 };
@@ -122,7 +122,7 @@ pub mod prelude {
         result_type,
     };
     pub use nexa_core::{FileId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
-    pub use nexa_idl::generate_rust as generate_rust_bindings;
+    pub use nexa_contract::generate_rust as generate_rust_bindings;
     pub use nexa_runtime::{
         CancelReason, CompletionAccounting, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostFunctionAuthority, HostFunctionAuthorityField,
@@ -165,8 +165,8 @@ pub mod prelude {
         compile_package_tests_with_contract, compile_package_with_contract,
         compile_standalone_package_with_contract, compile_standalone_with_contract,
         contract_fingerprint, contract_runtime_id, decode_module, effective_contract_descriptor,
-        entrypoint_signature, entrypoint_stable_id, parse_nidl, parse_nidl_ast,
-        standalone_main_stable_id, verify_module,
+        entrypoint_signature, entrypoint_stable_id, parse_contract, parse_contract_ast,
+        standalone_main_stable_id, validate_contract, verify_module,
     };
     pub use crate::{
         ByteRange, DiagnosticBatch, DiagnosticBatchLimits, DiagnosticPhase, LeafDiagnostic,

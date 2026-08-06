@@ -440,7 +440,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         "pub(package) fn crash() -> i32 { return test_host::fail(); }\n",
     );
 
-    let idl = nexa_idl::parse(IDL_SOURCE).map_err(|error| error.to_string())?;
+    let idl = nexa_contract::parse_contract(IDL_SOURCE).map_err(|error| error.to_string())?;
     let contract = crate::HostContractInput::with_source(
         &idl,
         SourceIdentity::standalone(IDL_PATH),
@@ -481,7 +481,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         .map(|function| function.function_index)
         .ok_or("compiled artifact has no entry debug function")?;
 
-    let host_hash = nexa_idl::contract_runtime_id(&idl);
+    let host_hash = nexa_contract::contract_runtime_id(&idl);
     let host_import = bytecode
         .host_imports
         .first()

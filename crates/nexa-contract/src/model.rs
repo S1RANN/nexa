@@ -5,7 +5,7 @@ use nexa_bytecode::ValueType;
 use nexa_core::{FileId, FingerprintBuilder, SourceSpan, StableId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlAst {
+pub struct ContractAst {
     pub source: String,
     pub span: SourceSpan,
     pub contract: ContractDecl,
@@ -205,7 +205,7 @@ impl fmt::Display for AbiFingerprint {
     }
 }
 
-/// A Rust identifier which has already passed NIDL naming, keyword, and collision validation.
+/// A Rust identifier which has already passed Contract naming, keyword, and collision validation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RustName(String);
 
@@ -267,7 +267,7 @@ pub enum ResolvedTypeKind {
 }
 
 impl ResolvedTypeRef {
-    /// Runtime/bytecode ABI lowering is total after NIDL validation.
+    /// Runtime/bytecode ABI lowering is total after Contract validation.
     #[must_use]
     pub fn value_type(&self) -> ValueType {
         match &self.kind {
@@ -447,7 +447,7 @@ pub struct ValidatedFunction {
     pub rust_names: FunctionRustNames,
     pub is_async: bool,
     pub parameters: Vec<ValidatedParameter>,
-    /// `None` is the NIDL v2 spelling of semantic Unit.
+    /// `None` is the Contract spelling of semantic Unit.
     pub result: Option<ResolvedTypeRef>,
     pub fuel_cost: u32,
     pub cancel_policy: CancelPolicy,
@@ -470,7 +470,7 @@ pub struct ValidatedParameter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NidlErrorKind {
+pub enum ContractErrorKind {
     Syntax,
     Duplicate,
     InvalidName,
@@ -483,15 +483,15 @@ pub enum NidlErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlError {
-    pub kind: NidlErrorKind,
+pub struct ContractError {
+    pub kind: ContractErrorKind,
     pub span: SourceSpan,
     pub message: String,
 }
 
-impl NidlError {
+impl ContractError {
     #[must_use]
-    pub fn new(kind: NidlErrorKind, span: SourceSpan, message: impl Into<String>) -> Self {
+    pub fn new(kind: ContractErrorKind, span: SourceSpan, message: impl Into<String>) -> Self {
         Self {
             kind,
             span,
@@ -501,11 +501,11 @@ impl NidlError {
 
     #[must_use]
     pub fn syntax(span: SourceSpan, message: impl Into<String>) -> Self {
-        Self::new(NidlErrorKind::Syntax, span, message)
+        Self::new(ContractErrorKind::Syntax, span, message)
     }
 }
 
-impl fmt::Display for NidlError {
+impl fmt::Display for ContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -515,17 +515,17 @@ impl fmt::Display for NidlError {
     }
 }
 
-impl std::error::Error for NidlError {}
+impl std::error::Error for ContractError {}
 
 impl ValidatedContract {
-    pub fn validate(ast: &NidlAst) -> Result<Self, Vec<NidlError>> {
+    pub fn validate(ast: &ContractAst) -> Result<Self, Vec<ContractError>> {
         Validator::new(ast).validate()
     }
 }
 
 struct Validator<'a> {
-    ast: &'a NidlAst,
-    errors: Vec<NidlError>,
+    ast: &'a ContractAst,
+    errors: Vec<ContractError>,
     type_names: BTreeMap<String, SourceSpan>,
     type_symbols: BTreeMap<String, PredeclaredType>,
     handle_names: BTreeSet<String>,
@@ -543,7 +543,7 @@ struct PredeclaredType {
 }
 
 impl<'a> Validator<'a> {
-    fn new(ast: &'a NidlAst) -> Self {
+    fn new(ast: &'a ContractAst) -> Self {
         let (token_targets, snapshot_targets) = generated_wrapper_targets(&ast.contract);
         Self {
             ast,
@@ -570,7 +570,7 @@ impl<'a> Validator<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn validate(mut self) -> Result<ValidatedContract, Vec<NidlError>> {
+    fn validate(mut self) -> Result<ValidatedContract, Vec<ContractError>> {
         let contract = &self.ast.contract;
         self.require_pascal_case("contract", &contract.name, contract.name_span);
         self.require_not_rust_keyword("contract", &contract.name, contract.name_span);
@@ -582,8 +582,8 @@ impl<'a> Validator<'a> {
         ] {
             if let Some(block) = block {
                 for attribute in &block.attributes {
-                    self.errors.push(NidlError::new(
-                        NidlErrorKind::InvalidAttribute,
+                    self.errors.push(ContractError::new(
+                        ContractErrorKind::InvalidAttribute,
                         attribute.span,
                         format!("`@{}` is not valid on a `{name}` block", attribute.name),
                     ));
@@ -1022,8 +1022,8 @@ impl<'a> Validator<'a> {
                 Some(TypeKind::Result(_, _))
             )
         {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidType,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidType,
                 function
                     .result
                     .as_ref()
@@ -1039,8 +1039,8 @@ impl<'a> Validator<'a> {
             if normalized.cancel_policy == CancelPolicy::ReturnError
                 && self.error_type_supports(error, "Cancelled") == Some(false)
             {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidType,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidType,
                     policy_or_type_span(function, "cancel", error.span),
                     "a Host async `@cancel(return_error)` error must be `i32` or an enum \
                      containing a unit `Cancelled` variant",
@@ -1049,8 +1049,8 @@ impl<'a> Validator<'a> {
             if normalized.abandon_policy == AbandonPolicy::ReturnError
                 && self.error_type_supports(error, "Abandoned") == Some(false)
             {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidType,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidType,
                     policy_or_type_span(function, "abandon", error.span),
                     "a Host async `@abandon(return_error)` error must be `i32` or an enum \
                      containing a unit `Abandoned` variant",
@@ -1233,8 +1233,8 @@ impl<'a> Validator<'a> {
         let mut seen = BTreeSet::new();
         for attribute in &function.attributes {
             if attribute.name != "capability" && !seen.insert(attribute.name.as_str()) {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     attribute.span,
                     format!("duplicate `@{}` attribute", attribute.name),
                 ));
@@ -1250,8 +1250,8 @@ impl<'a> Validator<'a> {
                     };
                     match u32::try_from(value) {
                         Ok(value) if value > 0 => normalized.fuel_cost = value,
-                        _ => self.errors.push(NidlError::new(
-                            NidlErrorKind::InvalidAttribute,
+                        _ => self.errors.push(ContractError::new(
+                            ContractErrorKind::InvalidAttribute,
                             attribute.span,
                             "@fuel must be an integer in 1..=4294967295",
                         )),
@@ -1263,8 +1263,8 @@ impl<'a> Validator<'a> {
                         Some(value) if value == "return_error" => CancelPolicy::ReturnError,
                         Some(value) if value == "cancel_task" => CancelPolicy::CancelTask,
                         Some(value) => {
-                            self.errors.push(NidlError::new(
-                                NidlErrorKind::InvalidAttribute,
+                            self.errors.push(ContractError::new(
+                                ContractErrorKind::InvalidAttribute,
                                 attribute.span,
                                 format!(
                                     "unknown @cancel policy `{value}`; expected `return_error` or `cancel_task`"
@@ -1275,8 +1275,8 @@ impl<'a> Validator<'a> {
                         None => CancelPolicy::ReturnError,
                     };
                     if !function.is_async {
-                        self.errors.push(NidlError::new(
-                            NidlErrorKind::InvalidAttribute,
+                        self.errors.push(ContractError::new(
+                            ContractErrorKind::InvalidAttribute,
                             attribute.span,
                             "@cancel is only valid on async Host functions",
                         ));
@@ -1289,8 +1289,8 @@ impl<'a> Validator<'a> {
                         Some(value) if value == "return_error" => AbandonPolicy::ReturnError,
                         Some(value) if value == "trap" => AbandonPolicy::Trap,
                         Some(value) => {
-                            self.errors.push(NidlError::new(
-                                    NidlErrorKind::InvalidAttribute,
+                            self.errors.push(ContractError::new(
+                                    ContractErrorKind::InvalidAttribute,
                                     attribute.span,
                                     format!(
                                         "unknown @abandon policy `{value}`; expected `return_error` or `trap`"
@@ -1301,8 +1301,8 @@ impl<'a> Validator<'a> {
                         None => AbandonPolicy::ReturnError,
                     };
                     if !function.is_async {
-                        self.errors.push(NidlError::new(
-                            NidlErrorKind::InvalidAttribute,
+                        self.errors.push(ContractError::new(
+                            ContractErrorKind::InvalidAttribute,
                             attribute.span,
                             "@abandon is only valid on async Host functions",
                         ));
@@ -1317,14 +1317,14 @@ impl<'a> Validator<'a> {
                                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
                             })
                         {
-                            self.errors.push(NidlError::new(
-                                NidlErrorKind::InvalidAttribute,
+                            self.errors.push(ContractError::new(
+                                ContractErrorKind::InvalidAttribute,
                                 attribute.span,
                                 format!("invalid capability name `{capability}`"),
                             ));
                         } else if normalized.capabilities.contains(&capability) {
-                            self.errors.push(NidlError::new(
-                                NidlErrorKind::InvalidAttribute,
+                            self.errors.push(ContractError::new(
+                                ContractErrorKind::InvalidAttribute,
                                 attribute.span,
                                 format!("duplicate capability `{capability}`"),
                             ));
@@ -1333,8 +1333,8 @@ impl<'a> Validator<'a> {
                         }
                     }
                 }
-                _ => self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                _ => self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     attribute.span,
                     format!(
                         "`@{}` is not valid on a {} function",
@@ -1354,14 +1354,14 @@ impl<'a> Validator<'a> {
         let mut seen_stable = false;
         for attribute in attributes {
             if attribute.name != "stable" {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     attribute.span,
                     format!("`@{}` is not valid on a {target}", attribute.name),
                 ));
             } else if seen_stable {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     attribute.span,
                     "duplicate `@stable` attribute",
                 ));
@@ -1385,8 +1385,8 @@ impl<'a> Validator<'a> {
                         || matches!(character, '_' | '-' | '.' | ':' | '/')
                 })
             {
-                self.errors.push(NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                self.errors.push(ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     attribute.span,
                     format!("invalid stable name `{value}` for {target}"),
                 ));
@@ -1407,8 +1407,8 @@ impl<'a> Validator<'a> {
         if let AttributeValue::String(value) = &argument.value {
             Some(value.clone())
         } else {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidAttribute,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidAttribute,
                 argument.span,
                 format!("{display} expects one string argument"),
             ));
@@ -1421,8 +1421,8 @@ impl<'a> Validator<'a> {
         if let AttributeValue::Integer(value) = &argument.value {
             Some(*value)
         } else {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidAttribute,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidAttribute,
                 argument.span,
                 format!("{display} expects one integer argument"),
             ));
@@ -1435,8 +1435,8 @@ impl<'a> Validator<'a> {
         if let AttributeValue::Identifier(value) = &argument.value {
             Some(value.clone())
         } else {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidAttribute,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidAttribute,
                 argument.span,
                 format!("{display} expects one identifier argument"),
             ));
@@ -1451,8 +1451,8 @@ impl<'a> Validator<'a> {
         allow_named: bool,
     ) -> Option<&'b AttributeArgument> {
         if attribute.arguments.len() != 1 {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidAttribute,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidAttribute,
                 attribute.span,
                 format!("{display} expects exactly one argument"),
             ));
@@ -1460,8 +1460,8 @@ impl<'a> Validator<'a> {
         }
         let argument = &attribute.arguments[0];
         if !allow_named && argument.name.is_some() {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidAttribute,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidAttribute,
                 argument.span,
                 format!("{display} does not accept named arguments"),
             ));
@@ -1504,8 +1504,8 @@ impl<'a> Validator<'a> {
                         Some(ResolvedTypeKind::Token(named))
                     }
                     Some(_) => {
-                        self.errors.push(NidlError::new(
-                            NidlErrorKind::InvalidType,
+                        self.errors.push(ContractError::new(
+                            ContractErrorKind::InvalidType,
                             ty.span,
                             "`Token<T>` requires `T` to be a declared handle type",
                         ));
@@ -1521,8 +1521,8 @@ impl<'a> Validator<'a> {
                         Some(ResolvedTypeKind::Snapshot(named))
                     }
                     Some(_) => {
-                        self.errors.push(NidlError::new(
-                            NidlErrorKind::InvalidType,
+                        self.errors.push(ContractError::new(
+                            ContractErrorKind::InvalidType,
                             ty.span,
                             "`Snapshot<T>` requires `T` to be a declared struct type",
                         ));
@@ -1535,10 +1535,10 @@ impl<'a> Validator<'a> {
                 if let Some(symbol) = self.type_symbols.get(name) {
                     Some(ResolvedTypeKind::Named(symbol.named.clone()))
                 } else {
-                    self.errors.push(NidlError::new(
-                        NidlErrorKind::UnknownType,
+                    self.errors.push(ContractError::new(
+                        ContractErrorKind::UnknownType,
                         ty.span,
-                        format!("unknown NIDL type `{name}`"),
+                        format!("unknown Contract type `{name}`"),
                     ));
                     None
                 }
@@ -1598,15 +1598,15 @@ impl<'a> Validator<'a> {
             name,
             "Array" | "Buffer" | "Option" | "Result" | "Token" | "Snapshot"
         ) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidName,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidName,
                 span,
-                format!("{kind} name `{name}` collides with a built-in NIDL type constructor"),
+                format!("{kind} name `{name}` collides with a built-in Contract type constructor"),
             ));
         }
         if let Some(previous) = self.type_names.insert(name.to_owned(), span) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::Duplicate,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::Duplicate,
                 span,
                 format!(
                     "duplicate type name `{name}`; first declaration is at bytes {}..{}",
@@ -1624,8 +1624,8 @@ impl<'a> Validator<'a> {
         span: SourceSpan,
     ) {
         if let Some(previous) = names.insert(name.to_owned(), span) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::Duplicate,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::Duplicate,
                 span,
                 format!(
                     "duplicate {kind} name `{name}`; first declaration is at bytes {}..{}",
@@ -1649,8 +1649,8 @@ impl<'a> Validator<'a> {
         if let Some((previous_owner, previous_span)) =
             self.stable_ids.insert(stable_id, (owner.clone(), span))
         {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::StableIdCollision,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::StableIdCollision,
                 span,
                 format!(
                     "stable ID collision between {owner} and {previous_owner} at bytes {}..{}",
@@ -1667,8 +1667,8 @@ impl<'a> Validator<'a> {
             .rust_names
             .insert(name.to_owned(), (owner.clone(), span))
         {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::RustNameCollision,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::RustNameCollision,
                 span,
                 format!(
                     "Rust name `{name}` collides between {owner} and {previous_owner} at bytes {}..{}",
@@ -1680,8 +1680,8 @@ impl<'a> Validator<'a> {
 
     fn require_pascal_case(&mut self, kind: &str, name: &str, span: SourceSpan) {
         if !is_pascal_case(name) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidName,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidName,
                 span,
                 format!("{kind} name `{name}` must be PascalCase"),
             ));
@@ -1690,8 +1690,8 @@ impl<'a> Validator<'a> {
 
     fn require_snake_case(&mut self, kind: &str, name: &str, span: SourceSpan) {
         if !is_snake_case(name) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::InvalidName,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::InvalidName,
                 span,
                 format!("{kind} name `{name}` must be snake_case"),
             ));
@@ -1700,8 +1700,8 @@ impl<'a> Validator<'a> {
 
     fn require_not_rust_keyword(&mut self, kind: &str, name: &str, span: SourceSpan) {
         if is_rust_keyword(name) {
-            self.errors.push(NidlError::new(
-                NidlErrorKind::RustNameCollision,
+            self.errors.push(ContractError::new(
+                ContractErrorKind::RustNameCollision,
                 span,
                 format!("{kind} name `{name}` collides with a Rust keyword"),
             ));
@@ -1875,7 +1875,7 @@ fn visit_layout<'a>(
     active: &mut Vec<&'a str>,
     complete: &mut BTreeSet<&'a str>,
     reported: &mut BTreeSet<Vec<&'a str>>,
-    errors: &mut Vec<NidlError>,
+    errors: &mut Vec<ContractError>,
     spans: &BTreeMap<String, SourceSpan>,
     incoming_span: Option<SourceSpan>,
 ) {
@@ -1889,8 +1889,8 @@ fn visit_layout<'a>(
             let span = incoming_span
                 .or_else(|| spans.get(name).copied())
                 .unwrap_or_default();
-            errors.push(NidlError::new(
-                NidlErrorKind::RecursiveLayout,
+            errors.push(ContractError::new(
+                ContractErrorKind::RecursiveLayout,
                 span,
                 format!(
                     "recursive value layout is forbidden: {}",
@@ -2020,44 +2020,44 @@ pub const fn empty_span(file: FileId) -> SourceSpan {
 
 #[cfg(test)]
 mod tests {
-    use super::{NidlErrorKind, ValidatedContract};
+    use super::{ContractErrorKind, ValidatedContract};
 
-    fn validation_errors(source: &str) -> Vec<super::NidlError> {
-        let ast = crate::parser::parse(source).expect("test source has valid NIDL syntax");
+    fn validation_errors(source: &str) -> Vec<super::ContractError> {
+        let ast = crate::parser::parse(source).expect("test source has valid Contract syntax");
         ValidatedContract::validate(&ast).expect_err("test source must fail semantic validation")
     }
 
     #[test]
     fn validates_typed_handle_targets_and_async_host_results() {
         for source in [
-            "contract Bad { struct Value {} host { fn token() -> Token<Value>; } }",
-            "contract Bad { handle Entity; host { fn snapshot() -> Snapshot<Entity>; } }",
-            "contract Bad { host { async fn load() -> i32; } }",
+            "contract Bad; struct Value {} host { fn token() -> Token<Value>; }",
+            "contract Bad; handle Entity; host { fn snapshot() -> Snapshot<Entity>; }",
+            "contract Bad; host { async fn load() -> i32; }",
         ] {
             assert!(
                 validation_errors(source)
                     .iter()
-                    .any(|error| error.kind == NidlErrorKind::InvalidType),
+                    .any(|error| error.kind == ContractErrorKind::InvalidType),
                 "{source}"
             );
         }
 
         let ast =
-            crate::parser::parse("contract Good { nexa { async fn update() -> i32; } }").unwrap();
+            crate::parser::parse("contract Good; nexa { async fn update() -> i32; }").unwrap();
         ValidatedContract::validate(&ast).expect("async Nexa results are unrestricted");
     }
 
     #[test]
     fn rejects_reserved_generated_rust_names() {
         for source in [
-            "contract Bad { struct HostError {} }",
-            "contract Bad { handle Job; struct JobToken {} host { fn token() -> Token<Job>; } }",
-            "contract Bad { struct Record {} struct RecordSnapshot {} host { fn snapshot() -> Snapshot<Record>; } }",
+            "contract Bad; struct HostError {}",
+            "contract Bad; handle Job; struct JobToken {} host { fn token() -> Token<Job>; }",
+            "contract Bad; struct Record {} struct RecordSnapshot {} host { fn snapshot() -> Snapshot<Record>; }",
         ] {
             assert!(
                 validation_errors(source)
                     .iter()
-                    .any(|error| error.kind == NidlErrorKind::RustNameCollision),
+                    .any(|error| error.kind == ContractErrorKind::RustNameCollision),
                 "{source}"
             );
         }

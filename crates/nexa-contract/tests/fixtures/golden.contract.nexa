@@ -1,0 +1,21 @@
+
+contract Golden;
+    handle Entity;
+
+    struct Cell {
+        x: i32,
+        y: i32,
+    }
+
+    enum Event {
+        Started,
+        Ended,
+    }
+
+    host {
+        fn log(message: string);
+    }
+
+    nexa {
+        fn on_event(event: Event) -> Array<i32>;
+    }

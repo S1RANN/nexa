@@ -20,7 +20,7 @@ use nexa_analysis::{
 use nexa_bytecode::{Module, result_type};
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_diagnostics::{ByteRange, Diagnostic, LabelStyle, SourceIdentity};
-use nexa_idl::{
+use nexa_contract::{
     AbandonPolicy, CancelPolicy, ResolvedTypeKind, ResolvedTypeRef, ValidatedContract,
     ValidatedFunction,
 };
@@ -192,7 +192,7 @@ fn resolved_snippet(
         edges: BTreeSet::new(),
     });
     let canonical_host_contract = contract
-        .map(|contract| nexa_idl::abi_descriptor(contract).bytes)
+        .map(|contract| nexa_contract::abi_descriptor(contract).bytes)
         .unwrap_or_default();
     let canonical_host_contract_source = contract
         .map(|contract| contract.source.as_bytes().to_vec())
@@ -200,7 +200,7 @@ fn resolved_snippet(
     // A Contract declares the legal entrypoint universe. Requiredness is an Engine/profile
     // decision and a plain snippet compile does not silently require every declared entrypoint.
     let canonical_host_required_entrypoints =
-        nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
+        nexa_contract::required_entrypoints_descriptor(std::iter::empty::<&str>());
     let fingerprint = snippet_build_fingerprint(
         package,
         &manifest,
@@ -248,6 +248,7 @@ fn snippet_build_fingerprint(
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: canonical_host_contract.to_vec(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: canonical_host_contract_source.to_vec(),
         host_required_entrypoints: canonical_host_required_entrypoints.to_vec(),
         repl_session_context: Vec::new(),
@@ -418,7 +419,7 @@ fn host_surface(
         .collect::<Result<Vec<_>, CompileError>>()?;
     Ok(HostContractSurface {
         contract_name: contract.name.clone(),
-        contract_stable_id: nexa_idl::contract_runtime_id(contract),
+        contract_stable_id: nexa_contract::contract_runtime_id(contract),
         types,
         functions,
         nexa_entrypoints,
@@ -439,8 +440,8 @@ fn async_result_surface(
     let ResolvedTypeKind::Result(success, error) = &result.kind else {
         return Err(CompileError::type_mismatch(None, None, span));
     };
-    let success_value = nexa_idl::abi_value_type(success);
-    let error_value = nexa_idl::abi_value_type(error);
+    let success_value = nexa_contract::abi_value_type(success);
+    let error_value = nexa_contract::abi_value_type(error);
     Ok(HostAsyncResultSurface {
         result_type: result_type(success_value, error_value).type_id,
         success: surface_type(success, host_module)?,
@@ -926,7 +927,7 @@ mod tests {
         );
         assert!(fingerprint.host_contract.is_empty());
         let empty_required_entrypoints =
-            nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
+            nexa_contract::required_entrypoints_descriptor(std::iter::empty::<&str>());
         assert_eq!(
             fingerprint.host_required_entrypoints,
             empty_required_entrypoints
@@ -938,7 +939,7 @@ mod tests {
         assert!(fingerprint.canonical_lock_graph.is_empty());
 
         let contract =
-            nexa_idl::parse("contract Host { nexa { fn update(value: i32) -> i32; } }").unwrap();
+            nexa_contract::parse_contract("contract Host { nexa { fn update(value: i32) -> i32; } }").unwrap();
         let hosted = resolved_snippet(
             "pub fn update(value: i32) -> i32 { return value; }\n",
             FileId(9),
@@ -957,7 +958,7 @@ mod tests {
         );
         assert_eq!(
             hosted.fingerprint_input.host_contract,
-            nexa_idl::abi_descriptor(&contract).bytes
+            nexa_contract::abi_descriptor(&contract).bytes
         );
         assert_eq!(
             hosted.fingerprint_input.host_contract_source,

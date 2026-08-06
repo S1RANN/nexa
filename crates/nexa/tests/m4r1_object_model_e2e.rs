@@ -212,7 +212,7 @@ fn execute(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_object_model_source_executes_through_verified_bytecode() {
-    let parsed_contract = nexa::parse_nidl(HOST_SOURCE).expect("valid empty NIDL contract");
+    let parsed_contract = nexa::parse_contract(HOST_SOURCE).expect("valid empty NIDL contract");
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(HOST_URI),

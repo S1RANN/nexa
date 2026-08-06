@@ -11,7 +11,7 @@ nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-core = { path = "../nexa-core" }
 nexa-diagnostics = { path = "../nexa-diagnostics" }
-nexa-idl = { path = "../nexa-idl" }
+nexa-contract = { path = "../nexa-contract" }
 nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
 nexa-stdlib = { path = "../nexa-stdlib" }
 nexa-syntax = { path = "../nexa-syntax" }

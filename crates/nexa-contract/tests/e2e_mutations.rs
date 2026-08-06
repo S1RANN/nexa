@@ -16,9 +16,9 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
     let root = artifact_root();
     clear_case_artifacts(&root);
     let shared_target = root.join("cargo-target");
-    let base_idl = nexa_idl::parse(e2e_support::BASE_NIDL).expect("base NIDL parses");
-    let base_contract_runtime_id = nexa_idl::contract_runtime_id(&base_idl);
-    let base_generated = nexa_idl::generate_rust(&base_idl).expect("base bindings generate");
+    let base_idl = nexa_contract::parse_contract(e2e_support::BASE_CONTRACT).expect("base NIDL parses");
+    let base_contract_runtime_id = nexa_contract::contract_runtime_id(&base_idl);
+    let base_generated = nexa_contract::generate_rust(&base_idl).expect("base bindings generate");
     let context = CaseContext {
         root: &root,
         shared_target: &shared_target,
@@ -57,9 +57,9 @@ fn clear_case_artifacts(root: &Path) {
 }
 
 fn execute_mutation(context: &CaseContext<'_>, mutation: &MutationCase) -> MutationEvidence {
-    let changed_idl = nexa_idl::parse(&mutation.mutated_nidl)
+    let changed_idl = nexa_contract::parse_contract(&mutation.mutated_contract)
         .unwrap_or_else(|error| panic!("{} must parse: {error}", mutation.name));
-    let changed_contract_runtime_id = nexa_idl::contract_runtime_id(&changed_idl);
+    let changed_contract_runtime_id = nexa_contract::contract_runtime_id(&changed_idl);
     if mutation.expected_changed_contract_runtime_id {
         assert_ne!(
             changed_contract_runtime_id, context.base_contract_runtime_id,
@@ -67,9 +67,9 @@ fn execute_mutation(context: &CaseContext<'_>, mutation: &MutationCase) -> Mutat
             mutation.name
         );
     }
-    let first = nexa_idl::generate_rust(&changed_idl).expect("first binding generation");
-    let second = nexa_idl::generate_rust(&changed_idl).expect("second binding generation");
-    let third = nexa_idl::generate_rust(&changed_idl).expect("third binding generation");
+    let first = nexa_contract::generate_rust(&changed_idl).expect("first binding generation");
+    let second = nexa_contract::generate_rust(&changed_idl).expect("second binding generation");
+    let third = nexa_contract::generate_rust(&changed_idl).expect("third binding generation");
     assert_eq!(first, second, "{} generation 1/2", mutation.name);
     assert_eq!(second, third, "{} generation 2/3", mutation.name);
 

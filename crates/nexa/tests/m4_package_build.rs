@@ -888,7 +888,7 @@ fn compile_worker_schedule(
         let rendezvous = Arc::clone(&rendezvous);
         let in_flight = Arc::clone(&in_flight);
         let max_in_flight = Arc::clone(&max_in_flight);
-        let parsed_contract = nexa::parse_nidl(contract_source).unwrap();
+        let parsed_contract = nexa::parse_contract(contract_source).unwrap();
         let contract = scale_host_contract(&parsed_contract, contract_source);
         let fixture = scale_fixture(
             &(0..count).collect::<Vec<_>>(),
@@ -904,7 +904,7 @@ fn compile_worker_schedule(
             let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_in_flight.fetch_max(active, Ordering::SeqCst);
             rendezvous.wait();
-            let parsed_contract = nexa::parse_nidl(&contract_source).unwrap();
+            let parsed_contract = nexa::parse_contract(&contract_source).unwrap();
             let contract = scale_host_contract(&parsed_contract, &contract_source);
             let mut local_pipeline = PipelineCounters::default();
             let (evidence, scale, query) = compile_scenario(
@@ -976,7 +976,7 @@ fn compile_worker_schedule(
 #[ignore = "run by cargo xtask m4-scale-stress"]
 #[allow(clippy::too_many_lines)]
 fn facade_scale_determinism_report() {
-    let parsed_contract = nexa::parse_nidl(SCALE_HOST_NIDL).unwrap();
+    let parsed_contract = nexa::parse_contract(SCALE_HOST_NIDL).unwrap();
     let contract = scale_host_contract(&parsed_contract, SCALE_HOST_NIDL);
     let mut pipeline = PipelineCounters::default();
     let count = BASE_MODULES + WORK_MODULES;

@@ -866,7 +866,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
 fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path) -> Option<String> {
     let source = snapshot.overlay_for_path(path)?;
     if path.extension().and_then(|extension| extension.to_str()) == Some("nidl")
-        && nexa::parse_nidl(source).is_err()
+        && nexa::parse_contract(source).is_err()
     {
         // The package analyzer turns this into one source-backed exact-span diagnostic below.
         // Feeding the same invalid text through project loading would add a generic duplicate and
@@ -903,7 +903,7 @@ fn contract_nidl_load_diagnostics(
         return None;
     }
     let source = snapshot.text_for_path(&contract_path).ok()??;
-    if nexa::parse_nidl(&source).is_ok() {
+    if nexa::parse_contract(&source).is_ok() {
         return None;
     }
     Some(
@@ -978,7 +978,7 @@ fn analyze_package_snapshot(
     let contract_path = project.contract_path.clone();
     let (validated_contract, contract_source) =
         if let Some(contract_overlay) = snapshot.overlay_for_path(&contract_path) {
-            let Ok(validated_contract) = nexa::parse_nidl(contract_overlay) else {
+            let Ok(validated_contract) = nexa::parse_contract(contract_overlay) else {
                 let root = contract_path
                     .parent()
                     .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
@@ -1413,7 +1413,7 @@ fn diagnostics_for_path(
 }
 
 fn diagnostics_for_nidl_source(path: &Path, source: &str) -> Result<Vec<EngineDiagnostic>, String> {
-    let Err(error) = nexa::parse_nidl(source) else {
+    let Err(error) = nexa::parse_contract(source) else {
         return Ok(Vec::new());
     };
     let identity = nexa::SourceIdentity::standalone(path.to_string_lossy().into_owned());
@@ -2812,7 +2812,7 @@ mod tests {
         .expect("resolved build");
         let old_fingerprint = build.build_fingerprint;
         let host_idl =
-            nexa::parse_nidl("contract NexaCliEmptyHost {}\n").expect("built-in Host IDL");
+            nexa::parse_contract("contract NexaCliEmptyHost {}\n").expect("built-in Host IDL");
         let host_contract = nexa::HostContractInput::canonical(&host_idl);
         let dependency = build
             .packages
@@ -3498,10 +3498,10 @@ mod tests {
             )),
             nexa::ErrorCode::NX7010
         );
-        let expected_idl = nexa::parse_nidl("contract Expected { nexa { fn run() -> i32; } }")
+        let expected_idl = nexa::parse_contract("contract Expected { nexa { fn run() -> i32; } }")
             .expect("expected IDL");
         let actual_idl =
-            nexa::parse_nidl("contract Actual { nexa { fn run() -> bool; } }").expect("actual IDL");
+            nexa::parse_contract("contract Actual { nexa { fn run() -> bool; } }").expect("actual IDL");
         let mismatch = nexa::PackageBuildError::EntrypointSignatureMismatch {
             name: "run".to_owned(),
             expected: nexa::entrypoint_signature(&expected_idl.nexa_functions[0]),
@@ -3881,7 +3881,7 @@ mod tests {
 
         let overlay = "contract AlsoBroken {";
         assert!(
-            nexa::parse_nidl(overlay).is_err(),
+            nexa::parse_contract(overlay).is_err(),
             "overlay NIDL is invalid"
         );
         let uri = super::path_to_file_uri(&contract).expect("contract URI");

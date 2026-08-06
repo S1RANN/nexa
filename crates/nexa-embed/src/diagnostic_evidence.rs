@@ -852,7 +852,7 @@ fn builder_with_contract(
 fn host_function_authority() -> HostFunctionAuthority {
     EVIDENCE_HOST_AUTHORITY
         .get_or_init(|| {
-            let contract = nexa::parse_nidl(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
+            let contract = nexa::parse_contract(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
             let model = nexa::BindingModel::from_contract(&contract)
                 .expect("diagnostic evidence Contract runtime binding model");
             let function = model
@@ -893,7 +893,7 @@ fn host_function_authority() -> HostFunctionAuthority {
 
 fn contract() -> crate::HostContract {
     *EVIDENCE_CONTRACT.get_or_init(|| {
-        let idl = nexa::parse_nidl(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
+        let idl = nexa::parse_contract(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
         for (name, expected) in [
             (Run::NAME, Run::STABLE_ID),
             (MissingRun::NAME, MissingRun::STABLE_ID),
@@ -922,7 +922,7 @@ fn contract() -> crate::HostContract {
 fn task_contract() -> crate::HostContract {
     *EVIDENCE_TASK_CONTRACT.get_or_init(|| {
         let idl =
-            nexa::parse_nidl(TASK_IDL_SOURCE).expect("diagnostic evidence task NIDL is valid");
+            nexa::parse_contract(TASK_IDL_SOURCE).expect("diagnostic evidence task NIDL is valid");
         let entrypoint = idl
             .nexa_functions
             .iter()

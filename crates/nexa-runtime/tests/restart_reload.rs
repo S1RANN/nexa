@@ -110,7 +110,7 @@ fn realm(module: VerifiedModule) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
 }
 
 fn compile(source: &str) -> VerifiedModule {
-    let contract = nexa_idl::parse(RELOAD_CONTRACT).expect("parse reload Contract");
+    let contract = nexa_contract::parse_contract(RELOAD_CONTRACT).expect("parse reload Contract");
     let mut module =
         nexa_compiler::compile_module_with_contract_file(source, FileId::default(), &contract)
             .expect("compile reload module");
@@ -119,13 +119,13 @@ fn compile(source: &str) -> VerifiedModule {
 }
 
 fn update_export_id() -> StableId {
-    let contract = nexa_idl::parse(RELOAD_CONTRACT).expect("parse reload Contract");
+    let contract = nexa_contract::parse_contract(RELOAD_CONTRACT).expect("parse reload Contract");
     let update = contract
         .nexa_functions
         .iter()
         .find(|entrypoint| entrypoint.name == "update")
         .expect("reload Contract declares update");
-    nexa_idl::entrypoint_stable_id(update)
+    nexa_contract::entrypoint_stable_id(update)
 }
 
 fn state_type_id(name: &str) -> StableId {

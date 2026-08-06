@@ -12,7 +12,7 @@ nexa-runtime = { path = "../../crates/nexa-runtime" }
 nexa-verifier = { path = "../../crates/nexa-verifier" }
 
 [build-dependencies]
-nexa-idl = { path = "../../crates/nexa-idl" }
+nexa-contract = { path = "../../crates/nexa-contract" }
 
 [lints.rust]
 unsafe_code = "allow"

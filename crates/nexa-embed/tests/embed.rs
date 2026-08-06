@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use nexa as nexa_idl;
+use nexa;
 use nexa::prelude as nexa_runtime;
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateTerminalKind, CapabilitySet,
@@ -44,10 +44,10 @@ const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const METER_RUN_ID: StableId = StableId(0x39e3_0598_78a5_d67d);
 
 fn host_function_authority(
-    contract: &nexa_idl::ValidatedContract,
+    contract: &nexa::ValidatedContract,
     name: &str,
 ) -> HostFunctionAuthority {
-    let model = nexa_idl::BindingModel::from_contract(contract)
+    let model = nexa::BindingModel::from_contract(contract)
         .expect("test Host Contract has a runtime binding model");
     let function = model
         .host_functions
@@ -286,14 +286,14 @@ impl ScriptExport for TaskRun {
 fn contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let idl = nexa_idl::parse_nidl(IDL_SOURCE).expect("test NIDL");
+        let idl = nexa::parse_contract(IDL_SOURCE).expect("test NIDL");
         let run = idl
             .nexa_functions
             .iter()
             .find(|function| function.name == Run::NAME)
             .expect("test NIDL declares the run entrypoint");
-        assert_eq!(nexa_idl::entrypoint_stable_id(run), RUN_ID);
-        let descriptor = nexa_idl::abi_descriptor(&idl);
+        assert_eq!(nexa::entrypoint_stable_id(run), RUN_ID);
+        let descriptor = nexa::abi_descriptor(&idl);
         let fingerprint = descriptor.fingerprint.into_bytes();
         let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
         HostContract::new(
@@ -301,7 +301,7 @@ fn contract() -> HostContract {
             IDL_SOURCE,
             descriptor,
             fingerprint,
-            nexa_idl::contract_runtime_id(&idl),
+            nexa::contract_runtime_id(&idl),
             nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
         )
     })
@@ -310,15 +310,15 @@ fn contract() -> HostContract {
 fn task_contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+        let idl = nexa::parse_contract(TASK_IDL_SOURCE).expect("test Task NIDL");
         let run = idl
             .nexa_functions
             .iter()
             .find(|function| function.name == TaskRun::NAME)
             .expect("test Task NIDL declares the run entrypoint");
         assert!(run.is_async);
-        assert_eq!(nexa_idl::entrypoint_stable_id(run), RUN_ID);
-        let descriptor = nexa_idl::abi_descriptor(&idl);
+        assert_eq!(nexa::entrypoint_stable_id(run), RUN_ID);
+        let descriptor = nexa::abi_descriptor(&idl);
         let fingerprint = descriptor.fingerprint.into_bytes();
         let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
         HostContract::new(
@@ -326,7 +326,7 @@ fn task_contract() -> HostContract {
             TASK_IDL_SOURCE,
             descriptor,
             fingerprint,
-            nexa_idl::contract_runtime_id(&idl),
+            nexa::contract_runtime_id(&idl),
             nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
         )
     })
@@ -394,7 +394,7 @@ fn source(id: &str, package: &str, activation: &str, script: &str) -> MemorySour
 fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilder {
     let contract = contract();
     let hash = contract.contract_runtime_id();
-    let idl = nexa_idl::parse_nidl(IDL_SOURCE).expect("test NIDL");
+    let idl = nexa::parse_contract(IDL_SOURCE).expect("test NIDL");
     let authority = host_function_authority(&idl, "wait");
     NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
@@ -410,7 +410,7 @@ fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilde
 fn task_builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilder {
     let contract = task_contract();
     let hash = contract.contract_runtime_id();
-    let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+    let idl = nexa::parse_contract(TASK_IDL_SOURCE).expect("test Task NIDL");
     let authority = host_function_authority(&idl, "wait");
     NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
@@ -549,14 +549,14 @@ fn engine_records_instruction_count_independently_from_fuel_charge() {
             fn run(value: i32) -> i32;
         }
     }";
-    let idl = nexa_idl::parse_nidl(METER_IDL).expect("meter NIDL");
+    let idl = nexa::parse_contract(METER_IDL).expect("meter NIDL");
     let run = idl
         .nexa_functions
         .iter()
         .find(|function| function.name == MeterRun::NAME)
         .expect("meter NIDL declares the run entrypoint");
-    assert_eq!(nexa_idl::entrypoint_stable_id(run), METER_RUN_ID);
-    let descriptor = nexa_idl::abi_descriptor(&idl);
+    assert_eq!(nexa::entrypoint_stable_id(run), METER_RUN_ID);
+    let descriptor = nexa::abi_descriptor(&idl);
     let fingerprint = descriptor.fingerprint.into_bytes();
     let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
     let contract = HostContract::new(
@@ -564,7 +564,7 @@ fn engine_records_instruction_count_independently_from_fuel_charge() {
         METER_IDL,
         descriptor,
         fingerprint,
-        nexa_idl::contract_runtime_id(&idl),
+        nexa::contract_runtime_id(&idl),
         nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
     );
     let hash = contract.contract_runtime_id();
@@ -944,7 +944,7 @@ fn runtime_trap_diagnostic_contains_script_stack_and_host_boundary() {
     );
     let contract = task_contract();
     let hash = contract.contract_runtime_id();
-    let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+    let idl = nexa::parse_contract(TASK_IDL_SOURCE).expect("test Task NIDL");
     let authority = host_function_authority(&idl, "wait");
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {

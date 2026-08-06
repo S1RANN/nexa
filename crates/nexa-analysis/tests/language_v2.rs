@@ -60,6 +60,7 @@ activation = "programmatic"
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: Vec::new(),
         host_required_entrypoints: Vec::new(),
         repl_session_context: Vec::new(),

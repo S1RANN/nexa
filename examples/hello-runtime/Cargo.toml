@@ -9,4 +9,4 @@ nexa-embed = { path = "../../crates/nexa-embed" }
 nexa-runtime = { path = "../../crates/nexa-runtime" }
 
 [build-dependencies]
-nexa-idl = { path = "../../crates/nexa-idl" }
+nexa-contract = { path = "../../crates/nexa-contract" }

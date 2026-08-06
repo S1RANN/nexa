@@ -1,19 +1,20 @@
 use std::collections::BTreeSet;
 
 use nexa_core::FileId;
-use nexa_idl::{
-    ABI_DESCRIPTOR_VERSION, NIDL_SYNTAX_VERSION, NidlErrorKind, ResolvedTypeKind, abi_descriptor,
-    contract_fingerprint, parse, parse_ast_with_file_id,
+use nexa_contract::{
+    ABI_DESCRIPTOR_VERSION, CONTRACT_SYNTAX_VERSION, ContractErrorKind, ResolvedTypeKind, abi_descriptor,
+    contract_fingerprint, parse_contract, parse_contract_ast_with_file_id,
 };
 
 const COMPLETE_CONTRACT: &str = r#"
 /// Profile contract documentation.
-contract Profile {
-    // Ordinary comments are lossless trivia.
-    handle Entity;
+contract Profile;
+
+// Ordinary comments are lossless trivia.
+handle Entity;
 
     /* Field and variant order are ABI-significant. */
-    struct Record {
+struct Record {
         name: string,
         entity: Entity,
         count: i64,
@@ -23,13 +24,13 @@ contract Profile {
         codepoint: rune,
     }
 
-    enum LoadError {
+enum LoadError {
         Missing,
         Invalid(i32),
         Cancelled,
     }
 
-    host {
+host {
         @fuel(8)
         @cancel(return_error)
         @abandon(trap)
@@ -41,16 +42,15 @@ contract Profile {
         fn snapshot() -> Snapshot<Record>;
     }
 
-    nexa {
+nexa {
         fn on_event(record: Record) -> Array<i32>;
         async fn refresh(record: Record) -> Result<i32, LoadError>;
     }
-}
 "#;
 
 #[test]
 fn parses_and_validates_the_complete_nidl_v2_surface() {
-    let ast = parse_ast_with_file_id(COMPLETE_CONTRACT, FileId(41)).unwrap();
+    let ast = parse_contract_ast_with_file_id(COMPLETE_CONTRACT, FileId(41)).unwrap();
     assert_eq!(ast.contract.name, "Profile");
     assert_eq!(ast.contract.name_span.file, FileId(41));
     assert_eq!(
@@ -58,7 +58,7 @@ fn parses_and_validates_the_complete_nidl_v2_surface() {
         " Profile contract documentation."
     );
 
-    let contract = parse(COMPLETE_CONTRACT).unwrap();
+    let contract = parse_contract(COMPLETE_CONTRACT).unwrap();
     assert_eq!(contract.name, "Profile");
     assert_eq!(contract.handles.len(), 1);
     assert_eq!(contract.structs.len(), 1);
@@ -77,7 +77,7 @@ fn parses_and_validates_the_complete_nidl_v2_surface() {
         load.result.as_ref().map(|result| &result.kind),
         Some(ResolvedTypeKind::Result(_, _))
     ));
-    assert_eq!(NIDL_SYNTAX_VERSION, 2);
+    assert_eq!(CONTRACT_SYNTAX_VERSION, 3);
     assert_eq!(ABI_DESCRIPTOR_VERSION, 2);
 }
 
@@ -102,7 +102,7 @@ fn rejects_every_removed_nidl_spelling() {
     ];
     for source in cases {
         assert!(
-            parse(source).is_err(),
+            parse_contract(source).is_err(),
             "removed syntax was accepted: {source}"
         );
     }
@@ -112,68 +112,68 @@ fn rejects_every_removed_nidl_spelling() {
 fn validates_names_attributes_layouts_and_source_spans() {
     let cases = [
         (
-            "contract bad_name {}",
-            NidlErrorKind::InvalidName,
+            "contract bad_name;",
+            ContractErrorKind::InvalidName,
             "bad_name",
         ),
         (
-            "contract Duplicate { struct Same {} enum Same {} }",
-            NidlErrorKind::Duplicate,
+            "contract Duplicate; struct Same {} enum Same {}",
+            ContractErrorKind::Duplicate,
             "Same",
         ),
         (
-            "contract Unknown { struct Value { item: Missing, } }",
-            NidlErrorKind::UnknownType,
+            "contract Unknown; struct Value { item: Missing, }",
+            ContractErrorKind::UnknownType,
             "Missing",
         ),
         (
-            "contract Recursive { struct Node { next: Node, } }",
-            NidlErrorKind::RecursiveLayout,
+            "contract Recursive; struct Node { next: Node, }",
+            ContractErrorKind::RecursiveLayout,
             "Node",
         ),
         (
-            "contract Attribute { host { @fuel(0) fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            "contract Attribute; host { @fuel(0) fn run(); }",
+            ContractErrorKind::InvalidAttribute,
             "@fuel(0)",
         ),
         (
-            "contract Attribute { host { @cancel(trap) async fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            "contract Attribute; host { @cancel(trap) async fn run(); }",
+            ContractErrorKind::InvalidAttribute,
             "@cancel(trap)",
         ),
         (
-            "contract Attribute { host { @abandon(trap) fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            "contract Attribute; host { @abandon(trap) fn run(); }",
+            ContractErrorKind::InvalidAttribute,
             "@abandon(trap)",
         ),
         (
-            "contract Naming { host { fn BadName(); } }",
-            NidlErrorKind::InvalidName,
+            "contract Naming; host { fn BadName(); }",
+            ContractErrorKind::InvalidName,
             "BadName",
         ),
         (
-            "contract Naming { struct Array {} }",
-            NidlErrorKind::InvalidName,
+            "contract Naming; struct Array {}",
+            ContractErrorKind::InvalidName,
             "Array",
         ),
         (
-            "contract Attribute { host { @capability(\"scope..read\") fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            "contract Attribute; host { @capability(\"scope..read\") fn run(); }",
+            ContractErrorKind::InvalidAttribute,
             "scope..read",
         ),
         (
-            "contract Attribute { host { @capability(\"scope:read\") fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            "contract Attribute; host { @capability(\"scope:read\") fn run(); }",
+            ContractErrorKind::InvalidAttribute,
             "scope:read",
         ),
         (
-            "contract Blocks { host {} host {} }",
-            NidlErrorKind::Duplicate,
+            "contract Blocks; host {} host {}",
+            ContractErrorKind::Duplicate,
             "host {}",
         ),
     ];
     for (source, kind, needle) in cases {
-        let error = parse(source).expect_err(source);
+        let error = parse_contract(source).expect_err(source);
         assert_eq!(error.kind, kind, "{source}: {error}");
         let span = &source[error.span.start as usize..error.span.end as usize];
         assert!(
@@ -186,84 +186,78 @@ fn validates_names_attributes_layouts_and_source_spans() {
 #[test]
 fn validates_async_host_return_error_policies_against_the_error_type() {
     let explicit_cancel = "\
-        contract Policy {
+        contract Policy;
             enum Fault { Failed, Abandoned, }
             host {
                 @cancel(return_error)
                 @abandon(return_error)
                 async fn run() -> Result<i32, Fault>;
-            }
-        }";
-    let error = parse(explicit_cancel).unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::InvalidType);
+            }\n";
+    let error = parse_contract(explicit_cancel).unwrap_err();
+    assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
         &explicit_cancel[error.span.start as usize..error.span.end as usize],
         "@cancel(return_error)"
     );
 
     let default_abandon = "\
-        contract Policy {
+        contract Policy;
             enum Fault { Failed, Cancelled, }
-            host { async fn run() -> Result<i32, Fault>; }
-        }";
-    let error = parse(default_abandon).unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::InvalidType);
+            host { async fn run() -> Result<i32, Fault>; }\n";
+    let error = parse_contract(default_abandon).unwrap_err();
+    assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
         &default_abandon[error.span.start as usize..error.span.end as usize],
         "Fault"
     );
 
-    parse("contract Policy { host { async fn run() -> Result<i32, i32>; } }").unwrap();
-    parse(
-        "contract Policy {
+    parse_contract("contract Policy; host { async fn run() -> Result<i32, i32>; }").unwrap();
+    parse_contract(
+        "contract Policy;
             enum Fault { Failed, }
             host {
                 @cancel(cancel_task)
                 @abandon(trap)
                 async fn run() -> Result<i32, Fault>;
-            }
-        }",
+            }\n",
     )
     .unwrap();
 }
 
 #[test]
 fn stable_ids_are_scoped_by_contract_and_declaration_category() {
-    let contract = parse(
+    let contract = parse_contract(
         r#"
-        contract Stable {
+        contract Stable;
             @stable("shared")
             handle Entity;
 
             @stable("shared")
             struct Record {}
-        }
         "#,
     )
     .unwrap();
     assert_ne!(contract.handles[0].stable_id, contract.structs[0].stable_id);
 
-    let renamed = parse(
+    let renamed = parse_contract(
         r#"
         @stable("contract")
-        contract Renamed {
+        contract Renamed;
             @stable("record")
             struct Changed {
                 value: i32,
             }
-        }
         "#,
     )
     .unwrap();
-    let original = parse(
+    let original = parse_contract(
         r#"
         @stable("contract")
-        contract Original {
+        contract Original;
             @stable("record")
             struct Record {
                 value: i32,
             }
-        }
         "#,
     )
     .unwrap();
@@ -274,38 +268,36 @@ fn stable_ids_are_scoped_by_contract_and_declaration_category() {
         renamed.structs[0].fields[0].stable_id
     );
 
-    let error = parse(
+    let error = parse_contract(
         r#"
-        contract Stable {
+        contract Stable;
             @stable("shared")
             handle Entity;
             @stable("shared")
             handle Actor;
-        }
         "#,
     )
     .unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::StableIdCollision);
+    assert_eq!(error.kind, ContractErrorKind::StableIdCollision);
 }
 
 #[test]
 fn descriptor_obeys_frozen_order_and_comment_rules() {
-    let first = parse(
+    let first = parse_contract(
         r"
-        contract Order {
+        contract Order;
             /// ignored
             struct Pair { first: i32, second: i64, }
             enum Event { Idle, Data(Pair), }
             host { fn read(value: Pair) -> Event; }
             nexa { fn write(value: Event); }
-        }
         ",
     )
     .unwrap();
-    let top_level_reordered = parse(
+    let top_level_reordered = parse_contract(
         r"
         // Formatting and block order are irrelevant.
-        contract Order {
+        contract Order;
             nexa { fn write(value: Event); }
             host { fn read(value: Pair) -> Event; }
             enum Event { Idle, Data(Pair), }
@@ -313,7 +305,6 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
                 first: i32,
                 second: i64,
             }
-        }
         ",
     )
     .unwrap();
@@ -326,14 +317,13 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
         contract_fingerprint(&top_level_reordered)
     );
 
-    let fields_reordered = parse(
+    let fields_reordered = parse_contract(
         r"
-        contract Order {
+        contract Order;
             struct Pair { second: i64, first: i32, }
             enum Event { Idle, Data(Pair), }
             host { fn read(value: Pair) -> Event; }
             nexa { fn write(value: Event); }
-        }
         ",
     )
     .unwrap();
@@ -345,9 +335,9 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
 
 #[test]
 fn async_entrypoint_effect_changes_the_descriptor() {
-    let synchronous = parse("contract Effect { nexa { fn run(value: i32) -> i32; } }").unwrap();
+    let synchronous = parse_contract("contract Effect; nexa { fn run(value: i32) -> i32; }").unwrap();
     let asynchronous =
-        parse("contract Effect { nexa { async fn run(value: i32) -> i32; } }").unwrap();
+        parse_contract("contract Effect; nexa { async fn run(value: i32) -> i32; }").unwrap();
     assert_ne!(
         contract_fingerprint(&synchronous),
         contract_fingerprint(&asynchronous)
@@ -358,9 +348,9 @@ fn async_entrypoint_effect_changes_the_descriptor() {
 #[ignore = "scale gate writes a machine-readable report"]
 #[allow(clippy::too_many_lines)]
 fn m4r1_nidl_mutation_stress() {
-    let base = parse(
-        "contract Stress { struct Value { item: i32, } \
-         host { fn work(value: Value) -> i32; } nexa { fn run(value: i32) -> i32; } }",
+    let base = parse_contract(
+        "contract Stress; struct Value { item: i32, } \
+         host { fn work(value: Value) -> i32; } nexa { fn run(value: i32) -> i32; }",
     )
     .unwrap();
     let base_fingerprint = contract_fingerprint(&base);
@@ -414,7 +404,7 @@ fn m4r1_nidl_mutation_stress() {
         for (category, source) in valid_changes {
             mutations += 1;
             *categories.entry(category).or_default() += 1;
-            match parse(&source) {
+            match parse_contract(&source) {
                 Ok(contract) => {
                     let fingerprint = contract_fingerprint(&contract);
                     if fingerprint == base_fingerprint {
@@ -433,7 +423,7 @@ fn m4r1_nidl_mutation_stress() {
         );
         mutations += 1;
         *categories.entry("comments").or_default() += 1;
-        match parse(&comment_change) {
+        match parse_contract(&comment_change) {
             Ok(contract) if contract_fingerprint(&contract) == base_fingerprint => {}
             Ok(_) => failures.push(format!("comment mutation {mutations} changed ABI")),
             Err(error) => failures.push(format!("comment mutation {mutations}: {error}")),
@@ -442,8 +432,8 @@ fn m4r1_nidl_mutation_stress() {
         let unknown = format!("\n\ncontract Stress {{ struct Value {{ item: Missing{cycle}, }} }}");
         mutations += 1;
         *categories.entry("source_spans").or_default() += 1;
-        match parse(&unknown) {
-            Err(error) if error.kind == NidlErrorKind::UnknownType => {
+        match parse_contract(&unknown) {
+            Err(error) if error.kind == ContractErrorKind::UnknownType => {
                 let actual = &unknown[error.span.start as usize..error.span.end as usize];
                 if actual != format!("Missing{cycle}") {
                     failures.push(format!(
@@ -460,28 +450,28 @@ fn m4r1_nidl_mutation_stress() {
             (
                 "naming",
                 format!("contract bad_name_{cycle} {{}}"),
-                NidlErrorKind::InvalidName,
+                ContractErrorKind::InvalidName,
             ),
             (
                 "duplicates",
                 "contract Stress { struct Same {} enum Same {} }".to_owned(),
-                NidlErrorKind::Duplicate,
+                ContractErrorKind::Duplicate,
             ),
             (
                 "recursive_layout",
                 "contract Stress { struct Node { next: Node, } }".to_owned(),
-                NidlErrorKind::RecursiveLayout,
+                ContractErrorKind::RecursiveLayout,
             ),
             (
                 "illegal_async",
                 "contract Stress { host { async fn load() -> i32; } }".to_owned(),
-                NidlErrorKind::InvalidType,
+                ContractErrorKind::InvalidType,
             ),
         ];
         for (category, source, expected) in invalid_changes {
             mutations += 1;
             *categories.entry(category).or_default() += 1;
-            match parse(&source) {
+            match parse_contract(&source) {
                 Err(error) if error.kind == expected => {}
                 other => failures.push(format!(
                     "invalid mutation {mutations} expected {expected:?}, got {other:?}"
@@ -496,7 +486,7 @@ fn m4r1_nidl_mutation_stress() {
         );
         mutations += 1;
         *categories.entry("host_nexa").or_default() += 1;
-        match parse(&reordered) {
+        match parse_contract(&reordered) {
             Ok(contract) if contract_fingerprint(&contract) == base_fingerprint => {}
             Ok(_) => failures.push(format!("block order mutation {mutations} changed ABI")),
             Err(error) => failures.push(format!("block order mutation {mutations}: {error}")),
@@ -509,7 +499,7 @@ fn m4r1_nidl_mutation_stress() {
         );
         mutations += 1;
         *categories.entry("illegal_async").or_default() += 1;
-        match parse(&async_entrypoint) {
+        match parse_contract(&async_entrypoint) {
             Ok(contract) => {
                 fingerprints.insert(contract_fingerprint(&contract));
             }

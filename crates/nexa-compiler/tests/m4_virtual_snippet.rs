@@ -77,8 +77,9 @@ activation = "default-enabled"
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: Vec::new(),
-        host_required_entrypoints: nexa_idl::required_entrypoints_descriptor(std::iter::empty::<
+        host_required_entrypoints: nexa_contract::required_entrypoints_descriptor(std::iter::empty::<
             &str,
         >()),
         repl_session_context: Vec::new(),
@@ -238,7 +239,7 @@ pub fn read() -> i32 {
     let host_contract = b"compiler-host-subset-v2".to_vec();
     let host_contract_source = b"virtual/dispatch-host.nidl\0compiler-host-subset-v2".to_vec();
     let host_required_entrypoints =
-        nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
+        nexa_contract::required_entrypoints_descriptor(std::iter::empty::<&str>());
     let fingerprint = BuildFingerprintInput {
         root_package: root,
         root_manifest: root_manifest.canonical_bytes(),
@@ -252,6 +253,7 @@ pub fn read() -> i32 {
             source_set_fingerprint(&dependency_sources),
         )]),
         host_contract: host_contract.clone(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: host_contract_source.clone(),
         host_required_entrypoints: host_required_entrypoints.clone(),
         repl_session_context: Vec::new(),
@@ -1261,7 +1263,7 @@ async fn work() -> i32 {
 
 #[test]
 fn qualified_host_snippet_uses_typed_analysis_and_preserves_file_id() {
-    let idl = nexa_idl::parse(
+    let idl = nexa_contract::parse_contract(
         r"
 contract GameHost {
     enum AnimationError { Missing, Cancelled }
@@ -1292,7 +1294,7 @@ pub async fn update(entity: i32) -> i32 {
     let verified = nexa_compiler::compile_with_contract_file(source, file, &idl).unwrap();
     assert_eq!(
         verified.module().host_contract_id,
-        Some(nexa_idl::contract_runtime_id(&idl))
+        Some(nexa_contract::contract_runtime_id(&idl))
     );
     assert_eq!(verified.module().host_imports.len(), 1);
     let module = verified.module();
@@ -1322,7 +1324,7 @@ pub async fn update(entity: i32) -> i32 {
 
 #[test]
 fn host_import_subset_keeps_the_referenced_contract_stable_identity() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse_contract(
         r"
 contract DispatchHost {
     host {
@@ -1370,7 +1372,7 @@ fn invoke_third() -> i32 {
 
 #[test]
 fn virtual_contract_adapter_preserves_multiple_host_capabilities() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse_contract(
         r#"
 contract CapabilityHost {
     host {
@@ -1394,7 +1396,7 @@ contract CapabilityHost {
 
 #[test]
 fn distinct_nidl_handles_emit_distinct_typed_resource_tokens() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse_contract(
         r"
 contract TokenHost {
     handle First;
@@ -1784,7 +1786,7 @@ contract SurfaceMatrix {
     }
 }
 "#;
-    nexa_idl::parse(current).expect("the frozen NIDL v2 surface parses");
+    nexa_contract::parse_contract(current).expect("the frozen NIDL v2 surface parses");
 
     let removed = [
         ("interface", "interface Old {}"),
@@ -1809,7 +1811,7 @@ contract SurfaceMatrix {
     ];
     for (name, source) in removed {
         assert!(
-            nexa_idl::parse(source).is_err(),
+            nexa_contract::parse_contract(source).is_err(),
             "removed NIDL v1 `{name}` form unexpectedly parsed:\n{source}"
         );
     }

@@ -9,17 +9,17 @@ publish.workspace = true
 nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-compiler = { path = "../nexa-compiler", optional = true }
 nexa-core = { path = "../nexa-core" }
-nexa-idl = { path = "../nexa-idl", optional = true }
+nexa-contract = { path = "../nexa-contract", optional = true }
 nexa-verifier = { path = "../nexa-verifier" }
 
 [dev-dependencies]
 nexa-compiler = { path = "../nexa-compiler" }
-nexa-idl = { path = "../nexa-idl" }
+nexa-contract = { path = "../nexa-contract" }
 
 [features]
 allocation-counting = []
 fuzzing = ["model-adapter"]
-model-adapter = ["dep:nexa-compiler", "dep:nexa-idl"]
+model-adapter = ["dep:nexa-compiler", "dep:nexa-contract"]
 profiler-overhead-control = []
 
 # M5 K1: the runtime hosts the single sanctioned unsafe kernel

@@ -506,7 +506,7 @@ fn m4r1_nidl_reload_stress() {
     let mut nidl_rejected = 0_u64;
     let mut restored_committed = 0_u64;
     let mut host_contract_mismatch = 0_u64;
-    let base_contract = nexa::parse_nidl(BASE_CONTRACT).expect("base NIDL stress Contract");
+    let base_contract = nexa::parse_contract(BASE_CONTRACT).expect("base NIDL stress Contract");
     let run = base_contract
         .nexa_functions
         .iter()
@@ -593,7 +593,7 @@ fn m4r1_nidl_reload_stress() {
              }}\n"
         );
         let changed_contract =
-            nexa::parse_nidl(&changed_contract_source).expect("changed NIDL stress Contract");
+            nexa::parse_contract(&changed_contract_source).expect("changed NIDL stress Contract");
         assert!(
             contract_fingerprints.insert(nexa::contract_fingerprint(&changed_contract)),
             "iteration {iteration} reused a Contract ABI fingerprint"
@@ -808,7 +808,7 @@ fn m4r1_nidl_reload_stress() {
 #[ignore = "M4 machine-evidence stress gate"]
 #[allow(clippy::too_many_lines)]
 fn m4_reload_stress() {
-    let idl = nexa::parse_nidl(IDL).expect("stress Host contract");
+    let idl = nexa::parse_contract(IDL).expect("stress Host contract");
     let run = idl
         .nexa_functions
         .iter()

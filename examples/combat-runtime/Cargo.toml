@@ -9,8 +9,8 @@ nexa = { path = "../../crates/nexa" }
 nexa-bytecode = { path = "../../crates/nexa-bytecode" }
 nexa-core = { path = "../../crates/nexa-core" }
 nexa-embed = { path = "../../crates/nexa-embed" }
-nexa-idl = { path = "../../crates/nexa-idl" }
+nexa-contract = { path = "../../crates/nexa-contract" }
 nexa-runtime = { path = "../../crates/nexa-runtime" }
 
 [build-dependencies]
-nexa-idl = { path = "../../crates/nexa-idl" }
+nexa-contract = { path = "../../crates/nexa-contract" }

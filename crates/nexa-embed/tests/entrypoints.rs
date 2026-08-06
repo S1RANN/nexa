@@ -109,7 +109,7 @@ impl HostRegistry for EmptyRegistry {
 fn contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let parsed = nexa::parse_nidl(CONTRACT_SOURCE).expect("Snake entrypoint Contract");
+        let parsed = nexa::parse_contract(CONTRACT_SOURCE).expect("Snake entrypoint Contract");
         for (name, expected) in [
             ("on_event", OnEvent::STABLE_ID),
             ("choose_food_spawn", ChooseFoodSpawn::STABLE_ID),

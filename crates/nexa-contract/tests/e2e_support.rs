@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use nexa_core::StableId;
 use serde_json::Value;
 
-pub const BASE_NIDL: &str = include_str!("fixtures/business_host/contract.nidl");
+pub const BASE_CONTRACT: &str = include_str!("fixtures/business_host/contract.nidl");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
 const BASE_NEXA_MODULE: &str = "use host::game as engine;\n\
 pub fn update(entity: i32) -> i32 { return engine::heartbeat(entity); }\n\
@@ -19,11 +19,11 @@ use std::fmt::Write as _;
 
 #[test]
 fn changed_binding_executes_through_generated_registry() {
-    let base_idl = nexa_idl::parse(include_str!("base_contract.nidl")).expect("base NIDL");
-    let changed_idl = nexa_idl::parse(include_str!("contract.nidl")).expect("changed NIDL");
+    let base_idl = nexa_contract::parse_contract(include_str!("base_contract.nidl")).expect("base NIDL");
+    let changed_idl = nexa_contract::parse_contract(include_str!("contract.nidl")).expect("changed NIDL");
     assert_eq!(
         CONTRACT_RUNTIME_ID,
-        nexa_idl::contract_runtime_id(&changed_idl)
+        nexa_contract::contract_runtime_id(&changed_idl)
     );
     let base_source = include_str!("base_module.nexa");
     let changed_source = include_str!("module.nexa");
@@ -36,7 +36,7 @@ fn changed_binding_executes_through_generated_registry() {
     let changed_state_schema_fingerprint = changed_module.module().state_schema_fingerprint;
     let affected_stable_id = {
         let binding_model =
-            nexa_idl::BindingModel::from_contract(&changed_idl).expect("changed binding model");
+            nexa_contract::BindingModel::from_contract(&changed_idl).expect("changed binding model");
         let changed_bytecode = changed_module.module();
         assert_eq!(
             changed_bytecode.host_contract_id,
@@ -334,7 +334,7 @@ impl MutationProbe {
                 r"
         assert_eq!(
             affected_function.cancel_policy,
-            nexa_idl::CancelPolicy::CancelTask
+            nexa_contract::CancelPolicy::CancelTask
         );
 ",
             ),
@@ -342,7 +342,7 @@ impl MutationProbe {
                 r"
         assert_eq!(
             affected_function.abandon_policy,
-            nexa_idl::AbandonPolicy::ReturnError
+            nexa_contract::AbandonPolicy::ReturnError
         );
 ",
             ),
@@ -390,7 +390,7 @@ impl MutationProbe {
         }
     }
 
-    fn registry_probe(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn registry_probe(self, contract: &nexa_contract::ValidatedContract) -> String {
         if matches!(self, Self::EntrypointAddition) {
             return String::new();
         }
@@ -512,7 +512,7 @@ impl MutationProbe {
         }
     }
 
-    fn registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         match self {
             Self::FunctionRename
             | Self::ReturnTypeChange
@@ -562,7 +562,7 @@ impl MutationProbe {
         }
     }
 
-    fn enum_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn enum_registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         let (enum_name, variant_name, payload, expectation) = match self {
             Self::EnumVariantRename => (
                 "AnimationError",
@@ -612,7 +612,7 @@ impl MutationProbe {
         )
     }
 
-    fn struct_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn struct_registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         let (struct_name, values, expectation) = match self {
             Self::StructFieldRename => (
                 "EnemyView",
@@ -684,7 +684,7 @@ impl MutationProbe {
 pub struct MutationCase {
     pub id: &'static str,
     pub name: &'static str,
-    pub mutated_nidl: String,
+    pub mutated_contract: String,
     pub unchanged_business_host_should_compile: bool,
     pub expected_diagnostic_symbols: &'static [&'static str],
     pub patch_business_host: fn(&str) -> String,
@@ -867,8 +867,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "12",
             "contract-rename",
-            "contract Game {",
-            "contract Combat {",
+            "contract Game;",
+            "contract Combat;",
             false,
             &["GameHost", "CombatHost"],
             patch_contract_rename,
@@ -961,8 +961,8 @@ fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
     let mutations = mutations();
     assert_eq!(mutations.len(), 20);
     for mutation in mutations {
-        assert_ne!(mutation.mutated_nidl, BASE_NIDL, "{}", mutation.name);
-        nexa_idl::parse(&mutation.mutated_nidl)
+        assert_ne!(mutation.mutated_contract, BASE_CONTRACT, "{}", mutation.name);
+        nexa_contract::parse_contract(&mutation.mutated_contract)
             .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
     }
 }
@@ -975,10 +975,10 @@ impl MutationCase {
 
     fn with_replacement(mut self, from: &str, to: &str) -> Self {
         assert!(
-            self.mutated_nidl.contains(from),
+            self.mutated_contract.contains(from),
             "missing mutation token {from}"
         );
-        self.mutated_nidl = self.mutated_nidl.replacen(from, to, 1);
+        self.mutated_contract = self.mutated_contract.replacen(from, to, 1);
         self
     }
 }
@@ -992,11 +992,11 @@ fn changed(
     expected_diagnostic_symbols: &'static [&'static str],
     patch_business_host: fn(&str) -> String,
 ) -> MutationCase {
-    assert!(BASE_NIDL.contains(from), "missing mutation token {from}");
+    assert!(BASE_CONTRACT.contains(from), "missing mutation token {from}");
     MutationCase {
         id,
         name,
-        mutated_nidl: BASE_NIDL.replacen(from, to, 1),
+        mutated_contract: BASE_CONTRACT.replacen(from, to, 1),
         unchanged_business_host_should_compile,
         expected_diagnostic_symbols,
         patch_business_host,
@@ -1179,7 +1179,7 @@ pub fn artifact_root() -> PathBuf {
 pub fn prepare_case(
     root: &Path,
     mutation: &MutationCase,
-    changed_contract: &nexa_idl::ValidatedContract,
+    changed_contract: &nexa_contract::ValidatedContract,
     base_generated: &str,
     changed_generated: &str,
 ) -> PathBuf {
@@ -1187,9 +1187,9 @@ pub fn prepare_case(
     for directory in ["base", "mutated", "host/src", "script"] {
         fs::create_dir_all(case.join(directory)).expect("create E2E artifact directory");
     }
-    fs::write(case.join("base/contract.nidl"), BASE_NIDL).expect("write base NIDL");
+    fs::write(case.join("base/contract.nidl"), BASE_CONTRACT).expect("write base NIDL");
     fs::write(case.join("base/bindings.rs"), base_generated).expect("write base binding");
-    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_nidl)
+    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_contract)
         .expect("write changed NIDL");
     for (index, generated) in [changed_generated, changed_generated, changed_generated]
         .iter()
@@ -1203,9 +1203,9 @@ pub fn prepare_case(
     }
     let changed_module = positive_module_source(mutation);
     fs::write(case.join("script/module.nexa"), &changed_module).expect("write positive script");
-    fs::write(case.join("host/src/base_contract.nidl"), BASE_NIDL)
+    fs::write(case.join("host/src/base_contract.nidl"), BASE_CONTRACT)
         .expect("write base contract fixture");
-    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_nidl)
+    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_contract)
         .expect("write changed contract fixture");
     fs::write(case.join("host/src/base_module.nexa"), BASE_NEXA_MODULE)
         .expect("write base script fixture");
