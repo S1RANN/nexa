@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod bench;
+mod contract;
 mod evidence;
 mod finalize;
 mod gates;
@@ -458,6 +459,14 @@ fn main() -> Result<(), DynError> {
         "test-entrypoints" => m4r1::test_entrypoints(),
         "m4r1-scale-stress" => m4r1::m4r1_scale_stress(),
         "finalize-m4-r1" => m4r1::finalize_m4r1(),
+        "test-contract-syntax" => contract::test_contract_syntax(),
+        "test-contract-semantics" => contract::test_contract_semantics(),
+        "test-contract-descriptor" => contract::test_contract_descriptor(),
+        "test-contract-codegen" => contract::test_contract_codegen(),
+        "test-contract-cli" => contract::test_contract_cli(),
+        "test-contract-lsp" => contract::test_contract_lsp(),
+        "contract-migration-check" => contract::contract_migration_check(),
+        "finalize-contract-v3" => contract::finalize_contract_v3_gates(true),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -478,7 +487,9 @@ fn main() -> Result<(), DynError> {
                  test-artifact-cache|test-runtime-fast-paths|test-host-engine-performance|\
                  m5-reload-peak-report|m5-cold-start-report|m5-product-corpus|\
                  m5-final-report|m5-v8-comparison|\
-                 m5-performance-regression|finalize-m5"
+                 m5-performance-regression|finalize-m5|test-contract-syntax|\
+                 test-contract-semantics|test-contract-descriptor|test-contract-codegen|\
+                 test-contract-cli|test-contract-lsp|contract-migration-check|finalize-contract-v3"
             );
             Err("unknown xtask command".into())
         }
@@ -4903,7 +4914,12 @@ fn test_nidl_span() -> Result<(), DynError> {
         "nexa-cli",
         "lsp_idl_diagnostic_uses_the_parser_token_span",
     ])?;
-    cargo(&["test", "-p", "nexa-idl", "parse_error"])
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-contract",
+        "rejects_every_removed_nidl_spelling",
+    ])
 }
 
 fn test_uri_matrix() -> Result<(), DynError> {
@@ -5700,7 +5716,7 @@ fn test_core() -> Result<(), DynError> {
 }
 
 fn test_binding() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-idl"])?;
+    cargo(&["test", "-p", "nexa-contract"])?;
     test_binding_after_workspace()?;
     cargo(&["test", "-p", "combat-runtime"])
 }
@@ -5709,7 +5725,7 @@ fn test_binding_after_workspace() -> Result<(), DynError> {
     cargo(&[
         "test",
         "-p",
-        "nexa-idl",
+        "nexa-contract",
         "--test",
         "e2e_mutations",
         "--",
@@ -5952,9 +5968,9 @@ fn repo_audit() -> Result<(), DynError> {
         .matches("snapshot: RuntimeRealmSnapshot")
         .count();
     let business_host_e2e_source = [
-        "crates/nexa-idl/tests/e2e_mutations.rs",
-        "crates/nexa-idl/tests/e2e_support.rs",
-        "crates/nexa-idl/tests/fixtures/business_host/business_host.rs",
+        "crates/nexa-contract/tests/e2e_mutations.rs",
+        "crates/nexa-contract/tests/e2e_support.rs",
+        "crates/nexa-contract/tests/fixtures/business_host/business_host.rs",
     ]
     .iter()
     .map(|path| fs::read_to_string(root.join(path)))
@@ -5972,7 +5988,8 @@ fn repo_audit() -> Result<(), DynError> {
     ) + business_host_e2e_source
         .matches("GeneratedHostStub")
         .count();
-    let e2e_support_source = fs::read_to_string(root.join("crates/nexa-idl/tests/e2e_support.rs"))?;
+    let e2e_support_source =
+        fs::read_to_string(root.join("crates/nexa-contract/tests/e2e_support.rs"))?;
     let mutation_report = fs::read(root.join("target/nexa-artifacts/idl-e2e/mutation-report.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());

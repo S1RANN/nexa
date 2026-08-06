@@ -16,7 +16,7 @@ use crate::{
     TrustLevel,
 };
 
-const IDL_SOURCE: &str = "contract Test {
+const IDL_SOURCE: &str = "contract Test;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -26,9 +26,8 @@ const IDL_SOURCE: &str = "contract Test {
     nexa {
         fn run(value: i32) -> i32;
         fn missing_run(value: i32) -> i32;
-    }
-}";
-const TASK_IDL_SOURCE: &str = "contract Test {
+    }";
+const TASK_IDL_SOURCE: &str = "contract Test;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -38,8 +37,7 @@ const TASK_IDL_SOURCE: &str = "contract Test {
     nexa {
         async fn run(value: i32) -> i32;
         fn missing_run(value: i32) -> i32;
-    }
-}";
+    }";
 const RUN_ID: StableId = StableId(0x7b5d_1e73_ccb5_ad74);
 const MISSING_RUN_ID: StableId = StableId(0xd1ad_b999_51e8_0fcd);
 const EVIDENCE_ENTRY: &str = "evidence.valid";

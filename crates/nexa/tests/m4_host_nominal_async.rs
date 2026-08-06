@@ -16,17 +16,16 @@ const PACKAGE_ID: &str = "host.nominal.fixture";
 const MODULE: &str = "host.nominal.fixture";
 const HOST_URI: &str = "nidl://tests/m4-host-nominal-async/nominal-host.nidl";
 const HOST: &str = r"
-contract NominalHost {
-    handle Ticket;
-    struct Payload { ticket: Ticket, label: string, }
-    enum Failure { Cancelled, Abandoned, Missing(Ticket), }
-    host {
-        fn issue() -> Ticket;
-        fn inspect(ticket: Ticket) -> Payload;
-        @cancel(return_error)
-        @abandon(trap)
-        async fn fetch(ticket: Ticket) -> Result<Payload, Failure>;
-    }
+contract NominalHost;
+handle Ticket;
+struct Payload { ticket: Ticket, label: string, }
+enum Failure { Cancelled, Abandoned, Missing(Ticket), }
+host {
+    fn issue() -> Ticket;
+    fn inspect(ticket: Ticket) -> Payload;
+    @cancel(return_error)
+    @abandon(trap)
+    async fn fetch(ticket: Ticket) -> Result<Payload, Failure>;
 }
 ";
 const SOURCE: &str = r"

@@ -72,10 +72,9 @@ fn export_compiled_task(
 fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
     let contract = nexa_contract::parse_contract(
         r"
-            contract BranchRootMap {
-                nexa {
-                    async fn branch_then_yield(condition: bool) -> i32;
-                }
+            contract BranchRootMap;
+            nexa {
+                async fn branch_then_yield(condition: bool) -> i32;
             }
         ",
     )
@@ -193,14 +192,13 @@ impl HostRegistry for HandleHost {
 fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
     let contract = nexa_contract::parse_contract(
         r"
-            contract RootMapHost {
-                handle Ticket;
-                host {
-                    fn issue() -> Ticket;
-                }
-                nexa {
-                    async fn hold_ticket() -> Ticket;
-                }
+            contract RootMapHost;
+            handle Ticket;
+            host {
+                fn issue() -> Ticket;
+            }
+            nexa {
+                async fn hold_ticket() -> Ticket;
             }
         ",
     )
@@ -517,10 +515,9 @@ fn nested_call_realm(verified: VerifiedModule) -> (RealmRuntime, nexa_runtime::M
 fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
     let contract = nexa_contract::parse_contract(
         r"
-            contract DeferRootMap {
-                nexa {
-                    async fn deferred(condition: bool) -> i32;
-                }
+            contract DeferRootMap;
+            nexa {
+                async fn deferred(condition: bool) -> i32;
             }
         ",
     )

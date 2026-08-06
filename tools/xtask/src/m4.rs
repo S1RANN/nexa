@@ -291,7 +291,7 @@ impl M4EditorPackageReport {
             ("nexa", "tree-sitter-nexa", &self.zed.grammar_revisions.nexa),
             (
                 "nexa_contract",
-                "tree-sitter-nexa-idl",
+                "tree-sitter-nexa-contract",
                 &self.zed.grammar_revisions.nexa_contract,
             ),
         ] {

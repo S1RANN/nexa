@@ -425,7 +425,7 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
 
 #[allow(clippy::too_many_lines)]
 fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticEvidence, String> {
-    const IDL_SOURCE: &str = "contract DiagnosticStackHost {\r\n    host {\r\n        fn fail() -> i32;\r\n    }\r\n    nexa {\r\n        fn entry() -> i32;\r\n    }\r\n}\r\n";
+    const IDL_SOURCE: &str = "contract DiagnosticStackHost;\r\nhost {\r\n    fn fail() -> i32;\r\n}\r\nnexa {\r\n    fn entry() -> i32;\r\n}\r\n";
     const IDL_PATH: &str = "diagnostic_stack_api.nidl";
     const ENTRY_SOURCE: &str = concat!(
         "use package::diagnostic_stack::middle as middle;\r\n",

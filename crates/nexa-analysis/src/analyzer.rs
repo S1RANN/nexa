@@ -3642,7 +3642,7 @@ impl<'a> Analyzer<'a> {
                                 .source
                                 .as_ref()
                                 .map_or(ByteRange::default(), |origin| origin.range),
-                            "NIDL nominal types must have a closed ABI",
+                            "Contract nominal types must have a closed ABI",
                         )),
                     );
                 }
@@ -3718,7 +3718,7 @@ impl<'a> Analyzer<'a> {
                             diagnostic = diagnostic.with_label(Label::primary(
                                 origin.identity.clone(),
                                 origin.range,
-                                "NIDL fields require a stable ID",
+                                "Contract fields require a stable ID",
                             ));
                         }
                         self.diagnostics.push(diagnostic);
@@ -3759,7 +3759,7 @@ impl<'a> Analyzer<'a> {
                             diagnostic = diagnostic.with_label(Label::primary(
                                 origin.identity.clone(),
                                 origin.range,
-                                "NIDL variants require a stable ID",
+                                "Contract variants require a stable ID",
                             ));
                         }
                         self.diagnostics.push(diagnostic);

@@ -96,14 +96,13 @@ fn write_allocation_receipt(cases: [(&str, u64); 6]) {
 
 // --- Contract and entrypoint markers ----------------------------------------
 
-const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints {
-    host {}
+const CONTRACT_SOURCE: &str = r"contract SnakeEntrypoints;
+host {}
 
-    nexa {
-        fn on_event(value: i32) -> i32;
-        fn choose_food_spawn(value: i32) -> i32;
-        fn calculate_food_effect(value: i32) -> i32;
-    }
+nexa {
+    fn on_event(value: i32) -> i32;
+    fn choose_food_spawn(value: i32) -> i32;
+    fn calculate_food_effect(value: i32) -> i32;
 }";
 
 macro_rules! i32_entrypoint {

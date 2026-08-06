@@ -1190,10 +1190,9 @@ fn cleanup_realm() -> (
 ) {
     let contract = nexa_contract::parse_contract(
         r"
-            contract CleanupTask {
-                nexa {
-                    async fn work(value: i32) -> i32;
-                }
+            contract CleanupTask;
+            nexa {
+                async fn work(value: i32) -> i32;
             }
         ",
     )

@@ -13,7 +13,7 @@ use nexa::prelude::{
 };
 use serde::Serialize;
 
-const IDL_SOURCE: &str = "contract TestHost {
+const IDL_SOURCE: &str = "contract TestHost;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -22,8 +22,7 @@ const IDL_SOURCE: &str = "contract TestHost {
     }
     nexa {
         fn run(value: i32) -> i32;
-    }
-}";
+    }";
 const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT: i32 = 10;

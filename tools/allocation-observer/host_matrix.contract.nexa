@@ -1,0 +1,65 @@
+contract AllocationMatrix;
+
+struct Record {
+    label: string,
+    value: i32,
+}
+
+enum Event {
+    Empty,
+    Record(Record),
+}
+
+struct Nested {
+    records: Array<Record>,
+    samples: Buffer<i32>,
+    label: string,
+}
+
+host {
+    fn inspect(
+        name: string,
+        record: Record,
+        event: Event,
+        option: Option<Record>,
+        result: Result<Record, Event>,
+        array: Array<Record>,
+        buffer: Buffer<Record>,
+        nested: Event,
+    ) -> i32;
+
+    fn inspect_scalar_collections(
+        array: Array<i32>,
+        buffer: Buffer<i32>,
+    ) -> i32;
+
+    fn return_string() -> string;
+    fn return_struct() -> Record;
+    fn return_enum() -> Event;
+    fn return_option() -> Option<Record>;
+    fn return_result() -> Result<Record, Event>;
+    fn return_array() -> Array<i32>;
+    fn return_buffer() -> Buffer<i32>;
+    fn return_array_struct() -> Array<Record>;
+    fn return_buffer_struct() -> Buffer<Record>;
+    fn return_nested_enum() -> Event;
+    fn return_option_array() -> Option<Array<Record>>;
+    fn return_result_buffer() -> Result<Buffer<Record>, Event>;
+    fn return_large_array() -> Array<i32>;
+    fn return_large_buffer() -> Buffer<i32>;
+    fn return_nested() -> Nested;
+    fn return_scalar() -> i32;
+
+    fn baseline8(
+        a: i32,
+        b: i32,
+        c: i32,
+        d: i32,
+        e: i32,
+        f: i32,
+        g: i32,
+        h: i32,
+    ) -> i32;
+
+    fn panic_host() -> i32;
+}

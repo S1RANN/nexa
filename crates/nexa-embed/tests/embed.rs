@@ -18,7 +18,7 @@ use nexa_runtime::{
     ScriptOutputReader, ScriptSignature, StableId, ValueType,
 };
 
-const IDL_SOURCE: &str = "contract TestHost {
+const IDL_SOURCE: &str = "contract TestHost;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -27,9 +27,8 @@ const IDL_SOURCE: &str = "contract TestHost {
     }
     nexa {
         fn run(value: i32) -> i32;
-    }
-}";
-const TASK_IDL_SOURCE: &str = "contract TestHost {
+    }";
+const TASK_IDL_SOURCE: &str = "contract TestHost;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -38,8 +37,7 @@ const TASK_IDL_SOURCE: &str = "contract TestHost {
     }
     nexa {
         async fn run(value: i32) -> i32;
-    }
-}";
+    }";
 const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const METER_RUN_ID: StableId = StableId(0x39e3_0598_78a5_d67d);
 
@@ -540,15 +538,14 @@ fn memory_source_enables_calls_disables_and_shuts_down() {
 
 #[test]
 fn engine_records_instruction_count_independently_from_fuel_charge() {
-    const METER_IDL: &str = "contract MeterHost {
+    const METER_IDL: &str = "contract MeterHost;
         host {
             @fuel(11)
             fn expensive(value: i32) -> i32;
         }
         nexa {
             fn run(value: i32) -> i32;
-        }
-    }";
+        }";
     let idl = nexa::parse_contract(METER_IDL).expect("meter NIDL");
     let run = idl
         .nexa_functions

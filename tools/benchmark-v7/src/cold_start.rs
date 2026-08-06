@@ -46,7 +46,7 @@ const CASE_NAMES: [&str; 8] = [
     "reload",
 ];
 
-const ENGINE_CONTRACT_SOURCE: &str = "contract BenchmarkColdStartHost {}\n";
+const ENGINE_CONTRACT_SOURCE: &str = "contract BenchmarkColdStartHost;\n";
 const STANDALONE_SCRIPT: &str = "40 + 2;\n";
 const STANDALONE_PACKAGE_SOURCE: &str =
     "fn main(args: Array<string>) -> i32 { return args.len(); }\n";

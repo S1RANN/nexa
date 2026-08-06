@@ -4320,7 +4320,7 @@ mod tests {
     }
 
     fn snapshot_with_host() -> PackageSourceSnapshot {
-        let host: Arc<str> = Arc::from("contract Host { host { fn ping() -> i32; } }\n");
+        let host: Arc<str> = Arc::from("contract Host;\nhost { fn ping() -> i32; }\n");
         PackageSourceSnapshot::new([
             CompiledSource {
                 file: FileId(1),
@@ -4487,7 +4487,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         let input = resolved_input(manifest, builder.build().unwrap(), &contract);
         let identity =
             CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
@@ -4499,7 +4499,7 @@ activation = "programmatic"
 
     #[test]
     fn library_check_rejects_both_directions_of_unit_return_mismatch() {
-        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         for (source, expected_message) in [
             ("fn bad() -> i32 { return; }\n", "expected i32, found unit"),
             ("fn bad() { return 1; }\n", "expected unit, found i32"),
@@ -4896,7 +4896,7 @@ activation = "programmatic"
     #[test]
     fn build_identity_includes_canonical_standard_library_descriptor() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         let contract_input = test_contract_input(&contract);
         let first = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -4992,7 +4992,7 @@ activation = "programmatic"
     #[test]
     fn package_fingerprint_uses_canonical_build_authorities() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         let contract_input = test_contract_input(&contract);
         let fingerprint = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -5148,7 +5148,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         let input = Arc::new(resolved_input(
             manifest,
             production.build().unwrap(),

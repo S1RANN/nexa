@@ -25,7 +25,7 @@ const ROOT_PACKAGE: &str = "scale.application";
 const SOURCE_ID: &str = "scale-source";
 const ROOT_DIRECTORY: &str = "packages/root";
 const SCALE_HOST_SOURCE_PATH: &str = "nidl://tests/m4-scale/host-contract.nidl";
-const SCALE_HOST_SOURCE: &str = "contract ScaleHost {}\n";
+const SCALE_HOST_SOURCE: &str = "contract ScaleHost;\n";
 const WORKER_COUNT: usize = 4;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
 

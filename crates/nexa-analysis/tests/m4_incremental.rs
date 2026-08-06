@@ -18,9 +18,9 @@ const DEPENDENCY_PACKAGE: &str = "incremental.lib";
 const SOURCE_ID: &str = "incremental-workspace";
 const ROOT_DIRECTORY: &str = "workspace/app";
 const DEPENDENCY_DIRECTORY: &str = "workspace/lib";
-const CONTRACT_A: &[u8] = b"contract Host { host { fn version() -> i32; } }\n";
+const CONTRACT_A: &[u8] = b"contract Host;\nhost { fn version() -> i32; }\n";
 const CONTRACT_B: &[u8] =
-    b"contract Host { host { fn version() -> i32; fn revision() -> i32; } }\n";
+    b"contract Host;\nhost { fn version() -> i32; fn revision() -> i32; }\n";
 const CONTRACT_SOURCE_IDENTITY: &[u8] = b"standalone:contracts/incremental.nidl";
 
 const LOCAL_A: &str = r"pub(package) fn package_value() -> i32 { return 1; }

@@ -2536,7 +2536,7 @@ fn run_legacy_audit() -> LegacyAudit {
         }
         if matches!(
             relative.as_str(),
-            "editors/tree-sitter-nexa-idl/grammar.js" | "editors/language-syntax.json"
+            "editors/tree-sitter-nexa-contract/grammar.js" | "editors/language-syntax.json"
         ) {
             for needle in [
                 "\"interface\"",
@@ -3675,7 +3675,7 @@ fn audit_file_selected(root: &Path, path: &Path) -> bool {
         || (extension == Some("rs")
             && (relative.starts_with("crates/") || relative.starts_with("examples/")))
         || relative == "editors/tree-sitter-nexa/grammar.js"
-        || relative == "editors/tree-sitter-nexa-idl/grammar.js"
+        || relative == "editors/tree-sitter-nexa-contract/grammar.js"
         || relative == "editors/language-syntax.json"
 }
 

@@ -1265,7 +1265,7 @@ async fn work() -> i32 {
 fn qualified_host_snippet_uses_typed_analysis_and_preserves_file_id() {
     let idl = nexa_contract::parse_contract(
         r"
-contract GameHost {
+contract GameHost;
     enum AnimationError { Missing, Cancelled }
     host {
         @cancel(return_error)
@@ -1275,7 +1275,6 @@ contract GameHost {
     nexa {
         fn update(entity: i32) -> i32;
     }
-}
 ",
     )
     .unwrap();
@@ -1326,13 +1325,12 @@ pub async fn update(entity: i32) -> i32 {
 fn host_import_subset_keeps_the_referenced_contract_stable_identity() {
     let contract = nexa_contract::parse_contract(
         r"
-contract DispatchHost {
+contract DispatchHost;
     host {
         fn first() -> i32;
         fn second() -> i32;
         fn third() -> i32;
     }
-}
 ",
     )
     .expect("valid three-function Host Contract");
@@ -1374,13 +1372,12 @@ fn invoke_third() -> i32 {
 fn virtual_contract_adapter_preserves_multiple_host_capabilities() {
     let contract = nexa_contract::parse_contract(
         r#"
-contract CapabilityHost {
+contract CapabilityHost;
     host {
         @capability("world.read")
         @capability("world.write")
         fn privileged() -> i32;
     }
-}
 "#,
     )
     .expect("multiple distinct capabilities are valid NIDL v2");
@@ -1398,7 +1395,7 @@ contract CapabilityHost {
 fn distinct_nidl_handles_emit_distinct_typed_resource_tokens() {
     let contract = nexa_contract::parse_contract(
         r"
-contract TokenHost {
+contract TokenHost;
     handle First;
     handle Second;
 
@@ -1406,7 +1403,6 @@ contract TokenHost {
         fn echo_first(value: Token<First>) -> Token<First>;
         fn echo_second(value: Token<Second>) -> Token<Second>;
     }
-}
 ",
     )
     .expect("valid nominal Handle contract");
@@ -1755,35 +1751,34 @@ fn removed_nexa_v1_surface_forms_are_rejected() {
 }
 
 #[test]
-fn nidl_v2_accepts_contract_blocks_and_rejects_removed_surface_forms() {
+fn contract_v3_flat_surface_parses_and_rejects_removed_surface_forms() {
     let current = r#"
-contract SurfaceMatrix {
-    handle Ticket;
+contract SurfaceMatrix;
+handle Ticket;
 
-    struct Point {
-        x: i32,
-        y: i32,
-    }
+struct Point {
+    x: i32,
+    y: i32,
+}
 
-    enum LoadError {
-        Missing,
-        Failed(Point),
-        Cancelled,
-    }
+enum LoadError {
+    Missing,
+    Failed(Point),
+    Cancelled,
+}
 
-    host {
-        fn log(message: string);
+host {
+    fn log(message: string);
 
-        @fuel(8)
-        @cancel(return_error)
-        @abandon(trap)
-        @capability("surface.read")
-        async fn load(ticket: Ticket) -> Result<Point, LoadError>;
-    }
+    @fuel(8)
+    @cancel(return_error)
+    @abandon(trap)
+    @capability("surface.read")
+    async fn load(ticket: Ticket) -> Result<Point, LoadError>;
+}
 
-    nexa {
-        fn on_event(points: Array<Point>) -> Option<Point>;
-    }
+nexa {
+    fn on_event(points: Array<Point>) -> Option<Point>;
 }
 "#;
     nexa_contract::parse_contract(current).expect("the frozen NIDL v2 surface parses");

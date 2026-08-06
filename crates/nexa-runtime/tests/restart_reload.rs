@@ -20,10 +20,9 @@ const ASYNC_MODULE_EXPORT: StableId = StableId(0x5252_4153_594e_4301);
 const SNIPPET_PACKAGE: &str = "nexa.snippet";
 const SNIPPET_MODULE: &str = "main";
 const RELOAD_CONTRACT: &str = "
-contract ReloadHost {
-    nexa {
-        async fn update(value: i32) -> i32;
-    }
+contract ReloadHost;
+nexa {
+    async fn update(value: i32) -> i32;
 }
 ";
 

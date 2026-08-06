@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use nexa_core::StableId;
 use serde_json::Value;
 
-pub const BASE_CONTRACT: &str = include_str!("fixtures/business_host/contract.nidl");
+pub const BASE_CONTRACT: &str = include_str!("fixtures/business_host/game.contract.nexa");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
 const BASE_NEXA_MODULE: &str = "use host::game as engine;\n\
 pub fn update(entity: i32) -> i32 { return engine::heartbeat(entity); }\n\
@@ -19,8 +19,8 @@ use std::fmt::Write as _;
 
 #[test]
 fn changed_binding_executes_through_generated_registry() {
-    let base_idl = nexa_contract::parse_contract(include_str!("base_contract.nidl")).expect("base NIDL");
-    let changed_idl = nexa_contract::parse_contract(include_str!("contract.nidl")).expect("changed NIDL");
+    let base_idl = nexa_contract::parse_contract(include_str!("base_contract.contract.nexa")).expect("base NIDL");
+    let changed_idl = nexa_contract::parse_contract(include_str!("contract.contract.nexa")).expect("changed NIDL");
     assert_eq!(
         CONTRACT_RUNTIME_ID,
         nexa_contract::contract_runtime_id(&changed_idl)
@@ -1187,9 +1187,9 @@ pub fn prepare_case(
     for directory in ["base", "mutated", "host/src", "script"] {
         fs::create_dir_all(case.join(directory)).expect("create E2E artifact directory");
     }
-    fs::write(case.join("base/contract.nidl"), BASE_CONTRACT).expect("write base NIDL");
+    fs::write(case.join("base/contract.contract.nexa"), BASE_CONTRACT).expect("write base NIDL");
     fs::write(case.join("base/bindings.rs"), base_generated).expect("write base binding");
-    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_contract)
+    fs::write(case.join("mutated/contract.contract.nexa"), &mutation.mutated_contract)
         .expect("write changed NIDL");
     for (index, generated) in [changed_generated, changed_generated, changed_generated]
         .iter()
@@ -1203,9 +1203,9 @@ pub fn prepare_case(
     }
     let changed_module = positive_module_source(mutation);
     fs::write(case.join("script/module.nexa"), &changed_module).expect("write positive script");
-    fs::write(case.join("host/src/base_contract.nidl"), BASE_CONTRACT)
+    fs::write(case.join("host/src/base_contract.contract.nexa"), BASE_CONTRACT)
         .expect("write base contract fixture");
-    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_contract)
+    fs::write(case.join("host/src/contract.contract.nexa"), &mutation.mutated_contract)
         .expect("write changed contract fixture");
     fs::write(case.join("host/src/base_module.nexa"), BASE_NEXA_MODULE)
         .expect("write base script fixture");
@@ -1232,7 +1232,7 @@ pub fn prepare_case(
              nexa-runtime={{path=\"{}\",features=[\"model-adapter\"]}}\n\
              nexa-compiler={{path=\"{}\"}}\n\
              nexa-bytecode={{path=\"{}\"}}\n\
-             nexa-idl={{path=\"{}\"}}\n\
+             nexa-contract={{path=\"{}\"}}\n\
              nexa-verifier={{path=\"{}\"}}\n",
             mutation.id,
             runtime.display(),

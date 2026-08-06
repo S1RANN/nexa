@@ -939,7 +939,7 @@ mod tests {
         assert!(fingerprint.canonical_lock_graph.is_empty());
 
         let contract =
-            nexa_contract::parse_contract("contract Host { nexa { fn update(value: i32) -> i32; } }").unwrap();
+            nexa_contract::parse_contract("contract Host; nexa { fn update(value: i32) -> i32; }").unwrap();
         let hosted = resolved_snippet(
             "pub fn update(value: i32) -> i32 { return value; }\n",
             FileId(9),

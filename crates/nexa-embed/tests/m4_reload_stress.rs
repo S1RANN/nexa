@@ -23,7 +23,7 @@ use nexa_embed::{
 };
 use serde::Serialize;
 
-const IDL: &str = "contract TestHost {
+const IDL: &str = "contract TestHost;
     enum WaitError { Cancelled, }
     host {
         @cancel(return_error)
@@ -33,8 +33,7 @@ const IDL: &str = "contract TestHost {
     nexa {
         fn run(value: i32) -> i32;
         async fn resource_probe(value: i32) -> i32;
-    }
-}";
+    }";
 const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const RESOURCE_PROBE_ID: StableId = StableId(0xfac0_ded9_4371_1d6f);
 const ITERATIONS_PER_CLASS: u64 = 100;
@@ -485,14 +484,13 @@ fn m4r1_nidl_reload_stress() {
     const ITERATIONS: u64 = 100;
     const REVISION: i32 = 50;
     const NAME_ALPHABET: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
-    const BASE_CONTRACT: &str = "contract TestHost {
+    const BASE_CONTRACT: &str = "contract TestHost;
         host {
             fn revision() -> i32;
         }
         nexa {
             fn run(value: i32) -> i32;
-        }
-    }";
+        }";
 
     let mut contract_fingerprints = BTreeSet::new();
     let mut stale_candidate_committed = 0_u64;
@@ -583,14 +581,13 @@ fn m4r1_nidl_reload_stress() {
             char::from(NAME_ALPHABET[low])
         );
         let changed_contract_source = format!(
-            "contract TestHost {{\n\
+            "contract TestHost;\n\
                  host {{\n\
                      fn {host_function}() -> i32;\n\
                  }}\n\
                  nexa {{\n\
                      fn run(value: i32) -> i32;\n\
-                 }}\n\
-             }}\n"
+                 }}\n"
         );
         let changed_contract =
             nexa::parse_contract(&changed_contract_source).expect("changed NIDL stress Contract");

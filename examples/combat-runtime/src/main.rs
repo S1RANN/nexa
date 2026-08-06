@@ -246,7 +246,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let declared_idl = nexa_contract::parse_contract(include_str!("../combat_api.contract.nexa"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
-        nexa_contract::generate_rust(&declared_idl)?,
+        nexa_contract::generate_rust_for_source_file(&declared_idl, "combat_api.contract.nexa")?,
         "Combat bindings must be generated without manual edits"
     );
     assert_eq!(

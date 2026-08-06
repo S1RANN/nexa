@@ -10,15 +10,14 @@ use nexa_analysis::{
 };
 
 const CONTRACT_SOURCE: &str = r"
-contract DependencyContract {
-    struct Payload {
-        value: i32,
-    }
-    host {
-        fn amber() -> Payload;
-        fn cobalt() -> Payload;
-        fn violet() -> Payload;
-    }
+contract DependencyContract;
+struct Payload {
+    value: i32,
+}
+host {
+    fn amber() -> Payload;
+    fn cobalt() -> Payload;
+    fn violet() -> Payload;
 }
 ";
 

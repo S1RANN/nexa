@@ -58,9 +58,9 @@ but may not self-waive a required row.
 | C19 | LSP semantics | URI/config selects Contract profile; diagnostics include syntax, naming, type, attribute/direction, Stable-ID, and generated-Rust-name collisions | `cargo xtask test-contract-lsp` | task #7 | PENDING |
 | C20 | Outline | Outline contains Contract, Struct, Enum, Handle, Host Function, and Nexa Function symbols | LSP snapshot fixtures | task #7 | PENDING |
 | C21 | Documentation | Contract Language, Descriptor, Codegen, Host Binding, CLI/development loop, editor support, migration guide, Roadmap, and Baseline Index agree on v3 boundaries | link check; terminology scan | task #8 | PENDING |
-| C22 | Split gates | All seven Contract commands exist, fail closed, and write reproducible evidence | task #9 receipts | task #9 | PENDING |
-| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check`; repository scan | task #9 | PENDING |
-| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | clean full gate receipt | task #9 | PENDING |
+| C22 | Split gates | All seven Contract commands exist, fail closed, and write reproducible evidence | `contract-v3-gates-receipt.json` (7/7 PASS) | task #9 | PASS |
+| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan | task #9 | PASS |
+| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | full gate receipt; one known M5 baseline exception documented | task #9 | NOTE |
 | C25 | Independent audit | Architecture, traversal security, Stable IDs, Descriptor determinism, public surface, and release evidence accepted independently | task #10 audit report | task #10 | PENDING |
 
 ## Required gate set
@@ -113,8 +113,8 @@ here and changes both this matrix and the Baseline Index milestone status to
 **COMPLETE**.
 
 ```text
-Candidate commit: PENDING
-Gate evidence: PENDING
+Candidate commit: d431146 (Phase 4 target), branch codex/contract-v3-gates
+Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt with one known M5 baseline exception
 Independent audit: PENDING
 Final decision: PENDING
 ```

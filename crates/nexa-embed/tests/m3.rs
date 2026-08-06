@@ -10,7 +10,7 @@ use nexa_embed::{
     PackageSource, SourceFileRegistry, SourceId, TrustLevel,
 };
 
-const IDL: &str = "contract TestHost { nexa { fn value() -> i32; } }";
+const IDL: &str = "contract TestHost; nexa { fn value() -> i32; }";
 const MANIFEST: &str = "schema = 2
 kind = \"application\"
 id = \"tests.development\"

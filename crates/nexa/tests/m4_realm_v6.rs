@@ -21,7 +21,7 @@ use nexa_runtime::{ModuleLifecycle, Object};
 
 const PACKAGE_ID: &str = "realm.v6.fixture";
 const HOST_URI: &str = "nidl://tests/m4-realm-v6/host.nidl";
-const HOST_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/host.nidl");
+const HOST_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/host.contract.nexa");
 const A_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/a.nexa");
 const B_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/b.nexa");
 const C_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/c.nexa");

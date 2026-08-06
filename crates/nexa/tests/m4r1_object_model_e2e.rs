@@ -19,15 +19,14 @@ const PACKAGE_ID: &str = "test.object-model-e2e";
 const MODULE: &str = "object.model.e2e";
 const HOST_URI: &str = "nidl://tests/m4r1-object-model-e2e/empty.nidl";
 const HOST_SOURCE: &str = r"
-contract Empty {
-    nexa {
+contract Empty;
+nexa {
         fn struct_value_copy() -> i32;
         fn enum_payload() -> i32;
         fn class_mutable_field() -> i32;
         fn class_identity() -> bool;
         fn option_class_some() -> i32;
         fn option_class_none() -> i32;
-    }
 }
 ";
 const SOURCE: &str = r"

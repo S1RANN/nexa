@@ -2475,7 +2475,7 @@ fn documentation_changes_source_identity_but_not_analyzed_public_api() {
 #[allow(clippy::too_many_lines)]
 fn diagnostic_registry_retains_every_host_and_static_module_origin() {
     const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
-    const HOST: &str = "contract FixtureHost { host { fn ping() -> i32; } }\r\n";
+    const HOST: &str = "contract FixtureHost;\nhost { fn ping() -> i32; }\n";
     const HOST_STRUCT: &str = "struct HostRecord { value: i32, }\r\n";
     const HOST_ENUM: &str = "enum HostChoice { Ready }\r\n";
     const STATIC_STRUCT: &str = "struct StaticRecord { value: i32, }\n";
@@ -2649,7 +2649,7 @@ fn diagnostic_registry_retains_every_host_and_static_module_origin() {
 #[test]
 fn conflicting_external_source_identity_fails_closed_before_typed_ir() {
     const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
-    const CONTRACT: &str = "contract FixtureHost {}\n";
+    const CONTRACT: &str = "contract FixtureHost;\n";
     const FUNCTION: &str = "fn ping() -> i32;\n";
     let input = resolved_input(
         root_fixture(

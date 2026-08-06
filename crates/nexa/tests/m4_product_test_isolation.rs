@@ -13,7 +13,7 @@ use nexa_analysis::{
     SourceSetBuilder,
 };
 
-const EMPTY_HOST_NIDL: &str = "contract Empty {}";
+const EMPTY_HOST_NIDL: &str = "contract Empty;";
 const EMPTY_HOST_URI: &str = "nidl://tests/m4-product-test-isolation/empty.nidl";
 
 fn host_contract<'a>(
@@ -407,10 +407,9 @@ fn exhausts_fuel() -> bool {
 #[test]
 fn canonical_analysis_rejects_an_indirect_host_call_before_test_codegen() {
     let contract_source = r"
-contract TestHost {
-    host {
-        fn clock() -> i32;
-    }
+contract TestHost;
+host {
+    fn clock() -> i32;
 }
 ";
     let parsed_contract = nexa_contract::parse_contract(contract_source).unwrap();
