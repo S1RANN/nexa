@@ -1188,7 +1188,7 @@ fn cleanup_realm() -> (
     RuntimeHost,
     StableId,
 ) {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
             contract CleanupTask {
                 nexa {

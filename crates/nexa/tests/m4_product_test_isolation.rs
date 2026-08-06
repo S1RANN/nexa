@@ -151,7 +151,7 @@ activation = "programmatic"
 #[test]
 fn test_only_changes_do_not_contaminate_the_product_build() {
     let manifest = application_manifest();
-    let parsed_contract = nexa_contract::parse(EMPTY_HOST_NIDL).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
     let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(manifest, &contract);
     let tests_returning_true = test_input(&product, true);
@@ -209,7 +209,7 @@ fn test_only_changes_do_not_contaminate_the_product_build() {
 
 #[test]
 fn product_check_discards_prior_test_modules_edges_and_invalidation_evidence() {
-    let parsed_contract = nexa_contract::parse(EMPTY_HOST_NIDL).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
     let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
@@ -267,7 +267,7 @@ fn product_check_discards_prior_test_modules_edges_and_invalidation_evidence() {
 
 #[test]
 fn canonical_compiler_accepts_an_imported_namespace_value_field_method_chain() {
-    let parsed_contract = nexa_contract::parse(EMPTY_HOST_NIDL).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
     let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product_with_sources(
         application_manifest(),
@@ -311,7 +311,7 @@ fn query_key_belongs_to_tests(key: &QueryKey) -> bool {
 
 #[test]
 fn canonical_test_build_traps_inside_a_fresh_realm_with_source_evidence() {
-    let parsed_contract = nexa_contract::parse(EMPTY_HOST_NIDL).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
     let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
@@ -369,7 +369,7 @@ fn b_still_runs_after_trap() -> bool {
 
 #[test]
 fn canonical_test_build_reports_realm_fuel_exhaustion_with_exact_stack() {
-    let parsed_contract = nexa_contract::parse(EMPTY_HOST_NIDL).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
     let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
@@ -413,7 +413,7 @@ contract TestHost {
     }
 }
 ";
-    let parsed_contract = nexa_contract::parse(contract_source).unwrap();
+    let parsed_contract = nexa_contract::parse_contract(contract_source).unwrap();
     let contract = host_contract(
         &parsed_contract,
         "nidl://tests/m4-product-test-isolation/test-host.nidl",

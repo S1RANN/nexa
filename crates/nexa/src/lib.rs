@@ -52,8 +52,8 @@ pub use nexa_contract::{
     CONTRACT_SYNTAX_VERSION, ContractAst, ContractError, ContractErrorKind, ValidatedContract, ValidatedFunction,
     abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
     effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
-    generate_rust as generate_rust_bindings, host_function_signature, parse as parse_contract,
-    parse_ast as parse_contract_ast,
+    generate_rust as generate_rust_bindings, host_function_signature, parse_contract,
+    parse_contract_ast, validate_contract,
 };
 pub use nexa_runtime::profiler;
 pub use nexa_runtime::{
@@ -166,7 +166,7 @@ pub mod prelude {
         compile_standalone_package_with_contract, compile_standalone_with_contract,
         contract_fingerprint, contract_runtime_id, decode_module, effective_contract_descriptor,
         entrypoint_signature, entrypoint_stable_id, parse_contract, parse_contract_ast,
-        standalone_main_stable_id, verify_module,
+        standalone_main_stable_id, validate_contract, verify_module,
     };
     pub use crate::{
         ByteRange, DiagnosticBatch, DiagnosticBatchLimits, DiagnosticPhase, LeafDiagnostic,

@@ -243,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let declared_idl = nexa_contract::parse(include_str!("../combat_api.nidl"))?;
+    let declared_idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
         nexa_contract::generate_rust(&declared_idl)?,
@@ -254,7 +254,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "update"
     );
     let _typed_export_id = <generated::Update as nexa_runtime::ScriptExport>::STABLE_ID;
-    let idl = nexa_contract::parse(include_str!("../combat_api.nidl"))?;
+    let idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         generated::CONTRACT_FINGERPRINT,
         nexa_contract::contract_fingerprint(&idl).into_bytes()

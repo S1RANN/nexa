@@ -915,14 +915,36 @@ pub fn generate_rust_tokens(contract: &ValidatedContract) -> Result<TokenStream,
 }
 
 pub fn generate_rust(contract: &ValidatedContract) -> Result<String, CodegenError> {
+    let header = format!("// @generated from Contract `{}`. DO NOT EDIT.\n", contract.name);
+    generate_rust_with_header(contract, &header)
+}
+
+/// Like [`generate_rust`], stamping the provenance header with the Contract source file name.
+///
+/// Only the file name (basename) of `source_path` enters the generated output; directories and
+/// absolute-path prefixes are always stripped so generated artifacts never leak build paths.
+pub fn generate_rust_for_source_file(
+    contract: &ValidatedContract,
+    source_path: impl AsRef<std::path::Path>,
+) -> Result<String, CodegenError> {
+    let source_path = source_path.as_ref();
+    let basename = source_path
+        .file_name()
+        .map_or_else(|| contract.name.clone(), |name| name.to_string_lossy().into_owned());
+    let header = format!("// Generated from {basename}. DO NOT EDIT.\n");
+    generate_rust_with_header(contract, &header)
+}
+
+fn generate_rust_with_header(
+    contract: &ValidatedContract,
+    header: &str,
+) -> Result<String, CodegenError> {
     let tokens = generate_rust_tokens(contract)?;
     let file = syn::parse2::<syn::File>(tokens)
         .map_err(|error| CodegenError::GeneratedSyntax(error.to_string()))?;
     let formatted = prettyplease::unparse(&file);
-    let header =
-        format!("// @generated from Contract `{}`. DO NOT EDIT.\n", contract.name);
     let mut generated = String::with_capacity(header.len() + formatted.len());
-    generated.push_str(&header);
+    generated.push_str(header);
     generated.push_str(&formatted);
     syn::parse_file(&generated)
         .map_err(|error| CodegenError::FormattedSyntax(error.to_string()))?;

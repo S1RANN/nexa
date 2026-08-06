@@ -70,7 +70,7 @@ fn export_compiled_task(
 
 #[test]
 fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
             contract BranchRootMap {
                 nexa {
@@ -191,7 +191,7 @@ impl HostRegistry for HandleHost {
 
 #[test]
 fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
             contract RootMapHost {
                 handle Ticket;
@@ -515,7 +515,7 @@ fn nested_call_realm(verified: VerifiedModule) -> (RealmRuntime, nexa_runtime::M
 
 #[test]
 fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
             contract DeferRootMap {
                 nexa {

@@ -1263,7 +1263,7 @@ async fn work() -> i32 {
 
 #[test]
 fn qualified_host_snippet_uses_typed_analysis_and_preserves_file_id() {
-    let idl = nexa_contract::parse(
+    let idl = nexa_contract::parse_contract(
         r"
 contract GameHost {
     enum AnimationError { Missing, Cancelled }
@@ -1324,7 +1324,7 @@ pub async fn update(entity: i32) -> i32 {
 
 #[test]
 fn host_import_subset_keeps_the_referenced_contract_stable_identity() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
 contract DispatchHost {
     host {
@@ -1372,7 +1372,7 @@ fn invoke_third() -> i32 {
 
 #[test]
 fn virtual_contract_adapter_preserves_multiple_host_capabilities() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r#"
 contract CapabilityHost {
     host {
@@ -1396,7 +1396,7 @@ contract CapabilityHost {
 
 #[test]
 fn distinct_nidl_handles_emit_distinct_typed_resource_tokens() {
-    let contract = nexa_contract::parse(
+    let contract = nexa_contract::parse_contract(
         r"
 contract TokenHost {
     handle First;
@@ -1786,7 +1786,7 @@ contract SurfaceMatrix {
     }
 }
 "#;
-    nexa_contract::parse(current).expect("the frozen NIDL v2 surface parses");
+    nexa_contract::parse_contract(current).expect("the frozen NIDL v2 surface parses");
 
     let removed = [
         ("interface", "interface Old {}"),
@@ -1811,7 +1811,7 @@ contract SurfaceMatrix {
     ];
     for (name, source) in removed {
         assert!(
-            nexa_contract::parse(source).is_err(),
+            nexa_contract::parse_contract(source).is_err(),
             "removed NIDL v1 `{name}` form unexpectedly parsed:\n{source}"
         );
     }

@@ -440,7 +440,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         "pub(package) fn crash() -> i32 { return test_host::fail(); }\n",
     );
 
-    let idl = nexa_contract::parse(IDL_SOURCE).map_err(|error| error.to_string())?;
+    let idl = nexa_contract::parse_contract(IDL_SOURCE).map_err(|error| error.to_string())?;
     let contract = crate::HostContractInput::with_source(
         &idl,
         SourceIdentity::standalone(IDL_PATH),

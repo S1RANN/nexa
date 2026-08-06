@@ -11,7 +11,7 @@ pub enum BuildError {
     MissingFileStem(PathBuf),
     MissingOutDir,
     Io(std::io::Error),
-    Nidl(super::ContractError),
+    Contract(super::ContractError),
     Codegen(super::CodegenError),
 }
 
@@ -31,7 +31,7 @@ impl From<std::io::Error> for BuildError {
 
 impl From<super::ContractError> for BuildError {
     fn from(error: super::ContractError) -> Self {
-        Self::Nidl(error)
+        Self::Contract(error)
     }
 }
 
@@ -44,13 +44,13 @@ impl From<super::CodegenError> for BuildError {
 pub fn generate(path: impl AsRef<Path>) -> Result<PathBuf, BuildError> {
     let path = path.as_ref();
     let source = std::fs::read_to_string(path)?;
-    let idl = super::parse(&source)?;
+    let idl = super::parse_contract(&source)?;
     let stem = path
         .file_stem()
         .ok_or_else(|| BuildError::MissingFileStem(path.to_path_buf()))?;
     let out_dir = std::env::var_os("OUT_DIR").ok_or(BuildError::MissingOutDir)?;
     let output = PathBuf::from(out_dir).join(stem).with_extension("rs");
-    let generated = super::generate_rust(&idl)?;
+    let generated = super::generate_rust_for_source_file(&idl, path)?;
     write_atomically(&output, generated.as_bytes())?;
     println!("cargo:rerun-if-changed={}", path.display());
     Ok(output)

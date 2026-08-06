@@ -16,7 +16,7 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
     let root = artifact_root();
     clear_case_artifacts(&root);
     let shared_target = root.join("cargo-target");
-    let base_idl = nexa_contract::parse(e2e_support::BASE_CONTRACT).expect("base NIDL parses");
+    let base_idl = nexa_contract::parse_contract(e2e_support::BASE_CONTRACT).expect("base NIDL parses");
     let base_contract_runtime_id = nexa_contract::contract_runtime_id(&base_idl);
     let base_generated = nexa_contract::generate_rust(&base_idl).expect("base bindings generate");
     let context = CaseContext {
@@ -57,7 +57,7 @@ fn clear_case_artifacts(root: &Path) {
 }
 
 fn execute_mutation(context: &CaseContext<'_>, mutation: &MutationCase) -> MutationEvidence {
-    let changed_idl = nexa_contract::parse(&mutation.mutated_contract)
+    let changed_idl = nexa_contract::parse_contract(&mutation.mutated_contract)
         .unwrap_or_else(|error| panic!("{} must parse: {error}", mutation.name));
     let changed_contract_runtime_id = nexa_contract::contract_runtime_id(&changed_idl);
     if mutation.expected_changed_contract_runtime_id {

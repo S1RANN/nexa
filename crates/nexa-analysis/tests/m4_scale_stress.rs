@@ -30,7 +30,7 @@ const WORKER_COUNT: usize = 4;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
 
 fn scale_host_contract() -> Vec<u8> {
-    let contract = nexa_contract::parse(SCALE_HOST_SOURCE).expect("scale Host NIDL");
+    let contract = nexa_contract::parse_contract(SCALE_HOST_SOURCE).expect("scale Host NIDL");
     nexa_contract::effective_contract_descriptor(
         &contract,
         &nexa_contract::EffectiveContractSelection::default(),

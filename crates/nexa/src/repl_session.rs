@@ -2066,7 +2066,7 @@ fn initialize_runtime(
     console: Arc<Mutex<ReplConsoleState>>,
     builds: &mut PackageBuildSession,
 ) -> Result<InitializedRuntime, ReplSessionError> {
-    let parsed_contract = nexa_contract::parse(CONSOLE_HOST_CONTRACT).map_err(|error| {
+    let parsed_contract = nexa_contract::parse_contract(CONSOLE_HOST_CONTRACT).map_err(|error| {
         ReplSessionError::Internal(format!("invalid built-in Console NIDL: {error}"))
     })?;
     let contract = HostContractInput::with_source(

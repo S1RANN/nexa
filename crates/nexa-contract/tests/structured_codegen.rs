@@ -1,6 +1,6 @@
 use nexa_contract::{
     BindingModel, CodegenError, abi_descriptor, contract_fingerprint, generate_rust,
-    generate_rust_tokens, parse,
+    generate_rust_tokens, parse_contract,
 };
 
 const CODEGEN_CONTRACT: &str = r"
@@ -37,7 +37,7 @@ contract Bindings;
 
 #[test]
 fn binding_model_contains_prevalidated_names_and_strategies() {
-    let contract = parse(CODEGEN_CONTRACT).unwrap();
+    let contract = parse_contract(CODEGEN_CONTRACT).unwrap();
     let model = BindingModel::from_contract(&contract).unwrap();
     assert_eq!(model.identity.source_name, "Bindings");
     assert_eq!(model.host_trait_ident.to_string(), "BindingsHost");
@@ -68,7 +68,7 @@ fn binding_model_contains_prevalidated_names_and_strategies() {
 
 #[test]
 fn generated_tokens_are_parsed_formatted_and_parsed_again() {
-    let contract = parse(CODEGEN_CONTRACT).unwrap();
+    let contract = parse_contract(CODEGEN_CONTRACT).unwrap();
     let tokens = generate_rust_tokens(&contract).unwrap();
     syn::parse2::<syn::File>(tokens).unwrap();
 
@@ -117,7 +117,7 @@ fn generated_tokens_are_parsed_formatted_and_parsed_again() {
 
 #[test]
 fn generated_registry_resolves_stable_ids_to_dense_slots() {
-    let contract = parse(
+    let contract = parse_contract(
         "contract Dispatch; host { \
          fn first() -> i32; \
          fn second() -> i32; \
@@ -156,7 +156,7 @@ fn illegal_or_colliding_names_never_reach_executable_rust() {
         "contract Collision; nexa { fn on_event(); fn on__event(); }",
         "contract Inject; nexa { fn r#break(); }",
     ] {
-        match parse(source) {
+        match parse_contract(source) {
             Err(_) => {}
             Ok(contract) => {
                 assert!(
@@ -174,7 +174,7 @@ fn illegal_or_colliding_names_never_reach_executable_rust() {
 
 #[test]
 fn codegen_descriptor_and_fingerprint_are_byte_deterministic() {
-    let contract = parse(CODEGEN_CONTRACT).unwrap();
+    let contract = parse_contract(CODEGEN_CONTRACT).unwrap();
     let first_source = generate_rust(&contract).unwrap();
     let first_descriptor = abi_descriptor(&contract);
     let first_fingerprint = contract_fingerprint(&contract);
@@ -187,7 +187,7 @@ fn codegen_descriptor_and_fingerprint_are_byte_deterministic() {
 
 #[test]
 fn recursive_collection_layouts_stop_at_generated_named_codec_boundaries() {
-    let contract = parse(
+    let contract = parse_contract(
         r"
         contract RecursiveBindings;
             enum Tree {
@@ -229,7 +229,7 @@ fn recursive_collection_layouts_stop_at_generated_named_codec_boundaries() {
 
 #[test]
 fn host_collections_are_typed_views_and_prelude_types_are_qualified() {
-    let contract = parse(
+    let contract = parse_contract(
         r"
         contract TypedCollections;
             handle Some;
@@ -286,14 +286,14 @@ fn host_collections_are_typed_views_and_prelude_types_are_qualified() {
 
 #[test]
 fn snapshot_schema_tracks_the_transitive_type_layout() {
-    let first = parse(
+    let first = parse_contract(
         "contract SnapshotContract; \
          struct Inner { value: i32, } \
          struct Outer { inner: Inner, } \
          host { fn snapshot() -> Snapshot<Outer>; }",
     )
     .unwrap();
-    let changed = parse(
+    let changed = parse_contract(
         "contract SnapshotContract; \
          struct Inner { value: i32, enabled: bool, } \
          struct Outer { inner: Inner, } \
@@ -328,7 +328,7 @@ fn binding_model_rejects_unencodable_snapshot_contents() {
          struct Bad { nested: Snapshot<Inner>, } \
          host { fn snapshot() -> Snapshot<Bad>; }",
     ] {
-        let contract = parse(source).unwrap();
+        let contract = parse_contract(source).unwrap();
         assert!(
             matches!(
                 BindingModel::from_contract(&contract),
@@ -342,7 +342,7 @@ fn binding_model_rejects_unencodable_snapshot_contents() {
 #[test]
 #[ignore = "spawns a nested Cargo check; exercised by the structured-codegen gate"]
 fn generated_fixture_cargo_checks() {
-    let contract = parse(CODEGEN_CONTRACT).unwrap();
+    let contract = parse_contract(CODEGEN_CONTRACT).unwrap();
     let generated = generate_rust(&contract).unwrap();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

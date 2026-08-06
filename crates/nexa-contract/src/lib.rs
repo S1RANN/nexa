@@ -13,7 +13,9 @@ pub mod parser;
 use nexa_bytecode::ValueType;
 use nexa_core::{FileId, StableId};
 
-pub use codegen::{BindingModel, CodegenError, generate_rust, generate_rust_tokens};
+pub use codegen::{
+    BindingModel, CodegenError, generate_rust, generate_rust_for_source_file, generate_rust_tokens,
+};
 pub use descriptor::{
     ABI_DESCRIPTOR_VERSION, AbiDescriptor, DeclarationFingerprint, EffectiveContractDescriptor,
     EffectiveContractSelection, EffectiveDescriptorError, CONTRACT_SYNTAX_VERSION, abi_descriptor,
@@ -31,29 +33,35 @@ pub use model::{
 };
 
 /// Lowers one exact Contract source snapshot into an AST with source spans and documentation.
-pub fn parse_ast(source: &str) -> Result<ContractAst, ContractError> {
-    parse_ast_with_file_id(source, FileId(0))
+pub fn parse_contract_ast(source: &str) -> Result<ContractAst, ContractError> {
+    parse_contract_ast_with_file_id(source, FileId(0))
 }
 
-/// Like [`parse_ast`], assigning every returned span to `file`.
-pub fn parse_ast_with_file_id(source: &str, file: FileId) -> Result<ContractAst, ContractError> {
+/// Like [`parse_contract_ast`], assigning every returned span to `file`.
+pub fn parse_contract_ast_with_file_id(
+    source: &str,
+    file: FileId,
+) -> Result<ContractAst, ContractError> {
     parser::parse_with_file_id(source, file).map_err(first_error)
 }
 
 /// Performs all Contract name, type, layout, attribute, and generated-name validation.
-pub fn validate(ast: &ContractAst) -> Result<ValidatedContract, ContractError> {
+pub fn validate_contract(ast: &ContractAst) -> Result<ValidatedContract, ContractError> {
     ValidatedContract::validate(ast).map_err(first_error)
 }
 
 /// Parses and validates one Contract definition.
-pub fn parse(source: &str) -> Result<ValidatedContract, ContractError> {
-    parse_with_file_id(source, FileId(0))
+pub fn parse_contract(source: &str) -> Result<ValidatedContract, ContractError> {
+    parse_contract_with_file_id(source, FileId(0))
 }
 
-/// Like [`parse`], assigning every returned span to `file`.
-pub fn parse_with_file_id(source: &str, file: FileId) -> Result<ValidatedContract, ContractError> {
-    let ast = parse_ast_with_file_id(source, file)?;
-    validate(&ast)
+/// Like [`parse_contract`], assigning every returned span to `file`.
+pub fn parse_contract_with_file_id(
+    source: &str,
+    file: FileId,
+) -> Result<ValidatedContract, ContractError> {
+    let ast = parse_contract_ast_with_file_id(source, file)?;
+    validate_contract(&ast)
 }
 
 fn first_error(mut errors: Vec<ContractError>) -> ContractError {

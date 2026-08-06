@@ -96,7 +96,7 @@ impl<'a> HostContractInput<'a> {
             return Err(HostContractSourceError::InvalidIdentity(identity));
         }
         let text = text.into();
-        let parsed = nexa_contract::parse(&text).map_err(HostContractSourceError::Parse)?;
+        let parsed = nexa_contract::parse_contract(&text).map_err(HostContractSourceError::Parse)?;
         if nexa_contract::abi_descriptor(&parsed).bytes != nexa_contract::abi_descriptor(contract).bytes {
             return Err(HostContractSourceError::ParsedContractMismatch);
         }
@@ -3757,7 +3757,7 @@ pub(crate) fn verify_package_artifact_integrity(
                 identity: source.identity.clone(),
             });
         }
-        let parsed = nexa_contract::parse(&source.text).map_err(|_| {
+        let parsed = nexa_contract::parse_contract(&source.text).map_err(|_| {
             PackageArtifactIntegrityError::InvalidHostDebugSource {
                 import: stable_host_import_identity(module, debug_info, host.import_index),
                 identity: source.identity.clone(),
@@ -4487,7 +4487,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_contract::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
         let input = resolved_input(manifest, builder.build().unwrap(), &contract);
         let identity =
             CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
@@ -4499,7 +4499,7 @@ activation = "programmatic"
 
     #[test]
     fn library_check_rejects_both_directions_of_unit_return_mismatch() {
-        let contract = nexa_contract::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
         for (source, expected_message) in [
             ("fn bad() -> i32 { return; }\n", "expected i32, found unit"),
             ("fn bad() { return 1; }\n", "expected unit, found i32"),
@@ -4855,7 +4855,7 @@ activation = "programmatic"
         let sources = snapshot_with_host();
         let mut debug = debug_info(SourceSpan::new(FileId(1), 13, 26));
         let host_source = sources.source(FileId(2)).unwrap();
-        let host_contract = nexa_contract::parse(&host_source.text).unwrap();
+        let host_contract = nexa_contract::parse_contract(&host_source.text).unwrap();
         let function_source = host_contract
             .host_functions
             .iter()
@@ -4896,7 +4896,7 @@ activation = "programmatic"
     #[test]
     fn build_identity_includes_canonical_standard_library_descriptor() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_contract::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
         let contract_input = test_contract_input(&contract);
         let first = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -4933,7 +4933,7 @@ activation = "programmatic"
              }\n\
              }\n",
         );
-        let idl = nexa_contract::parse(&source).unwrap();
+        let idl = nexa_contract::parse_contract(&source).unwrap();
         let base = HostContractInput::with_source(
             &idl,
             SourceIdentity::standalone("contracts/host.nidl"),
@@ -4993,7 +4993,7 @@ activation = "programmatic"
     #[test]
     fn package_fingerprint_uses_canonical_build_authorities() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_contract::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
         let contract_input = test_contract_input(&contract);
         let fingerprint = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -5149,7 +5149,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_contract::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse_contract("contract Empty {}").unwrap();
         let input = Arc::new(resolved_input(
             manifest,
             production.build().unwrap(),

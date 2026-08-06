@@ -1,49 +1,56 @@
 //! Phase 2 Golden baseline (task #5).
 //!
-//! Locks the canonical Contract Stable IDs, declaration Stable IDs, ABI descriptor bytes,
-//! Contract fingerprint, and generated Rust binding shape for a representative flat Contract v3
-//! source. These values are audited: semantic-equivalent migrations must NOT change them, and
-//! the only version-upgrade difference this milestone permits is `CONTRACT_SYNTAX_VERSION` being
-//! recorded in the Build Fingerprint (see `nexa-analysis` `BuildFingerprintInput`).
+//! Locks, for the checked-in `fixtures/golden.contract.nexa` source: the Contract Stable ID,
+//! every declaration Stable ID (handle/struct/field/enum/variant/host fn/nexa fn/parameters),
+//! the ABI descriptor bytes, the Contract fingerprint, the provenance header stamped from the
+//! Contract source file name, and a canonical snapshot of the generated public binding API.
+//! Semantic-equivalent migrations must not change any of these; the only permitted version
+//! upgrade this milestone is `CONTRACT_SYNTAX_VERSION` (recorded in the Build Fingerprint via
+//! `nexa-analysis::BuildFingerprintInput`, never in the descriptor bytes).
 
-use nexa_contract::{abi_descriptor, generate_rust, parse};
+use nexa_contract::{abi_descriptor, generate_rust, generate_rust_for_source_file, parse_contract};
 
-const GOLDEN_SOURCE: &str = r"
-contract Golden;
-    handle Entity;
-
-    struct Cell {
-        x: i32,
-        y: i32,
-    }
-
-    enum Event {
-        Started,
-        Ended,
-    }
-
-    host {
-        fn log(message: string);
-    }
-
-    nexa {
-        fn on_event(event: Event) -> Array<i32>;
-    }
-";
+const GOLDEN_SOURCE: &str = include_str!("fixtures/golden.contract.nexa");
 
 #[test]
-fn golden_contract_stable_ids_fingerprint_descriptor_and_binding_are_locked() {
-    let contract = parse(GOLDEN_SOURCE)
+fn golden_contract_and_declaration_stable_ids_are_locked() {
+    let contract = parse_contract(GOLDEN_SOURCE)
         .expect("the Golden contract is valid flat Contract v3 syntax");
+
+    assert_eq!(contract.stable_id.0, 0x079f_48e7_2477_dfb0, "contract");
+    assert_eq!(contract.handles[0].stable_id.0, 0x5805_175c_3d8c_424c, "handle Entity");
+
+    let cell = &contract.structs[0];
+    assert_eq!(cell.stable_id.0, 0x741d_0857_640e_9fc4, "struct Cell");
+    assert_eq!(cell.fields[0].stable_id.0, 0x53eb_ec4f_6958_03f3, "field Cell.x");
+    assert_eq!(cell.fields[1].stable_id.0, 0x95c5_b49e_2fa7_3db9, "field Cell.y");
+
+    let event = &contract.enums[0];
+    assert_eq!(event.stable_id.0, 0xcfa3_af2f_5ed1_4df0, "enum Event");
+    assert_eq!(event.variants[0].stable_id.0, 0xad45_75c2_a09e_68ca, "variant Started");
+    assert_eq!(event.variants[1].stable_id.0, 0xb1b3_8d20_96ad_b205, "variant Ended");
+
+    let log = &contract.host_functions[0];
+    assert_eq!(log.stable_id.0, 0xfd1d_55d7_3e3d_4441, "host fn log");
+    assert_eq!(
+        log.parameters[0].stable_id.0,
+        0x46d1_c221_b976_5897,
+        "host fn log(message)"
+    );
+
+    let on_event = &contract.nexa_functions[0];
+    assert_eq!(on_event.stable_id.0, 0xced5_39c2_2107_132d, "nexa fn on_event");
+    assert_eq!(
+        on_event.parameters[0].stable_id.0,
+        0x3e42_b2a3_0f2a_4476,
+        "nexa fn on_event(event)"
+    );
+}
+
+#[test]
+fn golden_descriptor_bytes_and_fingerprint_are_locked() {
+    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
     let descriptor = abi_descriptor(&contract);
-
-    // Stable IDs (contract + declarations) are golden-locked and must not drift.
-    assert_eq!(contract.stable_id.0, 0x079f_48e7_2477_dfb0);
-    assert_eq!(contract.handles[0].stable_id.0, 0x5805_175c_3d8c_424c);
-    assert_eq!(contract.structs[0].stable_id.0, 0x741d_0857_640e_9fc4);
-    assert_eq!(contract.enums[0].stable_id.0, 0xcfa3_af2f_5ed1_4df0);
-
-    // Descriptor bytes + fingerprint are byte-deterministic for equivalent semantics.
     assert_eq!(
         descriptor.bytes.as_slice(),
         GOLDEN_DESCRIPTOR_BYTES,
@@ -54,44 +61,71 @@ fn golden_contract_stable_ids_fingerprint_descriptor_and_binding_are_locked() {
         &GOLDEN_FINGERPRINT,
         "Contract fingerprint must remain unchanged for equivalent semantics"
     );
+}
 
-    // Generated Rust binding surface (registry/type/function names and version metadata).
-    let rust = generate_rust(&contract).expect("codegen succeeds for the Golden contract");
-    assert!(
-        rust.contains("pub const CONTRACT_SOURCE_NAME: &str = \"Golden\";"),
-        "generated binding must expose the canonical contract source name"
-    );
-    assert!(
-        rust.contains("pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;"),
-        "generated binding must carry CONTRACT_SYNTAX_VERSION = 3"
-    );
-    assert!(
-        rust.contains("pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;"),
-        "generated binding must keep HOST_CONTRACT_SCHEMA_VERSION = 2"
-    );
-    assert!(
-        rust.contains("pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;"),
-        "generated binding must keep ABI_DESCRIPTOR_VERSION = 2"
-    );
-    for needle in [
-        "pub struct Cell",
-        "pub enum Event",
-        "pub struct Entity(pub u64)",
-        "pub trait GoldenHost",
-        "impl GoldenHost for GeneratedHostStub",
-        "fn log<",
-        "\"on_event\"",
-        "pub const fn contract() -> nexa_runtime::HostContract",
-    ] {
-        assert!(
-            rust.contains(needle),
-            "generated binding shape must retain `{needle}`; missing from output:\n{rust}"
-        );
-    }
+#[test]
+fn golden_provenance_header_uses_the_contract_file_basename_only() {
+    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
 
-    // Re-generating is byte-deterministic.
+    let relative = generate_rust_for_source_file(&contract, "fixtures/golden.contract.nexa")
+        .expect("path-aware codegen succeeds");
+    assert!(
+        relative.starts_with("// Generated from golden.contract.nexa. DO NOT EDIT.\n"),
+        "provenance header must be stamped from the .contract.nexa file name"
+    );
+
+    let absolute = generate_rust_for_source_file(
+        &contract,
+        "/tmp/some/absolute/build/dir/golden.contract.nexa",
+    )
+    .expect("path-aware codegen succeeds");
     assert_eq!(
-        generate_rust(&contract).expect("regenerate"),
+        relative, absolute,
+        "directories and absolute path prefixes must never leak into generated output"
+    );
+
+    // The name-based variant keeps its own explicit provenance form.
+    let by_name = generate_rust(&contract).expect("codegen succeeds");
+    assert!(by_name.starts_with("// @generated from Contract `Golden`. DO NOT EDIT.\n"));
+}
+
+#[test]
+fn golden_generated_public_binding_api_snapshot_is_locked() {
+    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
+    let rust = generate_rust_for_source_file(&contract, "golden.contract.nexa")
+        .expect("codegen succeeds");
+
+    // Canonical public API digest: every generated `pub` item/signature line, sorted + deduped.
+    let mut public_items: Vec<String> = rust
+        .lines()
+        .filter(|line| line.trim_start().starts_with("pub "))
+        .map(|line| {
+            line.trim()
+                .trim_end_matches(" {")
+                .trim_end_matches('(')
+                .to_owned()
+        })
+        .collect();
+    public_items.sort();
+    public_items.dedup();
+
+    let expected: Vec<&str> = GOLDEN_PUBLIC_API_SNAPSHOT
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        public_items, expected,
+        "generated public binding API drifted from the golden snapshot"
+    );
+
+    // Version metadata inside the binding stays at the frozen values.
+    assert!(rust.contains("pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;"));
+    assert!(rust.contains("pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;"));
+    assert!(rust.contains("pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;"));
+
+    // Codegen is byte-deterministic.
+    assert_eq!(
+        generate_rust_for_source_file(&contract, "golden.contract.nexa").expect("regenerate"),
         rust,
         "codegen must be deterministic"
     );
@@ -121,3 +155,44 @@ const GOLDEN_FINGERPRINT: [u8; 32] = [
     0xc4, 0xa6, 0x41, 0x49, 0xa6, 0xa2, 0x64, 0x47, 0xf5, 0xd0, 0x2c, 0xce, 0x87, 0x9d, 0x78,
     0xa4, 0x6a,
 ];
+
+const GOLDEN_PUBLIC_API_SNAPSHOT: &str = r#"pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;
+pub const CONTRACT_DESCRIPTOR: &[u8] = &[
+pub const CONTRACT_FINGERPRINT: [u8; 32] = [
+pub const CONTRACT_RUNTIME_ID: nexa_runtime::StableId = nexa_runtime::StableId
+pub const CONTRACT_SOURCE_NAME: &str = "Golden";
+pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;
+pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;
+pub const NAME: &'static str = "on_event";
+pub const SOURCE: &str = "\ncontract Golden;\n    handle Entity;\n\n    struct Cell {\n        x: i32,\n        y: i32,\n    }\n\n    enum Event {\n        Started,\n        Ended,\n    }\n\n    host {\n        fn log(message: string);\n    }\n\n    nexa {\n        fn on_event(event: Event) -> Array<i32>;\n    }\n";
+pub const STABLE_ID: nexa_runtime::StableId = nexa_runtime::StableId
+pub const fn contract() -> nexa_runtime::HostContract
+pub const fn is_empty(self) -> bool
+pub const fn len(self) -> usize
+pub const fn new(host: H) -> Self
+pub const fn nexa_tag(&self) -> u32
+pub enum Event
+pub enum EventRef<'a>
+pub enum OnEvent {}
+pub event: Event,
+pub fn get(self, index: usize) -> ::std::result::Result<T, nexa_runtime::HostTrap>
+pub fn iter
+pub fn registry<H: GoldenHost + 'static>
+pub fn x(self) -> Result<i32, nexa_runtime::HostTrap>
+pub fn y(self) -> Result<i32, nexa_runtime::HostTrap>
+pub host: H,
+pub static HOST_FUNCTION_AUTHORITIES: ::std::sync::LazyLock<
+pub struct Cell
+pub struct CellRef<'a>(nexa_runtime::HostStructRef<'a>);
+pub struct Entity(pub u64);
+pub struct GeneratedHostRegistry<H>
+pub struct GeneratedHostStub;
+pub struct HostError(pub ::std::string::String);
+pub struct OnEventArgs
+pub struct __NexaArrayRef<'a, T>
+pub struct __NexaBufferRef<'a, T>
+pub trait GoldenHost
+pub type OnEventOutput = ::std::vec::Vec<i32>;
+pub x: i32,
+pub y: i32,
+"#;

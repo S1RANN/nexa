@@ -82,7 +82,7 @@ pub(crate) fn canonical_host_surface(
 ) -> Result<HostContractSurface, PackageEnvironmentError> {
     let source = Arc::clone(input.source().text());
     let identity = input.source().identity().clone();
-    let contract = nexa_contract::parse(&source).map_err(PackageEnvironmentError::InvalidHostSource)?;
+    let contract = nexa_contract::parse_contract(&source).map_err(PackageEnvironmentError::InvalidHostSource)?;
     if nexa_contract::abi_descriptor(&contract).bytes != nexa_contract::abi_descriptor(input.contract()).bytes
     {
         return Err(PackageEnvironmentError::HostSourceContractMismatch);
@@ -503,7 +503,7 @@ contract Host {
 
     #[test]
     fn v2_surface_contains_all_entrypoints_and_only_selected_requirements() {
-        let contract = nexa_contract::parse(CONTRACT).unwrap();
+        let contract = nexa_contract::parse_contract(CONTRACT).unwrap();
         let input = HostContractInput::with_source(
             &contract,
             SourceIdentity::standalone("memory://host.nidl"),
@@ -528,7 +528,7 @@ contract Host {
 
     #[test]
     fn exact_source_identity_and_spans_survive_the_adapter() {
-        let contract = nexa_contract::parse(CONTRACT).unwrap();
+        let contract = nexa_contract::parse_contract(CONTRACT).unwrap();
         let identity = SourceIdentity::standalone("memory://contracts/host.nidl");
         let input = HostContractInput::with_source(&contract, identity.clone(), CONTRACT).unwrap();
         let surface = canonical_host_surface(&input).unwrap();
@@ -552,7 +552,7 @@ contract Host {
 
     #[test]
     fn contract_entrypoints_are_optional_until_the_host_requires_them() {
-        let contract = nexa_contract::parse(CONTRACT).unwrap();
+        let contract = nexa_contract::parse_contract(CONTRACT).unwrap();
         let input = HostContractInput::canonical(&contract);
         assert_eq!(input.entrypoints().count(), 2);
         assert_eq!(input.required_entrypoints().count(), 0);

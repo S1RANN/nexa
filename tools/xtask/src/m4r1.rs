@@ -2201,7 +2201,7 @@ fn negative_test_evidence(path: &str, test: &str, source: &str) -> bool {
         ) => &[
             "let removed = [",
             "for (name, source) in removed",
-            "nexa_contract::parse(source).is_err()",
+            "nexa_contract::parse_contract(source).is_err()",
             "interface Old",
             "opaque Ticket",
             "sync fn ping",

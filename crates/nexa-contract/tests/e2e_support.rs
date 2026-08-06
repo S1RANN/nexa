@@ -19,8 +19,8 @@ use std::fmt::Write as _;
 
 #[test]
 fn changed_binding_executes_through_generated_registry() {
-    let base_idl = nexa_contract::parse(include_str!("base_contract.nidl")).expect("base NIDL");
-    let changed_idl = nexa_contract::parse(include_str!("contract.nidl")).expect("changed NIDL");
+    let base_idl = nexa_contract::parse_contract(include_str!("base_contract.nidl")).expect("base NIDL");
+    let changed_idl = nexa_contract::parse_contract(include_str!("contract.nidl")).expect("changed NIDL");
     assert_eq!(
         CONTRACT_RUNTIME_ID,
         nexa_contract::contract_runtime_id(&changed_idl)
@@ -962,7 +962,7 @@ fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
     assert_eq!(mutations.len(), 20);
     for mutation in mutations {
         assert_ne!(mutation.mutated_contract, BASE_CONTRACT, "{}", mutation.name);
-        nexa_contract::parse(&mutation.mutated_contract)
+        nexa_contract::parse_contract(&mutation.mutated_contract)
             .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
     }
 }

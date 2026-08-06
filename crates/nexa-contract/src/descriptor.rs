@@ -922,7 +922,7 @@ mod tests {
     };
 
     fn contract(source: &str) -> crate::ValidatedContract {
-        crate::parse(source).expect("test Contract must validate")
+        crate::parse_contract(source).expect("test Contract must validate")
     }
 
     fn take_u32(bytes: &[u8], cursor: &mut usize) -> u32 {
