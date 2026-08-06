@@ -1761,6 +1761,7 @@ pub fn canonical_package_build_fingerprint_input_with_contract_for_profile(
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
         host_contract: effective_contract.effective_descriptor().bytes.clone(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: canonical_host_contract_source_identity(&effective_contract),
         host_required_entrypoints: effective_contract.canonical_required_entrypoints(),
         language_version: NEXA_LANGUAGE_VERSION,

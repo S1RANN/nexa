@@ -77,6 +77,7 @@ activation = "default-enabled"
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: Vec::new(),
         host_required_entrypoints: nexa_contract::required_entrypoints_descriptor(std::iter::empty::<
             &str,
@@ -252,6 +253,7 @@ pub fn read() -> i32 {
             source_set_fingerprint(&dependency_sources),
         )]),
         host_contract: host_contract.clone(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: host_contract_source.clone(),
         host_required_entrypoints: host_required_entrypoints.clone(),
         repl_session_context: Vec::new(),

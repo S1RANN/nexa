@@ -205,6 +205,8 @@ pub struct BuildFingerprintInput {
     pub dependency_source_sets: BTreeMap<PackageId, SourceSetFingerprint>,
     /// Canonical semantic Host ABI bytes.
     pub host_contract: Vec<u8>,
+    /// Contract source syntax version (CONTRACT_SYNTAX_VERSION) that produced `host_contract`.
+    pub contract_syntax_version: u16,
     /// Exact source/debug identity for the Host contract, including standalone URI and raw text.
     pub host_contract_source: Vec<u8>,
     /// Canonical subset of Host-declared exports which this build must implement.
@@ -258,6 +260,7 @@ impl BuildFingerprintInput {
             }
         }
         builder.field_bytes("host-contract", &self.host_contract);
+        builder.field_bytes("contract-syntax-version", &self.contract_syntax_version.to_le_bytes());
         builder.field_bytes("host-contract-source", &self.host_contract_source);
         builder.field_bytes("host-required-entrypoints", &self.host_required_entrypoints);
         builder.field_bytes("repl-session-context", &self.repl_session_context);

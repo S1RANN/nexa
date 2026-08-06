@@ -206,6 +206,7 @@ fn resolved_input_with_contract_and_options(
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
         host_contract: host_contract.to_vec(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: host_contract_source.clone(),
         host_required_entrypoints: Vec::new(),
         repl_session_context: Vec::new(),

@@ -248,6 +248,7 @@ fn snippet_build_fingerprint(
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: canonical_host_contract.to_vec(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: canonical_host_contract_source.to_vec(),
         host_required_entrypoints: canonical_host_required_entrypoints.to_vec(),
         repl_session_context: Vec::new(),

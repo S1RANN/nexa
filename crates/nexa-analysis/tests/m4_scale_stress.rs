@@ -337,6 +337,7 @@ fn scale_fixture(module_order: &[usize], reverse_packages: bool) -> ScaleFixture
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
         host_contract: host_contract.clone(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: scale_host_source_identity(),
         host_required_entrypoints: scale_host_required_entrypoints_identity(),
         repl_session_context: Vec::new(),
@@ -659,6 +660,7 @@ fn load_scale_directory_fixture(root: &Path) -> ScaleFixture {
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
         host_contract: host_contract.clone(),
+        contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: scale_host_source_identity(),
         host_required_entrypoints: scale_host_required_entrypoints_identity(),
         repl_session_context: Vec::new(),
