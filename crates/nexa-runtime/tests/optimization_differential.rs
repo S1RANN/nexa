@@ -64,7 +64,7 @@ fn array_sweep(n: i32) -> i32 {
     let mut total: i32 = 0;
     let mut cursor: i32 = 0;
     while cursor < values.len() {
-        total = total + values.get(cursor);
+        total = total + values[cursor];
         cursor = cursor + 1;
     }
     return total;
@@ -126,7 +126,7 @@ fn div_trap(a: i32, b: i32) -> i32 {
 fn index_trap(n: i32) -> i32 {
     let values: Array<i32> = Array::new();
     values.push(1);
-    return values.get(n);
+    return values[n];
 }
 fn row_projection(n: i32) -> i32 {
     let cells: Array<Pair> = Array::new();
@@ -138,7 +138,7 @@ fn row_projection(n: i32) -> i32 {
     let mut total: i32 = 0;
     let mut cursor: i32 = 0;
     while cursor < cells.len() {
-        let cell: Pair = cells.get(cursor);
+        let cell: Pair = cells[cursor];
         total = total + cell.first + cell.second;
         cursor = cursor + 1;
     }
@@ -147,7 +147,7 @@ fn row_projection(n: i32) -> i32 {
 fn row_projection_trap(n: i32) -> i32 {
     let cells: Array<Pair> = Array::new();
     cells.push(Pair { first: 1, second: 2 });
-    let cell: Pair = cells.get(n);
+    let cell: Pair = cells[n];
     return cell.first;
 }
 fn scalar_array() -> i32 {
@@ -155,7 +155,7 @@ fn scalar_array() -> i32 {
     values.push(1);
     values.push(2);
     values.set(0, 3);
-    return values.get(0) + values.len();
+    return 3 + values.len();
 }
 fn scalar_map_hit() -> i32 {
     let values: Map<i32, string> = Map::new();

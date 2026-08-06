@@ -1415,6 +1415,17 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
         StandardIntrinsic::MapLen { key, value }
         | StandardIntrinsic::MapContains { key, value }
         | StandardIntrinsic::MapInsert { key, value } => has_map(key, value),
+        StandardIntrinsic::ValueToString { value } => match value {
+            ValueType::I32
+            | ValueType::I64
+            | ValueType::F32
+            | ValueType::F64
+            | ValueType::Bool
+            | ValueType::Rune
+            | ValueType::String => true,
+            ValueType::Named(id) => module.array_types.iter().any(|ty| ty.type_id == id),
+            ValueType::Ref => false,
+        },
         _ => true,
     }
 }
@@ -6788,6 +6799,7 @@ mod tests {
         StringSubstring,
         StringTrim,
         StringSplit,
+        ValueToString,
         ArrayLen,
         ArrayIsEmpty,
         ArrayGet,
@@ -6807,7 +6819,7 @@ mod tests {
     }
 
     impl FrozenIntrinsicKind {
-        const ALL: [Self; 42] = [
+        const ALL: [Self; 43] = [
             Self::OptionIsSome,
             Self::OptionIsNone,
             Self::ResultIsOk,
@@ -6834,6 +6846,7 @@ mod tests {
             Self::StringSubstring,
             Self::StringTrim,
             Self::StringSplit,
+            Self::ValueToString,
             Self::ArrayLen,
             Self::ArrayIsEmpty,
             Self::ArrayGet,
@@ -6881,6 +6894,7 @@ mod tests {
             StandardIntrinsic::StringSubstring => FrozenIntrinsicKind::StringSubstring,
             StandardIntrinsic::StringTrim => FrozenIntrinsicKind::StringTrim,
             StandardIntrinsic::StringSplit => FrozenIntrinsicKind::StringSplit,
+            StandardIntrinsic::ValueToString { .. } => FrozenIntrinsicKind::ValueToString,
             StandardIntrinsic::ArrayLen { .. } => FrozenIntrinsicKind::ArrayLen,
             StandardIntrinsic::ArrayIsEmpty { .. } => FrozenIntrinsicKind::ArrayIsEmpty,
             StandardIntrinsic::ArrayGet { .. } => FrozenIntrinsicKind::ArrayGet,
@@ -7059,6 +7073,11 @@ mod tests {
                 StandardIntrinsic::StringSplit,
                 vec![ValueType::String, ValueType::String],
                 string_array,
+            ),
+            spec(
+                StandardIntrinsic::ValueToString { value },
+                vec![value],
+                ValueType::String,
             ),
             spec(
                 StandardIntrinsic::ArrayLen { element: value },

@@ -3416,7 +3416,7 @@ impl CheckedInterpreter {
                         dst,
                         &mut continuation.arena,
                         heap.as_deref_mut(),
-                        module.layout_table(),
+                        module,
                         resolved_nominal,
                     )? {
                         PhysicalStandardIntrinsicOutcome::Returned => {
@@ -5357,7 +5357,7 @@ fn dynamic_instruction_fuel(
             ..
         } => {
             return standard_intrinsic_attempt_fuel(
-                intrinsic, args_base, args_count, arena, heap, resolved,
+                module, intrinsic, args_base, args_count, arena, heap, resolved,
             );
         }
         Instruction::StringLen { source, .. } | Instruction::StringRuneAt { source, .. } => {
@@ -5757,6 +5757,7 @@ fn standard_intrinsic_arguments(
 }
 
 fn standard_intrinsic_attempt_fuel(
+    module: &nexa_bytecode::Module,
     intrinsic: StandardIntrinsic,
     args_base: u16,
     args_count: u16,
@@ -5842,6 +5843,9 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::MapInsertAttempt => {
             map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
+        }
+        StandardIntrinsicFuelModel::ValueToString => {
+            formattable_attempt_fuel(module, intrinsic, arguments[0], heap_required()?)?
         }
     };
     let logical_slots = intrinsic.argument_count().saturating_add(1);
@@ -5999,11 +6003,13 @@ fn run_physical_standard_intrinsic(
     dst: u16,
     arena: &mut FrameArena,
     mut heap: Option<&mut Heap>,
-    layouts: &nexa_bytecode::layout::LayoutTable,
+    module: &VerifiedModule,
     resolved: ExecutableNominalOperand,
 ) -> Result<PhysicalStandardIntrinsicOutcome, InterpreterError> {
     use StandardIntrinsic as Intrinsic;
 
+    let layouts = module.layout_table();
+    let module = module.module();
     let abi = PhysicalStandardIntrinsicAbi::from_resolved(resolved)?;
     let argument_base = |index| abi.argument_base(args_base, index);
     let argument = |arena: &FrameArena, index| register(arena, argument_base(index)?);
@@ -6037,6 +6043,27 @@ fn run_physical_standard_intrinsic(
                 argument_base(1)?
             };
             arena.copy_register_range(source, dst, abi.result_slots)?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::ValueToString { value: ty } => {
+            if abi.argument_slots[0] != 1 || abi.result_slots != 1 {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let source = argument(arena, 0)?;
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let shape = formattable_shape(module, heap, source, ty, 0)?;
+            let capacity =
+                usize::try_from(shape.bytes).map_err(|_| InterpreterError::StringLengthOverflow)?;
+            heap.validate_string_length(capacity)?;
+            let mut text = String::with_capacity(capacity);
+            write_formattable_value(&mut text, module, heap, source, ty, 0)?;
+            if text.len() != capacity {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let rendered = allocate_runtime_string(heap, &text)?;
+            set_register(arena, dst, rendered)?;
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
         Intrinsic::ArrayGet { element } => {
@@ -6496,6 +6523,9 @@ fn run_standard_intrinsic(
                 Ok(StandardIntrinsicOutcome::Retry)
             }
         }
+        // ValueToString needs the module's recursive Array<T> metadata and is
+        // handled by run_physical_standard_intrinsic before this fallback.
+        Intrinsic::ValueToString { .. } => Err(InterpreterError::TypeMismatch),
         Intrinsic::DebugAssert => {
             let RuntimeValue::Bool(condition) = arguments[0] else {
                 return Err(InterpreterError::TypeMismatch);
@@ -6518,6 +6548,192 @@ fn run_standard_intrinsic(
                 crate::RuntimeMessage::inline(message),
             ))
         }
+    }
+}
+
+fn formattable_attempt_fuel(
+    module: &nexa_bytecode::Module,
+    intrinsic: StandardIntrinsic,
+    value: RuntimeValue,
+    heap: &Heap,
+) -> Result<u64, InterpreterError> {
+    let StandardIntrinsic::ValueToString { value: ty } = intrinsic else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    let shape = formattable_shape(module, heap, value, ty, 0)?;
+    let cells = shape
+        .cells
+        .checked_mul(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let bytes = fuel_blocks(shape.bytes, STANDARD_STRING_FUEL_BLOCK_BYTES)?
+        .checked_mul(2)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    cells
+        .checked_add(bytes)
+        .ok_or(InterpreterError::FuelCostOverflow)
+}
+
+const MAX_FORMATTABLE_DEPTH: u8 = 64;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FormattableShape {
+    cells: u64,
+    bytes: u64,
+}
+
+impl FormattableShape {
+    fn add(&mut self, other: Self) -> Result<(), InterpreterError> {
+        self.cells = self
+            .cells
+            .checked_add(other.cells)
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or(InterpreterError::StringLengthOverflow)?;
+        Ok(())
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<(), InterpreterError> {
+        self.bytes = self
+            .bytes
+            .checked_add(fuel_usize(bytes)?)
+            .ok_or(InterpreterError::StringLengthOverflow)?;
+        Ok(())
+    }
+}
+
+fn formattable_array_element(
+    module: &nexa_bytecode::Module,
+    ty: ValueType,
+) -> Result<ValueType, InterpreterError> {
+    let ValueType::Named(type_id) = ty else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    module
+        .array_types
+        .iter()
+        .find(|array| array.type_id == type_id)
+        .map(|array| array.element)
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn scalar_shape(
+    heap: &Heap,
+    value: RuntimeValue,
+    ty: ValueType,
+) -> Result<FormattableShape, InterpreterError> {
+    let bytes = match (ty, value) {
+        (ValueType::String, RuntimeValue::String { reference, .. }) => {
+            heap.string(reference)?.len()
+        }
+        (ValueType::I32, RuntimeValue::I32(_))
+        | (ValueType::I64, RuntimeValue::I64(_))
+        | (ValueType::F32, RuntimeValue::F32(_))
+        | (ValueType::F64, RuntimeValue::F64(_))
+        | (ValueType::Bool, RuntimeValue::Bool(_))
+        | (ValueType::Rune, RuntimeValue::Rune(_)) => {
+            let mut text = ScalarText::new();
+            write_scalar_text(value, &mut text)?;
+            text.as_str().len()
+        }
+        _ => return Err(InterpreterError::TypeMismatch),
+    };
+    Ok(FormattableShape {
+        cells: 1,
+        bytes: fuel_usize(bytes)?,
+    })
+}
+
+fn formattable_shape(
+    module: &nexa_bytecode::Module,
+    heap: &Heap,
+    value: RuntimeValue,
+    ty: ValueType,
+    depth: u8,
+) -> Result<FormattableShape, InterpreterError> {
+    if depth >= MAX_FORMATTABLE_DEPTH {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    if !matches!(ty, ValueType::Named(_)) {
+        return scalar_shape(heap, value, ty);
+    }
+
+    let element = formattable_array_element(module, ty)?;
+    let values = heap.array_values(value)?;
+    let mut shape = FormattableShape { cells: 1, bytes: 2 };
+    if values.len() > 1 {
+        shape.add_bytes(
+            values
+                .len()
+                .saturating_sub(1)
+                .checked_mul(2)
+                .ok_or(InterpreterError::StringLengthOverflow)?,
+        )?;
+    }
+    for item in values.iter() {
+        shape.add(formattable_shape(
+            module,
+            heap,
+            item,
+            element,
+            depth.saturating_add(1),
+        )?)?;
+    }
+    Ok(shape)
+}
+
+fn write_formattable_value(
+    output: &mut String,
+    module: &nexa_bytecode::Module,
+    heap: &Heap,
+    value: RuntimeValue,
+    ty: ValueType,
+    depth: u8,
+) -> Result<(), InterpreterError> {
+    if depth >= MAX_FORMATTABLE_DEPTH {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    match (ty, value) {
+        (ValueType::String, RuntimeValue::String { reference, .. }) => {
+            output.push_str(heap.string(reference)?);
+            Ok(())
+        }
+        (
+            ValueType::I32
+            | ValueType::I64
+            | ValueType::F32
+            | ValueType::F64
+            | ValueType::Bool
+            | ValueType::Rune,
+            value,
+        ) => {
+            let mut text = ScalarText::new();
+            write_scalar_text(value, &mut text)?;
+            output.push_str(text.as_str());
+            Ok(())
+        }
+        (ty @ ValueType::Named(_), value) => {
+            let element = formattable_array_element(module, ty)?;
+            let values = heap.array_values(value)?;
+            output.push('[');
+            for (index, item) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(", ");
+                }
+                write_formattable_value(
+                    output,
+                    module,
+                    heap,
+                    item,
+                    element,
+                    depth.saturating_add(1),
+                )?;
+            }
+            output.push(']');
+            Ok(())
+        }
+        _ => Err(InterpreterError::TypeMismatch),
     }
 }
 
@@ -8127,7 +8343,7 @@ fn arithmetic_constant() -> i32 {
     values.push(1);
     values.push(2);
     values.set(0, 3);
-    return values.get(0) + values.len();
+    return 3 + values.len();
 }
 "#;
         let module = nexa_compiler::compile(source).expect("constant kernels compile");

@@ -1205,7 +1205,9 @@ impl PackageBuildSession {
             let compilation_evidence =
                 package_compilation_evidence(&ir, &outcome.resolved_import_edges);
             self.pipeline.start_typed_compiler();
-            let compiled = nexa_compiler::compile_typed_package(&ir)?;
+            let compiled = nexa_compiler::compile_typed_package(&ir).map_err(|error| {
+                PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+            })?;
             validate_product_compiler_output(&compiled, &outcome)?;
             let verify_started = Instant::now();
             self.pipeline.start_verifier();
@@ -1362,7 +1364,9 @@ impl PackageBuildSession {
         let compilation_evidence =
             package_compilation_evidence(&ir, &outcome.resolved_import_edges);
         self.pipeline.start_typed_compiler();
-        let standalone = nexa_compiler::compile_typed_standalone_package(&ir)?;
+        let standalone = nexa_compiler::compile_typed_standalone_package(&ir).map_err(|error| {
+            PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+        })?;
         let compiled = standalone.package;
         validate_product_compiler_output(&compiled, &outcome)?;
         self.pipeline.start_verifier();
@@ -1618,7 +1622,9 @@ impl PackageBuildSession {
             .take()
             .ok_or_else(|| PackageBuildError::AnalysisFailed(outcome.diagnostics.clone()))?;
         self.pipeline.start_typed_compiler();
-        let compiled = nexa_compiler::compile_typed_package(&ir)?;
+        let compiled = nexa_compiler::compile_typed_package(&ir).map_err(|error| {
+            PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+        })?;
         validate_test_compiler_output(&compiled, &outcome)?;
         let module = compiled
             .test_module
@@ -2936,6 +2942,10 @@ pub enum PackageBuildError {
     HostContractSource(HostContractSourceError),
     Environment(crate::package_environment::PackageEnvironmentError),
     AnalysisFailed(DiagnosticBatch),
+    /// A typed-lowering failure converted into the shared source-backed batch so
+    /// every consumer renders compile-phase diagnostics through the unified
+    /// pipeline (stable code, user message, and exact source labels).
+    CompileFailed(DiagnosticBatch),
     MissingTypedPackageIr,
     Compile(nexa_compiler::CompileError),
     Verify(nexa_verifier::VerifyError),
@@ -3011,6 +3021,11 @@ impl fmt::Display for PackageBuildError {
             Self::AnalysisFailed(diagnostics) => write!(
                 formatter,
                 "package analysis failed: {} diagnostic(s)",
+                diagnostics.len()
+            ),
+            Self::CompileFailed(diagnostics) => write!(
+                formatter,
+                "package compilation failed: {} diagnostic(s)",
                 diagnostics.len()
             ),
             Self::MissingTypedPackageIr => {
@@ -3090,6 +3105,49 @@ impl From<nexa_compiler::CompileError> for PackageBuildError {
     fn from(value: nexa_compiler::CompileError) -> Self {
         Self::Compile(value)
     }
+}
+
+/// Converts a typed-lowering failure into the shared source-backed diagnostic batch.
+///
+/// The typed compiler reports spans with artifact-local [`FileId`]s whose dense
+/// assignment is owned by its lowering file table (all modules in canonical order,
+/// then external sources). This reproduces that table from the typed IR so every
+/// compile-phase label renders through the unified diagnostic pipeline with its
+/// exact source text.
+fn compile_error_diagnostic_batch(
+    ir: &nexa_analysis::TypedPackageIr,
+    error: &nexa_compiler::CompileError,
+) -> DiagnosticBatch {
+    let mut files = BTreeMap::<FileId, SourceIdentity>::new();
+    let mut builder = SourceSnapshotRegistry::builder();
+    let mut modules = ir.modules().iter().collect::<Vec<_>>();
+    modules.sort_by(|left, right| {
+        (left.package_id.as_str(), left.module.as_str(), &left.source).cmp(&(
+            right.package_id.as_str(),
+            right.module.as_str(),
+            &right.source,
+        ))
+    });
+    for module in &modules {
+        let identity =
+            SourceIdentity::package(module.package_id.as_str(), module.source.path.as_str());
+        files.insert(FileId(module.file_id.0), identity.clone());
+        let _ = builder.insert(identity, Arc::from(module.syntax.source.as_str()));
+    }
+    for external in ir.metadata().external_sources.iter() {
+        files.insert(FileId(external.file_id.0), external.identity.clone());
+        let _ = builder.insert(external.identity.clone(), Arc::clone(&external.text));
+    }
+    let facade = crate::Diagnostic::new(error, FileId::default());
+    let leaf = facade.to_leaf_with_source_identities(|file| {
+        files
+            .get(&file)
+            .cloned()
+            .unwrap_or_else(|| SourceIdentity::standalone(format!("<file:{}>", file.0)))
+    });
+    let mut batch = DiagnosticBatch::with_default_limits(builder.build());
+    batch.push(leaf);
+    batch
 }
 
 impl From<nexa_verifier::VerifyError> for PackageBuildError {

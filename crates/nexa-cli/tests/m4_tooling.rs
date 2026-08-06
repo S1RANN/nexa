@@ -221,6 +221,105 @@ fn lock_check_build_test_and_dev_share_the_schema2_closure() {
 }
 
 #[test]
+fn check_reports_compile_phase_type_mismatch_as_unified_diagnostic() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("main.nexa");
+    // `main` has no declared result type (unit), so the tail literal `1` (i32)
+    // survives analysis and fails in the typed lowering with a TypeMismatch.
+    fs::write(&source, "fn main() { 1 }").expect("write type-mismatch snippet");
+
+    // Human format: the typed-lowering failure must render through the unified
+    // diagnostic pipeline (stable code, user message, exact source line) and
+    // must never leak the internal Debug structure of `CompileError`.
+    let human = fixture.run(&["check", path(&source)]);
+    assert_exit(&human, 1);
+    let stderr = text(&human.stderr);
+    assert!(
+        stderr.contains("error[NX2101]: type mismatch"),
+        "human output must show the unified header, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fn main() { 1 }"),
+        "human output must include the exact source line, stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("TypeMismatch {"),
+        "human output leaked the internal variant structure, stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("SourceSpan {") && !stderr.contains("FileId("),
+        "human output leaked internal span structure, stderr:\n{stderr}"
+    );
+
+    // JSON format: the machine renderer reports the same source-backed batch.
+    let json = fixture.run(&["check", path(&source), "--diagnostic-format", "json"]);
+    assert_exit(&json, 1);
+    let batch: Value = serde_json::from_slice(&json.stderr).expect("JSON batch on stderr");
+    let diagnostic = &batch["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "NX2101");
+    assert_eq!(diagnostic["severity"], "error");
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .expect("diagnostic message")
+            .contains("type mismatch"),
+        "JSON message: {diagnostic}"
+    );
+    let label = diagnostic_label_at(&batch, 12, 13);
+    assert_eq!(
+        label["source"]["path"],
+        path(&source),
+        "label must point at the display source, not the virtual package path"
+    );
+    assert_eq!(label["source"]["packageId"], Value::Null);
+}
+
+#[test]
+fn dev_compile_failed_events_carry_a_minimal_diagnostic_summary() {
+    let fixture = Fixture::new();
+    assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
+    fs::write(
+        fixture.app.join("src/example/main.nexa"),
+        concat!(
+            "pub fn value() -> i32 { return 7; }\n",
+            "pub fn broken( -> i32 { return 1; }\n"
+        ),
+    )
+    .expect("write syntax-error Application");
+
+    let output = fixture.run(&[
+        "dev",
+        "--once",
+        "--project",
+        path(&fixture.project),
+        "--diagnostic-format",
+        "ndjson",
+    ]);
+    assert_exit(&output, 1);
+    let compile_failed = text(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["event"] == "compile-failed")
+        .unwrap_or_else(|| {
+            panic!(
+                "dev must emit a compile-failed event, stdout:\n{}",
+                text(&output.stdout)
+            )
+        });
+    let message = compile_failed["message"]
+        .as_str()
+        .expect("compile-failed event message");
+    assert_ne!(
+        message, "Last Known Good Candidate retained",
+        "the event must not drop the diagnostic summary"
+    );
+    assert!(
+        message.contains("NX1002") && message.contains("Last Known Good Candidate retained"),
+        "compile-failed event must carry the first diagnostic code plus the retention notice, got: {message}"
+    );
+}
+
+#[test]
 fn dev_reports_real_verifier_failures_after_the_freshness_gate() {
     let fixture = Fixture::new();
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
@@ -898,6 +997,73 @@ fn project_required_entrypoints_are_an_exact_subset_while_direct_contracts_requi
         text(&default_all.stderr).contains("run") || text(&default_all.stderr).contains("reset"),
         "omitting required_entrypoints must restore the complete NIDL surface: {}",
         text(&default_all.stderr)
+    );
+}
+
+#[test]
+fn standalone_compound_assignment_interpolation_and_receiver_methods_execute() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("language-features.nexa");
+    fs::write(
+        &source,
+        r#"use host::console;
+
+fn next_index(counter: Array<i32>) -> i32 {
+    counter[0] += 1;
+    return 1;
+}
+
+fn main(args: Array<string>) -> i32 {
+    let mut number = 20;
+    number += 2;
+    number -= 3;
+    number *= 4;
+    number /= 2;
+    number %= 7;
+    console::write_line("${number}");
+
+    let values = [10, 2];
+    let counter = [0];
+    values[next_index(counter)] += 5;
+    console::write_line("${values}");
+    console::write_line("${counter[0]}");
+    console::write_line("${[[1, 2], [3]]}");
+
+    let name = args.get(0).unwrap_or("world");
+    console::write_line("hello, ${name}");
+    let text = "  nexa  ".trim();
+    console::write_line(text);
+    console::write_line("${text.contains("nexa")}");
+    let parts = "a,b".split(",");
+    console::write_line("${parts}");
+    let outcome: Result<i32, string> = Result::Ok(9);
+    console::write_line("${outcome.unwrap_or(0)}");
+    return 0;
+}
+"#,
+    )
+    .expect("write standalone feature script");
+
+    let output = fixture.run(&["run", path(&source)]);
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "3\n",
+            "[10, 7]\n",
+            "1\n",
+            "[[1, 2], [3]]\n",
+            "hello, world\n",
+            "nexa\n",
+            "true\n",
+            "[a, b]\n",
+            "9\n",
+        )
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr:\n{}",
+        text(&output.stderr)
     );
 }
 

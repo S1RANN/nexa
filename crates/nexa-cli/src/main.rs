@@ -858,6 +858,11 @@ fn finish_resolved_build(
             render_diagnostic_batch(&batch, format)?;
             Err(CliError::rendered_diagnostic("Package analysis failed"))
         }
+        Err(project::BuildCompileError::Facade(nexa::PackageBuildError::CompileFailed(batch))) => {
+            let batch = diagnostics_for_build(build, &batch)?;
+            render_diagnostic_batch(&batch, format)?;
+            Err(CliError::rendered_diagnostic("Package compilation failed"))
+        }
         Err(project::BuildCompileError::Facade(error)) => Err(classify_facade_build_error(error)),
     }
 }
@@ -1504,6 +1509,11 @@ fn finish_standalone_build(
             let batch = diagnostics_for_build(build, &batch)?;
             render_diagnostic_batch(&batch, format)?;
             Err(CliError::rendered_diagnostic("Package analysis failed"))
+        }
+        Err(project::BuildCompileError::Facade(nexa::PackageBuildError::CompileFailed(batch))) => {
+            let batch = diagnostics_for_build(build, &batch)?;
+            render_diagnostic_batch(&batch, format)?;
+            Err(CliError::rendered_diagnostic("Package compilation failed"))
         }
         Err(project::BuildCompileError::Facade(error)) => Err(classify_facade_build_error(error)),
     }
@@ -2822,6 +2832,90 @@ mod tests {
             super::CliError::internal("worker terminated").exit_code(),
             3
         );
+    }
+
+    #[test]
+    fn compile_phase_errors_render_through_unified_diagnostic_pipeline() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexa-cli-compile-diag-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.nexa");
+        fs::write(&path, "fn main() { 1 }").unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        // The single-file `nexa check` path must surface typed-lowering failures
+        // as a source-backed diagnostic batch instead of leaking the internal
+        // Debug representation of the compile error.
+        let build = super::project::virtual_snippet(&source, &path).unwrap();
+        let result =
+            build.compile_with_limits(1, None, &[], false, nexa::VerifierLimits::default());
+        let batch = match result {
+            Err(super::project::BuildCompileError::Facade(
+                nexa::PackageBuildError::CompileFailed(batch),
+            )) => batch,
+            other => panic!("expected CompileFailed batch, got {other:?}"),
+        };
+        assert_eq!(batch.diagnostics().len(), 1);
+        let diagnostic = &batch.diagnostics()[0];
+        assert_eq!(diagnostic.code, nexa::ErrorCode::NX2101);
+        assert_eq!(diagnostic.severity, nexa::Severity::Error);
+        assert!(diagnostic.message.contains("type mismatch"));
+        let label = diagnostic
+            .primary_label()
+            .expect("compile-phase diagnostic retains its primary source label");
+        assert_eq!(label.range.start, 12);
+        assert_eq!(label.range.end, 13);
+
+        // The unified human renderer emits the code, the user message, and the
+        // exact source line with its label.
+        let rendered = nexa::LeafDiagnosticRenderer::human(&batch);
+        assert!(
+            rendered.contains("error[NX2101]: type mismatch"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("fn main() { 1 }"), "{rendered}");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn check_command_reports_compile_errors_as_rendered_diagnostics() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexa-cli-check-diag-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.nexa");
+        fs::write(&path, "fn main() { 1 }").unwrap();
+
+        // `nexa check` must return a diagnostic-or-test failure (exit 1) whose
+        // output was already rendered by the unified pipeline.
+        let error = check_command(
+            super::cli::CheckArgs {
+                input: Some(path),
+                project: None,
+                contract: None,
+                policy: None,
+                manifest_only: false,
+                limits_file: None,
+            },
+            DiagnosticFormat::Human,
+        )
+        .unwrap_err();
+        assert!(error.already_rendered(), "{error}");
+        assert_eq!(error.exit_code(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

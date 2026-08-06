@@ -141,12 +141,7 @@ fn render_human_diagnostic(
     let gutter_width = diagnostic
         .labels
         .iter()
-        .filter_map(|label| {
-            sources
-                .get(&label.source)
-                .map(|snapshot| snapshot.human_range(label.range).start.line)
-        })
-        .map(digit_count)
+        .filter_map(|label| label_context_gutter_width(sources, label))
         .max()
         .unwrap_or(1);
     for label in &diagnostic.labels {
@@ -173,7 +168,39 @@ fn render_human_diagnostic(
             if color { COLOR_RESET } else { "" },
         )
         .expect("writing to String cannot fail");
+        if let Some(replacement) = &fix.replacement {
+            write!(
+                output,
+                "\n   {}= help: replace with `{}`{}",
+                if color { COLOR_BOLD_BLUE } else { "" },
+                escape_replacement(replacement),
+                if color { COLOR_RESET } else { "" },
+            )
+            .expect("writing to String cannot fail");
+        }
     }
+}
+
+/// Renders a replacement on one safe, readable line: backslashes, the common whitespace escapes,
+/// and other control characters become visible so embedded newlines cannot corrupt the human
+/// layout and embedded escape sequences stay unambiguous.
+fn escape_replacement(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\0' => escaped.push_str("\\0"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character if (character as u32) < 0x20 || (character as u32) == 0x7f => {
+                write!(escaped, "\\x{:02x}", character as u32)
+                    .expect("writing to String cannot fail");
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn digit_count(mut value: u32) -> usize {
@@ -185,8 +212,32 @@ fn digit_count(mut value: u32) -> usize {
     digits
 }
 
+/// Digits needed for the widest line number a label renders, including its one-line context
+/// window above and below (clamped to the non-empty lines that actually exist in the file).
+fn label_context_gutter_width(sources: &SourceSnapshotRegistry, label: &Label) -> Option<usize> {
+    let snapshot = sources.get(&label.source)?;
+    let line = snapshot.human_range(label.range).start.line;
+    let mut widest = digit_count(line);
+    if let Some(before) = line.checked_sub(1).filter(|&line| {
+        snapshot
+            .line_text(line)
+            .is_some_and(|text| !text.is_empty())
+    }) {
+        widest = widest.max(digit_count(before));
+    }
+    if snapshot
+        .line_text(line.saturating_add(1))
+        .is_some_and(|text| !text.is_empty())
+    {
+        widest = widest.max(digit_count(line.saturating_add(1)));
+    }
+    Some(widest)
+}
+
 /// Renders one source label as a `--> file:line:col` header, the gutter, the source line, and a
-/// caret line whose width matches the span (clamped to the line end, at least one column).
+/// caret line whose width matches the span (clamped to the line end, at least one column). The
+/// label also gets a minimal one-line context window above and below (clamped to the file's
+/// lines, skipping empty lines) so the reader can locate the span without leaving the snippet.
 fn render_human_label(
     output: &mut String,
     sources: &SourceSnapshotRegistry,
@@ -215,7 +266,7 @@ fn render_human_label(
     let Some(line) = snapshot.line_text(range.start.line) else {
         return;
     };
-    let (expanded, columns) = expand_tabs(line);
+    let (_, columns) = expand_tabs(line);
     let gutter = " ".repeat(gutter_width);
     if color {
         write!(output, "\n{COLOR_BLUE}{gutter} |{COLOR_RESET}")
@@ -223,13 +274,16 @@ fn render_human_label(
     } else {
         write!(output, "\n{gutter} |").expect("writing to String cannot fail");
     }
-    if color {
-        write!(output, "\n{COLOR_BLUE}{:>gutter_width$} |{COLOR_RESET} {expanded}", range.start.line)
-            .expect("writing to String cannot fail");
-    } else {
-        write!(output, "\n{:>gutter_width$} | {expanded}", range.start.line)
-            .expect("writing to String cannot fail");
+    if let Some(before) = range
+        .start
+        .line
+        .checked_sub(1)
+        .and_then(|line| snapshot.line_text(line))
+        .filter(|text| !text.is_empty())
+    {
+        render_human_source_line(output, range.start.line - 1, before, gutter_width, color);
     }
+    render_human_source_line(output, range.start.line, line, gutter_width, color);
     let caret_start = columns
         .get(range.start.column.saturating_sub(1) as usize)
         .copied()
@@ -248,7 +302,11 @@ fn render_human_label(
             .saturating_sub(caret_start)
     };
     let caret_width = caret_width.max(1);
-    let caret = if label.style == LabelStyle::Primary { "^" } else { "-" };
+    let caret = if label.style == LabelStyle::Primary {
+        "^"
+    } else {
+        "-"
+    };
     let gutter_bar = if color {
         format!("{COLOR_BLUE}{gutter} |{COLOR_RESET}")
     } else {
@@ -265,6 +323,34 @@ fn render_human_label(
     .expect("writing to String cannot fail");
     if color {
         write!(output, "{COLOR_RESET}").expect("writing to String cannot fail");
+    }
+    if let Some(after) = snapshot
+        .line_text(range.start.line.saturating_add(1))
+        .filter(|text| !text.is_empty())
+    {
+        render_human_source_line(output, range.start.line + 1, after, gutter_width, color);
+    }
+}
+
+/// Renders one source line with its right-aligned line-number gutter, expanding tabs to
+/// four-column stops.
+fn render_human_source_line(
+    output: &mut String,
+    line_number: u32,
+    text: &str,
+    gutter_width: usize,
+    color: bool,
+) {
+    let (expanded, _) = expand_tabs(text);
+    if color {
+        write!(
+            output,
+            "\n{COLOR_BLUE}{line_number:>gutter_width$} |{COLOR_RESET} {expanded}"
+        )
+        .expect("writing to String cannot fail");
+    } else {
+        write!(output, "\n{line_number:>gutter_width$} | {expanded}")
+            .expect("writing to String cannot fail");
     }
 }
 
@@ -592,10 +678,7 @@ mod tests {
         SourceIdentity, SourceSnapshotRegistry, TextEditSuggestion,
     };
 
-    use super::{
-        DiagnosticRenderer, HUMAN_POSITION_ENCODING, MACHINE_POSITION_ENCODING,
-        RENDER_SCHEMA_VERSION,
-    };
+    use super::{DiagnosticRenderer, MACHINE_POSITION_ENCODING, RENDER_SCHEMA_VERSION};
 
     fn batch() -> DiagnosticBatch {
         let primary = SourceIdentity::package("root.app", "src/main.nexa");
@@ -665,7 +748,10 @@ mod tests {
         let source = SourceIdentity::package("root.app", "src/main.nexa");
         let mut sources = SourceSnapshotRegistry::builder();
         sources
-            .insert(source.clone(), "fn main() {\n\tlet value = 1 + \"x\";\n\tvalue\n}\n")
+            .insert(
+                source.clone(),
+                "fn main() {\n\tlet value = 1 + \"x\";\n\tvalue\n}\n",
+            )
             .unwrap();
         let mut batch = DiagnosticBatch::with_default_limits(sources.build());
         let line_start = u32::try_from("fn main() {\n".len()).unwrap();
@@ -693,6 +779,9 @@ mod tests {
         assert!(human.contains("2 |     let value = 1 + \"x\";"));
         assert!(human.contains("^ this expression is not a number"));
         assert!(human.contains("--- string literal has type `string`"));
+        // Context lines surround the labeled line, with the tabbed line expanded.
+        assert!(human.contains("1 | fn main() {"));
+        assert!(human.contains("3 |     value"));
         assert!(human.contains("= note: expected `i32`, found `string`"));
         assert!(human.contains(
             "error: 1 error emitted; 1 downstream error suppressed (caused by unknown type `u32`)"
@@ -713,18 +802,22 @@ mod tests {
         let mut batch = DiagnosticBatch::with_default_limits(sources.build());
         let start = u32::try_from("first\ns".len()).unwrap();
         batch.push(
-            Diagnostic::new(ErrorCode::NX2101, Severity::Error, "cross-line span")
-                .with_label(Label::primary(
+            Diagnostic::new(ErrorCode::NX2101, Severity::Error, "cross-line span").with_label(
+                Label::primary(
                     source,
                     ByteRange::new(start, start + 20),
                     "spans across lines",
-                )),
+                ),
+            ),
         );
         let human = DiagnosticRenderer::human(&batch);
         assert!(human.contains("--> multi.nexa:2:2"));
         assert!(human.contains("2 | second line"));
         assert!(human.contains("spans across lines"));
-        assert!(human.contains("^"));
+        assert!(human.contains('^'));
+        // The one-line context window is clamped to the file: line 1 before, line 3 after.
+        assert!(human.contains("1 | first"));
+        assert!(human.contains("3 | third"));
     }
 
     #[test]
@@ -862,8 +955,8 @@ mod tests {
         let line_start = u32::try_from("fn main() -> i32 {\n".len()).unwrap();
         let one_start = line_start + u32::try_from("    let value = ".len()).unwrap();
         let string_start = line_start + u32::try_from("    let value = 1 + ".len()).unwrap();
-        let return_start = line_start
-            + u32::try_from("    let value = 1 + \"x\";\n    ".len()).unwrap();
+        let return_start =
+            line_start + u32::try_from("    let value = 1 + \"x\";\n    ".len()).unwrap();
         batch.push(
             Diagnostic::new(ErrorCode::NX2101, Severity::Error, "type mismatch")
                 .with_label(Label::primary(
@@ -880,12 +973,13 @@ mod tests {
                 .with_fix(TextEditSuggestion::message("write `value` as an integer")),
         );
         batch.push(
-            Diagnostic::new(ErrorCode::NX1002, Severity::Error, "expected `;`")
-                .with_label(Label::primary(
+            Diagnostic::new(ErrorCode::NX1002, Severity::Error, "expected `;`").with_label(
+                Label::primary(
                     source,
                     ByteRange::new(return_start, return_start + 6),
                     "invalid Nexa syntax",
-                )),
+                ),
+            ),
         );
         batch.record_suppressed("caused by unknown type `u32`");
 
@@ -894,22 +988,94 @@ mod tests {
             "error[NX2101]: type mismatch\n",
             "  --> root.app:src/main.nexa:2:17\n",
             "  |\n",
+            "1 | fn main() -> i32 {\n",
             "2 |     let value = 1 + \"x\";\n",
             "  |                  ^ this expression is not a number\n",
+            "3 |     return value;\n",
             "  --> root.app:src/main.nexa:2:21\n",
             "  |\n",
+            "1 | fn main() -> i32 {\n",
             "2 |     let value = 1 + \"x\";\n",
             "  |                      --- string literal has type `string`\n",
+            "3 |     return value;\n",
             "   = note: expected `i32`, found `string`\n",
             "   = help: write `value` as an integer\n",
             "\n",
             "error[NX1002]: expected `;`\n",
             "  --> root.app:src/main.nexa:3:5\n",
             "  |\n",
+            "2 |     let value = 1 + \"x\";\n",
             "3 |     return value;\n",
             "  |      ^^^^^^ invalid Nexa syntax\n",
+            "4 | }\n",
             "error: 2 errors emitted; 1 downstream error suppressed (caused by unknown type `u32`)\n",
         );
         assert_eq!(human, expected);
+    }
+
+    #[test]
+    fn human_layout_shows_escaped_replacement_text() {
+        let source = SourceIdentity::standalone("fix.nexa");
+        let mut sources = SourceSnapshotRegistry::builder();
+        sources
+            .insert(source.clone(), "let marker = \"🚀\";\n")
+            .unwrap();
+        let mut batch = DiagnosticBatch::with_default_limits(sources.build());
+        let marker = u32::try_from("let marker = ".len()).unwrap();
+        batch.push(
+            Diagnostic::new(ErrorCode::NX1001, Severity::Error, "rewrite marker")
+                .with_fix(TextEditSuggestion::replacement(
+                    "normalize the marker literal",
+                    source.clone(),
+                    ByteRange::new(marker, marker + u32::try_from("\"🚀\"".len()).unwrap()),
+                    "let marker = {\n\t\"a\tb\"\r\n};\n\u{1}",
+                ))
+                .with_fix(TextEditSuggestion::replacement(
+                    "remove the marker",
+                    source,
+                    ByteRange::new(marker, marker + 1),
+                    "",
+                )),
+        );
+
+        let human = DiagnosticRenderer::human(&batch);
+        assert!(human.contains("= help: normalize the marker literal"));
+        assert!(
+            human.contains("= help: replace with `let marker = {\\n\\t\"a\\tb\"\\r\\n};\\n\\x01`")
+        );
+        assert!(human.contains("= help: remove the marker"));
+        assert!(human.contains("= help: replace with ``"));
+    }
+
+    #[test]
+    fn human_layout_clamps_context_lines_to_file_bounds() {
+        let source = SourceIdentity::standalone("bounds.nexa");
+        let mut sources = SourceSnapshotRegistry::builder();
+        sources
+            .insert(source.clone(), "first\nmiddle\nlast\n")
+            .unwrap();
+        let mut batch = DiagnosticBatch::with_default_limits(sources.build());
+        let last = u32::try_from("first\nmiddle\n".len()).unwrap();
+        batch.push(
+            Diagnostic::new(ErrorCode::NX1001, Severity::Error, "bound labels")
+                .with_label(Label::primary(
+                    source.clone(),
+                    ByteRange::new(0, 1),
+                    "first line",
+                ))
+                .with_label(Label::secondary(
+                    source,
+                    ByteRange::new(last, last + 4),
+                    "last line",
+                )),
+        );
+
+        let human = DiagnosticRenderer::human(&batch);
+        // Line 1 has no preceding context line; line 3 has no following one (the trailing
+        // newline's empty phantom line is not rendered as context).
+        assert!(human.contains("\n  |\n1 | first\n  |  ^ first line\n2 | middle\n"));
+        assert!(human.contains("\n  |\n2 | middle\n3 | last\n  |  --- last line\n"));
+        assert!(!human.contains("0 |"));
+        assert!(!human.contains("4 |"));
     }
 }

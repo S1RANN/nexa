@@ -1261,7 +1261,19 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
         CompileError::DuplicateName { name, .. } => write!(formatter, "duplicate name `{name}`"),
         CompileError::UnknownName { name, .. } => write!(formatter, "unknown name `{name}`"),
         CompileError::UnknownType { name, .. } => write!(formatter, "unknown type `{name}`"),
-        CompileError::TypeMismatch { .. } => formatter.write_str("type mismatch"),
+        CompileError::TypeMismatch {
+            expected, actual, ..
+        } => match (expected, actual) {
+            (Some(expected), Some(actual)) => write!(
+                formatter,
+                "type mismatch: expected `{expected}`, found `{actual}`"
+            ),
+            (Some(expected), None) => {
+                write!(formatter, "type mismatch: expected `{expected}`")
+            }
+            (None, Some(actual)) => write!(formatter, "type mismatch: found `{actual}`"),
+            (None, None) => formatter.write_str("type mismatch"),
+        },
         CompileError::MissingReturn { .. } => formatter.write_str("missing return"),
         CompileError::DeferCaptureLimit { .. } => {
             formatter.write_str("defer capture limit exceeded")

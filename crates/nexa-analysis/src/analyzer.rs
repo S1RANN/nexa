@@ -2201,7 +2201,8 @@ impl<'a> Analyzer<'a> {
                             "invalid Nexa syntax",
                         ));
                         if let Some(fix) = &error.fix {
-                            diagnostic = diagnostic.with_fix(TextEditSuggestion::message(fix.clone()));
+                            diagnostic =
+                                diagnostic.with_fix(TextEditSuggestion::message(fix.clone()));
                         }
                         self.diagnostics.push(diagnostic);
                     }
@@ -7298,6 +7299,41 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     value,
                 })
             }
+            StatementKind::CompoundAssign {
+                target,
+                operator,
+                value,
+            } => {
+                let place = self.check_place(target)?;
+                let target_type = place_type(&place, &self.analyzer.definitions);
+                let value = self.check_expression(value, Some(&target_type));
+                self.expect_type(&value.ty, &target_type, &value.span);
+                let result = binary_result(
+                    operator.kind,
+                    &target_type,
+                    &self.analyzer.definitions,
+                    &self.analyzer.type_metadata,
+                    &self.analyzer.variant_payloads,
+                    &self.analyzer.host_types,
+                )
+                .unwrap_or_else(|| {
+                    if contains_ir_error(&target_type) || contains_ir_error(&value.ty) {
+                        self.record_suppressed();
+                        return IrType::Error;
+                    }
+                    self.type_error(
+                        source_range(&self.module.source, statement.range),
+                        "invalid compound-assignment operand type",
+                    );
+                    IrType::Error
+                });
+                self.expect_type(&result, &target_type, &value.span);
+                Some(TypedStatementIr::CompoundAssign {
+                    target: place,
+                    operator: binary_operator(operator.kind),
+                    value,
+                })
+            }
             StatementKind::Return(value) => {
                 let value = value
                     .as_ref()
@@ -7925,13 +7961,33 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         }
                         InterpolationPart::Expression(expression) => {
                             let value = self.check_expression(expression, None);
-                            if !is_scalar(&value.ty) {
+                            if is_scalar(&value.ty) {
+                                values.push(value);
+                            } else if is_interpolatable(&value.ty) {
+                                values.push(TypedExpressionIr {
+                                    ty: IrType::String,
+                                    effect: value.effect,
+                                    span: value.span.clone(),
+                                    kind: TypedExpressionKind::BuiltinCall {
+                                        operation: BuiltinOperationIr::ValueToString,
+                                        type_arguments: vec![value.ty.clone()],
+                                        arguments: vec![value],
+                                    },
+                                });
+                            } else if contains_ir_error(&value.ty) {
+                                self.record_suppressed();
+                                values.push(value);
+                            } else {
                                 self.type_error(
                                     value.span.clone(),
-                                    "interpolation only accepts scalar values",
+                                    &format!(
+                                        "interpolation supports scalar values and Array<T> when \
+                                         its elements are formattable; {} is not formattable",
+                                        display_ir_type(&value.ty, &self.analyzer.definitions)
+                                    ),
                                 );
+                                values.push(value);
                             }
-                            values.push(value);
                         }
                     }
                 }
@@ -8433,6 +8489,55 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         Vec::new(),
                         false,
                     ),
+                    "contains" => (
+                        BuiltinOperationIr::StringContains,
+                        IrType::Bool,
+                        Vec::new(),
+                        vec![IrType::String],
+                        false,
+                    ),
+                    "starts_with" => (
+                        BuiltinOperationIr::StringStartsWith,
+                        IrType::Bool,
+                        Vec::new(),
+                        vec![IrType::String],
+                        false,
+                    ),
+                    "ends_with" => (
+                        BuiltinOperationIr::StringEndsWith,
+                        IrType::Bool,
+                        Vec::new(),
+                        vec![IrType::String],
+                        false,
+                    ),
+                    "substring" => (
+                        BuiltinOperationIr::StringSubstring,
+                        IrType::String,
+                        Vec::new(),
+                        vec![IrType::I32, IrType::I32],
+                        false,
+                    ),
+                    "trim" => (
+                        BuiltinOperationIr::StringTrim,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    "split" => (
+                        BuiltinOperationIr::StringSplit,
+                        IrType::Array(Box::new(IrType::String)),
+                        Vec::new(),
+                        vec![IrType::String],
+                        false,
+                    ),
+                    "to_string" => (
+                        BuiltinOperationIr::StringToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
                     _ => return None,
                 },
                 IrType::Array(element) => {
@@ -8446,9 +8551,16 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             Vec::new(),
                             false,
                         ),
+                        "is_empty" => (
+                            BuiltinOperationIr::ArrayIsEmpty,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
                         "get" => (
-                            BuiltinOperationIr::ArrayGet,
-                            element.clone(),
+                            BuiltinOperationIr::ArrayTryGet,
+                            IrType::Option(Box::new(element.clone())),
                             operation_type_arguments,
                             vec![IrType::I32],
                             false,
@@ -8540,6 +8652,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         ),
                         "set" => (
                             BuiltinOperationIr::MapSet,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![key.clone(), value.clone()],
+                            false,
+                        ),
+                        "insert" => (
+                            BuiltinOperationIr::MapInsert,
                             IrType::Bool,
                             operation_type_arguments,
                             vec![key.clone(), value.clone()],
@@ -8662,6 +8781,123 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         _ => return None,
                     }
                 }
+                IrType::Option(inner) => {
+                    let inner = inner.as_ref().clone();
+                    let operation_type_arguments = vec![inner.clone()];
+                    match method {
+                        "is_some" => (
+                            BuiltinOperationIr::OptionIsSome,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "is_none" => (
+                            BuiltinOperationIr::OptionIsNone,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "unwrap_or" => (
+                            BuiltinOperationIr::OptionUnwrapOr,
+                            inner.clone(),
+                            operation_type_arguments,
+                            vec![inner.clone()],
+                            false,
+                        ),
+                        _ => return None,
+                    }
+                }
+                IrType::Result(ok, error) => {
+                    let ok = ok.as_ref().clone();
+                    let error = error.as_ref().clone();
+                    let operation_type_arguments = vec![ok.clone(), error.clone()];
+                    match method {
+                        "is_ok" => (
+                            BuiltinOperationIr::ResultIsOk,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "is_err" => (
+                            BuiltinOperationIr::ResultIsErr,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "unwrap_or" => (
+                            BuiltinOperationIr::ResultUnwrapOr,
+                            ok.clone(),
+                            operation_type_arguments,
+                            vec![ok.clone()],
+                            false,
+                        ),
+                        _ => return None,
+                    }
+                }
+                IrType::I32 => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::I32ToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
+                IrType::I64 => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::I64ToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
+                IrType::F32 => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::F32ToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
+                IrType::F64 => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::F64ToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
+                IrType::Bool => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::BoolToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
+                IrType::Rune => match method {
+                    "to_string" => (
+                        BuiltinOperationIr::RuneToString,
+                        IrType::String,
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    ),
+                    _ => return None,
+                },
                 _ => return None,
             };
         let span = source_range(&self.module.source, whole.range);
@@ -9796,7 +10032,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ..MigrationFlow::default()
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 self.apply_migration_place(&mut paths, target);
                 self.apply_migration_expression(&mut paths, value);
                 MigrationFlow {
@@ -11536,8 +11773,25 @@ fn unknown_symbol_fix(
     builtin_types: &BTreeMap<String, DefinitionId>,
 ) -> Option<TextEditSuggestion> {
     const PRIMITIVES: &[&str] = &[
-        "bool", "rune", "string", "unit", "i8", "i16", "i32", "i64", "f32", "f64", "Option",
-        "Result", "Array", "Map", "Tuple", "Token", "Snapshot", "Buffer", "StateHandle",
+        "bool",
+        "rune",
+        "string",
+        "unit",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "f32",
+        "f64",
+        "Option",
+        "Result",
+        "Array",
+        "Map",
+        "Tuple",
+        "Token",
+        "Snapshot",
+        "Buffer",
+        "StateHandle",
     ];
     if name.chars().count() == 1 {
         return None;
@@ -11594,16 +11848,17 @@ fn unknown_symbol_fix(
         }
     }
     if usage == SymbolUse::Type {
-        for candidate in builtin_types.keys().map(String::as_str).chain(PRIMITIVES.iter().copied())
+        for candidate in builtin_types
+            .keys()
+            .map(String::as_str)
+            .chain(PRIMITIVES.iter().copied())
         {
             let distance = edit_distance(name, candidate, 2);
             if distance <= 2 {
                 let prefix = common_prefix_length(name, candidate);
                 if best.is_none_or(|(best_layer, best_distance, best_prefix, _)| {
                     (1, distance) < (best_layer, best_distance)
-                        || (best_layer == 1
-                            && distance == best_distance
-                            && prefix > best_prefix)
+                        || (best_layer == 1 && distance == best_distance && prefix > best_prefix)
                 }) {
                     best = Some((1, distance, prefix, candidate));
                 }
@@ -11891,7 +12146,8 @@ fn statement_contains_await(statement: &Statement) -> bool {
         StatementKind::Bind { value, .. }
         | StatementKind::Defer(value)
         | StatementKind::Expression(value) => expression_contains_await(value),
-        StatementKind::Assign { target, value } => {
+        StatementKind::Assign { target, value }
+        | StatementKind::CompoundAssign { target, value, .. } => {
             expression_contains_await(target) || expression_contains_await(value)
         }
         StatementKind::Return(value) => value.as_ref().is_some_and(expression_contains_await),

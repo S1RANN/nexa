@@ -131,8 +131,17 @@ pub enum BuiltinOperationIr {
     StringConcat,
     StringRuneAt,
     StringHash,
+    StringContains,
+    StringStartsWith,
+    StringEndsWith,
+    StringSubstring,
+    StringTrim,
+    StringSplit,
     ArrayLen,
+    ArrayIsEmpty,
     ArrayGet,
+    /// Bounds-checked receiver method returning `Option<T>`.
+    ArrayTryGet,
     ArraySet,
     ArrayPush,
     ArrayPop,
@@ -145,6 +154,7 @@ pub enum BuiltinOperationIr {
     MapLen,
     MapGet,
     MapSet,
+    MapInsert,
     MapRemove,
     MapContains,
     MapClear,
@@ -159,6 +169,22 @@ pub enum BuiltinOperationIr {
     StateHandleGeneration,
     StateHandleEqual,
     StateHandleHash,
+    OptionIsSome,
+    OptionIsNone,
+    OptionUnwrapOr,
+    ResultIsOk,
+    ResultIsErr,
+    ResultUnwrapOr,
+    StringToString,
+    I32ToString,
+    I64ToString,
+    F32ToString,
+    F64ToString,
+    BoolToString,
+    RuneToString,
+    /// Renders one recursively formattable value (scalars or `Array<T>` with
+    /// formattable elements) deterministically.
+    ValueToString,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -444,6 +470,13 @@ pub enum TypedStatementIr {
     },
     Assign {
         target: TypedPlaceIr,
+        value: TypedExpressionIr,
+    },
+    /// `target op= value` with the same numeric/String type rules as the
+    /// underlying binary operator. The target place is evaluated exactly once.
+    CompoundAssign {
+        target: TypedPlaceIr,
+        operator: BinaryOperator,
         value: TypedExpressionIr,
     },
     Expression(TypedExpressionIr),
@@ -1266,7 +1299,8 @@ fn validate_standard_calls_in_block(
                     validate_standard_calls_in_expression(value, bindings, migration_types)?;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 validate_standard_calls_in_place(target, bindings, migration_types)?;
                 validate_standard_calls_in_expression(value, bindings, migration_types)?;
             }
@@ -1784,7 +1818,8 @@ fn cleanup_block_is_synchronous(block: &TypedBlockIr, definitions: &[Definition]
         TypedStatementIr::Let { value, .. } => value
             .as_ref()
             .is_none_or(|value| cleanup_expression_is_synchronous(value, definitions)),
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             cleanup_place_is_synchronous(target, definitions)
                 && cleanup_expression_is_synchronous(value, definitions)
         }
@@ -1978,7 +2013,8 @@ fn validate_block(
                     validate_expression(value, limit)?;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 validate_place(target, limit)?;
                 validate_expression(value, limit)?;
             }
@@ -2644,7 +2680,8 @@ fn remap_block(
                     remap_expression(value, mapping)?;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 remap_place(target, mapping)?;
                 remap_expression(value, mapping)?;
             }

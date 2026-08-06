@@ -1,5 +1,6 @@
 use nexa_syntax::ast::{
-    AttributeArgumentClassification, DeclarationKind, ExpressionKind, StatementKind, parse_nexa_ast,
+    AttributeArgumentClassification, BinaryOperatorKind, DeclarationKind, ExpressionKind,
+    StatementKind, parse_nexa_ast,
 };
 use nexa_syntax::{
     CellCompleteness, Keyword, TokenKind, classify_cell_completeness, lex_nexa, parse_nexa,
@@ -74,6 +75,70 @@ script_score = script_score + 1;
         };
         matches!(receiver.kind, ExpressionKind::Await { .. })
     }));
+}
+
+#[test]
+fn compound_assignments_have_lossless_tokens_and_typed_ast_nodes() {
+    let source = r"
+fn update() {
+    let mut value = 20;
+    value += 2;
+    value -= 3;
+    value *= 4;
+    value /= 2;
+    value %= 7;
+}
+";
+    let lexed = lex_nexa(source).expect("small source");
+    let compound_tokens = lexed
+        .tokens
+        .iter()
+        .filter_map(|token| match token.kind {
+            TokenKind::PlusEqual
+            | TokenKind::MinusEqual
+            | TokenKind::StarEqual
+            | TokenKind::SlashEqual
+            | TokenKind::PercentEqual => Some(token.kind),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compound_tokens,
+        [
+            TokenKind::PlusEqual,
+            TokenKind::MinusEqual,
+            TokenKind::StarEqual,
+            TokenKind::SlashEqual,
+            TokenKind::PercentEqual,
+        ]
+    );
+
+    let tree = parse_nexa(source).expect("small source");
+    assert!(tree.errors.is_empty(), "tree errors: {:?}", tree.errors);
+    let ast = parse_nexa_ast(&tree);
+    assert!(ast.errors.is_empty(), "AST errors: {:?}", ast.errors);
+    let DeclarationKind::Function(function) = &ast.declarations[0].kind else {
+        panic!("function declaration");
+    };
+    let operators = function
+        .body
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::CompoundAssign { operator, .. } => Some(operator.kind),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operators,
+        [
+            BinaryOperatorKind::Add,
+            BinaryOperatorKind::Subtract,
+            BinaryOperatorKind::Multiply,
+            BinaryOperatorKind::Divide,
+            BinaryOperatorKind::Remainder,
+        ]
+    );
 }
 
 #[test]

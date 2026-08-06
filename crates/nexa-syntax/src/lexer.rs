@@ -125,6 +125,11 @@ impl Lexer {
             Some("||") => Some(TokenKind::PipePipe),
             Some("::") => Some(TokenKind::ColonColon),
             Some("..") => Some(TokenKind::DotDot),
+            Some("+=") => Some(TokenKind::PlusEqual),
+            Some("-=") => Some(TokenKind::MinusEqual),
+            Some("*=") => Some(TokenKind::StarEqual),
+            Some("/=") => Some(TokenKind::SlashEqual),
+            Some("%=") => Some(TokenKind::PercentEqual),
             _ => None,
         };
         if let Some(kind) = pair_kind {

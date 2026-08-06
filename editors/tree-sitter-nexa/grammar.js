@@ -284,7 +284,10 @@ module.exports = grammar({
     assignment_statement: ($) =>
       seq(
         field("target", choice($.path_expression, $.postfix_expression)),
-        "=",
+        field(
+          "operator",
+          alias(choice("=", "+=", "-=", "*=", "/=", "%="), $.operator),
+        ),
         field("value", $.expression),
         ";",
       ),
@@ -359,7 +362,7 @@ module.exports = grammar({
         binary($, PREC.EQUALITY, choice("==", "!=")),
         binary($, PREC.COMPARISON, choice("<", "<=", ">", ">=")),
         binary($, PREC.ADDITIVE, choice("+", "-")),
-        binary($, PREC.MULTIPLICATIVE, choice("*", "/")),
+        binary($, PREC.MULTIPLICATIVE, choice("*", "/", "%")),
       ),
 
     postfix_expression: ($) =>

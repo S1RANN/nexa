@@ -41,11 +41,16 @@ rebinding and permits writes through a Struct place:
 ```nexa
 let title = "classic";
 let mut score = 0;
-score = score + 10;
+score += 10;
+score *= 2;
 
 let mut cell = Cell { x: 1, y: 2 };
-cell.x = 3;
+cell.x -= 1;
 ```
+
+Nexa supports `+=`, `-=`, `*=`, `/=`, and `%=` on writable places. They use
+the same type rules as their binary operators and evaluate a field receiver or
+collection index exactly once. Prefix/postfix `++` and `--` remain unsupported.
 
 Binding mutability is shallow. A Class field can be changed only when that
 field itself is declared `mut`, regardless of whether the binding is mutable.
@@ -150,15 +155,21 @@ frame.
 
 ## String interpolation
 
-`${expression}` interpolates a string, integer, float, Boolean, or rune using
-deterministic, locale-free formatting:
+`${expression}` interpolates a string, integer, float, Boolean, rune, or an
+`Array<T>` whose elements are recursively formattable. Formatting is
+deterministic and locale-free:
 
 ```nexa
 let label: string = "score";
-let message: string = "${label}: ${score}";
+let values = [3, 1, 4];
+let message: string = "${label}: ${values}"; // score: [3, 1, 4]
 ```
 
-`\${` produces a literal `${`. Scalar conversion is verified, fuel-metered,
+Nested arrays use the same representation. Nominal objects, Maps, Tuples,
+Host values, and resource-bearing values are rejected rather than exposing
+object internals or risking recursive object traversal.
+
+`\${` produces a literal `${`. Conversion is verified, bounded, fuel-metered,
 and represented in Source Maps and precise Root Maps.
 
 ## Package tests

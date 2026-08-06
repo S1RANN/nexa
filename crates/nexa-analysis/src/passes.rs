@@ -489,7 +489,8 @@ fn count_calls_in_block(block: &TypedBlockIr, counts: &mut BTreeMap<DefinitionId
                     count_calls_in_expression(value, counts);
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 count_calls_in_place(target, counts);
                 count_calls_in_expression(value, counts);
             }
@@ -578,7 +579,8 @@ fn inline_calls_in_block(
                     inline_calls_in_expression(value, caller, candidates, growth, rewrites);
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 inline_calls_in_place(target, caller, candidates, growth, rewrites);
                 inline_calls_in_expression(value, caller, candidates, growth, rewrites);
             }
@@ -743,6 +745,10 @@ fn analyze_materialization_block(
                 analyze_materialization_place(target, invariant, report);
                 analyze_materialization_expression(value, invariant, report);
             }
+            TypedStatementIr::CompoundAssign { target, value, .. } => {
+                analyze_materialization_place(target, invariant, report);
+                analyze_materialization_expression(value, invariant, report);
+            }
             TypedStatementIr::Expression(expression) => {
                 analyze_materialization_expression(expression, invariant, report);
             }
@@ -882,6 +888,7 @@ const fn is_collection_boundary(operation: BuiltinOperationIr) -> bool {
             | BuiltinOperationIr::ArrayRemove
             | BuiltinOperationIr::MapGet
             | BuiltinOperationIr::MapSet
+            | BuiltinOperationIr::MapInsert
             | BuiltinOperationIr::MapRemove
     )
 }
@@ -1072,7 +1079,8 @@ fn specialize_match_block(
                     }
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 specialize_match_place(target, scopes, context);
                 specialize_match_expression(value, scopes, context);
                 if let Some(definition) = place_root_definition(target) {
@@ -1664,7 +1672,8 @@ fn propagate_statement(
                 }
             }
         }
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             substitute_place(target, scopes, mode, context);
             substitute_expression(value, scopes, mode, context);
             if let Some(root) = place_root_definition(target) {
@@ -1870,7 +1879,8 @@ fn fold_statement(statement: &mut TypedStatementIr, context: &mut PassContext) {
                 fold_expression(value, context);
             }
         }
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             fold_place(target, context);
             fold_expression(value, context);
         }
@@ -2145,7 +2155,8 @@ fn count_statement_references(
                 count_expression_references(value, uses);
             }
         }
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             count_place_references(target, uses);
             count_expression_references(value, uses);
         }
@@ -2395,6 +2406,7 @@ fn eliminate_in_block(
                 continue;
             }
             TypedStatementIr::Assign { .. }
+            | TypedStatementIr::CompoundAssign { .. }
             | TypedStatementIr::Defer { .. }
             | TypedStatementIr::Yield { .. } => {}
         }

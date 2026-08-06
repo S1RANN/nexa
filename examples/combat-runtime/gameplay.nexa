@@ -85,7 +85,7 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
         Option::None => 0,
     };
 
-    input.set(0, values.get(0));
+    input.set(0, values.get(0).unwrap_or(0));
     let copied: Buffer<i32> = input.slice(0, 2);
     input.copy(copied, 0, 1, 1);
 

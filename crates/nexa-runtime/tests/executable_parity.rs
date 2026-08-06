@@ -58,7 +58,7 @@ fn collections(n: i32) -> i32 {
     let mut total: i32 = 0;
     let mut cursor: i32 = 0;
     while cursor < values.len() {
-        total = total + values.get(cursor) + match table.get(cursor) {
+        total = total + values[cursor] + match table.get(cursor) {
             Option::Some(value) => value,
             Option::None => 0,
         };
@@ -72,7 +72,7 @@ fn div_trap(a: i32, b: i32) -> i32 {
 fn index_trap(n: i32) -> i32 {
     let values: Array<i32> = Array::new();
     values.push(1);
-    return values.get(n);
+    return values[n];
 }
 fn enum_collection(n: i32) -> i32 {
     let values: Array<Signal> = Array::new();
@@ -81,7 +81,7 @@ fn enum_collection(n: i32) -> i32 {
         values.push(Signal::Loud(index + 17));
         index = index + 1;
     }
-    return match values.get(0) {
+    return match values[0] {
         Signal::Quiet => 0,
         Signal::Loud(value) => value,
     };
@@ -359,10 +359,10 @@ fn leaf_array() -> i32 {
     values.push(1);
     values.push(2);
     values.set(0, 3);
-    return values.get(0) + values.len();
+    return 3 + values.len();
 }
 fn array_argument(values: Array<i32>) -> i32 {
-    return values.get(0);
+    return values[0];
 }
 fn leaf_buffer(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
     destination.copy(source, 0, 0, 3);

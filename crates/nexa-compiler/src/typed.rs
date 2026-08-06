@@ -1608,6 +1608,7 @@ fn validate_repl_defer_block<'a>(
             }
             TypedStatementIr::Let { .. }
             | TypedStatementIr::Assign { .. }
+            | TypedStatementIr::CompoundAssign { .. }
             | TypedStatementIr::Expression(_)
             | TypedStatementIr::Return(_)
             | TypedStatementIr::Break
@@ -1742,6 +1743,7 @@ fn validate_repl_new_field_writes(
             TypedStatementIr::Let { .. }
             | TypedStatementIr::Return(_)
             | TypedStatementIr::Expression(_)
+            | TypedStatementIr::CompoundAssign { .. }
             | TypedStatementIr::Break
             | TypedStatementIr::Continue
             | TypedStatementIr::Defer { .. }
@@ -1769,7 +1771,8 @@ fn repl_statement_reads_pending_field(
         TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
             value.as_ref().is_some_and(reads)
         }
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             repl_place_reads_pending_field(target, expected, initialized) || reads(value)
         }
         TypedStatementIr::Expression(value) => reads(value),
@@ -1932,7 +1935,8 @@ fn repl_direct_environment_write(
 
 fn repl_block_writes_any_field(block: &TypedBlockIr, expected: &BTreeSet<DefinitionId>) -> bool {
     block.statements.iter().any(|statement| match statement {
-        TypedStatementIr::Assign { target, .. } => {
+        TypedStatementIr::Assign { target, .. }
+        | TypedStatementIr::CompoundAssign { target, .. } => {
             matches!(target, TypedPlaceIr::StateField { field, .. } if expected.contains(field))
         }
         TypedStatementIr::If {
@@ -2395,7 +2399,8 @@ fn inline_array_candidate_capacity(
                     return None;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 if place_references_definition(target, definition)
                     || !inline_array_read_expression_allowed(value, definition, length)
                 {
@@ -2576,7 +2581,8 @@ fn inline_map_candidate_is_scalar(function: &TypedFunctionIr, definition: Defini
                     return false;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 if place_references_definition(target, definition)
                     || !inline_map_read_expression_allowed(value, definition)
                 {
@@ -2721,7 +2727,8 @@ fn statement_references_definition(statement: &TypedStatementIr, definition: Def
         TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => value
             .as_ref()
             .is_some_and(|value| expression_references_definition(value, definition)),
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             place_references_definition(target, definition)
                 || expression_references_definition(value, definition)
         }
@@ -2837,7 +2844,8 @@ fn inline_class_statement_is_scalar(
         TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => value
             .as_ref()
             .is_none_or(|value| inline_class_expression_is_scalar(value, definition)),
-        TypedStatementIr::Assign { target, value } => {
+        TypedStatementIr::Assign { target, value }
+        | TypedStatementIr::CompoundAssign { target, value, .. } => {
             inline_class_place_is_scalar(target, definition)
                 && inline_class_expression_is_scalar(value, definition)
         }
@@ -3368,6 +3376,38 @@ impl<'a> FunctionEmitter<'a> {
                     self.push(instruction, self.span(&value.span)?);
                 }
             },
+            TypedStatementIr::CompoundAssign {
+                target,
+                operator,
+                value,
+            } => match target {
+                TypedPlaceIr::Definition(definition) => {
+                    let destination = self.local(*definition)?;
+                    let source = self.allocate_expression(value)?;
+                    self.emit_expression(value, source)?;
+                    let span = self.span(&value.span)?;
+                    let result = self.allocate(lower_type(self.package, &value.ty, span)?)?;
+                    self.emit_compound_binary(
+                        *operator,
+                        &value.ty,
+                        destination,
+                        source,
+                        result,
+                        span,
+                    )?;
+                    let ty = lower_type(self.package, &value.ty, span)?;
+                    self.push(
+                        self.copy_value_instruction(ty, destination, result, span)?,
+                        span,
+                    );
+                }
+                TypedPlaceIr::Field { .. }
+                | TypedPlaceIr::ClassField { .. }
+                | TypedPlaceIr::StateField { .. }
+                | TypedPlaceIr::Index { .. } => {
+                    self.emit_compound_assign_place(target, *operator, value)?;
+                }
+            },
             TypedStatementIr::Expression(expression) => {
                 let destination = self.allocate_expression(expression)?;
                 self.emit_expression(expression, destination)?;
@@ -3653,6 +3693,116 @@ impl<'a> FunctionEmitter<'a> {
         self.emit_expression(value, value_register)?;
 
         let mut updated = value_register;
+        for (parent, type_id, field) in parents.into_iter().rev() {
+            let rebuilt = self.allocate(ValueType::Named(type_id))?;
+            self.push(
+                Instruction::StructWith {
+                    source: parent,
+                    field: field.stable_id,
+                    value: updated,
+                    dst: rebuilt,
+                },
+                self.function_span,
+            );
+            updated = rebuilt;
+        }
+        if self.register_types.get(usize::from(updated)) != Some(&Some(root.ty())) {
+            return Err(CompileError::type_mismatch(None, None, self.function_span));
+        }
+        self.store_struct_place_root(root, updated)?;
+        Ok(())
+    }
+
+    /// Instruction selection for one `target op= value` operation. Mirrors the
+    /// numeric/String rules of [`Self::emit_binary`] but operates on already
+    /// materialized registers so the target place is evaluated exactly once.
+    fn emit_compound_binary(
+        &mut self,
+        operator: BinaryOperator,
+        ty: &IrType,
+        lhs: u16,
+        rhs: u16,
+        dst: u16,
+        span: SourceSpan,
+    ) -> Result<(), CompileError> {
+        let value_type = lower_type(self.package, ty, span)?;
+        let instruction = match operator {
+            BinaryOperator::Add if value_type == ValueType::String => {
+                Instruction::StringConcat { dst, lhs, rhs }
+            }
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Remainder => {
+                let numeric = TypedNumericKind::from_ir_type(ty, span)?;
+                let operator = TypedNumericOperator::try_from(operator)
+                    .map_err(|()| CompileError::type_mismatch(None, None, span))?;
+                numeric.binary(operator, dst, lhs, rhs)
+            }
+            _ => return Err(CompileError::type_mismatch(None, None, span)),
+        };
+        self.push(instruction, span);
+        Ok(())
+    }
+
+    /// Read-modify-write lowering for `target op= value` on a nontrivial place
+    /// (Struct field, Class field, REPL State field, or collection index).
+    ///
+    /// The root base/index expressions are materialized exactly once (in
+    /// source order), then the RHS is evaluated, then the current value is
+    /// read, combined, and stored back through the same projection chain.
+    #[allow(clippy::too_many_lines)]
+    fn emit_compound_assign_place(
+        &mut self,
+        place: &TypedPlaceIr,
+        operator: BinaryOperator,
+        value: &TypedExpressionIr,
+    ) -> Result<(), CompileError> {
+        let mut projection_ids = Vec::new();
+        let root_place = flatten_struct_place(place, &mut projection_ids);
+        let (root, mut current) = self.prepare_struct_place_root(root_place)?;
+        let mut parents = Vec::with_capacity(projection_ids.len());
+        for field_id in &projection_ids {
+            let (owner, field) = self.layouts.fields.get(field_id).cloned().ok_or_else(|| {
+                CompileError::unknown_name(self.definition_name(*field_id), self.function_span)
+            })?;
+            let layout = self
+                .layouts
+                .aggregates
+                .get(&owner)
+                .cloned()
+                .ok_or_else(|| {
+                    CompileError::unknown_type(self.definition_name(owner), self.function_span)
+                })?;
+            if layout.kind != TypedAggregateKind::Struct
+                || self.register_types.get(usize::from(current))
+                    != Some(&Some(ValueType::Named(layout.type_id)))
+            {
+                return Err(CompileError::type_mismatch(None, None, self.function_span));
+            }
+            parents.push((current, layout.type_id, field.clone()));
+            let child = self.allocate(field.ty)?;
+            self.push(
+                Instruction::StructGet {
+                    source: current,
+                    field: field.stable_id,
+                    dst: child,
+                },
+                self.function_span,
+            );
+            current = child;
+        }
+        let span = self.span(&value.span)?;
+        let leaf = lower_type(self.package, &value.ty, span)?;
+        let value_register = self.allocate_expression(value)?;
+        if self.register_types.get(usize::from(value_register)) != Some(&Some(leaf)) {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        self.emit_expression(value, value_register)?;
+        let result = self.allocate(leaf)?;
+        self.emit_compound_binary(operator, &value.ty, current, value_register, result, span)?;
+        let mut updated = result;
         for (parent, type_id, field) in parents.into_iter().rev() {
             let rebuilt = self.allocate(ValueType::Named(type_id))?;
             self.push(
@@ -5026,6 +5176,22 @@ impl<'a> FunctionEmitter<'a> {
                 },
                 span,
             ),
+            BuiltinOperationIr::ArrayTryGet => {
+                let [element] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic: StandardIntrinsic::ArrayGet {
+                            element: lower_type(self.package, element, span)?,
+                        },
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
             BuiltinOperationIr::ArraySet => {
                 self.push(
                     Instruction::ArraySet {
@@ -5137,7 +5303,7 @@ impl<'a> FunctionEmitter<'a> {
                 };
                 self.push(instruction, span)
             }
-            BuiltinOperationIr::MapSet => {
+            BuiltinOperationIr::MapSet | BuiltinOperationIr::MapInsert => {
                 self.push(
                     Instruction::MapSet {
                         source: argument(0)?,
@@ -5269,6 +5435,200 @@ impl<'a> FunctionEmitter<'a> {
                 },
                 span,
             ),
+            BuiltinOperationIr::StringContains => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringContains,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::StringStartsWith => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringStartsWith,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::StringEndsWith => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringEndsWith,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::StringSubstring => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringSubstring,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::StringTrim => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringTrim,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::StringSplit => self.push(
+                Instruction::StandardIntrinsic {
+                    intrinsic: StandardIntrinsic::StringSplit,
+                    args_base,
+                    args_count: argument_slots,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::ArrayIsEmpty => {
+                let [element] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic: StandardIntrinsic::ArrayIsEmpty {
+                            element: lower_type(self.package, element, span)?,
+                        },
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
+            BuiltinOperationIr::OptionIsSome
+            | BuiltinOperationIr::OptionIsNone
+            | BuiltinOperationIr::OptionUnwrapOr => {
+                let [inner] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let inner = lower_type(self.package, inner, span)?;
+                let intrinsic = match operation {
+                    BuiltinOperationIr::OptionIsSome => {
+                        StandardIntrinsic::OptionIsSome { value: inner }
+                    }
+                    BuiltinOperationIr::OptionIsNone => {
+                        StandardIntrinsic::OptionIsNone { value: inner }
+                    }
+                    BuiltinOperationIr::OptionUnwrapOr => {
+                        StandardIntrinsic::OptionUnwrapOr { value: inner }
+                    }
+                    _ => unreachable!("option operations are matched above"),
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic,
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
+            BuiltinOperationIr::ResultIsOk
+            | BuiltinOperationIr::ResultIsErr
+            | BuiltinOperationIr::ResultUnwrapOr => {
+                let [ok, error] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let ok = lower_type(self.package, ok, span)?;
+                let error = lower_type(self.package, error, span)?;
+                let intrinsic = match operation {
+                    BuiltinOperationIr::ResultIsOk => {
+                        StandardIntrinsic::ResultIsOk { success: ok, error }
+                    }
+                    BuiltinOperationIr::ResultIsErr => {
+                        StandardIntrinsic::ResultIsErr { success: ok, error }
+                    }
+                    BuiltinOperationIr::ResultUnwrapOr => {
+                        StandardIntrinsic::ResultUnwrapOr { success: ok, error }
+                    }
+                    _ => unreachable!("result operations are matched above"),
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic,
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
+            BuiltinOperationIr::StringToString => self.push(
+                Instruction::StringToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::I32ToString => self.push(
+                Instruction::I32ToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::I64ToString => self.push(
+                Instruction::I64ToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::F32ToString => self.push(
+                Instruction::F32ToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::F64ToString => self.push(
+                Instruction::F64ToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::BoolToString => self.push(
+                Instruction::BoolToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::RuneToString => self.push(
+                Instruction::RuneToString {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::ValueToString => {
+                let [value] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic: StandardIntrinsic::ValueToString {
+                            value: lower_type(self.package, value, span)?,
+                        },
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
         };
         Ok(())
     }
@@ -6664,7 +7024,10 @@ fn validate_builtin_call_signature(
             validate_builtin_arguments(arguments, &[IrType::String], span)?;
             validate_builtin_result(result, &IrType::I32, span)
         }
-        BuiltinOperationIr::StringEqual => {
+        BuiltinOperationIr::StringEqual
+        | BuiltinOperationIr::StringContains
+        | BuiltinOperationIr::StringStartsWith
+        | BuiltinOperationIr::StringEndsWith => {
             if !type_arguments.is_empty() {
                 return Err(CompileError::type_mismatch(None, None, span));
             }
@@ -6694,6 +7057,7 @@ fn validate_builtin_call_signature(
         }
         BuiltinOperationIr::ArrayLen
         | BuiltinOperationIr::ArrayGet
+        | BuiltinOperationIr::ArrayTryGet
         | BuiltinOperationIr::ArraySet
         | BuiltinOperationIr::ArrayPush
         | BuiltinOperationIr::ArrayPop
@@ -6715,6 +7079,14 @@ fn validate_builtin_call_signature(
                 BuiltinOperationIr::ArrayGet | BuiltinOperationIr::ArrayRemove => {
                     validate_builtin_arguments(arguments, &[array, IrType::I32], span)?;
                     validate_builtin_result(result, element, span)
+                }
+                BuiltinOperationIr::ArrayTryGet => {
+                    validate_builtin_arguments(arguments, &[array, IrType::I32], span)?;
+                    validate_builtin_result(
+                        result,
+                        &IrType::Option(Box::new(element.clone())),
+                        span,
+                    )
                 }
                 BuiltinOperationIr::ArraySet | BuiltinOperationIr::ArrayInsert => {
                     validate_builtin_arguments(
@@ -6879,6 +7251,137 @@ fn validate_builtin_call_signature(
                 }
                 _ => unreachable!("state-handle operations are matched above"),
             }
+        }
+        BuiltinOperationIr::StringSubstring => {
+            if !type_arguments.is_empty() {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            validate_builtin_arguments(
+                arguments,
+                &[IrType::String, IrType::I32, IrType::I32],
+                span,
+            )?;
+            validate_builtin_result(result, &IrType::String, span)
+        }
+        BuiltinOperationIr::StringTrim => {
+            if !type_arguments.is_empty() {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            validate_builtin_arguments(arguments, &[IrType::String], span)?;
+            validate_builtin_result(result, &IrType::String, span)
+        }
+        BuiltinOperationIr::StringSplit => {
+            if !type_arguments.is_empty() {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            validate_builtin_arguments(arguments, &[IrType::String, IrType::String], span)?;
+            validate_builtin_result(result, &IrType::Array(Box::new(IrType::String)), span)
+        }
+        BuiltinOperationIr::ArrayIsEmpty => {
+            let [element] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[IrType::Array(Box::new(element.clone()))],
+                span,
+            )?;
+            validate_builtin_result(result, &IrType::Bool, span)
+        }
+        BuiltinOperationIr::MapInsert => {
+            let [key, value] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[
+                    IrType::Map(Box::new(key.clone()), Box::new(value.clone())),
+                    key.clone(),
+                    value.clone(),
+                ],
+                span,
+            )?;
+            validate_builtin_result(result, &IrType::Bool, span)
+        }
+        BuiltinOperationIr::OptionIsSome | BuiltinOperationIr::OptionIsNone => {
+            let [inner] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[IrType::Option(Box::new(inner.clone()))],
+                span,
+            )?;
+            validate_builtin_result(result, &IrType::Bool, span)
+        }
+        BuiltinOperationIr::OptionUnwrapOr => {
+            let [inner] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[IrType::Option(Box::new(inner.clone())), inner.clone()],
+                span,
+            )?;
+            validate_builtin_result(result, inner, span)
+        }
+        BuiltinOperationIr::ResultIsOk | BuiltinOperationIr::ResultIsErr => {
+            let [ok, error] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[IrType::Result(
+                    Box::new(ok.clone()),
+                    Box::new(error.clone()),
+                )],
+                span,
+            )?;
+            validate_builtin_result(result, &IrType::Bool, span)
+        }
+        BuiltinOperationIr::ResultUnwrapOr => {
+            let [ok, error] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(
+                arguments,
+                &[
+                    IrType::Result(Box::new(ok.clone()), Box::new(error.clone())),
+                    ok.clone(),
+                ],
+                span,
+            )?;
+            validate_builtin_result(result, ok, span)
+        }
+        BuiltinOperationIr::StringToString
+        | BuiltinOperationIr::I32ToString
+        | BuiltinOperationIr::I64ToString
+        | BuiltinOperationIr::F32ToString
+        | BuiltinOperationIr::F64ToString
+        | BuiltinOperationIr::BoolToString
+        | BuiltinOperationIr::RuneToString => {
+            if !type_arguments.is_empty() {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            let source = match operation {
+                BuiltinOperationIr::StringToString => IrType::String,
+                BuiltinOperationIr::I32ToString => IrType::I32,
+                BuiltinOperationIr::I64ToString => IrType::I64,
+                BuiltinOperationIr::F32ToString => IrType::F32,
+                BuiltinOperationIr::F64ToString => IrType::F64,
+                BuiltinOperationIr::BoolToString => IrType::Bool,
+                BuiltinOperationIr::RuneToString => IrType::Rune,
+                _ => unreachable!("scalar to-string operations are matched above"),
+            };
+            validate_builtin_arguments(arguments, &[source], span)?;
+            validate_builtin_result(result, &IrType::String, span)
+        }
+        BuiltinOperationIr::ValueToString => {
+            let [value] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            validate_builtin_arguments(arguments, std::slice::from_ref(value), span)?;
+            validate_builtin_result(result, &IrType::String, span)
         }
     }
 }
@@ -8508,7 +9011,8 @@ fn collect_block_type_metadata(
                     collect_expression_type_metadata(package, value, span, metadata)?;
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 collect_place_type_metadata(package, target, span, metadata)?;
                 collect_expression_type_metadata(package, value, span, metadata)?;
             }
@@ -9648,7 +10152,8 @@ fn collect_block_codegen_inputs(block: &TypedBlockIr, inputs: &mut CodegenInputs
                     collect_expression_codegen_inputs(value, inputs);
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 collect_place_codegen_inputs(target, inputs);
                 collect_expression_codegen_inputs(value, inputs);
             }
@@ -10225,7 +10730,8 @@ fn collect_block_call_graph(
                     );
                 }
             }
-            TypedStatementIr::Assign { target, value } => {
+            TypedStatementIr::Assign { target, value }
+            | TypedStatementIr::CompoundAssign { target, value, .. } => {
                 collect_place_call_graph(
                     package,
                     target,

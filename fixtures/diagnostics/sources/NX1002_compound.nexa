@@ -1,1 +1,1 @@
-fn main() -> i32 { let mut j: i32 = 1; j -= 1; return j; }
+fn main() -> i32 { let mut j: i32 = 1; j--; return j; }

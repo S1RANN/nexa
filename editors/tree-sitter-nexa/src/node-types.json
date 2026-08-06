@@ -203,6 +203,16 @@
     "type": "assignment_statement",
     "named": true,
     "fields": {
+      "operator": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "operator",
+            "named": true
+          }
+        ]
+      },
       "target": {
         "multiple": false,
         "required": true,

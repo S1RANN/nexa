@@ -198,6 +198,11 @@ pub enum StandardIntrinsic {
     StringSubstring,
     StringTrim,
     StringSplit,
+    /// Deterministic, bounded rendering of a scalar or recursive `Array<T>`.
+    /// Never renders nominal objects, maps, tuples, or Host values.
+    ValueToString {
+        value: ValueType,
+    },
     ArrayLen {
         element: ValueType,
     },
@@ -265,6 +270,9 @@ pub enum StandardIntrinsicFuelModel {
     },
     /// Scan and copy a string split, including its bounded result objects.
     StringSplit,
+    /// Render one recursively formattable value; charged per rendered cell
+    /// and per string byte so nested structures stay bounded.
+    ValueToString,
     /// Copy the current array range in 8-element work blocks.
     ArrayCopy,
     /// Resize retained array storage, including claim/release metadata.
@@ -289,7 +297,7 @@ pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
 
 impl StandardIntrinsic {
     /// Number of `StandardIntrinsic` tags reserved by the bytecode v7 wire codec.
-    pub const WIRE_VARIANT_COUNT: usize = 42;
+    pub const WIRE_VARIANT_COUNT: usize = 43;
 
     #[must_use]
     pub const fn canonical_name(self) -> &'static str {
@@ -320,6 +328,7 @@ impl StandardIntrinsic {
             Self::StringSubstring => "intrinsic.string.substring_scalar.v1",
             Self::StringTrim => "intrinsic.string.trim_unicode.v1",
             Self::StringSplit => "intrinsic.string.split_exact.v1",
+            Self::ValueToString { .. } => "intrinsic.value.to_string.v1",
             Self::ArrayLen { .. } => "intrinsic.array.len.v1",
             Self::ArrayIsEmpty { .. } => "intrinsic.array.is_empty.v1",
             Self::ArrayGet { .. } => "intrinsic.array.get.v1",
@@ -361,6 +370,7 @@ impl StandardIntrinsic {
             | Self::StringLen
             | Self::StringByteLen
             | Self::StringTrim
+            | Self::ValueToString { .. }
             | Self::ArrayLen { .. }
             | Self::ArrayIsEmpty { .. }
             | Self::ArrayPop { .. }
@@ -470,6 +480,7 @@ impl StandardIntrinsic {
                 0,
             ) => Some(map(key, value)),
             (Self::DebugAssert, 0) => Some(ValueType::Bool),
+            (Self::ValueToString { value }, 0) => Some(value),
             _ => None,
         }
     }
@@ -512,7 +523,9 @@ impl StandardIntrinsic {
             | Self::ArrayLen { .. }
             | Self::ArrayCapacity { .. }
             | Self::MapLen { .. } => ValueType::I32,
-            Self::StringSubstring | Self::StringTrim => ValueType::String,
+            Self::StringSubstring | Self::StringTrim | Self::ValueToString { .. } => {
+                ValueType::String
+            }
             Self::StringSplit => ValueType::Named(array_type(ValueType::String)),
             Self::ArrayGet { element } => ValueType::Named(option_type(element).type_id),
             Self::ArrayPop { element } => element,
@@ -555,7 +568,8 @@ impl StandardIntrinsic {
             | Self::MapContains { .. }
             | Self::MapGet { .. }
             | Self::MapInsert { .. }
-            | Self::MapRemove { .. } => 8,
+            | Self::MapRemove { .. }
+            | Self::ValueToString { .. } => 8,
             Self::ArrayGet { .. }
             | Self::ArrayPush { .. }
             | Self::ArrayPop { .. }
@@ -606,6 +620,7 @@ impl StandardIntrinsic {
                 StandardIntrinsicFuelModel::MapLookup
             }
             Self::MapInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
+            Self::ValueToString { .. } => StandardIntrinsicFuelModel::ValueToString,
             _ => StandardIntrinsicFuelModel::Fixed,
         }
     }
@@ -3239,6 +3254,7 @@ fn encode_standard_intrinsic(output: &mut Vec<u8>, intrinsic: StandardIntrinsic)
         StandardIntrinsic::ArrayCapacity { element } => (39, std::slice::from_ref(element)),
         StandardIntrinsic::ArrayClear { element } => (40, std::slice::from_ref(element)),
         StandardIntrinsic::ArrayShrinkToFit { element } => (41, std::slice::from_ref(element)),
+        StandardIntrinsic::ValueToString { value } => (42, std::slice::from_ref(value)),
     };
     output.push(tag);
     for ty in types {
@@ -3339,6 +3355,9 @@ fn decode_standard_intrinsic(reader: &mut Reader<'_>) -> Result<StandardIntrinsi
         },
         41 => StandardIntrinsic::ArrayShrinkToFit {
             element: unary(reader)?,
+        },
+        42 => StandardIntrinsic::ValueToString {
+            value: unary(reader)?,
         },
         value => return Err(DecodeError::InvalidStandardIntrinsic(value)),
     })
@@ -6201,6 +6220,7 @@ mod tests {
             StandardIntrinsic::StringSubstring,
             StandardIntrinsic::StringTrim,
             StandardIntrinsic::StringSplit,
+            StandardIntrinsic::ValueToString { value },
             StandardIntrinsic::ArrayLen { element: value },
             StandardIntrinsic::ArrayIsEmpty { element: value },
             StandardIntrinsic::ArrayGet { element: value },

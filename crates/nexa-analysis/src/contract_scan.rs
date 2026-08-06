@@ -284,7 +284,8 @@ impl AstReferenceScanner<'_> {
                 }
                 self.scan_expression(value);
             }
-            StatementKind::Assign { target, value } => {
+            StatementKind::Assign { target, value }
+            | StatementKind::CompoundAssign { target, value, .. } => {
                 self.scan_expression(target);
                 self.scan_expression(value);
             }

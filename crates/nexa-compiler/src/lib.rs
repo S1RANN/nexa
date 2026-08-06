@@ -224,8 +224,50 @@ impl fmt::Display for CompileError {
             Self::AnalysisDiagnostic(diagnostic) => {
                 write!(formatter, "{}: {}", diagnostic.code, diagnostic.message)
             }
-            _ => write!(formatter, "{self:?}"),
+            Self::DuplicateName { name, .. } => write!(formatter, "duplicate name `{name}`"),
+            Self::UnknownName { name, .. } => write!(formatter, "unknown name `{name}`"),
+            Self::UnknownType { name, .. } => write!(formatter, "unknown type `{name}`"),
+            Self::TypeMismatch {
+                expected, actual, ..
+            } => write_type_mismatch(expected.as_ref(), actual.as_ref(), formatter),
+            Self::MissingReturn { .. } => formatter.write_str("missing return"),
+            Self::DeferCaptureLimit { .. } => formatter.write_str("defer capture limit exceeded"),
+            Self::InvalidEffect { .. } => formatter.write_str("invalid function effect"),
+            Self::MissingMain { entry_module, .. } => write!(
+                formatter,
+                "standalone entry module `{entry_module}` has no main"
+            ),
+            Self::InvalidMainSignature { message, .. }
+            | Self::InvalidReplEntrypoint { message, .. } => formatter.write_str(message),
+            Self::MissingReplEntrypoint { .. } => {
+                formatter.write_str("compiled REPL cell is missing its transactional entrypoint")
+            }
+            Self::InvalidReloadMetadata { message, .. } => {
+                write!(formatter, "invalid reload metadata: {message}")
+            }
+            Self::TooManyRegisters { .. } => formatter.write_str("register limit exceeded"),
+            Self::Verify { message, .. } => {
+                write!(formatter, "verification failed: {message}")
+            }
         }
+    }
+}
+
+fn write_type_mismatch(
+    expected: Option<&ValueType>,
+    actual: Option<&ValueType>,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => write!(
+            formatter,
+            "type mismatch: expected `{expected}`, found `{actual}`"
+        ),
+        (Some(expected), None) => {
+            write!(formatter, "type mismatch: expected `{expected}`")
+        }
+        (None, Some(actual)) => write!(formatter, "type mismatch: found `{actual}`"),
+        (None, None) => formatter.write_str("type mismatch"),
     }
 }
 

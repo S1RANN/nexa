@@ -515,6 +515,27 @@ fn is_scalar(ty: &IrType) -> bool {
     )
 }
 
+/// Recursively formattable interpolation set: scalars plus `Array<T>` whose
+/// elements are themselves formattable.
+///
+/// Tuple, Option, Result, Map, Struct, Class, Buffer, and Host values are
+/// deliberately excluded for now. Keeping the first aggregate surface to
+/// arrays makes formatting deterministic without exposing nominal layouts or
+/// introducing recursive object traversal.
+fn is_interpolatable(ty: &IrType) -> bool {
+    match ty {
+        IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune => true,
+        IrType::Array(inner) => is_interpolatable(inner),
+        _ => false,
+    }
+}
+
 fn max_effect(left: IrEffect, right: IrEffect) -> IrEffect {
     if left == IrEffect::Task || right == IrEffect::Task {
         IrEffect::Task

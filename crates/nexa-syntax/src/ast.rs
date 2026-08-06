@@ -27,7 +27,9 @@ pub struct AstError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AstErrorKind {
     InvalidSyntax,
-    LegacyModuleDeclaration { path: TextRange },
+    LegacyModuleDeclaration {
+        path: TextRange,
+    },
     /// `name!(` looked like a Rust macro invocation; the callee is already explained by the
     /// error message, so downstream name resolution must not re-report it.
     RustMacroInvocation,
@@ -277,6 +279,11 @@ pub enum StatementKind {
     },
     Assign {
         target: Expression,
+        value: Expression,
+    },
+    CompoundAssign {
+        target: Expression,
+        operator: BinaryOperator,
         value: Expression,
     },
     Return(Option<Expression>),
@@ -878,19 +885,13 @@ impl<'a> Parser<'a> {
                 header_broken = true;
                 self.error(self.current_range(), "expected `(` after function name");
             }
-            while !self.at_end()
-                && !self.at(TokenKind::RParen)
-                && !self.at(TokenKind::LBrace)
-            {
+            while !self.at_end() && !self.at(TokenKind::RParen) && !self.at(TokenKind::LBrace) {
                 let parameter_start = self.current_range();
                 let parameter_name = self.identifier();
                 self.require_snake_case(&parameter_name, "parameter");
                 if self.take(TokenKind::Colon).is_none() {
                     if !parameter_error {
-                        self.error(
-                            self.current_range(),
-                            "expected `:` after parameter name",
-                        );
+                        self.error(self.current_range(), "expected `:` after parameter name");
                         parameter_error = true;
                         header_broken = true;
                     }
@@ -1282,6 +1283,21 @@ impl<'a> Parser<'a> {
             });
         }
         let target = self.expression(0);
+        if let Some(operator) = self.take_compound_operator() {
+            let value = self.expression(0);
+            let end = self.expect(
+                TokenKind::Semicolon,
+                "expected `;` after compound assignment",
+            );
+            return ParsedStatement::Statement(Statement {
+                kind: StatementKind::CompoundAssign {
+                    target,
+                    operator,
+                    value,
+                },
+                range: cover(start, end),
+            });
+        }
         if self.take(TokenKind::Equal).is_some() {
             let value = self.expression(0);
             let end = self.expect(TokenKind::Semicolon, "expected `;` after assignment");
@@ -1391,8 +1407,10 @@ impl<'a> Parser<'a> {
                 range: self.bump_range(),
             };
             if self.current_kind() == Some(TokenKind::Equal) {
-                // `+=`/`-=`/`*=`/`/=` are lexed as an operator followed by `=`; report them as a
-                // single friendly error and keep parsing as if the compound form were explicit.
+                // `x + = y` with whitespace lexes as `+` then `=`; the compound token `+=`
+                // is lexed as one token and handled at the statement level. Report the
+                // spaced form with a single friendly error and keep parsing as if the
+                // compound form were explicit.
                 let operator_text = self.text(operator.range).to_owned();
                 let equal_range = self.current_range();
                 let left_text = self.text(left.range).to_owned();
@@ -1401,10 +1419,8 @@ impl<'a> Parser<'a> {
                 let right_text = self.text(right.range).to_owned();
                 self.error_with_fix(
                     cover(operator.range, equal_range),
-                    &format!("`{operator_text}=` is not a Nexa operator"),
-                    format!(
-                        "write `{left_text} = {left_text} {operator_text} {right_text}`"
-                    ),
+                    &format!("`{operator_text} =` is not a Nexa operator"),
+                    format!("write `{left_text} {operator_text}= {right_text}`"),
                 );
                 let range = cover(left.range, right.range);
                 left = Expression {
@@ -1418,7 +1434,10 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if matches!(kind, BinaryOperatorKind::Add | BinaryOperatorKind::Subtract)
-                && matches!(self.current_kind(), Some(TokenKind::Plus | TokenKind::Minus))
+                && matches!(
+                    self.current_kind(),
+                    Some(TokenKind::Plus | TokenKind::Minus)
+                )
                 && operator.range.end == self.current_range().start
             {
                 // `i++` / `i--` are Rust/C postfix increments; report one friendly error and
@@ -1460,9 +1479,13 @@ impl<'a> Parser<'a> {
                     _ => UnaryOperatorKind::Not,
                 };
                 let operator_range = self.bump_range();
-                if matches!(kind, UnaryOperatorKind::Positive | UnaryOperatorKind::Negate)
-                    && matches!(self.current_kind(), Some(TokenKind::Plus | TokenKind::Minus))
-                    && operator_range.end == self.current_range().start
+                if matches!(
+                    kind,
+                    UnaryOperatorKind::Positive | UnaryOperatorKind::Negate
+                ) && matches!(
+                    self.current_kind(),
+                    Some(TokenKind::Plus | TokenKind::Minus)
+                ) && operator_range.end == self.current_range().start
                 {
                     // `++i` / `--i` are Rust/C increments; report one friendly error.
                     let plus = matches!(self.current_kind(), Some(TokenKind::Plus));
@@ -2232,6 +2255,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consumes one compound-assignment token (`+=`, `-=`, `*=`, `/=`, `%=`)
+    /// as its underlying binary operator, or returns `None`.
+    fn take_compound_operator(&mut self) -> Option<BinaryOperator> {
+        let (kind, range) = match self.current_kind()? {
+            TokenKind::PlusEqual => (BinaryOperatorKind::Add, self.bump_range()),
+            TokenKind::MinusEqual => (BinaryOperatorKind::Subtract, self.bump_range()),
+            TokenKind::StarEqual => (BinaryOperatorKind::Multiply, self.bump_range()),
+            TokenKind::SlashEqual => (BinaryOperatorKind::Divide, self.bump_range()),
+            TokenKind::PercentEqual => (BinaryOperatorKind::Remainder, self.bump_range()),
+            _ => return None,
+        };
+        Some(BinaryOperator { kind, range })
+    }
+
     fn take_keyword(&mut self, keyword: Keyword) -> Option<TextRange> {
         if self.at_keyword(keyword) {
             Some(self.bump_range())
@@ -2352,9 +2389,7 @@ impl<'a> Parser<'a> {
     }
 
     fn require_snake_case(&mut self, identifier: &Identifier, role: &str) {
-        if !identifier.text.starts_with('<')
-            && !is_snake_case(&identifier.text)
-        {
+        if !identifier.text.starts_with('<') && !is_snake_case(&identifier.text) {
             self.error(
                 identifier.range,
                 &format!("{role} name must use snake_case"),
@@ -2363,9 +2398,7 @@ impl<'a> Parser<'a> {
     }
 
     fn require_pascal_case(&mut self, identifier: &Identifier, role: &str) {
-        if !identifier.text.starts_with('<')
-            && !is_pascal_case(&identifier.text)
-        {
+        if !identifier.text.starts_with('<') && !is_pascal_case(&identifier.text) {
             self.error(
                 identifier.range,
                 &format!("{role} name must use PascalCase"),
@@ -2374,9 +2407,7 @@ impl<'a> Parser<'a> {
     }
 
     fn require_screaming_snake_case(&mut self, identifier: &Identifier) {
-        if !identifier.text.starts_with('<')
-            && !is_screaming_snake_case(&identifier.text)
-        {
+        if !identifier.text.starts_with('<') && !is_screaming_snake_case(&identifier.text) {
             self.error(identifier.range, "const name must use SCREAMING_SNAKE_CASE");
         }
     }

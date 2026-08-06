@@ -124,6 +124,24 @@ impl WorkspaceSnapshot<'_> {
             .map_or_else(|| path_to_file_uri(path), Ok)
     }
 
+    /// Finds an open document whose path ends with the identity-relative `relative` path. This
+    /// is the editor-snapshot fallback for related locations that carry only a standalone
+    /// relative path (for example the Host Contract `api.nidl` spelled as a bare file name): the
+    /// authoritative URI is the open document's URI, not a guess rooted at the diagnostic root.
+    fn document_for_relative_path(&self, relative: &Path) -> Option<&OpenDocument> {
+        let relative_components = relative.components().collect::<Vec<_>>();
+        if relative_components.is_empty() {
+            return None;
+        }
+        self.documents.values().find(|document| {
+            let lexical = lexical_path(&document.path);
+            let document_components = lexical.components().collect::<Vec<_>>();
+            document_components.len() >= relative_components.len()
+                && document_components[document_components.len() - relative_components.len()..]
+                    == relative_components[..]
+        })
+    }
+
     fn version_for_uri(&self, uri: &str) -> Option<i64> {
         self.documents
             .get(uri)
@@ -731,19 +749,27 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
             }) {
                 Ok(project) => project,
                 Err(error) => {
-                    report.diagnostics.push(LocatedDiagnostic::new(
-                        EngineDiagnostic::without_source(
-                            None,
-                            SourceId::new("editor").ok(),
-                            EngineDiagnosticStage::Manifest,
-                            nexa::ErrorCode::NX7002,
-                            error.to_string(),
-                        ),
-                        config
-                            .parent()
-                            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
-                        config,
-                    ));
+                    if let Some(precise) =
+                        contract_nidl_load_diagnostics(snapshot, &config, &error.to_string())
+                    {
+                        // An invalid Host Contract overlay (or disk text) is the actionable cause;
+                        // do not degrade the whole project to a generic NX7002 as well.
+                        report.diagnostics.extend(precise);
+                    } else {
+                        report.diagnostics.push(LocatedDiagnostic::new(
+                            EngineDiagnostic::without_source(
+                                None,
+                                SourceId::new("editor").ok(),
+                                EngineDiagnosticStage::Manifest,
+                                nexa::ErrorCode::NX7002,
+                                error.to_string(),
+                            ),
+                            config
+                                .parent()
+                                .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
+                            config,
+                        ));
+                    }
                     continue;
                 }
             };
@@ -850,6 +876,47 @@ fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path)
     Some(source.to_owned())
 }
 
+/// When project loading fails because the Host Contract text the editor is working against (the
+/// unsaved overlay, falling back to disk) is not valid NIDL, the load error is only a symptom of
+/// that broken contract. Report the precise parser/validation spans at the contract URI instead
+/// of a generic NX7002 anchored at the project manifest, and return `None` when the failure must
+/// stay a generic project-load diagnostic.
+fn contract_nidl_load_diagnostics(
+    snapshot: &WorkspaceSnapshot<'_>,
+    config: &Path,
+    load_error: &str,
+) -> Option<Vec<LocatedDiagnostic>> {
+    let root = config
+        .parent()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    let config_source = snapshot
+        .overlay_for_path(config)
+        .map(str::to_owned)
+        .or_else(|| std::fs::read_to_string(config).ok())?;
+    let parsed: project::ProjectConfig = toml::from_str(&config_source).ok()?;
+    let contract_path = root.join(parsed.contract);
+    // The loader reports the failure with the resolved contract path; the editor document may
+    // spell it differently (symlinked temp roots, `..` segments), so the file name is the stable
+    // discriminator between a contract-caused failure and an unrelated manifest/environment error.
+    let contract_name = contract_path.file_name().and_then(|name| name.to_str())?;
+    if !load_error.contains(contract_name) {
+        return None;
+    }
+    let source = snapshot.text_for_path(&contract_path).ok()??;
+    if nexa::parse_nidl(&source).is_ok() {
+        return None;
+    }
+    Some(
+        diagnostics_for_nidl_source(&contract_path, &source)
+            .ok()?
+            .into_iter()
+            .map(|diagnostic| {
+                LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
+            })
+            .collect(),
+    )
+}
+
 fn build_overlays(snapshot: &WorkspaceSnapshot<'_>) -> BTreeMap<PathBuf, String> {
     snapshot
         .documents
@@ -887,6 +954,11 @@ fn analyze_package_snapshot(
     }) {
         Ok(project) => project,
         Err(error) => {
+            if let Some(precise) =
+                contract_nidl_load_diagnostics(snapshot, config, &error.to_string())
+            {
+                return Ok(precise);
+            }
             return Ok(vec![LocatedDiagnostic::new(
                 EngineDiagnostic::without_source(
                     None,
@@ -1527,16 +1599,25 @@ fn lsp_diagnostic_with_paths(
             let end = byte_offset_to_lsp_position(source.text(), span.end as usize);
             let path = if let Some(path) = source_paths.get(file) {
                 path.clone()
-            } else {
-                if file.package_id().is_some() {
-                    return None;
-                }
-                let path = Path::new(file.path());
-                if path.is_absolute() {
-                    path.to_path_buf()
+            } else if file.package_id().is_none() {
+                let relative = Path::new(file.path());
+                if relative.is_absolute() {
+                    relative.to_path_buf()
+                } else if let Some(document) =
+                    snapshot.and_then(|snapshot| snapshot.document_for_relative_path(relative))
+                {
+                    // A relative standalone identity (e.g. a bare `api.nidl` contract) is
+                    // authoritative when the editor has that file open; prefer the open document
+                    // URI over a path guessed under the diagnostic root.
+                    document.path.clone()
                 } else {
-                    diagnostic_root?.join(path)
+                    diagnostic_root?.join(relative)
                 }
+            } else {
+                // A related location inside a package we have no identity-to-path mapping for
+                // (for example an embedded standard-library source) cannot be rendered as a
+                // truthful file URI. Drop it rather than inventing a path under the wrong root.
+                return None;
             };
             let uri = snapshot.map_or_else(
                 || path_to_file_uri(&path),
@@ -1869,13 +1950,14 @@ fn percent_decoded_path(url: &Url) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nexa_embed::{EngineDiagnosticStage, SourceId};
     use serde_json::json;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -3756,5 +3838,408 @@ mod tests {
         assert!(output.contains("\"version\":1"));
         assert!(output.contains("\"version\":2"));
         assert!(output.matches("\"diagnostics\":[]").count() >= 3);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lsp_invalid_nidl_overlay_keeps_precise_diagnostics_when_disk_is_invalid_too() {
+        let directory = TestDirectory::new("nidl-overlay-invalid-both");
+        let packages = directory.path().join("packages");
+        let contract = directory.path().join("api.nidl");
+        let config = directory.path().join("nexa.dev.toml");
+        fs::create_dir_all(&packages).expect("package source root");
+        fs::write(&contract, "contract Broken {").expect("invalid disk NIDL");
+        fs::write(
+            &config,
+            "schema = 2\n\
+             contract = \"api.nidl\"\n\
+             required_entrypoints = [\"run\"]\n\
+             [[sources]]\n\
+             id = \"fixture\"\n\
+             root = \"packages\"\n\
+             trust = \"first-party\"\n\
+             activation = [\"programmatic\"]\n\
+             capabilities = []\n\
+             allow_entitlement = false\n\
+             max_packages = 1\n\
+             [sources.limits]\n\
+             handler_fuel = 20000\n\
+             cumulative_budget = 100000\n\
+             heap_objects = 1024\n\
+             heap_bytes = 67108864\n\
+             string_bytes = 1048576\n\
+             collection_bytes = 33554432\n\
+             host_resources = 32\n\
+             tasks = 4\n\
+             release_records = 64\n",
+        )
+        .expect("project configuration");
+        assert!(
+            crate::project::LoadedProject::load(&config).is_err(),
+            "the disk NIDL is intentionally invalid"
+        );
+
+        let overlay = "contract AlsoBroken {";
+        assert!(
+            nexa::parse_nidl(overlay).is_err(),
+            "overlay NIDL is invalid"
+        );
+        let uri = super::path_to_file_uri(&contract).expect("contract URI");
+        let documents = BTreeMap::from([(
+            uri.clone(),
+            super::OpenDocument {
+                uri,
+                path: contract.clone(),
+                text: overlay.to_owned(),
+                version: 2,
+            },
+        )]);
+        let known_inputs = [contract.clone()].into_iter().collect();
+        let roots = [directory.path().to_path_buf()];
+        let snapshot = super::WorkspaceSnapshot {
+            roots: &roots,
+            documents: &documents,
+            known_inputs: &known_inputs,
+        };
+        let mut analyzer = super::CurrentWorkspaceAnalyzer::default();
+        let report = super::WorkspaceAnalyzer::analyze(
+            &mut analyzer,
+            &snapshot,
+            &[super::BuildInputChange {
+                path: contract.clone(),
+                input: super::BuildInputKind::Nidl,
+                change: super::ChangeKind::Changed,
+            }],
+        )
+        .expect("invalid NIDL overlay analysis");
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "an invalid unsaved NIDL overlay must degrade to one precise parse diagnostic, \
+             not a generic project-load error plus a duplicate: {:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{:?}", diagnostic.diagnostic))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.diagnostics[0].diagnostic.diagnostic.code,
+            nexa::ErrorCode::NX1002
+        );
+        assert!(
+            super::same_file_path(&report.diagnostics[0].source_path(), &contract),
+            "the precise diagnostic must be anchored at the NIDL file"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lsp_cross_package_related_information_uses_the_true_file_uri() {
+        let directory = TestDirectory::new("related-uri");
+        let workspace = directory.path().join("workspace");
+        let application = workspace.join("packages/app");
+        let source = application.join("src/app/main.nexa");
+        let config = workspace.join("nexa.dev.toml");
+        let contract = workspace.join("api.nidl");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("Package source directory");
+        fs::write(
+            &contract,
+            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
+        )
+        .expect("Host contract");
+        fs::write(&config, fixture_project_config("packages", "\"run\""))
+            .expect("project configuration");
+        fs::write(
+            application.join("package.toml"),
+            fixture_application_manifest("fixture.related"),
+        )
+        .expect("Package Manifest");
+        fs::write(&source, "pub fn run() -> bool { return true; }\n").expect("Package source");
+
+        let project = crate::project::LoadedProject::load(&config).expect("loaded project");
+        let discovered = project
+            .package_directories()
+            .expect("Package discovery")
+            .into_iter()
+            .find(|package| super::same_file_path(&package.directory, &application))
+            .expect("Application discovery");
+        project
+            .resolve_package_for_lock(&discovered)
+            .expect("generate nexa.lock");
+
+        let contract_uri = super::path_to_file_uri(&contract).expect("contract URI");
+        let source_uri = super::path_to_file_uri(&source).expect("source URI");
+        let documents = BTreeMap::from([(
+            contract_uri.clone(),
+            super::OpenDocument {
+                uri: contract_uri.clone(),
+                path: contract.clone(),
+                text: fs::read_to_string(&contract).expect("contract text"),
+                version: 1,
+            },
+        )]);
+        let known_inputs = [contract.clone(), source.clone()].into_iter().collect();
+        let roots = [workspace];
+        let snapshot = super::WorkspaceSnapshot {
+            roots: &roots,
+            documents: &documents,
+            known_inputs: &known_inputs,
+        };
+        let mut analyzer = super::CurrentWorkspaceAnalyzer::default();
+        let report = super::WorkspaceAnalyzer::analyze(
+            &mut analyzer,
+            &snapshot,
+            &[super::BuildInputChange {
+                path: source,
+                input: super::BuildInputKind::NexaSource,
+                change: super::ChangeKind::Opened,
+            }],
+        )
+        .expect("entrypoint mismatch analysis");
+        let mismatch = report
+            .diagnostics
+            .iter()
+            .find(|located| located.diagnostic.diagnostic.code == nexa::ErrorCode::NX7011)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing NX7011 entrypoint mismatch: {:?}",
+                    report
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| format!("{:?}", diagnostic.diagnostic))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            !mismatch.diagnostic.related.is_empty(),
+            "NX7011 must carry a related location at the Host contract"
+        );
+        let rendered = super::lsp_diagnostic_with_paths(
+            &mismatch.diagnostic,
+            Some(&mismatch.root),
+            &mismatch.source_paths,
+            Some(&snapshot),
+        );
+        let related = rendered["relatedInformation"]
+            .as_array()
+            .expect("relatedInformation array");
+        assert!(
+            related.iter().any(|entry| {
+                entry["location"]["uri"] == contract_uri && entry["location"]["uri"] != source_uri
+            }),
+            "related location must point at the Host contract URI {contract_uri}, got {related:?}"
+        );
+        for entry in related {
+            let uri = entry["location"]["uri"].as_str().expect("related URI");
+            assert!(
+                uri == contract_uri,
+                "every related location must use the true contract file URI: {related:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_related_information_fallback_uses_open_documents_and_drops_unmapped_packages() {
+        let identity = |package: Option<&str>, path: &str| {
+            package.map_or_else(
+                || nexa::SourceIdentity::standalone(path.to_owned()),
+                |package| nexa::SourceIdentity::package(package, path),
+            )
+        };
+        let mapped = identity(Some("fixture.lib"), "src/helper.nexa");
+        let unmapped = identity(Some("fixture.other"), "src/other.nexa");
+        let open_contract = identity(None, "api.nidl");
+        let on_disk_contract = identity(None, "other.nidl");
+        let mut sources = nexa::SourceSnapshotRegistry::builder();
+        for (source, text) in [
+            (&mapped, "pub fn value(x: i32) -> i32 { return x; }\n"),
+            (&unmapped, "pub fn other() -> i32 { return 1; }\n"),
+            (&open_contract, "contract OpenHost {}\n"),
+            (&on_disk_contract, "contract DiskHost {}\n"),
+        ] {
+            sources
+                .insert(source.clone(), text.to_owned())
+                .expect("source insert");
+        }
+        let sources = Arc::new(sources.build());
+        let mut leaf = nexa::LeafDiagnostic::new(
+            nexa::ErrorCode::NX1002,
+            nexa::Severity::Error,
+            "fallback fixture",
+        )
+        .with_label(nexa::LeafLabel::primary(
+            mapped.clone(),
+            nexa::ByteRange::new(0, 1),
+            "primary",
+        ));
+        for (source, message) in [
+            (&mapped, "mapped dependency"),
+            (&unmapped, "unmapped dependency"),
+            (&open_contract, "open contract"),
+            (&on_disk_contract, "on-disk contract"),
+        ] {
+            leaf = leaf.with_related(nexa::LeafRelatedLocation::new(
+                source.clone(),
+                nexa::ByteRange::new(0, 1),
+                message,
+            ));
+        }
+        let diagnostic = nexa_embed::EngineDiagnostic::from_leaf_diagnostic(
+            None,
+            SourceId::new("editor").ok(),
+            EngineDiagnosticStage::Parse,
+            &leaf,
+            &sources,
+        );
+        let source_paths = Arc::new(BTreeMap::from([(
+            mapped.clone(),
+            PathBuf::from("/tmp/packages/lib/src/helper.nexa"),
+        )]));
+        let diagnostic_root = PathBuf::from("/tmp/packages/app");
+        let open_uri = "file:///editor/api.nidl".to_owned();
+        let documents = BTreeMap::from([(
+            open_uri.clone(),
+            super::OpenDocument {
+                uri: open_uri.clone(),
+                path: PathBuf::from("/tmp/root/api.nidl"),
+                text: "contract OpenHost {}\n".to_owned(),
+                version: 1,
+            },
+        )]);
+        let known_inputs = BTreeSet::from([PathBuf::from("/tmp/root/api.nidl")]);
+        let roots = [PathBuf::from("/tmp/root")];
+        let snapshot = super::WorkspaceSnapshot {
+            roots: &roots,
+            documents: &documents,
+            known_inputs: &known_inputs,
+        };
+        let rendered = super::lsp_diagnostic_with_paths(
+            &diagnostic,
+            Some(&diagnostic_root),
+            &source_paths,
+            Some(&snapshot),
+        );
+        let related = rendered["relatedInformation"]
+            .as_array()
+            .expect("relatedInformation array");
+        let uris = related
+            .iter()
+            .map(|entry| entry["location"]["uri"].as_str().expect("related URI"))
+            .collect::<Vec<_>>();
+        assert!(
+            uris.contains(&"file:///tmp/packages/lib/src/helper.nexa"),
+            "mapped cross-package related location must use its true file URI: {related:?}"
+        );
+        assert!(
+            uris.contains(&"file:///editor/api.nidl"),
+            "relative standalone identity must prefer the open document URI: {related:?}"
+        );
+        assert!(
+            uris.contains(&"file:///tmp/packages/app/other.nidl"),
+            "relative standalone identity without an open document must stay bounded to the \
+             diagnostic root: {related:?}"
+        );
+        assert!(
+            !uris.contains(&"file:///tmp/packages/app/src/other.nexa")
+                && !uris.iter().any(|uri| uri.contains("src/other.nexa")),
+            "an unmapped package identity must be dropped, never rendered under the wrong root: \
+             {related:?}"
+        );
+        assert_eq!(
+            related.len(),
+            3,
+            "exactly one related entry is dropped: {related:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lsp_session_related_information_publishes_the_contract_file_uri() {
+        let directory = TestDirectory::new("related-e2e");
+        let workspace = directory.path().join("workspace");
+        let application = workspace.join("packages/app");
+        let source = application.join("src/app/main.nexa");
+        let config = workspace.join("nexa.dev.toml");
+        let contract = workspace.join("api.nidl");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("Package source directory");
+        fs::write(
+            &contract,
+            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
+        )
+        .expect("Host contract");
+        fs::write(&config, fixture_project_config("packages", "\"run\""))
+            .expect("project configuration");
+        fs::write(
+            application.join("package.toml"),
+            fixture_application_manifest("fixture.e2e"),
+        )
+        .expect("Package Manifest");
+        fs::write(&source, "pub fn run() -> bool { return true; }\n").expect("Package source");
+
+        let project = crate::project::LoadedProject::load(&config).expect("loaded project");
+        let discovered = project
+            .package_directories()
+            .expect("Package discovery")
+            .into_iter()
+            .find(|package| super::same_file_path(&package.directory, &application))
+            .expect("Application discovery");
+        project
+            .resolve_package_for_lock(&discovered)
+            .expect("generate nexa.lock");
+
+        let contract_uri = super::path_to_file_uri(&contract).expect("contract URI");
+        let source_uri = super::path_to_file_uri(&source).expect("source URI");
+        let messages = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "rootUri":super::path_to_file_uri(&workspace).expect("workspace URI")
+            }}),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didOpen",
+                "params":{"textDocument":{
+                    "uri":source_uri,
+                    "languageId":"nexa",
+                    "version":1,
+                    "text":"pub fn run() -> bool { return true; }\n"
+                }}
+            }),
+            json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}),
+            json!({"jsonrpc":"2.0","method":"exit","params":null}),
+        ];
+        let input = messages.iter().flat_map(framed).collect::<Vec<_>>();
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        super::run_session(&mut reader, &mut output).expect("LSP session");
+        let messages = decoded_messages(output);
+        let published = publish_messages(&messages);
+        let mismatch = published
+            .iter()
+            .flat_map(|message| {
+                message["params"]["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics array")
+                    .iter()
+            })
+            .find(|diagnostic| diagnostic["code"] == "NX7011")
+            .unwrap_or_else(|| panic!("missing NX7011 in published diagnostics"));
+        let related = mismatch["relatedInformation"]
+            .as_array()
+            .expect("relatedInformation array");
+        assert!(
+            !related.is_empty(),
+            "NX7011 must publish its Host contract related location: {mismatch}"
+        );
+        for entry in related {
+            let uri = entry["location"]["uri"].as_str().expect("related URI");
+            let related_path = super::file_uri_to_path(uri).expect("related file path");
+            assert!(
+                super::same_file_path(&related_path, &contract),
+                "cross-file related location must publish the true contract file URI (got {uri}, expected {contract_uri})"
+            );
+            assert_ne!(uri, source_uri);
+        }
     }
 }

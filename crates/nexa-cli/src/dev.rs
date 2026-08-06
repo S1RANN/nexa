@@ -55,7 +55,7 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                     &error.to_string(),
                 );
                 if once {
-                    deferred_error = Some(error);
+                    defer_error(&mut deferred_error, error);
                     break 'watch;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -87,7 +87,7 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                     &error.to_string(),
                 );
                 if once {
-                    deferred_error = Some(error);
+                    defer_error(&mut deferred_error, error);
                     break 'watch;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -167,9 +167,12 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
             retry_awaiting(&mut coordinator, &mut awaiting, &directories, format);
             while let Some(identity) = coordinator.start_next() {
                 let Some(build) = snapshots.get(&identity).cloned() else {
-                    deferred_error = Some(CliError::internal(format!(
-                        "DevelopmentCoordinator started unknown Candidate {identity:?}"
-                    )));
+                    defer_error(
+                        &mut deferred_error,
+                        CliError::internal(format!(
+                            "DevelopmentCoordinator started unknown Candidate {identity:?}"
+                        )),
+                    );
                     break 'watch;
                 };
                 let directory = build.root.directory.clone();
@@ -202,7 +205,7 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                             &format!("Build input became invalid before commit: {error}"),
                         );
                         if once {
-                            deferred_error = Some(error);
+                            defer_error(&mut deferred_error, error);
                             break 'watch;
                         }
                         continue;
@@ -222,7 +225,7 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                             &format!("Build input became invalid before commit: {error}"),
                         );
                         if once {
-                            deferred_error = Some(error);
+                            defer_error(&mut deferred_error, error);
                             break 'watch;
                         }
                         continue;
@@ -292,18 +295,21 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                                 );
                             }
                             Err(error) => {
+                                let summary = match &error {
+                                    project::BuildCompileError::Facade(
+                                        nexa::PackageBuildError::AnalysisFailed(batch)
+                                        | nexa::PackageBuildError::CompileFailed(batch),
+                                    ) => minimal_diagnostic_summary(batch),
+                                    _ => None,
+                                };
                                 let error = finish_resolved_build(&build, Err(error), format)
                                     .expect_err("an accepted failed compilation remains an error");
                                 if error.kind == CliErrorKind::WorkerIoOrInternal {
-                                    deferred_error = Some(error);
+                                    defer_error(&mut deferred_error, error);
                                     break 'watch;
                                 }
                                 rendered_failure = true;
-                                let message = if error.already_rendered() {
-                                    "Last Known Good Candidate retained".to_owned()
-                                } else {
-                                    error.to_string()
-                                };
+                                let message = failure_event_message(&error, summary.as_deref());
                                 emit_event(
                                     format,
                                     if terminal.kind == DevelopmentTerminalKind::VerifyFailed {
@@ -343,9 +349,12 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
                         );
                     }
                     DevelopmentCompletionOutcome::AlreadyTerminal { kind, .. } => {
-                        deferred_error = Some(CliError::internal(format!(
-                            "duplicate Development Candidate terminal: {kind:?}"
-                        )));
+                        defer_error(
+                            &mut deferred_error,
+                            CliError::internal(format!(
+                                "duplicate Development Candidate terminal: {kind:?}"
+                            )),
+                        );
                         break 'watch;
                     }
                     DevelopmentCompletionOutcome::Stale(stale) => {
@@ -388,14 +397,14 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
         );
     }
     let inspection = coordinator.inspection();
+    if let Some(error) = deferred_error {
+        return Err(error);
+    }
     if inspection.generations_without_terminal != 0 || inspection.duplicate_terminals != 0 {
         return Err(CliError::internal(format!(
             "DevelopmentCoordinator terminal invariant failed: {} missing, {} duplicate",
             inspection.generations_without_terminal, inspection.duplicate_terminals
         )));
-    }
-    if let Some(error) = deferred_error {
-        return Err(error);
     }
     emit_event(
         format,
@@ -410,6 +419,49 @@ pub fn dev_command(project_path: &Path, once: bool, format: DiagnosticFormat) ->
         ))
     } else {
         Ok(())
+    }
+}
+
+/// Records the first root-cause error and ignores later ones so a single `dev --once`/event-loop
+/// run cannot overwrite the original failure with a secondary diagnosis.
+fn defer_error(deferred_error: &mut Option<CliError>, error: CliError) {
+    if deferred_error.is_none() {
+        *deferred_error = Some(error);
+    }
+}
+
+/// Minimal diagnostic summary for a failed Candidate event: the first error-severity diagnostic's
+/// code and message, plus a count of any remaining diagnostics. Returns `None` only when the batch
+/// carries no diagnostics at all.
+fn minimal_diagnostic_summary(batch: &nexa::DiagnosticBatch) -> Option<String> {
+    let diagnostics = batch.diagnostics();
+    let first = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.severity == nexa::Severity::Error)
+        .or_else(|| diagnostics.first())?;
+    let code = first.code.as_str();
+    let message = first.message.trim();
+    let summary = if message.is_empty() {
+        code.to_owned()
+    } else {
+        format!("{code}: {message}")
+    };
+    let remaining = diagnostics.len().saturating_sub(1);
+    Some(if remaining > 0 {
+        format!("{summary} (and {remaining} more)")
+    } else {
+        summary
+    })
+}
+
+/// Event message for `compile-failed`/`verify-failed`: always carries a minimal diagnostic
+/// summary, preserving the "Last Known Good Candidate retained" notice for diagnostics that were
+/// already rendered separately.
+fn failure_event_message(error: &CliError, batch_summary: Option<&str>) -> String {
+    match (error.already_rendered(), batch_summary) {
+        (true, Some(summary)) => format!("{summary}; Last Known Good Candidate retained"),
+        (true, None) => format!("{error}; Last Known Good Candidate retained"),
+        (false, summary) => summary.map_or_else(|| error.to_string(), str::to_owned),
     }
 }
 
@@ -590,5 +642,89 @@ fn emit_event(
             }))
             .expect("development event JSON serialization does not fail")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defer_error_keeps_the_first_root_cause() {
+        let mut deferred = None;
+        defer_error(&mut deferred, CliError::environment("first root cause"));
+        defer_error(&mut deferred, CliError::internal("later secondary failure"));
+        assert_eq!(
+            deferred.map(|error| error.to_string()).as_deref(),
+            Some("first root cause")
+        );
+    }
+
+    #[test]
+    fn minimal_diagnostic_summary_reports_first_error_and_remaining_count() {
+        let sources = nexa::SourceSnapshotRegistry::builder().build();
+        let mut batch = nexa::DiagnosticBatch::with_default_limits(sources);
+        batch.push(nexa::LeafDiagnostic::new(
+            nexa::ErrorCode::new("NX1002"),
+            nexa::Severity::Error,
+            "unclosed delimiter",
+        ));
+        batch.push(nexa::LeafDiagnostic::new(
+            nexa::ErrorCode::new("NX2101"),
+            nexa::Severity::Error,
+            "expected unit, found i32",
+        ));
+        assert_eq!(
+            minimal_diagnostic_summary(&batch).as_deref(),
+            Some("NX1002: unclosed delimiter (and 1 more)")
+        );
+    }
+
+    #[test]
+    fn minimal_diagnostic_summary_falls_back_to_first_diagnostic_without_errors() {
+        let sources = nexa::SourceSnapshotRegistry::builder().build();
+        let mut batch = nexa::DiagnosticBatch::with_default_limits(sources);
+        batch.push(nexa::LeafDiagnostic::new(
+            nexa::ErrorCode::new("NX2001"),
+            nexa::Severity::Warning,
+            "unused value",
+        ));
+        assert_eq!(
+            minimal_diagnostic_summary(&batch).as_deref(),
+            Some("NX2001: unused value")
+        );
+    }
+
+    #[test]
+    fn minimal_diagnostic_summary_is_none_for_an_empty_batch() {
+        let sources = nexa::SourceSnapshotRegistry::builder().build();
+        let batch = nexa::DiagnosticBatch::with_default_limits(sources);
+        assert_eq!(minimal_diagnostic_summary(&batch), None);
+    }
+
+    #[test]
+    fn failure_event_message_keeps_summary_when_diagnostics_were_rendered() {
+        let error = CliError::rendered_diagnostic("Package analysis failed");
+        assert_eq!(
+            failure_event_message(&error, Some("NX1002: unclosed delimiter (and 4 more)")),
+            "NX1002: unclosed delimiter (and 4 more); Last Known Good Candidate retained"
+        );
+        assert_eq!(
+            failure_event_message(&error, None),
+            "Package analysis failed; Last Known Good Candidate retained"
+        );
+    }
+
+    #[test]
+    fn failure_event_message_keeps_unrendered_error_text() {
+        let error = CliError::diagnostic("package verification failed");
+        assert_eq!(
+            failure_event_message(&error, None),
+            "package verification failed"
+        );
+        assert_eq!(
+            failure_event_message(&error, Some("NX1002: unclosed delimiter")),
+            "NX1002: unclosed delimiter"
+        );
     }
 }
