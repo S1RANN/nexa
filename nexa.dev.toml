@@ -1,5 +1,5 @@
 schema = 2
-contract = "examples/snake-game/snake_api.nidl"
+contract = "examples/snake-game/snake_api.contract.nexa"
 required_entrypoints = ["on_event"]
 
 [[sources]]

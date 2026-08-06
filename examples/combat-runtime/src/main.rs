@@ -24,7 +24,7 @@ struct EngineHost {
 }
 
 const COMBAT_PACKAGE_ID: &str = "example.combat";
-const COMBAT_HOST_SOURCE: &str = "examples/combat-runtime/combat_api.nidl";
+const COMBAT_HOST_SOURCE: &str = "examples/combat-runtime/combat_api.contract.nexa";
 
 fn combat_symbol(kind: SymbolKind, name: &str) -> StableId {
     CanonicalSymbolIdentity::automatic(COMBAT_PACKAGE_ID, "game.combat", kind, name)
@@ -243,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let declared_idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
+    let declared_idl = nexa_contract::parse_contract(include_str!("../combat_api.contract.nexa"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
         nexa_contract::generate_rust(&declared_idl)?,
@@ -254,13 +254,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "update"
     );
     let _typed_export_id = <generated::Update as nexa_runtime::ScriptExport>::STABLE_ID;
-    let idl = nexa_contract::parse_contract(include_str!("../combat_api.nidl"))?;
+    let idl = nexa_contract::parse_contract(include_str!("../combat_api.contract.nexa"))?;
     assert_eq!(
         generated::CONTRACT_FINGERPRINT,
         nexa_contract::contract_fingerprint(&idl).into_bytes()
     );
     let host_contract_id = generated::CONTRACT_RUNTIME_ID;
-    let host_source = Arc::<str>::from(include_str!("../combat_api.nidl"));
+    let host_source = Arc::<str>::from(include_str!("../combat_api.contract.nexa"));
     let host_contract = nexa::HostContractInput::with_source(
         &idl,
         nexa::SourceIdentity::standalone(COMBAT_HOST_SOURCE),

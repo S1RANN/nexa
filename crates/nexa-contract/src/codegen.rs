@@ -953,10 +953,15 @@ pub fn generate_rust_for_source_file(
             path: source_path.display().to_string(),
         });
     }
-    // Contract source files SHOULD be named `*.contract.nexa`, but enforcing that here is task #6's
-    // file-discovery/path policy; this library function stays pure and does not emit build-script
-    // warnings (which would pollute CLI/JSON/NDJSON stdout). The security-relevant fail-closed
-    // checks (basename presence, UTF-8, CR/LF injection) live above.
+    // Contract source files must be named `*.contract.nexa`. This is a hard check to ensure
+    // consistent file discovery, avoid .nidl→.contract.nexa dual-format drift, and prevent
+    // non-standard extensions from entering the build pipeline.
+    if !basename.ends_with(".contract.nexa") {
+        return Err(CodegenError::InvalidSourceFileName {
+            reason: "Contract source file must use the `.contract.nexa` extension",
+            path: source_path.display().to_string(),
+        });
+    }
     let header = format!("// Generated from {basename}. DO NOT EDIT.\n");
     generate_rust_with_header(contract, &header)
 }

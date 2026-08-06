@@ -69,13 +69,13 @@ impl Fixture {
             "pub fn identity(value: i32) -> i32 { return value; }\n",
         )
         .expect("Library source");
-        let contract = root.join("app_api.nidl");
-        fs::write(&contract, "contract EmptyHost {}\n").expect("Host Contract");
+        let contract = root.join("app_api.contract.nexa");
+        fs::write(&contract, "contract EmptyHost;\n").expect("Host Contract");
         let project = root.join("nexa.dev.toml");
         fs::write(
             &project,
             "schema = 2\n\
-             contract = \"app_api.nidl\"\n\
+             contract = \"app_api.contract.nexa\"\n\
              required_entrypoints = []\n\
              [[sources]]\n\
              id = \"fixture\"\n\
@@ -647,7 +647,7 @@ fn package_test_cli_rejects_an_indirect_host_call_before_execution() {
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
     fs::write(
         &fixture.contract,
-        "contract TestHost {\n    host {\n        fn clock() -> i32;\n    }\n}\n",
+        "contract TestHost;\n    host {\n        fn clock() -> i32;\n    }\n",
     )
     .expect("Host contract");
     fs::write(
@@ -701,7 +701,7 @@ fn indirect_host() -> bool {
 fn project_check_accepts_nidl_comments_and_documentation() {
     let fixture = Fixture::new();
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
-    let source = "/// 空 Host contract。\ncontract EmptyHost {\n    // 界面\n}\n";
+    let source = "/// 空 Host contract。\ncontract EmptyHost;\n// 界面\n";
     fs::write(&fixture.contract, source).expect("commented Host Contract");
     let output = fixture.run(&[
         "check",
@@ -884,12 +884,11 @@ fn project_required_entrypoints_are_an_exact_subset_while_direct_contracts_requi
     let fixture = Fixture::new();
     fs::write(
         &fixture.contract,
-        "contract Host {\n\
+        "contract Host;\n\
              nexa {\n\
                  fn run() -> i32;\n\
                  fn reset();\n\
-             }\n\
-         }\n",
+             }\n",
     )
     .expect("Host Contract with two Nexa entrypoints");
     fs::write(

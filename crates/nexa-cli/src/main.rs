@@ -312,12 +312,12 @@ fn dispatch_cli(parsed: cli::Cli) -> CliResult<Option<i32>> {
         cli::Command::Migrate {
             command: cli::MigrateCommand::Check(arguments),
         } => legacy_result(migrate_check(arguments)).map(|()| None),
-        cli::Command::Nidl {
-            command: cli::NidlCommand::Check { file },
-        } => legacy_result(check_nidl(&file)).map(|()| None),
-        cli::Command::Nidl {
-            command: cli::NidlCommand::Generate { file },
-        } => legacy_result(generate_nidl(&file)).map(|()| None),
+        cli::Command::Contract {
+            command: cli::ContractCommand::Check { file },
+        } => legacy_result(check_contract(&file)).map(|()| None),
+        cli::Command::Contract {
+            command: cli::ContractCommand::Generate { file },
+        } => legacy_result(generate_contract(&file)).map(|()| None),
         cli::Command::Qa { command } => match command {
             cli::QaCommand::Models => legacy_result(check_models()).map(|()| None),
             cli::QaCommand::ModelReplay { artifact } => {
@@ -964,7 +964,7 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
         .ok_or_else(|| CliError::usage("usage: nexa build <source-or-package> [-o module.nxb]"))?;
     if source.is_dir() {
         let contract = contract
-            .ok_or_else(|| CliError::usage("Package build requires `--contract <app_api.nidl>`"))?;
+            .ok_or_else(|| CliError::usage("Package build requires `--contract <snake_api.contract.nexa>`"))?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
@@ -1146,7 +1146,7 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
     } = arguments;
     if project_path.is_none() && directory.is_none() {
         return Err(CliError::usage(
-            "usage: nexa test <package-directory> --contract <app_api.nidl> | \
+            "usage: nexa test <package-directory> --contract <snake_api.contract.nexa> | \
              nexa test --project <nexa.dev.toml>",
         ));
     }
@@ -1170,7 +1170,7 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
     } else {
         let directory = directory.expect("exclusive target was checked");
         let contract = contract
-            .ok_or_else(|| CliError::usage("Package test requires `--contract <app_api.nidl>`"))?;
+            .ok_or_else(|| CliError::usage("Package test requires `--contract <snake_api.contract.nexa>`"))?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
@@ -2146,19 +2146,19 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
     Ok(())
 }
 
-fn check_nidl(path: &Path) -> Result<(), String> {
+fn check_contract(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;
     println!(
-        "NIDL {} is valid; contract fingerprint {}",
+        "Contract {} is valid; contract fingerprint {}",
         path.display(),
         nexa::contract_fingerprint(&contract)
     );
     Ok(())
 }
 
-fn generate_nidl(path: &Path) -> Result<(), String> {
+fn generate_contract(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;

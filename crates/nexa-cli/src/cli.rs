@@ -67,7 +67,7 @@ pub(crate) enum Command {
     Build(BuildArgs),
 
     /// Discover and execute canonical @test functions.
-    #[command(after_help = "Examples:\n  nexa test packages/app --contract app_api.nidl")]
+    #[command(after_help = "Examples:\n  nexa test packages/app --contract snake_api.contract.nexa")]
     Test(TestArgs),
 
     /// Resolve and write a schema-2 project/package lockfile.
@@ -113,11 +113,11 @@ pub(crate) enum Command {
         command: MigrateCommand,
     },
 
-    /// Validate or generate NIDL v2 bindings.
-    #[command(after_help = "Examples:\n  nexa nidl check app.nidl\n  nexa nidl generate app.nidl")]
-    Nidl {
+    /// Validate or generate Contract bindings.
+    #[command(after_help = "Examples:\n  nexa contract check snake_api.contract.nexa\n  nexa contract generate snake_api.contract.nexa")]
+    Contract {
         #[command(subcommand)]
-        command: NidlCommand,
+        command: ContractCommand,
     },
 
     /// Internal qualification and repository-audit commands.
@@ -343,10 +343,10 @@ pub(crate) struct MigrateCheckArgs {
 }
 
 #[derive(Clone, Debug, Subcommand)]
-pub(crate) enum NidlCommand {
-    /// Parse and validate a NIDL v2 contract.
+pub(crate) enum ContractCommand {
+    /// Parse and validate a Contract file.
     Check { file: PathBuf },
-    /// Generate structured Rust bindings for a NIDL v2 contract.
+    /// Generate structured Rust bindings for a Contract file.
     Generate { file: PathBuf },
 }
 

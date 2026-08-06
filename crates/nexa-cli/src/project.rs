@@ -94,7 +94,7 @@ pub struct LoadedProject {
     pub contract_path: PathBuf,
     pub contract_source: String,
     pub contract: nexa::ValidatedContract,
-    /// Effective required-entrypoint subset. An omitted setting means every NIDL `nexa`
+    /// Effective required-entrypoint subset. An omitted setting means every Contract `nexa`
     /// function; an explicit empty list means no Package entrypoint is required.
     pub required_entrypoints: Vec<String>,
 }
@@ -563,8 +563,8 @@ impl LoadedProject {
         Self::load_snapshot(path, overlay_for_path, true)
     }
 
-    /// Loads an editor snapshot without rejecting a syntactically valid NIDL that temporarily
-    /// omits a configured Nexa entrypoint. The LSP reports that semantic error against the NIDL
+    /// Loads an editor snapshot without rejecting a syntactically valid Contract that temporarily
+    /// omits a configured Nexa entrypoint. The LSP reports that semantic error against the Contract
     /// URI after project discovery, while normal CLI and development loads remain strict.
     pub fn load_editor_snapshot(
         path: &Path,
@@ -1004,7 +1004,7 @@ pub fn resolve_direct_package_for_lock(
 }
 
 fn empty_host_contract() -> CliResult<nexa::ValidatedContract> {
-    nexa::parse_contract("contract NexaCliEmptyHost {}\n").map_err(|error| {
+    nexa::parse_contract("contract NexaCliEmptyHost;\n").map_err(|error| {
         CliError::internal(format!("invalid built-in empty Host contract: {error}"))
     })
 }
@@ -2306,7 +2306,7 @@ mod tests {
     #[test]
     fn project_config_rejects_the_removed_required_exports_key() {
         let legacy = r#"schema = 2
-contract = "api.nidl"
+contract = "api.contract.nexa"
 required_exports = []
 sources = []
 "#;
@@ -2315,7 +2315,7 @@ sources = []
 
     #[test]
     fn lockless_package_has_identical_cli_and_memory_source_build_identity() {
-        const CONTRACT: &str = "contract LocklessHost {}\n";
+        const CONTRACT: &str = "contract LocklessHost;\n";
         const MANIFEST: &str = "schema = 2\n\
 kind = \"application\"\n\
 id = \"example.lockless\"\n\
@@ -2333,13 +2333,13 @@ capabilities = []\n";
         let directory = TestDirectory::new();
         let package = directory.0.join("packages/app");
         fs::create_dir_all(package.join("src/example")).expect("create package source directory");
-        fs::write(directory.0.join("lockless.nidl"), CONTRACT).expect("write Host contract");
+        fs::write(directory.0.join("lockless.contract.nexa"), CONTRACT).expect("write Host contract");
         fs::write(package.join("package.toml"), MANIFEST).expect("write Package Manifest");
         fs::write(package.join("src/example/lockless.nexa"), SOURCE).expect("write Package source");
         fs::write(
             directory.0.join("nexa.dev.toml"),
             "schema = 2\n\
-contract = \"lockless.nidl\"\n\
+contract = \"lockless.contract.nexa\"\n\
 \n\
 [[sources]]\n\
 id = \"lockless\"\n\
@@ -2415,7 +2415,7 @@ release_records = 2048\n",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn host_contract_uri_changes_build_identity_and_artifact_source_registry() {
-        const CONTRACT: &str = "contract HostIdentity {}\n";
+        const CONTRACT: &str = "contract HostIdentity;\n";
         const MANIFEST: &str = "schema = 2\n\
 kind = \"application\"\n\
 id = \"example.hostidentity\"\n\
@@ -2430,7 +2430,7 @@ capabilities = []\n";
     return 1;\n\
 }\n";
         const CONFIG: &str = "schema = 2\n\
-contract = \"contract-a.nidl\"\n\
+contract = \"contract-a.contract.nexa\"\n\
 \n\
 [[sources]]\n\
 id = \"host-identity\"\n\
@@ -2455,8 +2455,8 @@ release_records = 2048\n";
         let directory = TestDirectory::new();
         let package = directory.0.join("packages/app");
         let config_path = directory.0.join("nexa.dev.toml");
-        let contract_a_path = directory.0.join("contract-a.nidl");
-        let contract_b_path = directory.0.join("contract-b.nidl");
+        let contract_a_path = directory.0.join("contract-a.contract.nexa");
+        let contract_b_path = directory.0.join("contract-b.contract.nexa");
         fs::create_dir_all(package.join("src/example")).expect("create package source directory");
         fs::write(&contract_a_path, CONTRACT).expect("write first Host contract");
         fs::write(&contract_b_path, CONTRACT).expect("write moved Host contract");
@@ -2489,7 +2489,7 @@ release_records = 2048\n";
 
         fs::write(
             &config_path,
-            CONFIG.replace("contract-a.nidl", "contract-b.nidl"),
+            CONFIG.replace("contract-a.contract.nexa", "contract-b.contract.nexa"),
         )
         .expect("retarget Project Manifest to the moved Host contract");
         let project_b = LoadedProject::load(&config_path).expect("load retargeted CLI project");

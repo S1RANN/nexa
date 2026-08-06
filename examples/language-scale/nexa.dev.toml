@@ -1,5 +1,5 @@
 schema = 2
-contract = "language_scale.nidl"
+contract = "language_scale.contract.nexa"
 required_entrypoints = ["on_event"]
 
 [[sources]]
