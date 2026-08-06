@@ -4,15 +4,15 @@ Version: **2.0.0**
 
 Status: **COMPLETE**
 
-The `.nidl` file is the only authoritative Host Contract definition. The
-normative NIDL, Descriptor, and generator rules are:
+The selected `.contract.nexa` file is the only authoritative Host Contract
+definition. The normative Contract, Descriptor, and generator rules are:
 
-- [`../abi/NIDL_V2.md`](../abi/NIDL_V2.md)
+- [`../abi/CONTRACT_LANGUAGE_V3.md`](../abi/CONTRACT_LANGUAGE_V3.md)
 - [`../abi/CONTRACT_DESCRIPTOR_V2.md`](../abi/CONTRACT_DESCRIPTOR_V2.md)
 - [`../abi/BINDING_CODEGEN_V2.md`](../abi/BINDING_CODEGEN_V2.md)
 
-`nexa-idl` consumes the shared lossless NIDL Syntax Tree, produces a
-source-preserving `NidlAst`, validates it once into `ValidatedContract`, and
+`nexa-contract` consumes the shared lossless `ContractSyntaxTree`, produces a
+source-preserving `ContractAst`, validates it once into `ValidatedContract`, and
 derives both ABI Descriptor v2 and a semantic `BindingModel`. No generator
 backend performs new name, type, or policy decisions while emitting code.
 
@@ -49,6 +49,12 @@ against handwritten business code, never a generated Stub. Each incompatible
 case applies an explicit minimal business-code patch before executing the
 changed binding.
 
+Contract Syntax v3 changes the source container and source identity, not Host
+ABI schema or Descriptor v2 framing. Equivalent migration preserves Stable
+IDs, normalized Descriptor bytes, and generated Host/Nexa binding shapes; the
+required syntax-version metadata rename is provenance. The Build Fingerprint
+records `CONTRACT_SYNTAX_VERSION = 3`.
+
 The active product contains no legacy function index, old export alias,
-formatted canonical-string hash, second private NIDL parser, or string-based
-Rust expression generator.
+formatted canonical-string hash, second private Contract parser, superseded
+public API alias, or string-based Rust expression generator.

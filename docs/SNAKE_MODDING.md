@@ -2,35 +2,35 @@
 
 Snake accepts reviewed local Packages placed under
 `examples/snake-game/packages/mods/<package>/`. Each Package contains a schema
-2 `package.toml`, a `src/` Source Module tree, and uses the shared NIDL v2
+2 `package.toml`, a `src/` Source Module tree, and uses the shared Contract v3
 Snake Contract. The Contract declares all Host calls in `host {}` and all
 legal Nexa entrypoints in `nexa {}`:
 
-```nidl
-contract Snake {
-    enum SnakeEvent {
-        GameStarted(GameSnapshot),
-        GameEnded(GameSnapshot),
-    }
+```nexa
+contract Snake;
 
-    enum SnakeCommand {
-        AddScore(i32),
-        ShowToast(string),
-    }
+enum SnakeEvent {
+    GameStarted(GameSnapshot),
+    GameEnded(GameSnapshot),
+}
 
-    host {
-        fn format_score(score: i32) -> string;
-    }
+enum SnakeCommand {
+    AddScore(i32),
+    ShowToast(string),
+}
 
-    nexa {
-        fn on_event(event: SnakeEvent) -> Array<SnakeCommand>;
-        fn choose_food_spawn(
-            context: FoodSpawnContext,
-        ) -> Option<Cell>;
-        fn calculate_food_effect(
-            context: FoodEatenContext,
-        ) -> FoodEffect;
-    }
+host {
+    fn format_score(score: i32) -> string;
+}
+
+nexa {
+    fn on_event(event: SnakeEvent) -> Array<SnakeCommand>;
+    fn choose_food_spawn(
+        context: FoodSpawnContext,
+    ) -> Option<Cell>;
+    fn calculate_food_effect(
+        context: FoodEatenContext,
+    ) -> FoodEffect;
 }
 ```
 
@@ -72,7 +72,7 @@ The Snake Host uses entrypoints according to their domain role:
 Absence of an Optional entrypoint does not prevent Package enable. If a Package
 does implement one, its stable ID and exact signature must match the effective
 Contract or loading fails. Required entrypoints are selected by the Engine
-through typed marker APIs, not encoded in NIDL.
+through typed marker APIs, not encoded in the Contract.
 
 Every returned command batch is checked before any command applies:
 

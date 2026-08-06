@@ -62,7 +62,7 @@ HostRebuildRequired
 Manifest priority, handler-fuel, and activation-preference changes are applied
 with a complete Candidate at a safe point. Policy, capability, and entitlement
 changes are reevaluated. A Package ID change is rediscovery, not an in-place
-replacement. A NIDL v2 Contract Descriptor or effective Contract fingerprint
+replacement. A Contract Descriptor or effective Contract fingerprint
 change requires rebuilding the Rust Host binding and cannot be reported as an
 ordinary script compile error.
 

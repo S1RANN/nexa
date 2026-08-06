@@ -28,7 +28,8 @@ Module identity; see [Source Modules](MODULES.md).
 
 ## Comments and documentation
 
-Nexa and NIDL accept `//` line comments, non-nested `/* ... */` block comments,
+Nexa executable and Contract source accept `//` line comments, non-nested
+`/* ... */` block comments,
 and `///` documentation comments. Documentation comments attach to the next
 declaration and remain in the lossless Syntax Tree. Comments and documentation
 do not affect Public API, Build, or ABI Fingerprints.

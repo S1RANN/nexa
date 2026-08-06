@@ -1,9 +1,10 @@
 # Nexa editor support
 
-Status: M4 COMPLETE; M4R1 COMPLETE
+Status: Contract Syntax v3 migration IN PROGRESS
 
-Nexa provides local syntax support for `.nexa` and `.nidl` files in VS Code
-and Zed. Version `0.1.2` provides syntax highlighting, bracket handling,
+Nexa provides local syntax support for executable `.nexa` files and
+`.contract.nexa` files in VS Code and Zed. The Contract file type is displayed
+as **Nexa Contract**. Version `0.1.2` provides syntax highlighting, bracket handling,
 indentation, outlines, and live compiler diagnostics through `nexa lsp`.
 It provides line/block comment configuration and documentation-comment
 highlighting. It does not provide semantic highlighting, completion, hover,
@@ -98,7 +99,7 @@ starts it with the `lsp` argument.
 The language server keeps unsaved document overlays by monotonically
 increasing document version. A stale `didChange` cannot replace a newer
 overlay, `didSave` republishes the current text, and `didClose` always clears
-Problems before returning to disk state. NIDL parser errors retain their exact
+Problems before returning to disk state. Contract parser errors retain their exact
 byte Span and are converted to UTF-16 LSP positions.
 
 File URIs are handled by the standard URL implementation, including Unix
@@ -122,18 +123,23 @@ Nexa support follows the current compiler Lexer and Parser:
   collections, `Option`, `Result`, and Reload intrinsics
 - namespace and associated-item `::`, member `.`, Range and update `..`
 
-NIDL support follows the shared NIDL Syntax Tree and validated Contract model:
+Contract support follows the shared `SourceProfile::Contract`,
+`ContractSyntaxTree`, and validated Contract model:
 
-- `contract`, `struct`, `enum`, and `handle` declarations
+- one first `contract Name;` Header with documentation and attributes
+- flat `struct`, `enum`, and `handle` declarations
 - `host {}` and `nexa {}` blocks
-- synchronous `fn` and Host `async fn`
+- synchronous and asynchronous Host/Nexa functions
 - `@fuel`, `@cancel`, `@abandon`, and `@capability` attributes
 - `Array`, `Buffer`, `Option`, `Result`, `Token`, and `Snapshot` types
 - line, block, and documentation comments
+- outlines for Contract, Struct, Enum, Handle, Host Function, and Nexa Function
 
-Editor parsing remains structural. The compiler and NIDL validator own naming,
-type, attribute, object-mutability, await-context, and main-signature
-diagnostics.
+The LSP selects the Contract profile from the URI and project configuration
+using the same resolver as the CLI. Contract documents publish syntax, naming,
+type-resolution, attribute/direction, Stable-ID collision, and generated Rust
+name collision diagnostics. Editor parsing remains structural; compiler and
+Contract validation remain authoritative.
 
 ## Updating the grammar
 

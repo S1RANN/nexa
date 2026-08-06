@@ -42,7 +42,7 @@ Incremental GC v1 = COMPLETE
 Runtime Fast Paths v1 = COMPLETE
 M6 LLVM JIT = DEFER
 Nexa Language v2 = COMPLETE
-NIDL v2 = COMPLETE
+Contract Syntax v3 = IN PROGRESS
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -104,25 +104,33 @@ JIT decision is **DEFER**: M5 met every frozen performance target, but neither
 per-workload CPU sampling nor a bounded LLVM compilation-cost prototype proves
 the remaining JIT GO conditions.
 
+Contract Syntax v3 is the active migration milestone. It introduces one flat
+`*.contract.nexa` source profile with `contract Name;`, Contract-named public
+crate/API/CLI/editor surfaces, and dedicated migration gates. It does not
+change Host schema v2, Descriptor v2 framing, or Bytecode v7. Completion is
+tracked by the
+[Contract v3 acceptance matrix](baseline/abi/CONTRACT_V3_ACCEPTANCE.md).
+
 See [Source Modules](docs/MODULES.md),
 [Local Libraries](docs/LOCAL_LIBRARIES.md),
 [Incremental Analysis](docs/INCREMENTAL_ANALYSIS.md),
 [M4 Language Additions](docs/M4_LANGUAGE.md),
 [Standard Library](docs/STANDARD_LIBRARY.md),
 [Package Tests](docs/PACKAGE_TESTS.md),
-[NIDL v2](docs/NIDL.md),
+[Contract v3](docs/CONTRACT.md),
 [Standalone](docs/STANDALONE.md),
-[REPL](docs/REPL.md), and the
-[schema 2 migration guide](docs/MIGRATING_TO_M4.md).
+[REPL](docs/REPL.md), the
+[schema 2 migration guide](docs/MIGRATING_TO_M4.md), and the
+[Contract v3 migration guide](docs/MIGRATING_TO_CONTRACT_V3.md).
 
 `examples/hello-runtime` is the minimal high-level onboarding example. It uses
 `nexa-embed` to discover one in-memory package, enable it, call a generated
 typed entrypoint, and print `hello, world`; it does not manage Realm, Scope,
 Task, or release queues. `examples/combat-runtime` remains the low-level
-consistency example. Its
-`combat_api.nidl` is the only Host API source and generates the Rust Trait,
-Dispatcher, codecs, stable function IDs, full ABI Descriptor v2 and Contract
-fingerprint, typed Nexa entrypoint markers, and test Stub into `OUT_DIR`. A
+consistency example. Its `combat_api.contract.nexa` is the only Host API source
+and generates the Rust Trait, Dispatcher, codecs, stable function IDs, full ABI
+Descriptor v2 and Contract fingerprint, typed Nexa entrypoint markers, and test
+Stub into `OUT_DIR`. A
 Package build derives its smaller effective Contract fingerprint from the
 surface actually used by its linked closure. The Host implements only the
 generated Trait.
@@ -132,11 +140,11 @@ migrates state on staging, commits the new root, then activates it. Migration
 failure rolls back before commit; activation failure remains observable after
 commit. Old continuations and intermediate completion queues are not supported.
 
-The binding gate compiles 20 textual `.nidl` mutations against the handwritten
-`BusinessHostV1`, applies explicit business-code patches where required, rejects
-old bytecode before interpretation, and executes the changed `heartbeat`
-contract through `GeneratedHostRegistry<PatchedBusinessHost>`. External callers
-cannot create Requests or manually place Tasks into Waiting: those transitions
+The binding gate compiles 20 textual `.contract.nexa` mutations against the
+handwritten `BusinessHostV1`, applies explicit business-code patches where
+required, rejects old bytecode before interpretation, and executes the changed
+`heartbeat` contract through `GeneratedHostRegistry<PatchedBusinessHost>`.
+External callers cannot create Requests or manually place Tasks into Waiting: those transitions
 only come from generated Host bindings and `TaskPoll::Waiting`. Real
 `RealmRuntime` differential/fuzz coverage makes invalid events call public
 Runtime APIs, while Combat verifies Request, Token, and Snapshot release

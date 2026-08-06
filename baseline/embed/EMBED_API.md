@@ -16,7 +16,7 @@ points are `discover`, `enable_defaults`, `enable`,
 `shutdown`. The application never needs Realm, Module, Scope, Task, release
 queue, or raw `RuntimeValue` operations.
 
-Generated bindings expose the validated NIDL v2 Contract, its full ABI
+Generated bindings expose the validated Contract v3 source, its full ABI
 Descriptor v2 and full Contract fingerprint, a `HostContract`, a Registry
 factory, and a typed marker for every Nexa entrypoint. Each resolved Package
 build derives its own effective Descriptor and fingerprint from that full
@@ -83,6 +83,6 @@ Engine, Package, development, diagnostic, Reload, and metric DTOs. These APIs
 do not expose Realm, Runtime Host objects, or raw handles.
 
 The immutable M1 through M3R3 completion tags remain historical boundaries.
-M4 is complete at `language-scale-m4-complete`. M4R1 completes the breaking
-Language v2, NIDL v2, structured binding, Standalone, REPL, and
+M4 is complete at `language-scale-m4-complete`. M4R1 completed the breaking
+Language v2, prior Contract surface, structured binding, Standalone, REPL, and
 multiple-entrypoint surfaces.

@@ -57,7 +57,7 @@ a bounded `DevelopmentEvent`.
 
 The scanner uses modification metadata only as a possible prefilter. It
 resolves one immutable build input containing the manifest, lockfile, all
-source modules, the full local library closure, the effective NIDL v2
+source modules, the full local library closure, the effective Contract v3
 contract, and effective compiler options. The commit identity is a 256-bit
 `BuildFingerprint`. A change must produce the same complete input for
 `stable_scan_count` consecutive scans before compilation is queued.
@@ -118,7 +118,7 @@ Commit requires both the latest candidate generation and equality between the
 candidate build fingerprint and the newly resolved desired build input. This
 check is independent of ordinary scan cadence and rejects stale initial
 enable, manual reload, automatic results, and retained CLI candidates after
-add/delete/rename/ABA, dependency, lockfile, manifest, compiler-option, or NIDL
+add/delete/rename/ABA, dependency, lockfile, manifest, compiler-option, or Contract
 contract changes. A refresh failure closes the gate.
 
 `EngineInspection` reports cumulative `created_generations`,
@@ -139,7 +139,7 @@ generation in memory.
 An activation failure is post-commit and faults the package. A later valid
 source generation may construct a fresh runtime and restore it to `Enabled`.
 
-A changed NIDL Host surface cannot be committed as script-only reload.
+A changed Contract Host surface cannot be committed as script-only reload.
 `nexa dev` emits `HostRebuildRequired`, keeps Last Known Good, and instructs
 the developer to rebuild the Rust Host bindings.
 
@@ -159,7 +159,7 @@ names declared in the Contract's `nexa {}` block:
 
 ```toml
 schema = 2
-contract = "app_api.nidl"
+contract = "app_api.contract.nexa"
 required_entrypoints = ["on_event"]
 ```
 
@@ -186,13 +186,25 @@ Single-package checks have three explicit validation levels:
 
 ```sh
 cargo run -p nexa-cli -- check path/to/package --manifest-only
-cargo run -p nexa-cli -- check path/to/package --contract app_api.nidl
+cargo run -p nexa-cli -- check path/to/package --contract app_api.contract.nexa
 cargo run -p nexa-cli -- check path/to/package \
-  --contract app_api.nidl --policy source-policy.toml
+  --contract app_api.contract.nexa --policy source-policy.toml
 ```
 
 Structured output reports `manifest-only`, `contract`, or `full-policy`.
 Project checks always report `full-policy`.
+
+Inspect or generate one Contract directly with the Contract command group:
+
+```sh
+cargo run -p nexa-cli -- contract check app_api.contract.nexa
+cargo run -p nexa-cli -- contract generate app_api.contract.nexa
+```
+
+The resolver verifies existence, suffix, project-root containment, symbolic
+link and `..` traversal, and the single-current-Contract rule before parsing.
+JSON and NDJSON expose `contractPath`, `contractSyntaxVersion`, and
+`contractDiagnostic`; there is no dual-write compatibility surface.
 
 For direct execution use `nexa run`, documented in
 [STANDALONE.md](STANDALONE.md). For an isolated interactive compiler/runtime

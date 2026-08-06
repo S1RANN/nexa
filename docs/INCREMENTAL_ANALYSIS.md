@@ -51,7 +51,7 @@ The following fingerprints are distinct:
 
 - `SourceSetFingerprint`: normalized paths and source contents.
 - `PublicApiFingerprint`: public signatures, effects, layouts, field
-  mutability, async effects, NIDL entry signatures, and public Const values.
+  mutability, async effects, Contract entry signatures, and public Const values.
 - `StateSchemaFingerprint`: `@state` Class metadata and stable field
   identities.
 - `BuildFingerprint`: root and dependency source closure, the Package-specific

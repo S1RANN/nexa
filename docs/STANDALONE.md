@@ -63,14 +63,14 @@ declaration is present.
 
 Standalone programs receive only the deterministic `host::console` contract:
 
-```nidl
-contract Console {
-    host {
-        fn write(value: string);
-        fn write_line(value: string);
-        fn write_error(value: string);
-        fn write_error_line(value: string);
-    }
+```nexa
+contract Console;
+
+host {
+    fn write(value: string);
+    fn write_line(value: string);
+    fn write_error(value: string);
+    fn write_error_line(value: string);
 }
 ```
 

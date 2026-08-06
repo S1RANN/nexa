@@ -12,14 +12,14 @@ This document defines the Language v2 Standalone execution profile used by
 
 Every Standalone run binds this synchronous Host surface:
 
-```nidl
-contract Console {
-    host {
-        fn write(value: string);
-        fn write_line(value: string);
-        fn write_error(value: string);
-        fn write_error_line(value: string);
-    }
+```nexa
+contract Console;
+
+host {
+    fn write(value: string);
+    fn write_line(value: string);
+    fn write_error(value: string);
+    fn write_error_line(value: string);
 }
 ```
 

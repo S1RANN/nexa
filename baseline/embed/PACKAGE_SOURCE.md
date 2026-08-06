@@ -26,6 +26,15 @@ Source IDs must be unique in one embed instance. Package IDs must be globally
 unique across all sources. If multiple candidates claim one package ID, every
 claim is `Incompatible`; scanning order never chooses a winner.
 
+The project may select one current `.contract.nexa` Host Contract. That file
+is resolved separately under `SourceProfile::Contract`; it never enters a
+Package Source Module Graph and never receives a path-derived module identity.
+Filesystem resolution requires the exact suffix, canonical containment within
+the allowed project root, and rejection of parent or symbolic-link escape.
+The normalized Contract source identity and `CONTRACT_SYNTAX_VERSION = 3`
+participate in build freshness, while the absolute path remains outside ABI
+identity.
+
 M2 sources are local and trusted by host policy. Remote download, network
 access, arbitrary filesystem access, a public package market, and an
 adversarial-code sandbox are outside this specification.

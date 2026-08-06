@@ -10,38 +10,38 @@ interpreter or address a function by bytecode index.
 
 ## Define the Host contract
 
-NIDL v2 makes the call direction explicit:
+Contract v3 makes the call direction explicit:
 
-```nidl
-contract App {
-    enum Event {
-        Started,
-        Message(string),
-    }
+```nexa
+contract App;
 
-    enum Command {
-        Log(string),
-    }
+enum Event {
+    Started,
+    Message(string),
+}
 
-    enum LoadError {
-        Missing,
-        Denied,
-        Cancelled,
-    }
+enum Command {
+    Log(string),
+}
 
-    host {
-        fn format_message(message: string) -> string;
+enum LoadError {
+    Missing,
+    Denied,
+    Cancelled,
+}
 
-        @fuel(8)
-        @cancel(return_error)
-        @abandon(trap)
-        async fn load_message(id: string) -> Result<string, LoadError>;
-    }
+host {
+    fn format_message(message: string) -> string;
 
-    nexa {
-        fn on_event(event: Event) -> Array<Command>;
-        fn inspect_state() -> Option<string>;
-    }
+    @fuel(8)
+    @cancel(return_error)
+    @abandon(trap)
+    async fn load_message(id: string) -> Result<string, LoadError>;
+}
+
+nexa {
+    fn on_event(event: Event) -> Array<Command>;
+    fn inspect_state() -> Option<string>;
 }
 ```
 
@@ -55,7 +55,7 @@ Generate bindings from a build script:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    nexa_idl::build::generate("app_api.nidl")?;
+    nexa_contract::build::generate("app_api.contract.nexa")?;
     Ok(())
 }
 ```
@@ -68,7 +68,7 @@ mod generated {
 }
 ```
 
-Generation consumes a validated NIDL v2 contract and emits deterministic Rust
+Generation consumes a validated Contract v3 source and emits deterministic Rust
 through a structured token model. The generated module contains:
 
 - the `AppHost` trait and a typed Host registry;
@@ -86,11 +86,11 @@ For example, `fn on_event(...)` generates `OnEvent`, `OnEventArgs`, and
 `OnEventOutput`; `OnEvent::NAME` is `"on_event"`. Generated code contains no
 legacy function-index API.
 
-Generated tokens remain typed end to end. A NIDL `Token<Entity>` becomes an
+Generated tokens remain typed end to end. A Contract `Token<Entity>` becomes an
 `EntityToken` whose Rust and Runtime identities derive from the `Entity`
 Handle Stable ID; it cannot decode or release a token for another Handle.
 
-See [NIDL.md](NIDL.md) for the complete contract grammar, attributes, naming
+See [CONTRACT.md](CONTRACT.md) for the complete contract grammar, attributes, naming
 rules, and ABI identity rules.
 
 ## Construct the Engine
@@ -200,7 +200,7 @@ entrypoints. Unused Optional declarations remain outside it. A stale candidate
 cannot commit after a source add, delete, rename, dependency retarget, lockfile
 change, newly effective Contract declaration, or option change.
 
-A changed NIDL Host surface cannot be committed as a script-only reload.
+A changed Contract Host surface cannot be committed as a script-only reload.
 Development mode emits `HostRebuildRequired`, retains Last Known Good, and
 requires rebuilding the Rust application and generated bindings. Adding an
 unrelated optional `nexa` entrypoint does not invalidate packages that do not

@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **5.0.0**
+Version: **6.0.0-rc.1**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -29,7 +29,7 @@ Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa Language v2 = COMPLETE
-NIDL v2 = COMPLETE
+Contract Syntax v3 = IN PROGRESS
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -50,7 +50,7 @@ Precedence is:
 Internal Language Scope
 > Language v2 and Object Model v2
 > Async v2, Standalone v1, and REPL v1
-> NIDL v2, Contract Descriptor v2, and Binding Codegen v2
+> Contract Language v3, Contract Descriptor v2, and Binding Codegen v2
 > Host Binding
 > Task Runtime
 > Restart Reload
@@ -74,24 +74,28 @@ changed those historical baselines. M4 is complete from the immutable M3R3
 completion commit and is marked by the annotated
 `language-scale-m4-complete` tag.
 
-M4R1 is the completed breaking reset of the source language, NIDL, generated
-Rust bindings, Standalone entry model, and REPL. No M4 source or NIDL
-compatibility surface is normative. The specifications below define the only
-accepted v2 surface.
+M4R1 is the completed breaking reset of the executable source language,
+generated Rust bindings, Standalone entry model, and REPL. Contract Syntax v3
+is a later, independently gated source-container migration. It replaces the
+Contract file/profile/public naming surface without changing Host schema v2 or
+Descriptor v2 framing. The acceptance state is tracked in
+[`abi/CONTRACT_V3_ACCEPTANCE.md`](abi/CONTRACT_V3_ACCEPTANCE.md).
 
 ## Frozen active versions
 
 ```text
 NEXA_LANGUAGE_VERSION = 2
-NIDL_SYNTAX_VERSION = 2
+CONTRACT_SYNTAX_VERSION = 3
 HOST_CONTRACT_SCHEMA_VERSION = 2
 ABI_DESCRIPTOR_VERSION = 2
 BYTECODE_VERSION = 7
 ```
 
-These are structured protocol values, not display strings. Active products
-reject every other source, Contract, Descriptor, or Bytecode version instead
-of selecting a compatibility parser or decoder.
+These are structured protocol values, not display strings. Contract syntax is
+version 3 while Host schema and Descriptor framing remain version 2; equality
+between these values is neither required nor implied. Active products reject
+every other source, Contract, Descriptor, or Bytecode version instead of
+selecting a compatibility parser or decoder.
 
 ## Active specifications
 
@@ -101,9 +105,10 @@ of selecting a compatibility parser or decoder.
 - [`language/ASYNC_V2.md`](language/ASYNC_V2.md)
 - [`language/STANDALONE_V2.md`](language/STANDALONE_V2.md)
 - [`language/REPL_V1.md`](language/REPL_V1.md)
-- [`abi/NIDL_V2.md`](abi/NIDL_V2.md)
+- [`abi/CONTRACT_LANGUAGE_V3.md`](abi/CONTRACT_LANGUAGE_V3.md)
 - [`abi/CONTRACT_DESCRIPTOR_V2.md`](abi/CONTRACT_DESCRIPTOR_V2.md)
 - [`abi/BINDING_CODEGEN_V2.md`](abi/BINDING_CODEGEN_V2.md)
+- [`abi/CONTRACT_V3_ACCEPTANCE.md`](abi/CONTRACT_V3_ACCEPTANCE.md)
 - [`internal/HOST_BINDING.md`](internal/HOST_BINDING.md)
 - [`internal/TASK_RUNTIME.md`](internal/TASK_RUNTIME.md)
 - [`internal/RESTART_RELOAD.md`](internal/RESTART_RELOAD.md)
@@ -123,7 +128,8 @@ of selecting a compatibility parser or decoder.
 - [`../docs/PACKAGE_TESTS.md`](../docs/PACKAGE_TESTS.md)
 - [`../docs/INCREMENTAL_ANALYSIS.md`](../docs/INCREMENTAL_ANALYSIS.md)
 - [`../docs/MIGRATING_TO_M4.md`](../docs/MIGRATING_TO_M4.md)
-- [`../docs/NIDL.md`](../docs/NIDL.md)
+- [`../docs/CONTRACT.md`](../docs/CONTRACT.md)
+- [`../docs/MIGRATING_TO_CONTRACT_V3.md`](../docs/MIGRATING_TO_CONTRACT_V3.md)
 - [`../docs/STANDALONE.md`](../docs/STANDALONE.md)
 - [`../docs/REPL.md`](../docs/REPL.md)
 - [`abi/IDL.md`](abi/IDL.md)
@@ -151,9 +157,9 @@ of selecting a compatibility parser or decoder.
 | D65 | Active | Task runtime | `internal/TASK_RUNTIME.md` | caller-authored low-level task events |
 | D66 | Active | Reload | `internal/RESTART_RELOAD.md` | seamless multi-epoch reload |
 | D67 | Active | Language and object model v2 | `language/LANGUAGE_V2.md`, `language/OBJECT_MODEL_V2.md` | M4 source surface |
-| D68 | Active | NIDL and generated bindings v2 | `abi/NIDL_V2.md`, `abi/CONTRACT_DESCRIPTOR_V2.md`, `abi/BINDING_CODEGEN_V2.md` | NIDL v1 surface and legacy index generation |
 | D69 | Active | Standalone and REPL | `language/STANDALONE_V2.md`, `language/REPL_V1.md` | low-level function-index-only execution |
 | D70 | Active | M5 performance authority | `performance/M5_SCOPE.md` | benchmark-v6-only performance evidence |
+| D71 | Active | Contract Syntax v3 and generated bindings | `abi/CONTRACT_LANGUAGE_V3.md`, `abi/CONTRACT_DESCRIPTOR_V2.md`, `abi/BINDING_CODEGEN_V2.md`, `abi/CONTRACT_V3_ACCEPTANCE.md` | enclosing Contract source container, old file suffix, old public names, and old CLI/editor surface |
 
 ## Historical boundary
 
