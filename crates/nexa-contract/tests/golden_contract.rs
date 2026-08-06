@@ -8,7 +8,7 @@
 
 use nexa_contract::{abi_descriptor, generate_rust, parse};
 
-const GOLDEN_SOURCE: &str = r#"
+const GOLDEN_SOURCE: &str = r"
 contract Golden;
     handle Entity;
 
@@ -29,7 +29,7 @@ contract Golden;
     nexa {
         fn on_event(event: Event) -> Array<i32>;
     }
-"#;
+";
 
 #[test]
 fn golden_contract_stable_ids_fingerprint_descriptor_and_binding_are_locked() {
@@ -38,7 +38,7 @@ fn golden_contract_stable_ids_fingerprint_descriptor_and_binding_are_locked() {
     let descriptor = abi_descriptor(&contract);
 
     // Stable IDs (contract + declarations) are golden-locked and must not drift.
-    assert_eq!(contract.stable_id.0, 0x79f4_8e72_477d_fb0);
+    assert_eq!(contract.stable_id.0, 0x079f_48e7_2477_dfb0);
     assert_eq!(contract.handles[0].stable_id.0, 0x5805_175c_3d8c_424c);
     assert_eq!(contract.structs[0].stable_id.0, 0x741d_0857_640e_9fc4);
     assert_eq!(contract.enums[0].stable_id.0, 0xcfa3_af2f_5ed1_4df0);

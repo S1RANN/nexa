@@ -205,7 +205,7 @@ pub struct BuildFingerprintInput {
     pub dependency_source_sets: BTreeMap<PackageId, SourceSetFingerprint>,
     /// Canonical semantic Host ABI bytes.
     pub host_contract: Vec<u8>,
-    /// Contract source syntax version (CONTRACT_SYNTAX_VERSION) that produced `host_contract`.
+    /// Contract source syntax version (`CONTRACT_SYNTAX_VERSION`) that produced `host_contract`.
     pub contract_syntax_version: u16,
     /// Exact source/debug identity for the Host contract, including standalone URI and raw text.
     pub host_contract_source: Vec<u8>,
@@ -374,6 +374,42 @@ mod tests {
         assert_eq!(
             public_api_fingerprint([a.clone(), b.clone()]),
             public_api_fingerprint([b, a])
+        );
+    }
+
+    #[test]
+    fn contract_syntax_version_is_recorded_in_the_build_fingerprint() {
+        let package = PackageId::new("example.package").unwrap();
+        let base = BuildFingerprintInput {
+            root_package: package,
+            root_manifest: b"manifest".to_vec(),
+            root_source_set: SourceSetFingerprint::from_bytes([0u8; 32]),
+            dependency_manifests: BTreeMap::new(),
+            dependency_source_sets: BTreeMap::new(),
+            host_contract: b"descriptor".to_vec(),
+            contract_syntax_version: 3,
+            host_contract_source: b"source".to_vec(),
+            host_required_entrypoints: Vec::new(),
+            repl_session_context: Vec::new(),
+            language_version: 1,
+            standard_library_version: "0.1.0".into(),
+            standard_library_descriptor: Vec::new(),
+            compiler_version: "test".into(),
+            bytecode_version: 1,
+            runtime_semantics_version: 1,
+            opcode_cost_table_version: 1,
+            deterministic_math_backend: "test".into(),
+            compiler_options: Vec::new(),
+            canonical_lock_graph: Vec::new(),
+        };
+
+        let mut changed_version = base.clone();
+        changed_version.contract_syntax_version = 2;
+
+        assert_ne!(
+            base.fingerprint(),
+            changed_version.fingerprint(),
+            "changing only CONTRACT_SYNTAX_VERSION must change the Build Fingerprint"
         );
     }
 }
