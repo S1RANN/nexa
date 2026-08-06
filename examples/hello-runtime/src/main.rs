@@ -51,8 +51,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut engine = NexaEngine::builder(generated::contract())
         .host_contract_source(
-            SourceIdentity::standalone("examples/hello-runtime/hello_api.nidl"),
-            Arc::<str>::from(include_str!("../hello_api.nidl")),
+            SourceIdentity::standalone("examples/hello-runtime/hello_api.contract.nexa"),
+            Arc::<str>::from(include_str!("../hello_api.contract.nexa")),
         )
         .host_factory(|_: &nexa_embed::PackageContext| generated::registry(StdoutConsole))
         .package_source(source)

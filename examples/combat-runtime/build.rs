@@ -1,3 +1,3 @@
 fn main() {
-    nexa_contract::build::generate("combat_api.nidl").expect("generate Combat bindings");
+    nexa_contract::build::generate("combat_api.contract.nexa").expect("generate Combat bindings");
 }

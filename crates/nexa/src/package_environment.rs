@@ -471,33 +471,33 @@ mod tests {
     use super::*;
 
     const CONTRACT: &str = r#"
-contract Host {
-    handle Entity;
+contract Host;
 
-    struct Pair {
-        left: i32,
-        right: i32,
-    }
+handle Entity;
 
-    enum Failure {
-        Cancelled,
-        Abandoned,
-    }
+struct Pair {
+    left: i32,
+    right: i32,
+}
 
-    host {
-        fn ping(value: Pair) -> i32;
+enum Failure {
+    Cancelled,
+    Abandoned,
+}
 
-        @fuel(7)
-        @cancel(return_error)
-        @abandon(return_error)
-        @capability("profile.read")
-        async fn load(entity: Entity) -> Result<Pair, Failure>;
-    }
+host {
+    fn ping(value: Pair) -> i32;
 
-    nexa {
-        fn on_event(value: Pair) -> bool;
-        fn reset();
-    }
+    @fuel(7)
+    @cancel(return_error)
+    @abandon(return_error)
+    @capability("profile.read")
+    async fn load(entity: Entity) -> Result<Pair, Failure>;
+}
+
+nexa {
+    fn on_event(value: Pair) -> bool;
+    fn reset();
 }
 "#;
 

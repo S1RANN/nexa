@@ -116,11 +116,13 @@ fn invalid_source_file_name_fails_closed_and_cannot_inject_rust() {
             if reason.contains("CR/LF")
     ));
 
-    // Non-`.contract.nexa` suffix is advisory (allowed during the .nidl->.contract.nexa
-    // migration); the file still generates with its basename provenance.
-    let generated = generate_rust_for_source_file(&contract, "naughty.rs")
-        .expect("advisory suffix does not fail generation");
-    assert!(generated.starts_with("// Generated from naughty.rs. DO NOT EDIT.\n"));
+    // Non-`.contract.nexa` suffix is a hard fail.
+    let err = generate_rust_for_source_file(&contract, "naughty.rs").unwrap_err();
+    assert!(matches!(
+        err,
+        nexa_contract::CodegenError::InvalidSourceFileName { reason, .. }
+            if reason.contains(".contract.nexa")
+    ));
 
     // Non-UTF-8 file name is rejected.
     let bad = std::path::PathBuf::from(OsStr::from_bytes(b"bad-\xff.contract.nexa"));

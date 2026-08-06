@@ -1,3 +1,3 @@
 fn main() {
-    nexa_contract::build::generate("hello_api.nidl").expect("generate hello bindings");
+    nexa_contract::build::generate("hello_api.contract.nexa").expect("generate hello bindings");
 }

@@ -122,7 +122,7 @@ fn public_help_hides_qa_and_reports_command_typos() {
     let help = fixture.run(&["--help"]);
     assert_exit(&help, 0);
     let help = text(&help.stdout);
-    for command in ["check", "build", "run", "repl", "exec", "migrate", "nidl"] {
+    for command in ["check", "build", "run", "repl", "exec", "migrate", "contract"] {
         assert!(help.contains(command), "help omitted `{command}`:\n{help}");
     }
     assert!(

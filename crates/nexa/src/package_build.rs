@@ -4926,11 +4926,10 @@ activation = "programmatic"
     fn required_entrypoint_view_changes_effective_identity_not_runtime_contract() {
         let (manifest, sources) = manifest_and_sources();
         let source: Arc<str> = Arc::from(
-            "contract Host {\n\
+            "contract Host;\n\
              nexa {\n\
                  fn run() -> i32;\n\
                  fn reset();\n\
-             }\n\
              }\n",
         );
         let idl = nexa_contract::parse_contract(&source).unwrap();

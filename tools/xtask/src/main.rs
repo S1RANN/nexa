@@ -707,7 +707,7 @@ fn test_cli_commands() -> Result<(), DynError> {
         "check",
         "examples/language-scale/packages/app",
         "--contract",
-        "examples/language-scale/language_scale.nidl",
+        "examples/language-scale/language_scale.contract.nexa",
         "--policy",
         policy
             .to_str()
@@ -740,7 +740,7 @@ fn test_cli_direct_contract_rejection() -> Result<(), DynError> {
             "check",
             "examples/snake-game/packages/builtin/classic-rules",
             "--contract",
-            "examples/snake-game/snake_api.nidl",
+            "examples/snake-game/snake_api.contract.nexa",
             "--diagnostic-format",
             "json",
         ])
@@ -5720,9 +5720,9 @@ fn test_binding_after_workspace() -> Result<(), DynError> {
         "-p",
         "nexa-cli",
         "--",
-        "nidl",
+        "contract",
         "check",
-        "examples/combat-runtime/combat_api.nidl",
+        "examples/combat-runtime/combat_api.contract.nexa",
     ])
 }
 
