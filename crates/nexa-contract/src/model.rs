@@ -2030,9 +2030,9 @@ mod tests {
     #[test]
     fn validates_typed_handle_targets_and_async_host_results() {
         for source in [
-            "contract Bad { struct Value {} host { fn token() -> Token<Value>; } }",
-            "contract Bad { handle Entity; host { fn snapshot() -> Snapshot<Entity>; } }",
-            "contract Bad { host { async fn load() -> i32; } }",
+            "contract Bad; struct Value {} host { fn token() -> Token<Value>; }",
+            "contract Bad; handle Entity; host { fn snapshot() -> Snapshot<Entity>; }",
+            "contract Bad; host { async fn load() -> i32; }",
         ] {
             assert!(
                 validation_errors(source)
@@ -2043,16 +2043,16 @@ mod tests {
         }
 
         let ast =
-            crate::parser::parse("contract Good { nexa { async fn update() -> i32; } }").unwrap();
+            crate::parser::parse("contract Good; nexa { async fn update() -> i32; }").unwrap();
         ValidatedContract::validate(&ast).expect("async Nexa results are unrestricted");
     }
 
     #[test]
     fn rejects_reserved_generated_rust_names() {
         for source in [
-            "contract Bad { struct HostError {} }",
-            "contract Bad { handle Job; struct JobToken {} host { fn token() -> Token<Job>; } }",
-            "contract Bad { struct Record {} struct RecordSnapshot {} host { fn snapshot() -> Snapshot<Record>; } }",
+            "contract Bad; struct HostError {}",
+            "contract Bad; handle Job; struct JobToken {} host { fn token() -> Token<Job>; }",
+            "contract Bad; struct Record {} struct RecordSnapshot {} host { fn snapshot() -> Snapshot<Record>; }",
         ] {
             assert!(
                 validation_errors(source)

@@ -8,12 +8,13 @@ use nexa_contract::{
 
 const COMPLETE_CONTRACT: &str = r#"
 /// Profile contract documentation.
-contract Profile {
-    // Ordinary comments are lossless trivia.
-    handle Entity;
+contract Profile;
+
+// Ordinary comments are lossless trivia.
+handle Entity;
 
     /* Field and variant order are ABI-significant. */
-    struct Record {
+struct Record {
         name: string,
         entity: Entity,
         count: i64,
@@ -23,13 +24,13 @@ contract Profile {
         codepoint: rune,
     }
 
-    enum LoadError {
+enum LoadError {
         Missing,
         Invalid(i32),
         Cancelled,
     }
 
-    host {
+host {
         @fuel(8)
         @cancel(return_error)
         @abandon(trap)
@@ -41,11 +42,10 @@ contract Profile {
         fn snapshot() -> Snapshot<Record>;
     }
 
-    nexa {
+nexa {
         fn on_event(record: Record) -> Array<i32>;
         async fn refresh(record: Record) -> Result<i32, LoadError>;
     }
-}
 "#;
 
 #[test]
@@ -77,7 +77,7 @@ fn parses_and_validates_the_complete_nidl_v2_surface() {
         load.result.as_ref().map(|result| &result.kind),
         Some(ResolvedTypeKind::Result(_, _))
     ));
-    assert_eq!(CONTRACT_SYNTAX_VERSION, 2);
+    assert_eq!(CONTRACT_SYNTAX_VERSION, 3);
     assert_eq!(ABI_DESCRIPTOR_VERSION, 2);
 }
 
@@ -112,62 +112,62 @@ fn rejects_every_removed_nidl_spelling() {
 fn validates_names_attributes_layouts_and_source_spans() {
     let cases = [
         (
-            "contract bad_name {}",
+            "contract bad_name;",
             ContractErrorKind::InvalidName,
             "bad_name",
         ),
         (
-            "contract Duplicate { struct Same {} enum Same {} }",
+            "contract Duplicate; struct Same {} enum Same {}",
             ContractErrorKind::Duplicate,
             "Same",
         ),
         (
-            "contract Unknown { struct Value { item: Missing, } }",
+            "contract Unknown; struct Value { item: Missing, }",
             ContractErrorKind::UnknownType,
             "Missing",
         ),
         (
-            "contract Recursive { struct Node { next: Node, } }",
+            "contract Recursive; struct Node { next: Node, }",
             ContractErrorKind::RecursiveLayout,
             "Node",
         ),
         (
-            "contract Attribute { host { @fuel(0) fn run(); } }",
+            "contract Attribute; host { @fuel(0) fn run(); }",
             ContractErrorKind::InvalidAttribute,
             "@fuel(0)",
         ),
         (
-            "contract Attribute { host { @cancel(trap) async fn run(); } }",
+            "contract Attribute; host { @cancel(trap) async fn run(); }",
             ContractErrorKind::InvalidAttribute,
             "@cancel(trap)",
         ),
         (
-            "contract Attribute { host { @abandon(trap) fn run(); } }",
+            "contract Attribute; host { @abandon(trap) fn run(); }",
             ContractErrorKind::InvalidAttribute,
             "@abandon(trap)",
         ),
         (
-            "contract Naming { host { fn BadName(); } }",
+            "contract Naming; host { fn BadName(); }",
             ContractErrorKind::InvalidName,
             "BadName",
         ),
         (
-            "contract Naming { struct Array {} }",
+            "contract Naming; struct Array {}",
             ContractErrorKind::InvalidName,
             "Array",
         ),
         (
-            "contract Attribute { host { @capability(\"scope..read\") fn run(); } }",
+            "contract Attribute; host { @capability(\"scope..read\") fn run(); }",
             ContractErrorKind::InvalidAttribute,
             "scope..read",
         ),
         (
-            "contract Attribute { host { @capability(\"scope:read\") fn run(); } }",
+            "contract Attribute; host { @capability(\"scope:read\") fn run(); }",
             ContractErrorKind::InvalidAttribute,
             "scope:read",
         ),
         (
-            "contract Blocks { host {} host {} }",
+            "contract Blocks; host {} host {}",
             ContractErrorKind::Duplicate,
             "host {}",
         ),
@@ -186,14 +186,13 @@ fn validates_names_attributes_layouts_and_source_spans() {
 #[test]
 fn validates_async_host_return_error_policies_against_the_error_type() {
     let explicit_cancel = "\
-        contract Policy {
+        contract Policy;
             enum Fault { Failed, Abandoned, }
             host {
                 @cancel(return_error)
                 @abandon(return_error)
                 async fn run() -> Result<i32, Fault>;
-            }
-        }";
+            }\n";
     let error = parse(explicit_cancel).unwrap_err();
     assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
@@ -202,10 +201,9 @@ fn validates_async_host_return_error_policies_against_the_error_type() {
     );
 
     let default_abandon = "\
-        contract Policy {
+        contract Policy;
             enum Fault { Failed, Cancelled, }
-            host { async fn run() -> Result<i32, Fault>; }
-        }";
+            host { async fn run() -> Result<i32, Fault>; }\n";
     let error = parse(default_abandon).unwrap_err();
     assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
@@ -213,16 +211,15 @@ fn validates_async_host_return_error_policies_against_the_error_type() {
         "Fault"
     );
 
-    parse("contract Policy { host { async fn run() -> Result<i32, i32>; } }").unwrap();
+    parse("contract Policy; host { async fn run() -> Result<i32, i32>; }").unwrap();
     parse(
-        "contract Policy {
+        "contract Policy;
             enum Fault { Failed, }
             host {
                 @cancel(cancel_task)
                 @abandon(trap)
                 async fn run() -> Result<i32, Fault>;
-            }
-        }",
+            }\n",
     )
     .unwrap();
 }
@@ -231,13 +228,12 @@ fn validates_async_host_return_error_policies_against_the_error_type() {
 fn stable_ids_are_scoped_by_contract_and_declaration_category() {
     let contract = parse(
         r#"
-        contract Stable {
+        contract Stable;
             @stable("shared")
             handle Entity;
 
             @stable("shared")
             struct Record {}
-        }
         "#,
     )
     .unwrap();
@@ -246,24 +242,22 @@ fn stable_ids_are_scoped_by_contract_and_declaration_category() {
     let renamed = parse(
         r#"
         @stable("contract")
-        contract Renamed {
+        contract Renamed;
             @stable("record")
             struct Changed {
                 value: i32,
             }
-        }
         "#,
     )
     .unwrap();
     let original = parse(
         r#"
         @stable("contract")
-        contract Original {
+        contract Original;
             @stable("record")
             struct Record {
                 value: i32,
             }
-        }
         "#,
     )
     .unwrap();
@@ -276,12 +270,11 @@ fn stable_ids_are_scoped_by_contract_and_declaration_category() {
 
     let error = parse(
         r#"
-        contract Stable {
+        contract Stable;
             @stable("shared")
             handle Entity;
             @stable("shared")
             handle Actor;
-        }
         "#,
     )
     .unwrap_err();
@@ -292,20 +285,19 @@ fn stable_ids_are_scoped_by_contract_and_declaration_category() {
 fn descriptor_obeys_frozen_order_and_comment_rules() {
     let first = parse(
         r"
-        contract Order {
+        contract Order;
             /// ignored
             struct Pair { first: i32, second: i64, }
             enum Event { Idle, Data(Pair), }
             host { fn read(value: Pair) -> Event; }
             nexa { fn write(value: Event); }
-        }
         ",
     )
     .unwrap();
     let top_level_reordered = parse(
         r"
         // Formatting and block order are irrelevant.
-        contract Order {
+        contract Order;
             nexa { fn write(value: Event); }
             host { fn read(value: Pair) -> Event; }
             enum Event { Idle, Data(Pair), }
@@ -313,7 +305,6 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
                 first: i32,
                 second: i64,
             }
-        }
         ",
     )
     .unwrap();
@@ -328,12 +319,11 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
 
     let fields_reordered = parse(
         r"
-        contract Order {
+        contract Order;
             struct Pair { second: i64, first: i32, }
             enum Event { Idle, Data(Pair), }
             host { fn read(value: Pair) -> Event; }
             nexa { fn write(value: Event); }
-        }
         ",
     )
     .unwrap();
@@ -345,9 +335,9 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
 
 #[test]
 fn async_entrypoint_effect_changes_the_descriptor() {
-    let synchronous = parse("contract Effect { nexa { fn run(value: i32) -> i32; } }").unwrap();
+    let synchronous = parse("contract Effect; nexa { fn run(value: i32) -> i32; }").unwrap();
     let asynchronous =
-        parse("contract Effect { nexa { async fn run(value: i32) -> i32; } }").unwrap();
+        parse("contract Effect; nexa { async fn run(value: i32) -> i32; }").unwrap();
     assert_ne!(
         contract_fingerprint(&synchronous),
         contract_fingerprint(&asynchronous)
@@ -359,8 +349,8 @@ fn async_entrypoint_effect_changes_the_descriptor() {
 #[allow(clippy::too_many_lines)]
 fn m4r1_nidl_mutation_stress() {
     let base = parse(
-        "contract Stress { struct Value { item: i32, } \
-         host { fn work(value: Value) -> i32; } nexa { fn run(value: i32) -> i32; } }",
+        "contract Stress; struct Value { item: i32, } \
+         host { fn work(value: Value) -> i32; } nexa { fn run(value: i32) -> i32; }",
     )
     .unwrap();
     let base_fingerprint = contract_fingerprint(&base);

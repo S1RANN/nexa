@@ -1799,7 +1799,7 @@ fn validate_frozen_versions(
         ),
         (
             "crates/nexa-idl/src/descriptor.rs",
-            "pub const CONTRACT_SYNTAX_VERSION: u16 = 2;",
+            "pub const CONTRACT_SYNTAX_VERSION: u16 = 3;",
         ),
         (
             "crates/nexa-runtime/src/host.rs",

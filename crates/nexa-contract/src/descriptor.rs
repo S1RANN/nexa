@@ -11,7 +11,7 @@ use crate::model::{
 };
 
 /// The only accepted Contract source syntax version.
-pub const CONTRACT_SYNTAX_VERSION: u16 = 2;
+pub const CONTRACT_SYNTAX_VERSION: u16 = 3;
 /// The canonical binary ABI descriptor version.
 pub const ABI_DESCRIPTOR_VERSION: u16 = 2;
 
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn top_level_wire_is_self_describing_and_hashes_exact_bytes() {
-        let contract = contract("contract Example {}");
+        let contract = contract("contract Example;");
         let descriptor = abi_descriptor(&contract);
 
         let payload = assert_top_level_header(descriptor.as_bytes(), CONTRACT_DOMAIN);
@@ -980,11 +980,10 @@ mod tests {
     fn full_sequences_embed_unframed_raw_declaration_fingerprints() {
         let contract = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Payload {
                         value: i32,
                     }
-                }
             ",
         );
         let descriptor = abi_descriptor(&contract);
@@ -1010,7 +1009,7 @@ mod tests {
     fn declaration_tags_and_nexa_effect_are_fixed_wire_data() {
         let contract = contract(
             r"
-                contract Example {
+                contract Example;
                     handle Identity;
                     enum Failure {
                         Rejected,
@@ -1028,7 +1027,6 @@ mod tests {
                         fn update();
                         async fn on_event();
                     }
-                }
             ",
         );
         let records = ContractRecords::new(&contract);
@@ -1078,7 +1076,7 @@ mod tests {
     fn host_attributes_are_normalized_before_fingerprinting() {
         let first = contract(
             r#"
-                contract Example {
+                contract Example;
                     host {
                         @fuel(7)
                         @capability("zeta.read")
@@ -1087,12 +1085,11 @@ mod tests {
                         @abandon(trap)
                         async fn load() -> Result<i32, i32>;
                     }
-                }
             "#,
         );
         let reordered = contract(
             r#"
-                contract Example {
+                contract Example;
                     host {
                         @abandon(trap)
                         @capability("alpha.read")
@@ -1101,7 +1098,6 @@ mod tests {
                         @cancel(cancel_task)
                         async fn load() -> Result<i32, i32>;
                     }
-                }
             "#,
         );
 
@@ -1116,7 +1112,7 @@ mod tests {
         let first = contract(
             r"
                 /// Documentation is not ABI.
-                contract Example {
+                contract Example;
                     struct Payload {
                         value: i32,
                     }
@@ -1129,12 +1125,11 @@ mod tests {
                     nexa {
                         fn on_event(payload: Payload) -> Result<i32, Failure>;
                     }
-                }
             ",
         );
         let reordered = contract(
             r"
-                contract Example {
+                contract Example;
                     nexa {
                         fn on_event(payload: Payload) -> Result<i32, Failure>;
                     }
@@ -1148,7 +1143,6 @@ mod tests {
                     struct Payload {
                         value: i32,
                     }
-                }
             ",
         );
 
@@ -1159,7 +1153,7 @@ mod tests {
     fn ordered_members_are_semantic() {
         let first = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Pair {
                         left: i32,
                         right: i64,
@@ -1171,12 +1165,11 @@ mod tests {
                     host {
                         fn combine(left: i32, right: i64) -> Pair;
                     }
-                }
             ",
         );
         let reordered_fields = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Pair {
                         right: i64,
                         left: i32,
@@ -1188,12 +1181,11 @@ mod tests {
                     host {
                         fn combine(left: i32, right: i64) -> Pair;
                     }
-                }
             ",
         );
         let reordered_variants = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Pair {
                         left: i32,
                         right: i64,
@@ -1205,12 +1197,11 @@ mod tests {
                     host {
                         fn combine(left: i32, right: i64) -> Pair;
                     }
-                }
             ",
         );
         let reordered_parameters = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Pair {
                         left: i32,
                         right: i64,
@@ -1222,7 +1213,6 @@ mod tests {
                     host {
                         fn combine(right: i64, left: i32) -> Pair;
                     }
-                }
             ",
         );
 
@@ -1239,7 +1229,7 @@ mod tests {
     fn effective_descriptor_ignores_unrelated_optional_surface() {
         let first = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Payload {
                         value: i32,
                     }
@@ -1253,12 +1243,11 @@ mod tests {
                         fn required(payload: Payload);
                         fn optional_a() -> i32;
                     }
-                }
             ",
         );
         let extended = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Payload {
                         value: i32,
                     }
@@ -1275,7 +1264,6 @@ mod tests {
                         fn optional_a() -> i32;
                         fn optional_b(value: Unused);
                     }
-                }
             ",
         );
         let selection = EffectiveContractSelection {
@@ -1320,12 +1308,11 @@ mod tests {
     fn required_entrypoint_is_not_repeated_as_present_optional() {
         let contract = contract(
             r"
-                contract Example {
+                contract Example;
                     nexa {
                         fn required();
                         fn optional();
                     }
-                }
             ",
         );
         let selection = EffectiveContractSelection {
@@ -1360,7 +1347,7 @@ mod tests {
     fn effective_descriptor_includes_transitive_shared_type_layouts() {
         let first = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Inner {
                         value: i32,
                     }
@@ -1370,12 +1357,11 @@ mod tests {
                     nexa {
                         fn on_event(value: Outer);
                     }
-                }
             ",
         );
         let changed = contract(
             r"
-                contract Example {
+                contract Example;
                     struct Inner {
                         value: i64,
                     }
@@ -1385,7 +1371,6 @@ mod tests {
                     nexa {
                         fn on_event(value: Outer);
                     }
-                }
             ",
         );
         let selection = EffectiveContractSelection {

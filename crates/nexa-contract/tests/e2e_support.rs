@@ -867,8 +867,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "12",
             "contract-rename",
-            "contract Game {",
-            "contract Combat {",
+            "contract Game;",
+            "contract Combat;",
             false,
             &["GameHost", "CombatHost"],
             patch_contract_rename,
