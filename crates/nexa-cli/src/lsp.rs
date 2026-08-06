@@ -1443,7 +1443,7 @@ fn validate_required_entrypoints_for_contract(
             .any(|entrypoint| entrypoint.name == *name)
         {
             return Err(format!(
-                "required Nexa entrypoint `{name}` is not declared by the current NIDL"
+                "required Nexa entrypoint `{name}` is not declared by the current Contract"
             ));
         }
     }
