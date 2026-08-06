@@ -40,6 +40,14 @@ pub fn lex_nidl(source: &str) -> Result<Lexed, SourceTooLarge> {
     Ok(Lexer::new(source, LexerLanguage::Nidl)?.lex())
 }
 
+/// Lexes a Contract source file (suffix `*.contract.nexa`) with the Contract profile.
+///
+/// Contract files share the same lexical grammar as the legacy NIDL profile. This is the
+/// canonical entry for Contract profile parsing introduced with `Syntax` v3.
+pub fn lex_contract(source: &str) -> Result<Lexed, SourceTooLarge> {
+    lex_nidl(source)
+}
+
 struct Lexer {
     source: SourceText,
     language: LexerLanguage,

@@ -181,6 +181,14 @@ impl NidlAttributeValue {
 ///
 /// Lexical and delimiter errors from the tree are returned before typed
 /// parsing, so downstream crates receive one syntax-diagnostic stream.
+/// Parses one Contract file's lossless [`SyntaxTree`] into the flat `ContractAst` model.
+///
+/// This is the canonical Contract AST entry introduced with Syntax v3; it is identical to
+/// [`parse_nidl_ast`] and keeps the same diagnostic stream for downstream crates.
+pub fn parse_contract_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
+    parse_nidl_ast(tree)
+}
+
 pub fn parse_nidl_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
     if tree.language != SyntaxLanguage::Nidl {
         return Err(vec![NidlAstError {
@@ -204,6 +212,7 @@ pub fn parse_nidl_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
 struct Parser<'a> {
     tree: &'a SyntaxTree,
     cursor: usize,
+    previous: Option<TextRange>,
 }
 
 struct Prefix {
@@ -214,19 +223,26 @@ struct Prefix {
 
 impl<'a> Parser<'a> {
     const fn new(tree: &'a SyntaxTree) -> Self {
-        Self { tree, cursor: 0 }
+        Self {
+            tree,
+            cursor: 0,
+            previous: None,
+        }
     }
 
     fn parse(mut self) -> Result<NidlAst, NidlAstError> {
-        let prefix = self.prefix()?;
-        let start = prefix.start.unwrap_or_else(|| self.current_range());
+        let header_prefix = self.prefix()?;
+        let start = header_prefix.start.unwrap_or_else(|| self.current_range());
         self.expect_keyword(crate::Keyword::Contract, "expected `contract`")?;
         let name = self.identifier("contract name")?;
-        self.expect(TokenKind::LBrace, "expected `{` after contract name")?;
+        // Flat header: `contract Name;` — every declaration after it belongs to the
+        // contract until end of file.
+        self.expect(TokenKind::Semicolon, "expected `;` after contract header")?;
         let mut items = Vec::new();
-        while !self.at(TokenKind::RBrace) {
+        loop {
+            self.skip_ordinary_trivia();
             if self.at_end() {
-                return Err(self.error_here("expected a contract item or `}`"));
+                break;
             }
             let item_prefix = self.prefix()?;
             let item_start = item_prefix.start.unwrap_or_else(|| self.current_range());
@@ -257,25 +273,19 @@ impl<'a> Parser<'a> {
                     )?)
                 }
                 _ => {
-                    return Err(
-                        self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`")
-                    );
+                    return Err(self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`"));
                 }
             };
             items.push(item);
         }
-        let end = self.expect(TokenKind::RBrace, "expected `}` after contract")?;
-        self.skip_ordinary_trivia();
-        if !self.at_end() {
-            return Err(self.error_here("unexpected token after contract"));
-        }
+        let end = self.previous_end().unwrap_or(start);
         let range = cover(start, end);
         Ok(NidlAst {
             source: self.tree.source.clone(),
             contract: NidlContract {
                 name,
-                docs: prefix.docs,
-                attributes: prefix.attributes,
+                docs: header_prefix.docs,
+                attributes: header_prefix.attributes,
                 items,
                 range,
             },
@@ -699,7 +709,12 @@ impl<'a> Parser<'a> {
     fn bump(&mut self) -> Option<Token> {
         let token = *self.tree.tokens.get(self.cursor)?;
         self.cursor += 1;
+        self.previous = Some(token.range);
         Some(token)
+    }
+
+    fn previous_end(&self) -> Option<TextRange> {
+        self.previous
     }
 
     fn current_range(&self) -> TextRange {

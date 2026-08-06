@@ -1,11 +1,10 @@
-contract Console {
-    host {
-        fn log(
-            message: string,
-        ) -> i32;
-    }
+contract Console;
+host {
+    fn log(
+        message: string,
+    ) -> i32;
+}
 
-    nexa {
-        fn main() -> i32;
-    }
+nexa {
+    fn main() -> i32;
 }

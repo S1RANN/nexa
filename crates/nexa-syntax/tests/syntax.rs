@@ -39,16 +39,15 @@ fn nexa_lexer_is_lossless_and_keeps_comment_trivia() {
 fn nidl_v2_comments_strings_and_contract_are_lossless() {
     let source = r#"
 /// Snake ABI.
-contract Snake {
-    // Host implementation.
-    host {
-        @capability("profile.read")
-        async fn load(id: i32) -> Result<i32, i32>;
-    }
-    /* Nexa implementation. */
-    nexa {
-        fn score() -> i32;
-    }
+contract Snake;
+// Host implementation.
+host {
+    @capability("profile.read")
+    async fn load(id: i32) -> Result<i32, i32>;
+}
+/* Nexa implementation. */
+nexa {
+    fn score() -> i32;
 }
 "#;
     let lexed = lex_nidl(source).expect("small source");
