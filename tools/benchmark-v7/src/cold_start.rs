@@ -525,12 +525,12 @@ fn resolved_fixture(
 fn console_contract_input() -> HostContractInput<'static> {
     static MODEL: OnceLock<nexa::ValidatedContract> = OnceLock::new();
     let model = MODEL.get_or_init(|| {
-        nexa::parse_contract(nexa::CONSOLE_HOST_NIDL).expect("built-in Console contract")
+        nexa::parse_contract(nexa::CONSOLE_HOST_CONTRACT).expect("built-in Console contract")
     });
     HostContractInput::with_source(
         model,
         SourceIdentity::standalone(nexa::CONSOLE_HOST_SOURCE_IDENTITY),
-        Arc::<str>::from(nexa::CONSOLE_HOST_NIDL),
+        Arc::<str>::from(nexa::CONSOLE_HOST_CONTRACT),
     )
     .expect("exact built-in Console source")
 }

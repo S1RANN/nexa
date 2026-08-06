@@ -93,7 +93,7 @@ pub use package_test::{
     PackageTestOptions, PackageTestRunError,
 };
 pub use repl_session::{
-    CONSOLE_HOST_NIDL, CONSOLE_HOST_SOURCE_IDENTITY, ReplCellOutcome, ReplConsoleEmission,
+    CONSOLE_HOST_CONTRACT, CONSOLE_HOST_SOURCE_IDENTITY, ReplCellOutcome, ReplConsoleEmission,
     ReplConsoleHost, ReplConsoleHostError, ReplConsoleStream, ReplGcReport, ReplMemoryReport,
     ReplResolvedCellInput, ReplSession, ReplSessionError, ReplSessionLimits,
 };

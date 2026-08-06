@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use nexa_core::StableId;
 use serde_json::Value;
 
-pub const BASE_NIDL: &str = include_str!("fixtures/business_host/contract.nidl");
+pub const BASE_CONTRACT: &str = include_str!("fixtures/business_host/contract.nidl");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
 const BASE_NEXA_MODULE: &str = "use host::game as engine;\n\
 pub fn update(entity: i32) -> i32 { return engine::heartbeat(entity); }\n\
@@ -684,7 +684,7 @@ impl MutationProbe {
 pub struct MutationCase {
     pub id: &'static str,
     pub name: &'static str,
-    pub mutated_nidl: String,
+    pub mutated_contract: String,
     pub unchanged_business_host_should_compile: bool,
     pub expected_diagnostic_symbols: &'static [&'static str],
     pub patch_business_host: fn(&str) -> String,
@@ -961,8 +961,8 @@ fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
     let mutations = mutations();
     assert_eq!(mutations.len(), 20);
     for mutation in mutations {
-        assert_ne!(mutation.mutated_nidl, BASE_NIDL, "{}", mutation.name);
-        nexa_contract::parse(&mutation.mutated_nidl)
+        assert_ne!(mutation.mutated_contract, BASE_CONTRACT, "{}", mutation.name);
+        nexa_contract::parse(&mutation.mutated_contract)
             .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
     }
 }
@@ -975,10 +975,10 @@ impl MutationCase {
 
     fn with_replacement(mut self, from: &str, to: &str) -> Self {
         assert!(
-            self.mutated_nidl.contains(from),
+            self.mutated_contract.contains(from),
             "missing mutation token {from}"
         );
-        self.mutated_nidl = self.mutated_nidl.replacen(from, to, 1);
+        self.mutated_contract = self.mutated_contract.replacen(from, to, 1);
         self
     }
 }
@@ -992,11 +992,11 @@ fn changed(
     expected_diagnostic_symbols: &'static [&'static str],
     patch_business_host: fn(&str) -> String,
 ) -> MutationCase {
-    assert!(BASE_NIDL.contains(from), "missing mutation token {from}");
+    assert!(BASE_CONTRACT.contains(from), "missing mutation token {from}");
     MutationCase {
         id,
         name,
-        mutated_nidl: BASE_NIDL.replacen(from, to, 1),
+        mutated_contract: BASE_CONTRACT.replacen(from, to, 1),
         unchanged_business_host_should_compile,
         expected_diagnostic_symbols,
         patch_business_host,
@@ -1187,9 +1187,9 @@ pub fn prepare_case(
     for directory in ["base", "mutated", "host/src", "script"] {
         fs::create_dir_all(case.join(directory)).expect("create E2E artifact directory");
     }
-    fs::write(case.join("base/contract.nidl"), BASE_NIDL).expect("write base NIDL");
+    fs::write(case.join("base/contract.nidl"), BASE_CONTRACT).expect("write base NIDL");
     fs::write(case.join("base/bindings.rs"), base_generated).expect("write base binding");
-    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_nidl)
+    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_contract)
         .expect("write changed NIDL");
     for (index, generated) in [changed_generated, changed_generated, changed_generated]
         .iter()
@@ -1203,9 +1203,9 @@ pub fn prepare_case(
     }
     let changed_module = positive_module_source(mutation);
     fs::write(case.join("script/module.nexa"), &changed_module).expect("write positive script");
-    fs::write(case.join("host/src/base_contract.nidl"), BASE_NIDL)
+    fs::write(case.join("host/src/base_contract.nidl"), BASE_CONTRACT)
         .expect("write base contract fixture");
-    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_nidl)
+    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_contract)
         .expect("write changed contract fixture");
     fs::write(case.join("host/src/base_module.nexa"), BASE_NEXA_MODULE)
         .expect("write base script fixture");

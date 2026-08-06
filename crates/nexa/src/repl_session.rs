@@ -26,7 +26,7 @@ use nexa_runtime::{
 use crate::{CompiledReplCellArtifact, HostContractInput, PackageBuildError, PackageBuildSession};
 
 /// Built-in Host contract used by standalone scripts and REPL sessions.
-pub const CONSOLE_HOST_NIDL: &str = "contract Console;\n\
+pub const CONSOLE_HOST_CONTRACT: &str = "contract Console;\n\
     host {\n\
         fn write(value: string);\n\
         fn write_line(value: string);\n\
@@ -977,7 +977,7 @@ impl ReplSession {
         }
         let expected_contract_source = SourceIdentity::standalone(CONSOLE_HOST_SOURCE_IDENTITY);
         if input.contract.source().identity() != &expected_contract_source
-            || input.contract.source().text().as_ref() != CONSOLE_HOST_NIDL
+            || input.contract.source().text().as_ref() != CONSOLE_HOST_CONTRACT
         {
             return Err(ReplSessionError::InvalidCellSource {
                 source: input.cell.source.clone(),
@@ -2066,13 +2066,13 @@ fn initialize_runtime(
     console: Arc<Mutex<ReplConsoleState>>,
     builds: &mut PackageBuildSession,
 ) -> Result<InitializedRuntime, ReplSessionError> {
-    let parsed_contract = nexa_contract::parse(CONSOLE_HOST_NIDL).map_err(|error| {
+    let parsed_contract = nexa_contract::parse(CONSOLE_HOST_CONTRACT).map_err(|error| {
         ReplSessionError::Internal(format!("invalid built-in Console NIDL: {error}"))
     })?;
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(CONSOLE_HOST_SOURCE_IDENTITY),
-        CONSOLE_HOST_NIDL,
+        CONSOLE_HOST_CONTRACT,
     )
     .map_err(|error| ReplSessionError::Build(PackageBuildError::HostContractSource(error)))?;
     let seed = builds
