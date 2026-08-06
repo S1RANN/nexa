@@ -15,6 +15,46 @@ use serde::Deserialize;
 
 use crate::{CliError, CliResult};
 
+/// Validates that `path` has a `.contract.nexa` extension, returning a consistent
+/// `CliError::contract_usage` on failure (including migration diagnostics for legacy `.nidl`).
+/// This is the shared entry used by both direct CLI commands and project config loading.
+pub fn validate_contract_path(path: &Path, command: &str) -> CliResult<()> {
+    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+        return Err(CliError::contract_usage(
+            format!(
+                "`{command}` requires a file with a valid name; got `{}`",
+                path.display()
+            ),
+            path,
+        ));
+    };
+    if file_name.ends_with(".contract.nexa") {
+        return Ok(());
+    }
+    if file_name.ends_with(".nidl") {
+        let new_name = path.with_extension("contract.nexa");
+        let new_name_str = new_name
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        return Err(CliError::contract_usage(
+            format!(
+                "`{command}` accepts only `*.contract.nexa` files; \
+                 `{file_name}` uses the legacy `.nidl` extension. \
+                 Rename it to `{new_name_str}` and replace the outer `contract Name {{ ... }}` \
+                 block with a flat `contract Name;` header at the top of the file."
+            ),
+            path,
+        ));
+    }
+    Err(CliError::contract_usage(
+        format!(
+            "`{command}` accepts only `*.contract.nexa` files, got `{file_name}`"
+        ),
+        path,
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
@@ -672,27 +712,7 @@ impl LoadedProject {
         // file does not exist). This ensures migration diagnostics for legacy .nidl
         // paths are emitted even when the file is missing.
         let contract_lexical = &config.contract;
-        let contract_basename = contract_lexical
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("");
-        if !contract_basename.ends_with(".contract.nexa") {
-            if contract_basename.ends_with(".nidl") {
-                let new_name = contract_lexical.with_extension("contract.nexa");
-                let new_name_str = new_name
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-                return Err(CliError::usage(format!(
-                    "project config `contract` uses the legacy `.nidl` extension; \
-                     rename `{contract_basename}` to `{new_name_str}` and replace the outer \
-                     `contract Name {{ ... }}` block with a flat `contract Name;` header"
-                )));
-            }
-            return Err(CliError::usage(format!(
-                "project config `contract` must point to a `*.contract.nexa` file, got `{contract_basename}`"
-            )));
-        }
+        validate_contract_path(contract_lexical, "project config `contract`")?;
 
         let contract_path = resolve_within(&root, contract_lexical)?;
         let contract_source = overlay_for_path(&contract_path).map_or_else(

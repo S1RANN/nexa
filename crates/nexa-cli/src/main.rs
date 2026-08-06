@@ -84,6 +84,10 @@ pub(crate) struct CliError {
     kind: CliErrorKind,
     message: String,
     already_rendered: bool,
+    /// When set, the error is a contract-related error and should be rendered
+    /// with structured `contractPath`/`contractSyntaxVersion`/`contractDiagnostic`
+    /// fields in JSON/NDJSON output instead of the generic envelope.
+    pub(crate) contract_path: Option<String>,
 }
 
 impl CliError {
@@ -92,6 +96,7 @@ impl CliError {
             kind: CliErrorKind::DiagnosticOrTestFailure,
             message: message.into(),
             already_rendered: false,
+            contract_path: None,
         }
     }
 
@@ -100,6 +105,34 @@ impl CliError {
             kind: CliErrorKind::DiagnosticOrTestFailure,
             message: message.into(),
             already_rendered: true,
+            contract_path: None,
+        }
+    }
+
+    pub(crate) fn contract_diagnostic(message: impl Into<String>, path: &Path) -> Self {
+        Self {
+            kind: CliErrorKind::DiagnosticOrTestFailure,
+            message: message.into(),
+            already_rendered: false,
+            contract_path: Some(path.display().to_string()),
+        }
+    }
+
+    pub(crate) fn contract_usage(message: impl Into<String>, path: &Path) -> Self {
+        Self {
+            kind: CliErrorKind::UsageOrEnvironment,
+            message: message.into(),
+            already_rendered: false,
+            contract_path: Some(path.display().to_string()),
+        }
+    }
+
+    pub(crate) fn contract_internal(message: impl Into<String>, path: &Path) -> Self {
+        Self {
+            kind: CliErrorKind::WorkerIoOrInternal,
+            message: message.into(),
+            already_rendered: false,
+            contract_path: Some(path.display().to_string()),
         }
     }
 
@@ -108,6 +141,7 @@ impl CliError {
             kind: CliErrorKind::UsageOrEnvironment,
             message: message.into(),
             already_rendered: false,
+            contract_path: None,
         }
     }
 
@@ -120,6 +154,7 @@ impl CliError {
             kind: CliErrorKind::WorkerIoOrInternal,
             message: message.into(),
             already_rendered: false,
+            contract_path: None,
         }
     }
 
@@ -128,6 +163,7 @@ impl CliError {
             kind: CliErrorKind::RuntimeTrap,
             message: message.into(),
             already_rendered: false,
+            contract_path: None,
         }
     }
 
@@ -366,6 +402,38 @@ fn render_cli_outcome(outcome: &CommandOutcome, diagnostic_format: DiagnosticFor
     if error.already_rendered {
         return;
     }
+    // If this error is tagged with a contract path, emit a structured
+    // contract-diagnostic envelope instead of the generic one.
+    if let Some(ref contract_path) = error.contract_path {
+        let envelope = json!({
+            "contractPath": contract_path,
+            "contractSyntaxVersion": nexa::CONTRACT_SYNTAX_VERSION,
+            "contractDiagnostic": {
+                "message": error.message,
+                "exitCode": error.exit_code(),
+            },
+        });
+        let rendered = match diagnostic_format {
+            DiagnosticFormat::Human => {
+                eprintln!("nexa: {}", error.message);
+                return;
+            }
+            DiagnosticFormat::Json => serde_json::to_string(&json!({
+                "status": "error",
+                "command": "contract",
+                "data": envelope,
+            })),
+            DiagnosticFormat::Ndjson => serde_json::to_string(&json!({
+                "schema": 1,
+                "status": "error",
+                "command": "contract",
+                "data": envelope,
+            })),
+        }
+        .unwrap_or_else(|_| format!("{{\"error\":\"{}}}\"}}", error.message));
+        eprintln!("{rendered}");
+        return;
+    }
     match diagnostic_format {
         DiagnosticFormat::Human => eprintln!("nexa: {error}"),
         DiagnosticFormat::Json => eprintln!(
@@ -529,10 +597,10 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
         })?;
         validate_contract_path(contract, "nexa check --contract")?;
         let contract_source = std::fs::read_to_string(contract).map_err(|error| {
-            CliError::internal(format!("could not read {}: {error}", contract.display()))
+            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), contract)
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), contract)
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -969,10 +1037,10 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
             .ok_or_else(|| CliError::usage("Package build requires `--contract <snake_api.contract.nexa>`"))?;
         validate_contract_path(&contract, "nexa build --contract")?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
-            CliError::internal(format!("could not read {}: {error}", contract.display()))
+            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), &contract)
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), &contract)
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -1176,10 +1244,10 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
             .ok_or_else(|| CliError::usage("Package test requires `--contract <snake_api.contract.nexa>`"))?;
         validate_contract_path(&contract, "nexa test --contract")?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
-            CliError::internal(format!("could not read {}: {error}", contract.display()))
+            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), &contract)
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), &contract)
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -2183,10 +2251,10 @@ fn validate_contract_path(path: &Path, command: &str) -> CliResult<()> {
 fn check_contract(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
     validate_contract_path(path, "nexa contract check")?;
     let source = std::fs::read_to_string(path).map_err(|error| {
-        CliError::internal(format!("could not read {}: {error}", path.display()))
+        CliError::contract_internal(format!("could not read {}: {error}", path.display()), path)
     })?;
     let contract = nexa::parse_contract(&source).map_err(|error| {
-        CliError::diagnostic(format!("invalid {}: {error}", path.display()))
+        CliError::contract_diagnostic(format!("invalid {}: {error}", path.display()), path)
     })?;
     let fingerprint = nexa::contract_fingerprint(&contract);
     let syntax_version = nexa::CONTRACT_SYNTAX_VERSION;
@@ -2236,10 +2304,10 @@ fn check_contract(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
 fn generate_contract(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
     validate_contract_path(path, "nexa contract generate")?;
     let source = std::fs::read_to_string(path).map_err(|error| {
-        CliError::internal(format!("could not read {}: {error}", path.display()))
+        CliError::contract_internal(format!("could not read {}: {error}", path.display()), path)
     })?;
     let contract = nexa::parse_contract(&source).map_err(|error| {
-        CliError::diagnostic(format!("invalid {}: {error}", path.display()))
+        CliError::contract_diagnostic(format!("invalid {}: {error}", path.display()), path)
     })?;
     let generated = nexa::generate_rust_for_source_file(&contract, path)
         .map_err(|error| CliError::internal(error.to_string()))?;
