@@ -9,6 +9,7 @@
 //! `nexa-analysis::BuildFingerprintInput`, never in the descriptor bytes).
 
 use nexa_contract::{abi_descriptor, generate_rust, generate_rust_for_source_file, parse_contract};
+use std::fmt::Write as _;
 
 const GOLDEN_SOURCE: &str = include_str!("fixtures/golden.contract.nexa");
 #[test]
@@ -164,6 +165,7 @@ fn toks(t: &dyn quote::ToTokens) -> String {
     quote::ToTokens::to_token_stream(t).to_string()
 }
 
+#[allow(clippy::too_many_lines)]
 fn public_api_snapshot(source: &str) -> Vec<String> {
     use syn::Visibility;
     let ast: syn::File = syn::parse_str(source).expect("generated binding parses as Rust");
@@ -183,10 +185,11 @@ fn public_api_snapshot(source: &str) -> Vec<String> {
                 if matches!(st.vis, Visibility::Public(_)) {
                     out.push(format!("pub struct {}{}", st.ident, toks(&st.generics)));
                 }
-                if let syn::Fields::Named(fields) = &st.fields {
-                    for f in &fields.named {
-                        if matches!(f.vis, Visibility::Public(_)) {
-                            out.push(format!("pub {}: {}", f.ident.as_ref().unwrap(), toks(&f.ty)));
+                for f in struct_fields(&st.fields) {
+                    if matches!(f.vis, Visibility::Public(_)) {
+                        match &f.ident {
+                            Some(name) => out.push(format!("pub {}: {}", name, field_ty(f))),
+                            None => out.push(format!("pub field {}", field_ty(f))),
                         }
                     }
                 }
@@ -196,7 +199,25 @@ fn public_api_snapshot(source: &str) -> Vec<String> {
                     out.push(format!("pub enum {}{}", en.ident, toks(&en.generics)));
                 }
                 for v in en.variants {
-                    out.push(format!("pub variant {}::{}", en.ident, v.ident));
+                    let payload = match &v.fields {
+                        syn::Fields::Named(_) => "{...}".into(),
+                        syn::Fields::Unnamed(f) => {
+                            let tys = f
+                                .unnamed
+                                .iter()
+                                .map(|f| toks(&f.ty))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("({tys})")
+                        }
+                        syn::Fields::Unit => String::new(),
+                    };
+                    let disc = if let Some((_, e)) = &v.discriminant {
+                        format!(" = {}", toks(e))
+                    } else {
+                        String::new()
+                    };
+                    out.push(format!("pub variant {}::{}{}{}", en.ident, v.ident, payload, disc));
                 }
             }
             syn::Item::Trait(tr) if matches!(tr.vis, Visibility::Public(_)) => {
@@ -214,7 +235,7 @@ fn public_api_snapshot(source: &str) -> Vec<String> {
                             "pub trait {}::{}{}",
                             tr.ident,
                             method.sig.ident,
-                            method_sig_tail(&method.sig)
+                            sig_tail(&method.sig)
                         )),
                         _ => {}
                     }
@@ -234,14 +255,14 @@ fn public_api_snapshot(source: &str) -> Vec<String> {
                             out.push(format!("impl {}::type {}", self_ty, t.ident));
                         }
                         syn::ImplItem::Fn(m) if matches!(m.vis, Visibility::Public(_)) => out.push(
-                            format!("impl {}::{}{}", self_ty, m.sig.ident, method_sig_tail(&m.sig)),
+                            format!("impl {}::{}{}", self_ty, m.sig.ident, sig_tail(&m.sig)),
                         ),
                         _ => {}
                     }
                 }
             }
             syn::Item::Fn(f) if matches!(f.vis, Visibility::Public(_)) => {
-                out.push(format!("pub fn {}", f.sig.ident));
+                out.push(format!("pub fn sig {}{}", f.sig.ident, sig_tail(&f.sig)));
             }
             _ => {}
         }
@@ -252,11 +273,53 @@ fn public_api_snapshot(source: &str) -> Vec<String> {
     out
 }
 
-/// Renders the tail of a function signature (generics, parameters, where clause, return type),
-/// excluding the body.
-fn method_sig_tail(sig: &syn::Signature) -> String {
-    let params: Vec<String> = sig
-        .inputs
+fn struct_fields(fields: &syn::Fields) -> Vec<&syn::Field> {
+    match fields {
+        syn::Fields::Named(f) => f.named.iter().collect(),
+        syn::Fields::Unnamed(f) => f.unnamed.iter().collect(),
+        syn::Fields::Unit => Vec::new(),
+    }
+}
+
+fn field_ty(f: &syn::Field) -> String {
+    toks(&f.ty)
+}
+
+/// Renders a full function signature (qualifiers const/async/unsafe/extern, generics, inputs,
+/// output, where clause) excluding the body. Falls back to just the input/output if the signature
+/// cannot be tokenized standalone.
+fn sig_tail(sig: &syn::Signature) -> String {
+    let mut q = String::new();
+    if sig.constness.is_some() {
+        q.push_str("const ");
+    }
+    if sig.asyncness.is_some() {
+        q.push_str("async ");
+    }
+    if sig.unsafety.is_some() {
+        q.push_str("unsafe ");
+    }
+    if let Some(abi) = &sig.abi {
+        q.push_str("extern ");
+        if let Some(name) = &abi.name {
+            let _ = std::write!(q, "{} ", name.value());
+        }
+    }
+    let inputs = render_inputs(&sig.inputs);
+    let ret = match &sig.output {
+        syn::ReturnType::Default => String::new(),
+        syn::ReturnType::Type(_, ty) => format!(" -> {}", toks(&**ty)),
+    };
+    let where_s = sig
+        .generics
+        .where_clause
+        .as_ref()
+        .map_or_else(String::new, |wc| toks(wc));
+    format!("{q}{}{inputs}{}{where_s}", toks(&sig.generics), ret)
+}
+
+fn render_inputs(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> String {
+    inputs
         .iter()
         .map(|p| match p {
             syn::FnArg::Typed(pt) => {
@@ -281,17 +344,7 @@ fn method_sig_tail(sig: &syn::Signature) -> String {
                 }
             }
         })
-        .collect();
-    let where_s = if sig.generics.where_clause.is_some() {
-        " where ..."
-    } else {
-        ""
-    };
-    let ret = match &sig.output {
-        syn::ReturnType::Default => String::new(),
-        syn::ReturnType::Type(_, ty) => format!(" -> {}", toks(&**ty)),
-    };
-    format!("{}{}{}{}", toks(&sig.generics), params.join(""), where_s, ret)
+        .collect()
 }
 
 const GOLDEN_DESCRIPTOR_BYTES: &[u8] = &[
@@ -321,18 +374,18 @@ const GOLDEN_FINGERPRINT: [u8; 32] = [
 
 const GOLDEN_PUBLIC_API_SNAPSHOT: &str = r"impl CellRef < 'a >::x(self) -> Result < i32 , nexa_runtime :: HostTrap >
 impl CellRef < 'a >::y(self) -> Result < i32 , nexa_runtime :: HostTrap >
-impl Event::nexa_tag(&self) -> u32
-impl GeneratedHostRegistry < H >::new(host: H) -> Self
+impl Event::nexa_tagconst (&self) -> u32
+impl GeneratedHostRegistry < H >::newconst (host: H) -> Self
 impl OnEvent::const NAME: & 'static str
 impl OnEvent::const STABLE_ID: nexa_runtime :: StableId
 impl __NexaArrayRef < 'a , T >::get(self)(index: usize) -> :: std :: result :: Result < T , nexa_runtime :: HostTrap >
-impl __NexaArrayRef < 'a , T >::is_empty(self) -> bool
+impl __NexaArrayRef < 'a , T >::is_emptyconst (self) -> bool
 impl __NexaArrayRef < 'a , T >::iter(self) -> impl :: std :: iter :: ExactSizeIterator < Item = :: std :: result :: Result < T , nexa_runtime :: HostTrap > , > + 'a
-impl __NexaArrayRef < 'a , T >::len(self) -> usize
+impl __NexaArrayRef < 'a , T >::lenconst (self) -> usize
 impl __NexaBufferRef < 'a , T >::get(self)(index: usize) -> :: std :: result :: Result < T , nexa_runtime :: HostTrap >
-impl __NexaBufferRef < 'a , T >::is_empty(self) -> bool
+impl __NexaBufferRef < 'a , T >::is_emptyconst (self) -> bool
 impl __NexaBufferRef < 'a , T >::iter(self) -> impl :: std :: iter :: ExactSizeIterator < Item = :: std :: result :: Result < T , nexa_runtime :: HostTrap > , > + 'a
-impl __NexaBufferRef < 'a , T >::len(self) -> usize
+impl __NexaBufferRef < 'a , T >::lenconst (self) -> usize
 pub const ABI_DESCRIPTOR_VERSION: u16
 pub const CONTRACT_DESCRIPTOR: & [u8]
 pub const CONTRACT_FINGERPRINT: [u8 ; 32]
@@ -345,8 +398,10 @@ pub enum Event
 pub enum EventRef< 'a >
 pub enum OnEvent
 pub event: Event
-pub fn contract
-pub fn registry
+pub field :: std :: string :: String
+pub field u64
+pub fn sig contractconst  -> nexa_runtime :: HostContract
+pub fn sig registry< H : GoldenHost + 'static >(host: H) -> :: std :: boxed :: Box < dyn nexa_runtime :: HostRegistry >
 pub host: H
 pub static HOST_FUNCTION_AUTHORITIES: :: std :: sync :: LazyLock < [nexa_runtime :: HostFunctionAuthority ; 1usize] , >
 pub struct Cell
@@ -365,7 +420,6 @@ pub variant Event::Ended
 pub variant Event::Started
 pub variant EventRef::Ended
 pub variant EventRef::Started
-pub variant EventRef::__Lifetime
+pub variant EventRef::__Lifetime(:: std :: marker :: PhantomData < & 'a () >)
 pub x: i32
 pub y: i32";
-

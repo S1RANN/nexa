@@ -953,17 +953,10 @@ pub fn generate_rust_for_source_file(
             path: source_path.display().to_string(),
         });
     }
-    // Contract source files SHOULD be named `*.contract.nexa`. Enforcing it here would break the
-    // in-flight .nidl -> .contract.nexa example migration (task #6), so it is advisory (a note in
-    // the provenance header), not a hard error. The security-relevant fail-closed checks are
-    // basename presence, UTF-8, and CR/LF injection above.
-    if let Some(message) = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.ends_with(".contract.nexa"))
-    {
-        println!("cargo:warning=contract source `{message}` should be named `*.contract.nexa`; rename from `.nidl`");
-    }
+    // Contract source files SHOULD be named `*.contract.nexa`, but enforcing that here is task #6's
+    // file-discovery/path policy; this library function stays pure and does not emit build-script
+    // warnings (which would pollute CLI/JSON/NDJSON stdout). The security-relevant fail-closed
+    // checks (basename presence, UTF-8, CR/LF injection) live above.
     let header = format!("// Generated from {basename}. DO NOT EDIT.\n");
     generate_rust_with_header(contract, &header)
 }
