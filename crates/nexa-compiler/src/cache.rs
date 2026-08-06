@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use nexa_analysis::{ResolvedBuildInput, source_set_fingerprint};
 use nexa_core::{BuildFingerprint, FileId, FingerprintBuilder, StableId};
-use nexa_idl::ValidatedContract;
+use nexa_contract::ValidatedContract;
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::CompileError;
@@ -385,7 +385,7 @@ impl ArtifactCache {
         let mut lookup = FingerprintBuilder::new("compiler.artifact-cache-snippet-identity", 1);
         lookup.field_str("source", source);
         let contract_fingerprint = contract.map(|contract| {
-            let fingerprint = nexa_idl::contract_fingerprint(contract).into_bytes();
+            let fingerprint = nexa_contract::contract_fingerprint(contract).into_bytes();
             lookup.field_u8("contract-present", 1);
             lookup.field_bytes("contract", &fingerprint);
             lookup.field_str("contract-source", &contract.source);

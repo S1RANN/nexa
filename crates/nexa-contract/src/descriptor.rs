@@ -10,8 +10,8 @@ use crate::model::{
     ValidatedParameter, ValidatedStruct, ValidatedVariant,
 };
 
-/// The only accepted NIDL source syntax version.
-pub const NIDL_SYNTAX_VERSION: u16 = 2;
+/// The only accepted Contract source syntax version.
+pub const CONTRACT_SYNTAX_VERSION: u16 = 2;
 /// The canonical binary ABI descriptor version.
 pub const ABI_DESCRIPTOR_VERSION: u16 = 2;
 
@@ -148,12 +148,12 @@ pub enum EffectiveDescriptorError {
 impl fmt::Display for EffectiveDescriptorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownType(name) => write!(formatter, "unknown NIDL type `{name}`"),
+            Self::UnknownType(name) => write!(formatter, "unknown Contract type `{name}`"),
             Self::UnknownHostFunction(name) => {
-                write!(formatter, "unknown NIDL Host function `{name}`")
+                write!(formatter, "unknown Contract Host function `{name}`")
             }
             Self::UnknownNexaEntrypoint(name) => {
-                write!(formatter, "unknown NIDL Nexa entrypoint `{name}`")
+                write!(formatter, "unknown Contract Nexa entrypoint `{name}`")
             }
         }
     }
@@ -852,8 +852,8 @@ enum Tag {
 
 const ENUM_NO_PAYLOAD: u8 = 0x00;
 const ENUM_TUPLE_PAYLOAD: u8 = 0x01;
-// `0x02` is reserved by Descriptor v2 for record enum payloads. NIDL v2's
-// current validated model has no record-payload form.
+// `0x02` is reserved by Descriptor v2 for record enum payloads. The current
+// validated Contract model has no record-payload form.
 const CANCEL_RETURN_ERROR: u8 = 0x01;
 const CANCEL_TASK: u8 = 0x02;
 const ABANDON_RETURN_ERROR: u8 = 0x01;
@@ -922,7 +922,7 @@ mod tests {
     };
 
     fn contract(source: &str) -> crate::ValidatedContract {
-        crate::parse(source).expect("test NIDL must validate")
+        crate::parse(source).expect("test Contract must validate")
     }
 
     fn take_u32(bytes: &[u8], cursor: &mut usize) -> u32 {

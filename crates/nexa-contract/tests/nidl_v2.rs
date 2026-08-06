@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use nexa_core::FileId;
-use nexa_idl::{
-    ABI_DESCRIPTOR_VERSION, NIDL_SYNTAX_VERSION, NidlErrorKind, ResolvedTypeKind, abi_descriptor,
+use nexa_contract::{
+    ABI_DESCRIPTOR_VERSION, CONTRACT_SYNTAX_VERSION, ContractErrorKind, ResolvedTypeKind, abi_descriptor,
     contract_fingerprint, parse, parse_ast_with_file_id,
 };
 
@@ -77,7 +77,7 @@ fn parses_and_validates_the_complete_nidl_v2_surface() {
         load.result.as_ref().map(|result| &result.kind),
         Some(ResolvedTypeKind::Result(_, _))
     ));
-    assert_eq!(NIDL_SYNTAX_VERSION, 2);
+    assert_eq!(CONTRACT_SYNTAX_VERSION, 2);
     assert_eq!(ABI_DESCRIPTOR_VERSION, 2);
 }
 
@@ -113,62 +113,62 @@ fn validates_names_attributes_layouts_and_source_spans() {
     let cases = [
         (
             "contract bad_name {}",
-            NidlErrorKind::InvalidName,
+            ContractErrorKind::InvalidName,
             "bad_name",
         ),
         (
             "contract Duplicate { struct Same {} enum Same {} }",
-            NidlErrorKind::Duplicate,
+            ContractErrorKind::Duplicate,
             "Same",
         ),
         (
             "contract Unknown { struct Value { item: Missing, } }",
-            NidlErrorKind::UnknownType,
+            ContractErrorKind::UnknownType,
             "Missing",
         ),
         (
             "contract Recursive { struct Node { next: Node, } }",
-            NidlErrorKind::RecursiveLayout,
+            ContractErrorKind::RecursiveLayout,
             "Node",
         ),
         (
             "contract Attribute { host { @fuel(0) fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            ContractErrorKind::InvalidAttribute,
             "@fuel(0)",
         ),
         (
             "contract Attribute { host { @cancel(trap) async fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            ContractErrorKind::InvalidAttribute,
             "@cancel(trap)",
         ),
         (
             "contract Attribute { host { @abandon(trap) fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            ContractErrorKind::InvalidAttribute,
             "@abandon(trap)",
         ),
         (
             "contract Naming { host { fn BadName(); } }",
-            NidlErrorKind::InvalidName,
+            ContractErrorKind::InvalidName,
             "BadName",
         ),
         (
             "contract Naming { struct Array {} }",
-            NidlErrorKind::InvalidName,
+            ContractErrorKind::InvalidName,
             "Array",
         ),
         (
             "contract Attribute { host { @capability(\"scope..read\") fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            ContractErrorKind::InvalidAttribute,
             "scope..read",
         ),
         (
             "contract Attribute { host { @capability(\"scope:read\") fn run(); } }",
-            NidlErrorKind::InvalidAttribute,
+            ContractErrorKind::InvalidAttribute,
             "scope:read",
         ),
         (
             "contract Blocks { host {} host {} }",
-            NidlErrorKind::Duplicate,
+            ContractErrorKind::Duplicate,
             "host {}",
         ),
     ];
@@ -195,7 +195,7 @@ fn validates_async_host_return_error_policies_against_the_error_type() {
             }
         }";
     let error = parse(explicit_cancel).unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::InvalidType);
+    assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
         &explicit_cancel[error.span.start as usize..error.span.end as usize],
         "@cancel(return_error)"
@@ -207,7 +207,7 @@ fn validates_async_host_return_error_policies_against_the_error_type() {
             host { async fn run() -> Result<i32, Fault>; }
         }";
     let error = parse(default_abandon).unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::InvalidType);
+    assert_eq!(error.kind, ContractErrorKind::InvalidType);
     assert_eq!(
         &default_abandon[error.span.start as usize..error.span.end as usize],
         "Fault"
@@ -285,7 +285,7 @@ fn stable_ids_are_scoped_by_contract_and_declaration_category() {
         "#,
     )
     .unwrap_err();
-    assert_eq!(error.kind, NidlErrorKind::StableIdCollision);
+    assert_eq!(error.kind, ContractErrorKind::StableIdCollision);
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn m4r1_nidl_mutation_stress() {
         mutations += 1;
         *categories.entry("source_spans").or_default() += 1;
         match parse(&unknown) {
-            Err(error) if error.kind == NidlErrorKind::UnknownType => {
+            Err(error) if error.kind == ContractErrorKind::UnknownType => {
                 let actual = &unknown[error.span.start as usize..error.span.end as usize];
                 if actual != format!("Missing{cycle}") {
                     failures.push(format!(
@@ -460,22 +460,22 @@ fn m4r1_nidl_mutation_stress() {
             (
                 "naming",
                 format!("contract bad_name_{cycle} {{}}"),
-                NidlErrorKind::InvalidName,
+                ContractErrorKind::InvalidName,
             ),
             (
                 "duplicates",
                 "contract Stress { struct Same {} enum Same {} }".to_owned(),
-                NidlErrorKind::Duplicate,
+                ContractErrorKind::Duplicate,
             ),
             (
                 "recursive_layout",
                 "contract Stress { struct Node { next: Node, } }".to_owned(),
-                NidlErrorKind::RecursiveLayout,
+                ContractErrorKind::RecursiveLayout,
             ),
             (
                 "illegal_async",
                 "contract Stress { host { async fn load() -> i32; } }".to_owned(),
-                NidlErrorKind::InvalidType,
+                ContractErrorKind::InvalidType,
             ),
         ];
         for (category, source, expected) in invalid_changes {

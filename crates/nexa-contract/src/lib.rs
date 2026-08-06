@@ -1,7 +1,7 @@
-//! NIDL v2 syntax lowering, validation, ABI descriptors, and structured Rust bindings.
+//! Contract syntax lowering, validation, ABI descriptors, and structured Rust bindings.
 //!
 //! The crate has one front end:
-//! `nexa-syntax::parse_nidl` → [`NidlAst`] → [`ValidatedContract`].
+//! `nexa-syntax::parse_contract` → [`ContractAst`] → [`ValidatedContract`].
 //! Rust bindings are built as token trees and are parsed twice before source is returned.
 
 pub mod build;
@@ -16,51 +16,51 @@ use nexa_core::{FileId, StableId};
 pub use codegen::{BindingModel, CodegenError, generate_rust, generate_rust_tokens};
 pub use descriptor::{
     ABI_DESCRIPTOR_VERSION, AbiDescriptor, DeclarationFingerprint, EffectiveContractDescriptor,
-    EffectiveContractSelection, EffectiveDescriptorError, NIDL_SYNTAX_VERSION, abi_descriptor,
+    EffectiveContractSelection, EffectiveDescriptorError, CONTRACT_SYNTAX_VERSION, abi_descriptor,
     contract_fingerprint, effective_contract_descriptor, effective_contract_fingerprint,
     host_function_fingerprints, nexa_entrypoint_fingerprints, type_layout_fingerprints,
 };
 pub use model::{
     AbandonPolicy, AbiFingerprint, Attribute, AttributeArgument, AttributeValue, CancelPolicy,
     ContractDecl, ContractRustNames, DocComment, EnumDecl, EnumRustNames, FieldDecl, FunctionBlock,
-    FunctionDecl, FunctionRustNames, HandleDecl, HandleRustNames, NamedAbiKind, NidlAst, NidlError,
-    NidlErrorKind, ParameterDecl, ResolvedNamedType, ResolvedTypeKind, ResolvedTypeRef, RustName,
+    FunctionDecl, FunctionRustNames, HandleDecl, HandleRustNames, NamedAbiKind, ContractAst, ContractError,
+    ContractErrorKind, ParameterDecl, ResolvedNamedType, ResolvedTypeKind, ResolvedTypeRef, RustName,
     SnapshotRustNames, StructDecl, StructRustNames, TypeKind, TypeRef, ValidatedContract,
     ValidatedEnum, ValidatedField, ValidatedFunction, ValidatedHandle, ValidatedParameter,
     ValidatedStruct, ValidatedVariant, VariantDecl,
 };
 
-/// Lowers one exact NIDL v2 source snapshot into an AST with source spans and documentation.
-pub fn parse_ast(source: &str) -> Result<NidlAst, NidlError> {
+/// Lowers one exact Contract source snapshot into an AST with source spans and documentation.
+pub fn parse_ast(source: &str) -> Result<ContractAst, ContractError> {
     parse_ast_with_file_id(source, FileId(0))
 }
 
 /// Like [`parse_ast`], assigning every returned span to `file`.
-pub fn parse_ast_with_file_id(source: &str, file: FileId) -> Result<NidlAst, NidlError> {
+pub fn parse_ast_with_file_id(source: &str, file: FileId) -> Result<ContractAst, ContractError> {
     parser::parse_with_file_id(source, file).map_err(first_error)
 }
 
-/// Performs all NIDL name, type, layout, attribute, and generated-name validation.
-pub fn validate(ast: &NidlAst) -> Result<ValidatedContract, NidlError> {
+/// Performs all Contract name, type, layout, attribute, and generated-name validation.
+pub fn validate(ast: &ContractAst) -> Result<ValidatedContract, ContractError> {
     ValidatedContract::validate(ast).map_err(first_error)
 }
 
-/// Parses and validates one NIDL v2 Contract.
-pub fn parse(source: &str) -> Result<ValidatedContract, NidlError> {
+/// Parses and validates one Contract definition.
+pub fn parse(source: &str) -> Result<ValidatedContract, ContractError> {
     parse_with_file_id(source, FileId(0))
 }
 
 /// Like [`parse`], assigning every returned span to `file`.
-pub fn parse_with_file_id(source: &str, file: FileId) -> Result<ValidatedContract, NidlError> {
+pub fn parse_with_file_id(source: &str, file: FileId) -> Result<ValidatedContract, ContractError> {
     let ast = parse_ast_with_file_id(source, file)?;
     validate(&ast)
 }
 
-fn first_error(mut errors: Vec<NidlError>) -> NidlError {
+fn first_error(mut errors: Vec<ContractError>) -> ContractError {
     if errors.is_empty() {
-        return NidlError::syntax(
+        return ContractError::syntax(
             nexa_core::SourceSpan::new(FileId(0), 0, 0),
-            "NIDL validation failed without a diagnostic",
+            "Contract validation failed without a diagnostic",
         );
     }
     errors.remove(0)
@@ -105,7 +105,7 @@ pub fn host_function_signature(function: &ValidatedFunction) -> nexa_bytecode::S
     entrypoint_signature(function)
 }
 
-/// Lowers one validated NIDL type to its bytecode ABI value identity.
+/// Lowers one validated Contract type to its bytecode ABI value identity.
 #[must_use]
 pub fn abi_value_type(ty: &ResolvedTypeRef) -> ValueType {
     ty.value_type()

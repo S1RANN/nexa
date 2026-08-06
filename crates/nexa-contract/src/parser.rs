@@ -11,20 +11,20 @@ use nexa_syntax::{
 
 use crate::model::{
     Attribute, AttributeArgument, AttributeValue, ContractDecl, DocComment, EnumDecl, FieldDecl,
-    FunctionBlock, FunctionDecl, HandleDecl, NidlAst, NidlError, NidlErrorKind, ParameterDecl,
+    FunctionBlock, FunctionDecl, HandleDecl, ContractAst, ContractError, ContractErrorKind, ParameterDecl,
     StructDecl, TypeKind, TypeRef, VariantDecl,
 };
 
-pub fn parse(source: &str) -> Result<NidlAst, Vec<NidlError>> {
+pub fn parse(source: &str) -> Result<ContractAst, Vec<ContractError>> {
     parse_with_file_id(source, FileId(0))
 }
 
-pub fn parse_with_file_id(source: &str, file: FileId) -> Result<NidlAst, Vec<NidlError>> {
+pub fn parse_with_file_id(source: &str, file: FileId) -> Result<ContractAst, Vec<ContractError>> {
     let tree = parse_contract(source).map_err(|error| {
-        vec![NidlError::syntax(
+        vec![ContractError::syntax(
             SourceSpan::new(file, 0, 0),
             format!(
-                "NIDL source is too large for 32-bit source spans ({} bytes)",
+                "Contract source is too large for 32-bit source spans ({} bytes)",
                 error.bytes
             ),
         )]
@@ -32,13 +32,13 @@ pub fn parse_with_file_id(source: &str, file: FileId) -> Result<NidlAst, Vec<Nid
     let syntax = parse_contract_ast(&tree).map_err(|errors| {
         errors
             .into_iter()
-            .map(|error| NidlError::syntax(span(file, error.range), error.message))
+            .map(|error| ContractError::syntax(span(file, error.range), error.message))
             .collect::<Vec<_>>()
     })?;
     lower_ast(&syntax, file).map_err(|error| vec![error])
 }
 
-fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<NidlAst, NidlError> {
+fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<ContractAst, ContractError> {
     let contract = &ast.contract;
     let mut handles = Vec::new();
     let mut structs = Vec::new();
@@ -66,8 +66,8 @@ fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<NidlAst, NidlError> {
                         ContractFunctionBlockKind::Host => "host",
                         ContractFunctionBlockKind::Nexa => "nexa",
                     };
-                    return Err(NidlError::new(
-                        NidlErrorKind::Duplicate,
+                    return Err(ContractError::new(
+                        ContractErrorKind::Duplicate,
                         span(file, block.range),
                         format!("a contract may contain at most one `{name}` block"),
                     ));
@@ -77,7 +77,7 @@ fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<NidlAst, NidlError> {
     }
 
     let contract_span = span(file, contract.range);
-    Ok(NidlAst {
+    Ok(ContractAst {
         source: ast.source.as_str().to_owned(),
         span: span(file, ast.range),
         contract: ContractDecl {
@@ -95,7 +95,7 @@ fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<NidlAst, NidlError> {
     })
 }
 
-fn lower_handle(handle: &SyntaxHandle, file: FileId) -> Result<HandleDecl, NidlError> {
+fn lower_handle(handle: &SyntaxHandle, file: FileId) -> Result<HandleDecl, ContractError> {
     Ok(HandleDecl {
         name: handle.name.text.clone(),
         name_span: span(file, handle.name.range),
@@ -105,7 +105,7 @@ fn lower_handle(handle: &SyntaxHandle, file: FileId) -> Result<HandleDecl, NidlE
     })
 }
 
-fn lower_struct(structure: &SyntaxStruct, file: FileId) -> Result<StructDecl, NidlError> {
+fn lower_struct(structure: &SyntaxStruct, file: FileId) -> Result<StructDecl, ContractError> {
     Ok(StructDecl {
         name: structure.name.text.clone(),
         name_span: span(file, structure.name.range),
@@ -120,7 +120,7 @@ fn lower_struct(structure: &SyntaxStruct, file: FileId) -> Result<StructDecl, Ni
     })
 }
 
-fn lower_field(field: &SyntaxField, file: FileId) -> Result<FieldDecl, NidlError> {
+fn lower_field(field: &SyntaxField, file: FileId) -> Result<FieldDecl, ContractError> {
     Ok(FieldDecl {
         name: field.name.text.clone(),
         name_span: span(file, field.name.range),
@@ -131,7 +131,7 @@ fn lower_field(field: &SyntaxField, file: FileId) -> Result<FieldDecl, NidlError
     })
 }
 
-fn lower_enum(enumeration: &SyntaxEnum, file: FileId) -> Result<EnumDecl, NidlError> {
+fn lower_enum(enumeration: &SyntaxEnum, file: FileId) -> Result<EnumDecl, ContractError> {
     Ok(EnumDecl {
         name: enumeration.name.text.clone(),
         name_span: span(file, enumeration.name.range),
@@ -146,7 +146,7 @@ fn lower_enum(enumeration: &SyntaxEnum, file: FileId) -> Result<EnumDecl, NidlEr
     })
 }
 
-fn lower_variant(variant: &SyntaxVariant, file: FileId) -> Result<VariantDecl, NidlError> {
+fn lower_variant(variant: &SyntaxVariant, file: FileId) -> Result<VariantDecl, ContractError> {
     Ok(VariantDecl {
         name: variant.name.text.clone(),
         name_span: span(file, variant.name.range),
@@ -164,7 +164,7 @@ fn lower_variant(variant: &SyntaxVariant, file: FileId) -> Result<VariantDecl, N
 fn lower_function_block(
     block: &SyntaxFunctionBlock,
     file: FileId,
-) -> Result<FunctionBlock, NidlError> {
+) -> Result<FunctionBlock, ContractError> {
     Ok(FunctionBlock {
         span: span(file, block.range),
         docs: lower_docs(&block.docs, file),
@@ -177,7 +177,7 @@ fn lower_function_block(
     })
 }
 
-fn lower_function(function: &SyntaxFunction, file: FileId) -> Result<FunctionDecl, NidlError> {
+fn lower_function(function: &SyntaxFunction, file: FileId) -> Result<FunctionDecl, ContractError> {
     Ok(FunctionDecl {
         name: function.name.text.clone(),
         name_span: span(file, function.name.range),
@@ -198,7 +198,7 @@ fn lower_function(function: &SyntaxFunction, file: FileId) -> Result<FunctionDec
     })
 }
 
-fn lower_parameter(parameter: &SyntaxParameter, file: FileId) -> Result<ParameterDecl, NidlError> {
+fn lower_parameter(parameter: &SyntaxParameter, file: FileId) -> Result<ParameterDecl, ContractError> {
     Ok(ParameterDecl {
         name: parameter.name.text.clone(),
         name_span: span(file, parameter.name.range),
@@ -209,7 +209,7 @@ fn lower_parameter(parameter: &SyntaxParameter, file: FileId) -> Result<Paramete
     })
 }
 
-fn lower_type(ty: &SyntaxTypeRef, file: FileId) -> Result<TypeRef, NidlError> {
+fn lower_type(ty: &SyntaxTypeRef, file: FileId) -> Result<TypeRef, ContractError> {
     let lowered_arguments = ty
         .arguments
         .iter()
@@ -234,11 +234,11 @@ fn lower_type(ty: &SyntaxTypeRef, file: FileId) -> Result<TypeRef, NidlError> {
             | "Option" | "Result" | "Token" | "Snapshot",
             _,
         ) => {
-            return Err(NidlError::new(
-                NidlErrorKind::UnknownType,
+            return Err(ContractError::new(
+                ContractErrorKind::UnknownType,
                 span(file, ty.range),
                 format!(
-                    "NIDL type `{}` has {} type argument(s), which is not valid in NIDL v2",
+                    "Contract type `{}` has {} type argument(s), which is not valid in Contract syntax v3",
                     ty.name.text,
                     lowered_arguments.len()
                 ),
@@ -246,10 +246,10 @@ fn lower_type(ty: &SyntaxTypeRef, file: FileId) -> Result<TypeRef, NidlError> {
         }
         (name, []) => TypeKind::Named(name.to_owned()),
         (name, _) => {
-            return Err(NidlError::new(
-                NidlErrorKind::UnknownType,
+            return Err(ContractError::new(
+                ContractErrorKind::UnknownType,
                 span(file, ty.range),
-                format!("named NIDL type `{name}` cannot have type arguments"),
+                format!("named Contract type `{name}` cannot have type arguments"),
             ));
         }
     };
@@ -271,14 +271,14 @@ fn lower_docs(docs: &[SyntaxDocComment], file: FileId) -> Vec<DocComment> {
 fn lower_attributes(
     attributes: &[SyntaxAttribute],
     file: FileId,
-) -> Result<Vec<Attribute>, NidlError> {
+) -> Result<Vec<Attribute>, ContractError> {
     attributes
         .iter()
         .map(|attribute| lower_attribute(attribute, file))
         .collect()
 }
 
-fn lower_attribute(attribute: &SyntaxAttribute, file: FileId) -> Result<Attribute, NidlError> {
+fn lower_attribute(attribute: &SyntaxAttribute, file: FileId) -> Result<Attribute, ContractError> {
     Ok(Attribute {
         name: attribute.name.text.clone(),
         name_span: span(file, attribute.name.range),
@@ -294,7 +294,7 @@ fn lower_attribute(attribute: &SyntaxAttribute, file: FileId) -> Result<Attribut
 fn lower_attribute_argument(
     argument: &SyntaxAttributeArgument,
     file: FileId,
-) -> Result<AttributeArgument, NidlError> {
+) -> Result<AttributeArgument, ContractError> {
     let value = match &argument.value {
         SyntaxAttributeValue::Identifier(identifier) => {
             AttributeValue::Identifier(identifier.text.clone())
@@ -302,8 +302,8 @@ fn lower_attribute_argument(
         SyntaxAttributeValue::String { cooked, .. } => AttributeValue::String(cooked.clone()),
         SyntaxAttributeValue::Integer { raw, range } => {
             AttributeValue::Integer(raw.parse().map_err(|_| {
-                NidlError::new(
-                    NidlErrorKind::InvalidAttribute,
+                ContractError::new(
+                    ContractErrorKind::InvalidAttribute,
                     span(file, *range),
                     format!("integer attribute argument `{raw}` is out of range"),
                 )

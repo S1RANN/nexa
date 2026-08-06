@@ -62,18 +62,18 @@ impl HostContractSource {
 /// do not retain an original `.nidl` file can use [`HostContractInput::canonical`].
 #[derive(Clone, Debug)]
 pub struct HostContractInput<'a> {
-    contract: &'a nexa_idl::ValidatedContract,
+    contract: &'a nexa_contract::ValidatedContract,
     source: HostContractSource,
     required_entrypoint_indices: Arc<[usize]>,
-    effective_selection: Arc<nexa_idl::EffectiveContractSelection>,
-    effective_descriptor: Arc<nexa_idl::EffectiveContractDescriptor>,
+    effective_selection: Arc<nexa_contract::EffectiveContractSelection>,
+    effective_descriptor: Arc<nexa_contract::EffectiveContractDescriptor>,
 }
 
 impl<'a> HostContractInput<'a> {
     #[must_use]
-    pub fn canonical(contract: &'a nexa_idl::ValidatedContract) -> Self {
+    pub fn canonical(contract: &'a nexa_contract::ValidatedContract) -> Self {
         let selection = default_effective_selection(contract, &[]);
-        let descriptor = nexa_idl::effective_contract_descriptor(contract, &selection)
+        let descriptor = nexa_contract::effective_contract_descriptor(contract, &selection)
             .expect("the validated Contract's own declarations form a valid selection");
         Self {
             contract,
@@ -88,7 +88,7 @@ impl<'a> HostContractInput<'a> {
     }
 
     pub fn with_source(
-        contract: &'a nexa_idl::ValidatedContract,
+        contract: &'a nexa_contract::ValidatedContract,
         identity: SourceIdentity,
         text: impl Into<Arc<str>>,
     ) -> Result<Self, HostContractSourceError> {
@@ -96,12 +96,12 @@ impl<'a> HostContractInput<'a> {
             return Err(HostContractSourceError::InvalidIdentity(identity));
         }
         let text = text.into();
-        let parsed = nexa_idl::parse(&text).map_err(HostContractSourceError::Parse)?;
-        if nexa_idl::abi_descriptor(&parsed).bytes != nexa_idl::abi_descriptor(contract).bytes {
+        let parsed = nexa_contract::parse(&text).map_err(HostContractSourceError::Parse)?;
+        if nexa_contract::abi_descriptor(&parsed).bytes != nexa_contract::abi_descriptor(contract).bytes {
             return Err(HostContractSourceError::ParsedContractMismatch);
         }
         let selection = default_effective_selection(contract, &[]);
-        let descriptor = nexa_idl::effective_contract_descriptor(contract, &selection)
+        let descriptor = nexa_contract::effective_contract_descriptor(contract, &selection)
             .expect("the validated Contract's own declarations form a valid selection");
         Ok(Self {
             contract,
@@ -171,7 +171,7 @@ impl<'a> HostContractInput<'a> {
         selection
             .present_optional_nexa_entrypoints
             .retain(|name| !selection.required_nexa_entrypoints.contains(name));
-        let descriptor = nexa_idl::effective_contract_descriptor(self.contract, &selection)
+        let descriptor = nexa_contract::effective_contract_descriptor(self.contract, &selection)
             .map_err(HostContractSourceError::InvalidEffectiveSelection)?;
         Ok(Self {
             contract: self.contract,
@@ -183,7 +183,7 @@ impl<'a> HostContractInput<'a> {
     }
 
     #[must_use]
-    pub const fn contract(&self) -> &nexa_idl::ValidatedContract {
+    pub const fn contract(&self) -> &nexa_contract::ValidatedContract {
         self.contract
     }
 
@@ -194,19 +194,19 @@ impl<'a> HostContractInput<'a> {
 
     /// Package-specific Contract selection bound into the build fingerprint.
     #[must_use]
-    pub fn effective_selection(&self) -> &nexa_idl::EffectiveContractSelection {
+    pub fn effective_selection(&self) -> &nexa_contract::EffectiveContractSelection {
         &self.effective_selection
     }
 
     /// Canonical ABI Descriptor v2 bytes for this Package's effective Contract.
     #[must_use]
-    pub fn effective_descriptor(&self) -> &nexa_idl::EffectiveContractDescriptor {
+    pub fn effective_descriptor(&self) -> &nexa_contract::EffectiveContractDescriptor {
         &self.effective_descriptor
     }
 
     /// Full 32-byte Package-specific Contract fingerprint used by build/freshness identity.
     #[must_use]
-    pub fn effective_contract_fingerprint(&self) -> nexa_idl::AbiFingerprint {
+    pub fn effective_contract_fingerprint(&self) -> nexa_contract::AbiFingerprint {
         self.effective_descriptor.fingerprint
     }
 
@@ -214,7 +214,7 @@ impl<'a> HostContractInput<'a> {
     /// entrypoints. The Host-selected required subset remains authoritative.
     pub fn selecting_effective_contract(
         &self,
-        mut selection: nexa_idl::EffectiveContractSelection,
+        mut selection: nexa_contract::EffectiveContractSelection,
     ) -> Result<Self, HostContractSourceError> {
         selection.required_nexa_entrypoints = self
             .required_entrypoints()
@@ -223,7 +223,7 @@ impl<'a> HostContractInput<'a> {
         selection
             .present_optional_nexa_entrypoints
             .retain(|name| !selection.required_nexa_entrypoints.contains(name));
-        let descriptor = nexa_idl::effective_contract_descriptor(self.contract, &selection)
+        let descriptor = nexa_contract::effective_contract_descriptor(self.contract, &selection)
             .map_err(HostContractSourceError::InvalidEffectiveSelection)?;
         Ok(Self {
             contract: self.contract,
@@ -283,7 +283,7 @@ impl<'a> HostContractInput<'a> {
             .iter()
             .map(|function| (function.stable_id, function.name.clone()))
             .collect::<BTreeMap<_, _>>();
-        let selection = nexa_idl::EffectiveContractSelection {
+        let selection = nexa_contract::EffectiveContractSelection {
             referenced_types: references
                 .referenced_types
                 .iter()
@@ -311,12 +311,12 @@ impl<'a> HostContractInput<'a> {
     /// Compact runtime compatibility identity for the complete validated Contract.
     #[must_use]
     pub fn runtime_id(&self) -> nexa_core::StableId {
-        nexa_idl::contract_runtime_id(self.contract)
+        nexa_contract::contract_runtime_id(self.contract)
     }
 
     /// All legal Nexa entrypoints declared by this contract.
     #[must_use]
-    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = &nexa_idl::ValidatedFunction> + '_ {
+    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = &nexa_contract::ValidatedFunction> + '_ {
         self.contract.nexa_functions.iter()
     }
 
@@ -324,7 +324,7 @@ impl<'a> HostContractInput<'a> {
     #[must_use]
     pub fn required_entrypoints(
         &self,
-    ) -> impl ExactSizeIterator<Item = &nexa_idl::ValidatedFunction> + '_ {
+    ) -> impl ExactSizeIterator<Item = &nexa_contract::ValidatedFunction> + '_ {
         self.required_entrypoint_indices
             .iter()
             .map(|index| &self.contract.nexa_functions[*index])
@@ -333,7 +333,7 @@ impl<'a> HostContractInput<'a> {
     /// Canonical identity of the effective required-entrypoint view.
     #[must_use]
     pub fn canonical_required_entrypoints(&self) -> Vec<u8> {
-        nexa_idl::required_entrypoints_descriptor(
+        nexa_contract::required_entrypoints_descriptor(
             self.required_entrypoints()
                 .map(|entrypoint| entrypoint.name.as_str()),
         )
@@ -341,10 +341,10 @@ impl<'a> HostContractInput<'a> {
 }
 
 fn default_effective_selection(
-    contract: &nexa_idl::ValidatedContract,
+    contract: &nexa_contract::ValidatedContract,
     required_entrypoints: &[String],
-) -> nexa_idl::EffectiveContractSelection {
-    nexa_idl::EffectiveContractSelection {
+) -> nexa_contract::EffectiveContractSelection {
+    nexa_contract::EffectiveContractSelection {
         referenced_types: contract
             .handles
             .iter()
@@ -394,11 +394,11 @@ fn contract_scan_fallback_module(sources: &PackageSourceSet) -> ModulePath {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostContractSourceError {
     InvalidIdentity(SourceIdentity),
-    Parse(nexa_idl::NidlError),
+    Parse(nexa_contract::ContractError),
     ParsedContractMismatch,
     UnknownRequiredEntrypoint(String),
     DuplicateRequiredEntrypoint(String),
-    InvalidEffectiveSelection(nexa_idl::EffectiveDescriptorError),
+    InvalidEffectiveSelection(nexa_contract::EffectiveDescriptorError),
     EffectiveContractScan(nexa_analysis::EffectiveContractScanError),
     Environment(crate::package_environment::PackageEnvironmentError),
 }
@@ -2694,9 +2694,9 @@ fn validate_compiler_standard_library_sources(
 }
 
 pub(crate) fn union_effective_contract_selection(
-    left: &nexa_idl::EffectiveContractSelection,
-    right: &nexa_idl::EffectiveContractSelection,
-) -> nexa_idl::EffectiveContractSelection {
+    left: &nexa_contract::EffectiveContractSelection,
+    right: &nexa_contract::EffectiveContractSelection,
+) -> nexa_contract::EffectiveContractSelection {
     let mut merged = left.clone();
     merged
         .referenced_types
@@ -2717,8 +2717,8 @@ pub(crate) fn union_effective_contract_selection(
 }
 
 fn effective_selection_is_superset(
-    candidate: &nexa_idl::EffectiveContractSelection,
-    required: &nexa_idl::EffectiveContractSelection,
+    candidate: &nexa_contract::EffectiveContractSelection,
+    required: &nexa_contract::EffectiveContractSelection,
 ) -> bool {
     candidate
         .referenced_types
@@ -2893,7 +2893,7 @@ fn validate_host_entrypoints(
         return Err(PackageBuildError::HostContractIdMismatch);
     }
     for required in contract.required_entrypoints() {
-        let stable_id = nexa_idl::entrypoint_stable_id(required);
+        let stable_id = nexa_contract::entrypoint_stable_id(required);
         let Some(actual) = module
             .exports
             .iter()
@@ -2903,7 +2903,7 @@ fn validate_host_entrypoints(
                 required.name.clone(),
             ));
         };
-        let expected = nexa_idl::entrypoint_signature(required);
+        let expected = nexa_contract::entrypoint_signature(required);
         if actual.signature != expected {
             return Err(PackageBuildError::EntrypointSignatureMismatch {
                 name: required.name.clone(),
@@ -3756,7 +3756,7 @@ pub(crate) fn verify_package_artifact_integrity(
                 identity: source.identity.clone(),
             });
         }
-        let parsed = nexa_idl::parse(&source.text).map_err(|_| {
+        let parsed = nexa_contract::parse(&source.text).map_err(|_| {
             PackageArtifactIntegrityError::InvalidHostDebugSource {
                 import: stable_host_import_identity(module, debug_info, host.import_index),
                 identity: source.identity.clone(),
@@ -4400,7 +4400,7 @@ source_root = "src"
     fn resolved_input(
         manifest: PackageManifest,
         sources: PackageSourceSet,
-        contract: &nexa_idl::ValidatedContract,
+        contract: &nexa_contract::ValidatedContract,
     ) -> ResolvedBuildInput {
         let contract_input = test_contract_input(contract);
         let source_id = SourceId::new("package-build-test").unwrap();
@@ -4443,7 +4443,7 @@ source_root = "src"
         .unwrap()
     }
 
-    fn test_contract_input(contract: &nexa_idl::ValidatedContract) -> HostContractInput<'_> {
+    fn test_contract_input(contract: &nexa_contract::ValidatedContract) -> HostContractInput<'_> {
         HostContractInput::with_source(
             contract,
             SourceIdentity::standalone("nidl://tests/package-build.nidl"),
@@ -4455,7 +4455,7 @@ source_root = "src"
     fn canonical_artifact() -> (
         CompiledPackageArtifact,
         ResolvedBuildInput,
-        nexa_idl::ValidatedContract,
+        nexa_contract::ValidatedContract,
     ) {
         let manifest = PackageManifest::parse(
             r#"
@@ -4486,7 +4486,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse("contract Empty {}").unwrap();
         let input = resolved_input(manifest, builder.build().unwrap(), &contract);
         let identity =
             CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
@@ -4498,7 +4498,7 @@ activation = "programmatic"
 
     #[test]
     fn library_check_rejects_both_directions_of_unit_return_mismatch() {
-        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse("contract Empty {}").unwrap();
         for (source, expected_message) in [
             ("fn bad() -> i32 { return; }\n", "expected i32, found unit"),
             ("fn bad() { return 1; }\n", "expected unit, found i32"),
@@ -4555,7 +4555,7 @@ activation = "programmatic"
 
     fn exact_host_build_fingerprint(
         input: &ResolvedBuildInput,
-        contract: &nexa_idl::ValidatedContract,
+        contract: &nexa_contract::ValidatedContract,
     ) -> BuildFingerprint {
         let exact_host = HostContractInput::with_source(
             contract,
@@ -4854,7 +4854,7 @@ activation = "programmatic"
         let sources = snapshot_with_host();
         let mut debug = debug_info(SourceSpan::new(FileId(1), 13, 26));
         let host_source = sources.source(FileId(2)).unwrap();
-        let host_contract = nexa_idl::parse(&host_source.text).unwrap();
+        let host_contract = nexa_contract::parse(&host_source.text).unwrap();
         let function_source = host_contract
             .host_functions
             .iter()
@@ -4895,7 +4895,7 @@ activation = "programmatic"
     #[test]
     fn build_identity_includes_canonical_standard_library_descriptor() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse("contract Empty {}").unwrap();
         let contract_input = test_contract_input(&contract);
         let first = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -4932,7 +4932,7 @@ activation = "programmatic"
              }\n\
              }\n",
         );
-        let idl = nexa_idl::parse(&source).unwrap();
+        let idl = nexa_contract::parse(&source).unwrap();
         let base = HostContractInput::with_source(
             &idl,
             SourceIdentity::standalone("contracts/host.nidl"),
@@ -4984,15 +4984,15 @@ activation = "programmatic"
         );
         assert_ne!(full.fingerprint(), subset.fingerprint());
         assert_eq!(
-            nexa_idl::contract_runtime_id(base.contract()),
-            nexa_idl::contract_runtime_id(run_only.contract())
+            nexa_contract::contract_runtime_id(base.contract()),
+            nexa_contract::contract_runtime_id(run_only.contract())
         );
     }
 
     #[test]
     fn package_fingerprint_uses_canonical_build_authorities() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse("contract Empty {}").unwrap();
         let contract_input = test_contract_input(&contract);
         let fingerprint = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
@@ -5093,7 +5093,7 @@ activation = "programmatic"
         assert!(!artifact.encode_module().is_empty());
         assert_eq!(
             artifact.module().host_contract_id,
-            Some(nexa_idl::contract_runtime_id(&contract))
+            Some(nexa_contract::contract_runtime_id(&contract))
         );
         let host_source = artifact
             .source_files
@@ -5148,7 +5148,7 @@ activation = "programmatic"
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract = nexa_contract::parse("contract Empty {}").unwrap();
         let input = Arc::new(resolved_input(
             manifest,
             production.build().unwrap(),

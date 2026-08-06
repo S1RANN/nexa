@@ -11,7 +11,7 @@ pub enum BuildError {
     MissingFileStem(PathBuf),
     MissingOutDir,
     Io(std::io::Error),
-    Nidl(super::NidlError),
+    Nidl(super::ContractError),
     Codegen(super::CodegenError),
 }
 
@@ -29,8 +29,8 @@ impl From<std::io::Error> for BuildError {
     }
 }
 
-impl From<super::NidlError> for BuildError {
-    fn from(error: super::NidlError) -> Self {
+impl From<super::ContractError> for BuildError {
+    fn from(error: super::ContractError) -> Self {
         Self::Nidl(error)
     }
 }

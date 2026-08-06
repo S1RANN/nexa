@@ -30,10 +30,10 @@ const WORKER_COUNT: usize = 4;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
 
 fn scale_host_contract() -> Vec<u8> {
-    let contract = nexa_idl::parse(SCALE_HOST_SOURCE).expect("scale Host NIDL");
-    nexa_idl::effective_contract_descriptor(
+    let contract = nexa_contract::parse(SCALE_HOST_SOURCE).expect("scale Host NIDL");
+    nexa_contract::effective_contract_descriptor(
         &contract,
-        &nexa_idl::EffectiveContractSelection::default(),
+        &nexa_contract::EffectiveContractSelection::default(),
     )
     .expect("empty scale Host effective Contract")
     .bytes
@@ -57,7 +57,7 @@ fn scale_host_source_identity() -> Vec<u8> {
 }
 
 fn scale_host_required_entrypoints_identity() -> Vec<u8> {
-    nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>())
+    nexa_contract::required_entrypoints_descriptor(std::iter::empty::<&str>())
 }
 
 #[derive(Serialize)]

@@ -30,7 +30,7 @@ use std::time::Duration;
 // Keep implementation paths descriptive while routing every public runtime/IDL/core type through
 // the stable `nexa` facade.
 use nexa as nexa_diagnostics;
-use nexa as nexa_idl;
+use nexa;
 use nexa as nexa_verifier;
 use nexa::prelude as nexa_core;
 use nexa::prelude as nexa_runtime;
@@ -160,7 +160,7 @@ fn prepare_entrypoint_plans(
 
 pub struct NexaEngine {
     contract: HostContract,
-    idl: nexa_idl::ValidatedContract,
+    idl: nexa::ValidatedContract,
     host_contract_source_identity: nexa::SourceIdentity,
     host_contract_source: std::sync::Arc<str>,
     host_factory: Box<dyn HostRegistryFactory>,
@@ -205,13 +205,13 @@ impl NexaEngine {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn from_builder(builder: NexaEngineBuilder) -> Result<Self, EngineError> {
-        let idl = nexa_idl::parse_nidl(builder.contract.source())
+        let idl = nexa::parse_contract(builder.contract.source())
             .map_err(|error| EngineError::Contract(error.to_string()))?;
-        let descriptor = nexa_idl::abi_descriptor(&idl);
+        let descriptor = nexa::abi_descriptor(&idl);
         if idl.name != builder.contract.contract_name()
             || descriptor.as_bytes() != builder.contract.canonical_descriptor()
             || descriptor.fingerprint.into_bytes() != builder.contract.contract_fingerprint()
-            || nexa_idl::contract_runtime_id(&idl) != builder.contract.contract_runtime_id()
+            || nexa::contract_runtime_id(&idl) != builder.contract.contract_runtime_id()
             || builder.contract.generator_schema_version()
                 != nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION
         {
@@ -224,8 +224,8 @@ impl NexaEngine {
             .iter()
             .map(|entrypoint| EntrypointSignature {
                 name: entrypoint.name.clone(),
-                stable_id: nexa_idl::entrypoint_stable_id(entrypoint),
-                signature: nexa_idl::entrypoint_signature(entrypoint),
+                stable_id: nexa::entrypoint_stable_id(entrypoint),
+                signature: nexa::entrypoint_signature(entrypoint),
                 effect: if entrypoint.is_async {
                     nexa_runtime::FunctionEffect::Task
                 } else {
@@ -4139,7 +4139,7 @@ fn development_event_data(
 fn runtime_trap_diagnostic(
     record: &PackageRecord,
     contract: &HostContract,
-    idl: &nexa_idl::ValidatedContract,
+    idl: &nexa::ValidatedContract,
     trap: &nexa_runtime::Trap,
     export: &str,
 ) -> EngineDiagnostic {

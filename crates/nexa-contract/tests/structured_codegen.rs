@@ -1,4 +1,4 @@
-use nexa_idl::{
+use nexa_contract::{
     BindingModel, CodegenError, abi_descriptor, contract_fingerprint, generate_rust,
     generate_rust_tokens, parse,
 };
@@ -80,7 +80,7 @@ fn generated_tokens_are_parsed_formatted_and_parsed_again() {
         "pub const CONTRACT_FINGERPRINT",
         "pub const CONTRACT_RUNTIME_ID",
         "pub const CONTRACT_SOURCE_NAME",
-        "pub const NIDL_SYNTAX_VERSION: u16 = 2",
+        "pub const CONTRACT_SYNTAX_VERSION: u16 = 2",
         "pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2",
         "pub const ABI_DESCRIPTOR_VERSION: u16 = 2",
         "pub trait BindingsHost",

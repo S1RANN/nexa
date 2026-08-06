@@ -678,7 +678,7 @@ impl LoadedProject {
             },
             Ok,
         )?;
-        let contract = nexa::parse_nidl(&contract_source).map_err(|error| {
+        let contract = nexa::parse_contract(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract_path.display()))
         })?;
         let required_entrypoints = config.required_entrypoints.clone().unwrap_or_else(|| {
@@ -1004,13 +1004,13 @@ pub fn resolve_direct_package_for_lock(
 }
 
 fn empty_host_contract() -> CliResult<nexa::ValidatedContract> {
-    nexa::parse_nidl("contract NexaCliEmptyHost {}\n").map_err(|error| {
+    nexa::parse_contract("contract NexaCliEmptyHost {}\n").map_err(|error| {
         CliError::internal(format!("invalid built-in empty Host contract: {error}"))
     })
 }
 
 pub fn standalone_host_contract_snapshot() -> CliResult<HostContractSnapshot> {
-    let contract = nexa::parse_nidl(nexa::CONSOLE_HOST_NIDL).map_err(|error| {
+    let contract = nexa::parse_contract(nexa::CONSOLE_HOST_NIDL).map_err(|error| {
         CliError::internal(format!(
             "invalid built-in standalone Console contract: {error}"
         ))

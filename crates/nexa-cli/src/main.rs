@@ -529,7 +529,7 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
         let contract_source = std::fs::read_to_string(contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
@@ -968,7 +968,7 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
@@ -1174,7 +1174,7 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
@@ -2149,7 +2149,7 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
 fn check_nidl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let contract = nexa::parse_nidl(&source).map_err(|error| error.to_string())?;
+    let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;
     println!(
         "NIDL {} is valid; contract fingerprint {}",
         path.display(),
@@ -2161,7 +2161,7 @@ fn check_nidl(path: &Path) -> Result<(), String> {
 fn generate_nidl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let contract = nexa::parse_nidl(&source).map_err(|error| error.to_string())?;
+    let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;
     let generated =
         nexa::prelude::generate_rust_bindings(&contract).map_err(|error| error.to_string())?;
     print!("{generated}");

@@ -210,9 +210,9 @@ version = "0.1.0"
 dependencies = [
  "nexa",
  "nexa-bytecode",
+ "nexa-contract",
  "nexa-core",
  "nexa-embed",
- "nexa-idl",
  "nexa-runtime",
 ]
 
@@ -373,8 +373,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hello-runtime"
 version = "0.1.0"
 dependencies = [
+ "nexa-contract",
  "nexa-embed",
- "nexa-idl",
  "nexa-runtime",
 ]
 
@@ -610,9 +610,9 @@ dependencies = [
  "nexa-analysis",
  "nexa-bytecode",
  "nexa-compiler",
+ "nexa-contract",
  "nexa-core",
  "nexa-diagnostics",
- "nexa-idl",
  "nexa-runtime",
  "nexa-stdlib",
  "nexa-syntax",
@@ -627,9 +627,9 @@ name = "nexa-analysis"
 version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
+ "nexa-contract",
  "nexa-core",
  "nexa-diagnostics",
- "nexa-idl",
  "nexa-stdlib",
  "nexa-syntax",
  "semver",
@@ -702,12 +702,30 @@ version = "0.1.0"
 dependencies = [
  "nexa-analysis",
  "nexa-bytecode",
+ "nexa-contract",
  "nexa-core",
  "nexa-diagnostics",
- "nexa-idl",
  "nexa-runtime",
  "nexa-stdlib",
  "nexa-verifier",
+]
+
+[[package]]
+name = "nexa-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-runtime",
+ "nexa-syntax",
+ "nexa-verifier",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -738,24 +756,6 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
-]
-
-[[package]]
-name = "nexa-idl"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-runtime",
- "nexa-syntax",
- "nexa-verifier",
- "prettyplease",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -801,8 +801,8 @@ version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
  "nexa-compiler",
+ "nexa-contract",
  "nexa-core",
- "nexa-idl",
  "nexa-verifier",
 ]
 
@@ -1040,8 +1040,8 @@ name = "snake-game"
 version = "0.1.0"
 dependencies = [
  "macroquad",
+ "nexa-contract",
  "nexa-embed",
- "nexa-idl",
  "nexa-runtime",
  "serde",
  "serde_json",

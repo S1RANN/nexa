@@ -218,7 +218,7 @@ struct M4EditorArtifactEvidence {
 #[serde(deny_unknown_fields)]
 struct M4EditorGrammarRevisions {
     nexa: String,
-    nexa_idl: String,
+    nexa_contract: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,9 +290,9 @@ impl M4EditorPackageReport {
         for (name, directory_name, revision) in [
             ("nexa", "tree-sitter-nexa", &self.zed.grammar_revisions.nexa),
             (
-                "nexa_idl",
+                "nexa_contract",
                 "tree-sitter-nexa-idl",
-                &self.zed.grammar_revisions.nexa_idl,
+                &self.zed.grammar_revisions.nexa_contract,
             ),
         ] {
             validate_git_revision(revision, &format!("Zed {name} grammar revision"))?;

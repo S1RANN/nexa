@@ -142,7 +142,7 @@ impl ConsoleRegistry {
                 "standalone Host import debug metadata is incomplete".into(),
             ));
         }
-        let contract = nexa::parse_nidl(nexa::CONSOLE_HOST_NIDL).map_err(|error| {
+        let contract = nexa::parse_contract(nexa::CONSOLE_HOST_NIDL).map_err(|error| {
             StandaloneRuntimeError::Internal(format!(
                 "invalid built-in Console Host contract: {error}"
             ))

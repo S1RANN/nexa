@@ -405,7 +405,7 @@ struct ConsoleRegistry {
 
 impl ConsoleRegistry {
     fn new(
-        contract: &nexa_idl::ValidatedContract,
+        contract: &nexa_contract::ValidatedContract,
         state: Arc<Mutex<ReplConsoleState>>,
     ) -> Result<Self, ReplSessionError> {
         let function_slot = |name: &str| {
@@ -427,7 +427,7 @@ impl ConsoleRegistry {
             .map(console_function_authority)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            contract_runtime_id: nexa_idl::contract_runtime_id(contract),
+            contract_runtime_id: nexa_contract::contract_runtime_id(contract),
             functions: ConsoleFunctionSlots {
                 write: function_slot("write")?,
                 write_line: function_slot("write_line")?,
@@ -441,9 +441,9 @@ impl ConsoleRegistry {
 }
 
 fn console_function_authority(
-    function: &nexa_idl::ValidatedFunction,
+    function: &nexa_contract::ValidatedFunction,
 ) -> Result<HostFunctionAuthority, ReplSessionError> {
-    let signature = nexa_idl::host_function_signature(function);
+    let signature = nexa_contract::host_function_signature(function);
     if function.is_async
         || signature.parameters.as_slice() != CONSOLE_HOST_PARAMETERS
         || signature.result.is_some()
@@ -534,8 +534,8 @@ pub struct ReplSession {
     active_module: Option<ModuleHandle>,
     owner: Option<ScopeHandle>,
     contract_runtime_id: nexa_core::StableId,
-    contract_fingerprint: nexa_idl::AbiFingerprint,
-    committed_contract_selection: nexa_idl::EffectiveContractSelection,
+    contract_fingerprint: nexa_contract::AbiFingerprint,
+    committed_contract_selection: nexa_contract::EffectiveContractSelection,
     latest_artifact: Option<CompiledReplCellArtifact>,
     source_origins: BTreeMap<SourceIdentity, ReplSourceOrigin>,
     diagnostics: VecDeque<DiagnosticBatch>,
@@ -569,7 +569,7 @@ impl ReplSession {
             owner: Some(runtime.owner),
             contract_runtime_id: runtime.contract_runtime_id,
             contract_fingerprint: runtime.contract_fingerprint,
-            committed_contract_selection: nexa_idl::EffectiveContractSelection::default(),
+            committed_contract_selection: nexa_contract::EffectiveContractSelection::default(),
             latest_artifact: None,
             source_origins: BTreeMap::new(),
             diagnostics: VecDeque::new(),
@@ -944,7 +944,7 @@ impl ReplSession {
         self.owner = Some(runtime.owner);
         self.contract_runtime_id = runtime.contract_runtime_id;
         self.contract_fingerprint = runtime.contract_fingerprint;
-        self.committed_contract_selection = nexa_idl::EffectiveContractSelection::default();
+        self.committed_contract_selection = nexa_contract::EffectiveContractSelection::default();
         self.latest_artifact = None;
         self.source_origins.clear();
         self.diagnostics.clear();
@@ -968,7 +968,7 @@ impl ReplSession {
         input: &ReplResolvedCellInput<'_, '_>,
     ) -> Result<(), ReplSessionError> {
         if input.contract.runtime_id() != self.contract_runtime_id
-            || nexa_idl::abi_descriptor(input.contract.contract()).fingerprint
+            || nexa_contract::abi_descriptor(input.contract.contract()).fingerprint
                 != self.contract_fingerprint
         {
             return Err(ReplSessionError::Build(
@@ -1155,13 +1155,13 @@ fn charge_rendered_value(
 }
 
 fn stage_effective_contract<'contract>(
-    committed: &nexa_idl::EffectiveContractSelection,
+    committed: &nexa_contract::EffectiveContractSelection,
     contract: &HostContractInput<'contract>,
     input: &ResolvedBuildInput,
 ) -> Result<
     (
         HostContractInput<'contract>,
-        nexa_idl::EffectiveContractSelection,
+        nexa_contract::EffectiveContractSelection,
     ),
     ReplSessionError,
 > {
@@ -2058,7 +2058,7 @@ struct InitializedRuntime {
     module: ModuleHandle,
     owner: ScopeHandle,
     contract_runtime_id: nexa_core::StableId,
-    contract_fingerprint: nexa_idl::AbiFingerprint,
+    contract_fingerprint: nexa_contract::AbiFingerprint,
 }
 
 fn initialize_runtime(
@@ -2066,7 +2066,7 @@ fn initialize_runtime(
     console: Arc<Mutex<ReplConsoleState>>,
     builds: &mut PackageBuildSession,
 ) -> Result<InitializedRuntime, ReplSessionError> {
-    let parsed_contract = nexa_idl::parse(CONSOLE_HOST_NIDL).map_err(|error| {
+    let parsed_contract = nexa_contract::parse(CONSOLE_HOST_NIDL).map_err(|error| {
         ReplSessionError::Internal(format!("invalid built-in Console NIDL: {error}"))
     })?;
     let contract = HostContractInput::with_source(
@@ -2079,7 +2079,7 @@ fn initialize_runtime(
         .compile_repl_seed_with_contract(&contract, nexa_verifier::VerifierLimits::default())?;
     let registry = ConsoleRegistry::new(&parsed_contract, console)?;
     let contract_runtime_id = contract.runtime_id();
-    let contract_fingerprint = nexa_idl::abi_descriptor(&parsed_contract).fingerprint;
+    let contract_fingerprint = nexa_contract::abi_descriptor(&parsed_contract).fingerprint;
     let runtime_host = RuntimeHost::new(32);
     let mut realm = RealmRuntime::hosted(
         RealmConfig {

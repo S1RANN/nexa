@@ -70,7 +70,7 @@ fn export_compiled_task(
 
 #[test]
 fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse(
         r"
             contract BranchRootMap {
                 nexa {
@@ -116,7 +116,7 @@ fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
         "a reference initialized on only one predecessor is dead after the join"
     );
 
-    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
+    let contract_runtime_id = nexa_contract::contract_runtime_id(&contract);
     let schema = verified.module().state_schema_fingerprint;
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let module = realm
@@ -191,7 +191,7 @@ impl HostRegistry for HandleHost {
 
 #[test]
 fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse(
         r"
             contract RootMapHost {
                 handle Ticket;
@@ -235,8 +235,8 @@ fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
         "Host handles are registry-owned scalar slots, not GC references"
     );
 
-    let contract_fingerprint = nexa_idl::contract_fingerprint(&contract);
-    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
+    let contract_fingerprint = nexa_contract::contract_fingerprint(&contract);
+    let contract_runtime_id = nexa_contract::contract_runtime_id(&contract);
     assert_eq!(
         contract_runtime_id,
         nexa_runtime::contract_runtime_id_from_fingerprint(contract_fingerprint.into_bytes())
@@ -515,7 +515,7 @@ fn nested_call_realm(verified: VerifiedModule) -> (RealmRuntime, nexa_runtime::M
 
 #[test]
 fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
-    let contract = nexa_idl::parse(
+    let contract = nexa_contract::parse(
         r"
             contract DeferRootMap {
                 nexa {
@@ -567,7 +567,7 @@ fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
             .all(|is_root| !is_root),
         "the branch-only register is dead at the join; only the defer record owns the string"
     );
-    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
+    let contract_runtime_id = nexa_contract::contract_runtime_id(&contract);
     let schema = verified.module().state_schema_fingerprint;
 
     let mut realm = RealmRuntime::isolated(RealmConfig::default());

@@ -789,7 +789,7 @@ fn exercise_a_activation(artifact: &CompiledPackageArtifact, contract: &nexa::Va
 
 #[test]
 fn realm_v6_fixtures_cross_the_canonical_pipeline_and_execute_in_realm() {
-    let parsed_contract = nexa::parse_nidl(HOST_SOURCE).expect("realm v6 Host NIDL");
+    let parsed_contract = nexa::parse_contract(HOST_SOURCE).expect("realm v6 Host NIDL");
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(HOST_URI),

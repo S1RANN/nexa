@@ -74,7 +74,7 @@ fn source_set(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn static_library_host_reference_defines_the_effective_contract() {
-    let parsed_contract = nexa::parse_nidl(CONTRACT_SOURCE).expect("fixture NIDL");
+    let parsed_contract = nexa::parse_contract(CONTRACT_SOURCE).expect("fixture NIDL");
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(

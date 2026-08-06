@@ -29,7 +29,7 @@ impl CandidateBuildContext {
     pub fn new(host_contract: impl Into<Vec<u8>>) -> Self {
         let host_contract = host_contract.into();
         if let Ok(source) = std::str::from_utf8(&host_contract)
-            && let Ok(idl) = nexa::parse_nidl(source)
+            && let Ok(idl) = nexa::parse_contract(source)
         {
             let contract = nexa::HostContractInput::canonical(&idl);
             return Self {
@@ -172,7 +172,7 @@ pub(crate) fn resolve_application_candidates(
 
         let host_source = std::str::from_utf8(&build.host_contract)
             .map_err(|error| PackageSourceError::HostContract(error.to_string()))?;
-        let host_contract = nexa::parse_nidl(host_source)
+        let host_contract = nexa::parse_contract(host_source)
             .map_err(|error| PackageSourceError::HostContract(error.to_string()))?;
         let host_contract_input = nexa::HostContractInput::with_source(
             &host_contract,

@@ -129,7 +129,7 @@ fn function_signature(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_build_preserves_host_nominals_and_async_result_arms() {
-    let parsed_contract = nexa::parse_nidl(HOST).expect("fixture NIDL");
+    let parsed_contract = nexa::parse_contract(HOST).expect("fixture NIDL");
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(HOST_URI),

@@ -1799,7 +1799,7 @@ fn validate_frozen_versions(
         ),
         (
             "crates/nexa-idl/src/descriptor.rs",
-            "pub const NIDL_SYNTAX_VERSION: u16 = 2;",
+            "pub const CONTRACT_SYNTAX_VERSION: u16 = 2;",
         ),
         (
             "crates/nexa-runtime/src/host.rs",
@@ -2201,7 +2201,7 @@ fn negative_test_evidence(path: &str, test: &str, source: &str) -> bool {
         ) => &[
             "let removed = [",
             "for (name, source) in removed",
-            "nexa_idl::parse(source).is_err()",
+            "nexa_contract::parse(source).is_err()",
             "interface Old",
             "opaque Ticket",
             "sync fn ping",

@@ -525,7 +525,7 @@ fn resolved_fixture(
 fn console_contract_input() -> HostContractInput<'static> {
     static MODEL: OnceLock<nexa::ValidatedContract> = OnceLock::new();
     let model = MODEL.get_or_init(|| {
-        nexa::parse_nidl(nexa::CONSOLE_HOST_NIDL).expect("built-in Console contract")
+        nexa::parse_contract(nexa::CONSOLE_HOST_NIDL).expect("built-in Console contract")
     });
     HostContractInput::with_source(
         model,
@@ -538,7 +538,7 @@ fn console_contract_input() -> HostContractInput<'static> {
 fn engine_contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let model = nexa::parse_nidl(ENGINE_CONTRACT_SOURCE).expect("WP98 Engine Host contract");
+        let model = nexa::parse_contract(ENGINE_CONTRACT_SOURCE).expect("WP98 Engine Host contract");
         let descriptor = nexa::abi_descriptor(&model);
         let fingerprint = descriptor.fingerprint.into_bytes();
         let descriptor = Box::leak(descriptor.bytes.into_boxed_slice());

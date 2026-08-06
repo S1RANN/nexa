@@ -62,7 +62,7 @@ impl HostRegistry for Registry {
 fn host_function_authority() -> HostFunctionAuthority {
     HOST_AUTHORITY
         .get_or_init(|| {
-            let contract = nexa::parse_nidl(IDL_SOURCE).expect("freshness test NIDL");
+            let contract = nexa::parse_contract(IDL_SOURCE).expect("freshness test NIDL");
             let model = nexa::BindingModel::from_contract(&contract)
                 .expect("freshness Contract runtime binding model");
             let function = model
@@ -495,7 +495,7 @@ struct FreshnessReport {
 fn contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let contract = nexa::parse_nidl(IDL_SOURCE).expect("freshness test IDL");
+        let contract = nexa::parse_contract(IDL_SOURCE).expect("freshness test IDL");
         let run = contract
             .nexa_functions
             .iter()

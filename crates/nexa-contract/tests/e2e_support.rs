@@ -19,11 +19,11 @@ use std::fmt::Write as _;
 
 #[test]
 fn changed_binding_executes_through_generated_registry() {
-    let base_idl = nexa_idl::parse(include_str!("base_contract.nidl")).expect("base NIDL");
-    let changed_idl = nexa_idl::parse(include_str!("contract.nidl")).expect("changed NIDL");
+    let base_idl = nexa_contract::parse(include_str!("base_contract.nidl")).expect("base NIDL");
+    let changed_idl = nexa_contract::parse(include_str!("contract.nidl")).expect("changed NIDL");
     assert_eq!(
         CONTRACT_RUNTIME_ID,
-        nexa_idl::contract_runtime_id(&changed_idl)
+        nexa_contract::contract_runtime_id(&changed_idl)
     );
     let base_source = include_str!("base_module.nexa");
     let changed_source = include_str!("module.nexa");
@@ -36,7 +36,7 @@ fn changed_binding_executes_through_generated_registry() {
     let changed_state_schema_fingerprint = changed_module.module().state_schema_fingerprint;
     let affected_stable_id = {
         let binding_model =
-            nexa_idl::BindingModel::from_contract(&changed_idl).expect("changed binding model");
+            nexa_contract::BindingModel::from_contract(&changed_idl).expect("changed binding model");
         let changed_bytecode = changed_module.module();
         assert_eq!(
             changed_bytecode.host_contract_id,
@@ -334,7 +334,7 @@ impl MutationProbe {
                 r"
         assert_eq!(
             affected_function.cancel_policy,
-            nexa_idl::CancelPolicy::CancelTask
+            nexa_contract::CancelPolicy::CancelTask
         );
 ",
             ),
@@ -342,7 +342,7 @@ impl MutationProbe {
                 r"
         assert_eq!(
             affected_function.abandon_policy,
-            nexa_idl::AbandonPolicy::ReturnError
+            nexa_contract::AbandonPolicy::ReturnError
         );
 ",
             ),
@@ -390,7 +390,7 @@ impl MutationProbe {
         }
     }
 
-    fn registry_probe(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn registry_probe(self, contract: &nexa_contract::ValidatedContract) -> String {
         if matches!(self, Self::EntrypointAddition) {
             return String::new();
         }
@@ -512,7 +512,7 @@ impl MutationProbe {
         }
     }
 
-    fn registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         match self {
             Self::FunctionRename
             | Self::ReturnTypeChange
@@ -562,7 +562,7 @@ impl MutationProbe {
         }
     }
 
-    fn enum_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn enum_registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         let (enum_name, variant_name, payload, expectation) = match self {
             Self::EnumVariantRename => (
                 "AnimationError",
@@ -612,7 +612,7 @@ impl MutationProbe {
         )
     }
 
-    fn struct_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+    fn struct_registry_arguments(self, contract: &nexa_contract::ValidatedContract) -> String {
         let (struct_name, values, expectation) = match self {
             Self::StructFieldRename => (
                 "EnemyView",
@@ -962,7 +962,7 @@ fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
     assert_eq!(mutations.len(), 20);
     for mutation in mutations {
         assert_ne!(mutation.mutated_nidl, BASE_NIDL, "{}", mutation.name);
-        nexa_idl::parse(&mutation.mutated_nidl)
+        nexa_contract::parse(&mutation.mutated_nidl)
             .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
     }
 }
@@ -1179,7 +1179,7 @@ pub fn artifact_root() -> PathBuf {
 pub fn prepare_case(
     root: &Path,
     mutation: &MutationCase,
-    changed_contract: &nexa_idl::ValidatedContract,
+    changed_contract: &nexa_contract::ValidatedContract,
     base_generated: &str,
     changed_generated: &str,
 ) -> PathBuf {

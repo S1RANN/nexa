@@ -1,4 +1,4 @@
-//! Structured Rust binding generation for validated NIDL v2 contracts.
+//! Structured Rust binding generation for validated Contracts.
 //!
 //! The backend deliberately operates on [`BindingModel`] instead of syntax or AST nodes. Every
 //! Rust fragment is constructed as a [`TokenStream`], parsed as a complete [`syn::File`], formatted
@@ -15,7 +15,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::descriptor::{
-    ABI_DESCRIPTOR_VERSION, EffectiveContractSelection, NIDL_SYNTAX_VERSION, abi_descriptor,
+    ABI_DESCRIPTOR_VERSION, EffectiveContractSelection, CONTRACT_SYNTAX_VERSION, abi_descriptor,
     effective_contract_fingerprint,
 };
 use crate::model::{
@@ -229,7 +229,7 @@ impl fmt::Display for CodegenError {
             ),
             Self::UnknownNamedType { name, span } => write!(
                 formatter,
-                "unknown NIDL type `{name}` at bytes {}..{}",
+                "unknown Contract type `{name}` at bytes {}..{}",
                 span.start, span.end
             ),
             Self::InvalidTypedHandle { kind, span } => write!(
@@ -950,7 +950,7 @@ fn generate_contract_header(model: &BindingModel) -> TokenStream {
     let contract_runtime_id = model.contract_runtime_id.0;
     let contract_name = &model.identity.source_name;
     let source_text = &model.source_text;
-    let nidl_syntax_version = NIDL_SYNTAX_VERSION;
+    let contract_syntax_version = CONTRACT_SYNTAX_VERSION;
     let abi_descriptor_version = ABI_DESCRIPTOR_VERSION;
     quote! {
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1067,7 +1067,7 @@ fn generate_contract_header(model: &BindingModel) -> TokenStream {
         }
 
         pub const CONTRACT_SOURCE_NAME: &str = #contract_name;
-        pub const NIDL_SYNTAX_VERSION: u16 = #nidl_syntax_version;
+        pub const CONTRACT_SYNTAX_VERSION: u16 = #contract_syntax_version;
         pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;
         pub const ABI_DESCRIPTOR_VERSION: u16 = #abi_descriptor_version;
         pub const CONTRACT_FINGERPRINT: [u8; 32] = [#(#fingerprint),*];
@@ -2602,7 +2602,7 @@ fn generate_host_surface(model: &BindingModel) -> Result<TokenStream, CodegenErr
             .enumerate()
             .map(|(index, function)| {
                 let stable_id = function.identity.stable_id.0;
-                let slot = u32::try_from(index).expect("NIDL host function count fits u32");
+                let slot = u32::try_from(index).expect("Contract host function count fits u32");
                 quote!(
                     nexa_runtime::StableId(#stable_id) =>
                     ::std::option::Option::Some(
@@ -2934,7 +2934,7 @@ fn generate_host_dispatch_arm(
     index: usize,
     function: &BindingFunction,
 ) -> Result<TokenStream, CodegenError> {
-    let slot = u32::try_from(index).expect("NIDL host function count fits u32");
+    let slot = u32::try_from(index).expect("Contract host function count fits u32");
     let method_ident = &function.identity.rust_ident;
     let arity = function.parameters.len();
     let arity_mismatch = if arity == 0 {
