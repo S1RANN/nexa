@@ -3,10 +3,10 @@
     {
       "name": "nexa_idl",
       "camelcase": "NexaIdl",
-      "scope": "source.nexa-idl",
+      "scope": "source.nexa-contract",
       "path": ".",
       "file-types": [
-        "nidl"
+        "contract.nexa"
       ],
       "highlights": [
         "queries/highlights.scm"
@@ -16,7 +16,7 @@
   "metadata": {
     "version": "0.2.0",
     "license": "MIT OR Apache-2.0",
-    "description": "Tree-sitter grammar for NIDL v2 contracts.",
+    "description": "Tree-sitter grammar for Host Contract files (Contract syntax v3).",
     "authors": [
       {
         "name": "Nexa Contributors"

@@ -58,15 +58,15 @@ const nexaExamples = [
   "examples/snake-game/packages/mods/weird-foods/src/snake/weird_foods.nexa",
 ];
 const nidlExamples = [
-  "editors/fixtures/m4-language.nidl",
-  "editors/fixtures/nidl-comment-invalid.nidl",
-  "editors/fixtures/nidl-enum-comment-invalid.nidl",
+  "editors/fixtures/m4-language.contract.nexa",
+  "editors/fixtures/nexa-contract-comment-invalid.contract.nexa",
+  "editors/fixtures/nexa-contract-enum-comment-invalid.contract.nexa",
   "examples/combat-runtime/combat_api.nidl",
   "examples/game.nidl",
   "examples/hello-runtime/hello_api.nidl",
   "examples/language-scale/language_scale.nidl",
   "examples/snake-game/snake_api.nidl",
-  "crates/nexa-idl/tests/fixtures/business_host/contract.nidl",
+  "crates/nexa-contract/tests/fixtures/business_host/contract.nidl",
 ];
 
 const queryChecks = [
@@ -103,31 +103,31 @@ const queryChecks = [
   [
     idlGrammarDirectory,
     "tree-sitter-nexa-idl/queries/highlights.scm",
-    "editors/fixtures/m4-language.nidl",
+    "editors/fixtures/m4-language.contract.nexa",
     ["keyword", "function", "type", "type.builtin", "attribute"],
   ],
   [
     idlGrammarDirectory,
-    "zed/languages/nexa-idl/highlights.scm",
-    "editors/fixtures/m4-language.nidl",
+    "zed/languages/nexa-contract/highlights.scm",
+    "editors/fixtures/m4-language.contract.nexa",
     ["keyword", "function", "type", "type.builtin", "attribute"],
   ],
   [
     idlGrammarDirectory,
-    "zed/languages/nexa-idl/indents.scm",
-    "editors/fixtures/m4-language.nidl",
+    "zed/languages/nexa-contract/indents.scm",
+    "editors/fixtures/m4-language.contract.nexa",
     ["indent", "end"],
   ],
   [
     idlGrammarDirectory,
-    "zed/languages/nexa-idl/brackets.scm",
-    "editors/fixtures/m4-language.nidl",
+    "zed/languages/nexa-contract/brackets.scm",
+    "editors/fixtures/m4-language.contract.nexa",
     ["open", "close"],
   ],
   [
     idlGrammarDirectory,
-    "zed/languages/nexa-idl/outline.scm",
-    "editors/fixtures/m4-language.nidl",
+    "zed/languages/nexa-contract/outline.scm",
+    "editors/fixtures/m4-language.contract.nexa",
     ["item", "name", "context"],
   ],
 ];
@@ -181,9 +181,9 @@ function validateJsonFiles() {
     "tree-sitter-nexa-idl/src/node-types.json",
     "vscode/package.json",
     "vscode/language-configuration/nexa.json",
-    "vscode/language-configuration/nexa-idl.json",
+    "vscode/language-configuration/nexa-contract.json",
     "vscode/syntaxes/nexa.tmLanguage.json",
-    "vscode/syntaxes/nexa-idl.tmLanguage.json",
+    "vscode/syntaxes/nexa-contract.tmLanguage.json",
   ];
   for (const file of files) {
     parseJson(path.join(editorsDirectory, file));
@@ -223,7 +223,7 @@ function validateContributions() {
   for (const required of [
     "BUILD_INPUT_GLOB",
     "*.nexa",
-    "*.nidl",
+    "*.contract.nexa",
     "package.toml",
     "nexa.lock",
     "nexa.dev.toml",
@@ -251,8 +251,8 @@ function validateContributions() {
     "VS Code Nexa language contribution is invalid",
   );
   assert(
-    languages.get("nexa-idl")?.extensions?.includes(".nidl"),
-    "VS Code Nexa IDL language contribution is invalid",
+    languages.get("nexa-contract")?.extensions?.includes(".contract.nexa"),
+    "VS Code Nexa Contract language contribution is invalid",
   );
 
   const grammars = new Map(
@@ -266,8 +266,8 @@ function validateContributions() {
     "VS Code Nexa scope is invalid",
   );
   assert(
-    grammars.get("nexa-idl") === "source.nexa-idl",
-    "VS Code Nexa IDL scope is invalid",
+    grammars.get("nexa-contract") === "source.nexa-contract",
+    "VS Code Nexa Contract scope is invalid",
   );
 
   const nexaConfig = parseJson(
@@ -280,18 +280,18 @@ function validateContributions() {
     "Nexa must register its line and block comments",
   );
   const nidlConfig = parseJson(
-    path.join(vscodeDirectory, "language-configuration", "nexa-idl.json"),
+    path.join(vscodeDirectory, "language-configuration", "nexa-contract.json"),
   );
   assert(
     nidlConfig.comments?.lineComment === "//" &&
       nidlConfig.comments?.blockComment?.[0] === "/*" &&
       nidlConfig.comments?.blockComment?.[1] === "*/",
-    "NIDL must register its v2 line, block, and documentation comments",
+    "Contract must register its line, block, and documentation comments",
   );
 
   for (const [language, config] of [
     ["nexa", nexaConfig],
-    ["nexa-idl", nidlConfig],
+    ["nexa-contract", nidlConfig],
   ]) {
     const configuredPairs = [
       ...config.brackets,
@@ -319,16 +319,16 @@ function validateZedFiles() {
   );
 
   const idlSource = read(
-    path.join(zedDirectory, "languages", "nexa-idl", "config.toml"),
+    path.join(zedDirectory, "languages", "nexa-contract", "config.toml"),
   );
   const idlConfig = TOML.parse(idlSource);
   assert(
     idlConfig.grammar === "nexa_idl",
-    "Nexa IDL must use grammar nexa_idl",
+    "Nexa Contract must use grammar nexa_idl",
   );
   assert(
     idlConfig.line_comments?.includes("// "),
-    "Nexa IDL must register v2 line and documentation comments",
+    "Nexa Contract must register line and documentation comments",
   );
 
   const manifest = TOML.parse(renderZedManifest());
@@ -348,7 +348,7 @@ function validateZedFiles() {
   );
   assert(
     manifest.language_servers?.nexa?.languages?.includes("Nexa") &&
-      manifest.language_servers?.nexa?.languages?.includes("Nexa IDL"),
+      manifest.language_servers?.nexa?.languages?.includes("Nexa Contract"),
     "Zed must attach the Nexa language server to both languages",
   );
   assert(
@@ -478,7 +478,7 @@ function validateSyntaxContract() {
     path.join(vscodeDirectory, "syntaxes", "nexa.tmLanguage.json"),
   );
   const idlTextMate = parseJson(
-    path.join(vscodeDirectory, "syntaxes", "nexa-idl.tmLanguage.json"),
+    path.join(vscodeDirectory, "syntaxes", "nexa-contract.tmLanguage.json"),
   );
   assert(
     Object.hasOwn(nexaTextMate.repository, "comments"),
@@ -486,7 +486,7 @@ function validateSyntaxContract() {
   );
   assert(
     Object.hasOwn(idlTextMate.repository, "comments"),
-    "NIDL TextMate grammar must define comments",
+    "Contract TextMate grammar must define comments",
   );
   assert(
     read(
@@ -496,11 +496,11 @@ function validateSyntaxContract() {
         path.join(
           zedDirectory,
           "languages",
-          "nexa-idl",
+          "nexa-contract",
           "highlights.scm",
         ),
       ).includes("(doc_comment) @comment.documentation"),
-    "NIDL documentation comments must be highlighted in Tree-sitter and Zed",
+    "Contract documentation comments must be highlighted in Tree-sitter and Zed",
   );
   const operatorPatterns = nexaTextMate.repository.operators.patterns.map(
     (pattern) => pattern.match,
@@ -524,8 +524,8 @@ async function validateTextMateTokenization() {
       path.join(vscodeDirectory, "syntaxes", "nexa.tmLanguage.json"),
     ],
     [
-      "source.nexa-idl",
-      path.join(vscodeDirectory, "syntaxes", "nexa-idl.tmLanguage.json"),
+      "source.nexa-contract",
+      path.join(vscodeDirectory, "syntaxes", "nexa-contract.tmLanguage.json"),
     ],
   ]);
   const registry = new Registry({
@@ -556,9 +556,9 @@ async function validateTextMateTokenization() {
       ],
     },
     {
-      scopeName: "source.nexa-idl",
+      scopeName: "source.nexa-contract",
       line: "async fn load_profile(id: string) -> Result<Profile, LoadError>;",
-      operators: [["->", "keyword.operator.arrow.nexa-idl"]],
+      operators: [["->", "keyword.operator.arrow.nexa-contract"]],
     },
   ];
 

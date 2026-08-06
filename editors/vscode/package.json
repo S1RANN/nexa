@@ -1,7 +1,7 @@
 {
   "name": "nexa-language-support",
   "displayName": "Nexa Language Support",
-  "description": "Syntax highlighting, structural editing, and diagnostics for Nexa v2 and NIDL v2.",
+  "description": "Syntax highlighting, structural editing, and diagnostics for Nexa v2 and Host Contracts.",
   "version": "0.2.0",
   "publisher": "s1rann",
   "license": "MIT OR Apache-2.0",
@@ -16,7 +16,7 @@
   "main": "./extension.js",
   "activationEvents": [
     "onLanguage:nexa",
-    "onLanguage:nexa-idl",
+    "onLanguage:nexa-contract",
     "onCommand:nexa.restartLanguageServer"
   ],
   "categories": [
@@ -24,7 +24,7 @@
   ],
   "keywords": [
     "nexa",
-    "nidl",
+    "contract",
     "language",
     "syntax"
   ],
@@ -62,16 +62,16 @@
         "configuration": "./language-configuration/nexa.json"
       },
       {
-        "id": "nexa-idl",
+        "id": "nexa-contract",
         "aliases": [
-          "Nexa IDL",
-          "NIDL",
-          "nidl"
+          "Nexa Contract",
+          "contract",
+          "nexa"
         ],
         "extensions": [
-          ".nidl"
+          ".contract.nexa"
         ],
-        "configuration": "./language-configuration/nexa-idl.json"
+        "configuration": "./language-configuration/nexa-contract.json"
       }
     ],
     "grammars": [
@@ -81,9 +81,9 @@
         "path": "./syntaxes/nexa.tmLanguage.json"
       },
       {
-        "language": "nexa-idl",
-        "scopeName": "source.nexa-idl",
-        "path": "./syntaxes/nexa-idl.tmLanguage.json"
+        "language": "nexa-contract",
+        "scopeName": "source.nexa-contract",
+        "path": "./syntaxes/nexa-contract.tmLanguage.json"
       }
     ]
   }

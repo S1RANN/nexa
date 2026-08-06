@@ -32,11 +32,17 @@ module.exports = grammar({
 
     nidl_document: ($) =>
       seq(
+        field("header", $.contract_header),
+        repeat($.contract_member),
+      ),
+
+    // Contract Syntax v3 (flat): `contract <Name>;` is the file-level header, then
+    // struct/enum/handle/host/nexa items follow at the top level with no outer block.
+    contract_header: ($) =>
+      seq(
         field("keyword", $.contract_keyword),
         field("name", $.nidl_type_identifier),
-        "{",
-        repeat($.contract_member),
-        "}",
+        ";",
       ),
 
     contract_member: ($) =>

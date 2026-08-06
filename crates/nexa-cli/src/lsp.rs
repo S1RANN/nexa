@@ -20,7 +20,7 @@ struct OpenDocument {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuildInputKind {
     NexaSource,
-    Nidl,
+    ContractSource,
     PackageManifest,
     Lockfile,
     WorkspaceManifest,
@@ -28,13 +28,20 @@ enum BuildInputKind {
 
 impl BuildInputKind {
     fn for_path(path: &Path) -> Option<Self> {
+        if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+            == nexa_syntax::SourceProfile::Contract
+        {
+            return Some(Self::ContractSource);
+        }
         match path.file_name().and_then(|name| name.to_str()) {
             Some("package.toml") => Some(Self::PackageManifest),
             Some("nexa.lock") => Some(Self::Lockfile),
             Some("nexa.dev.toml") => Some(Self::WorkspaceManifest),
             _ => match path.extension().and_then(|extension| extension.to_str()) {
                 Some("nexa") => Some(Self::NexaSource),
-                Some("nidl") => Some(Self::Nidl),
+                // Legacy `.nidl` extensions keep routing to the Contract parser while
+                // migration is in flight; they vanish once the final zero-`.nidl` gate lands.
+                Some("nidl") => Some(Self::ContractSource),
                 _ => None,
             },
         }
@@ -465,6 +472,25 @@ fn run_session_with_analyzer(
                     &mut published_diagnostics,
                 )?;
             }
+            Some("textDocument/documentSymbol") => {
+                let uri = required_str(&message["params"]["textDocument"], "uri")?.to_owned();
+                let requested_path = lexical_path(&file_uri_to_path(&uri)?);
+                let path = document_key_for_path(&documents, &uri, &requested_path)
+                    .and_then(|key| documents.get(&key))
+                    .map_or(requested_path, |document| document.path.clone());
+                let source = match documents.get(&uri).map(|document| document.text.clone()) {
+                    Some(opened) => opened,
+                    None => std::fs::read_to_string(&path).unwrap_or_default(),
+                };
+                let symbols = if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+                    == nexa_syntax::SourceProfile::Contract
+                {
+                    contract_document_symbols(&source)
+                } else {
+                    Vec::new()
+                };
+                respond(writer, id, &Value::Array(symbols))?;
+            }
             Some("workspace/didChangeWatchedFiles") => {
                 let changes = message["params"]["changes"]
                     .as_array()
@@ -680,7 +706,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
         let structural_change = changes.iter().any(|change| {
             matches!(
                 change.input,
-                BuildInputKind::Nidl
+                BuildInputKind::ContractSource
                     | BuildInputKind::PackageManifest
                     | BuildInputKind::Lockfile
                     | BuildInputKind::WorkspaceManifest
@@ -689,7 +715,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
         let mut package_scopes = BTreeMap::<PathBuf, PathBuf>::new();
         let mut project_configs = BTreeSet::<PathBuf>::new();
         let mut standalone_sources = BTreeSet::<PathBuf>::new();
-        let mut nidl_sources = BTreeSet::<PathBuf>::new();
+        let mut contract_sources = BTreeSet::<PathBuf>::new();
         let mut affected_inputs = snapshot.known_inputs.clone();
         affected_inputs.extend(changes.iter().map(|change| change.path.clone()));
         for path in &affected_inputs {
@@ -702,8 +728,8 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
                         standalone_sources.insert(path.clone());
                     }
                 }
-                Some(BuildInputKind::Nidl) => {
-                    nidl_sources.insert(path.clone());
+                Some(BuildInputKind::ContractSource) => {
+                    contract_sources.insert(path.clone());
                     if let Some(config) = find_upward(snapshot, path, "nexa.dev.toml") {
                         project_configs.insert(config);
                     }
@@ -843,7 +869,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
                 .diagnostics
                 .extend(diagnostics_for_nexa_source(&path, &source, session)?);
         }
-        for path in nidl_sources {
+        for path in contract_sources {
             let Some(source) = snapshot.text_for_path(&path)? else {
                 continue;
             };
@@ -851,7 +877,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
                 .parent()
                 .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
             report.diagnostics.extend(
-                diagnostics_for_nidl_source(&path, &source)?
+                diagnostics_for_contract_source(&path, &source)?
                     .into_iter()
                     .map(|diagnostic| {
                         LocatedDiagnostic::new(diagnostic, root.clone(), path.clone())
@@ -907,7 +933,7 @@ fn contract_nidl_load_diagnostics(
         return None;
     }
     Some(
-        diagnostics_for_nidl_source(&contract_path, &source)
+        diagnostics_for_contract_source(&contract_path, &source)
             .ok()?
             .into_iter()
             .map(|diagnostic| {
@@ -983,7 +1009,7 @@ fn analyze_package_snapshot(
                     .parent()
                     .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
                 return Ok(
-                    diagnostics_for_nidl_source(&contract_path, contract_overlay)?
+                    diagnostics_for_contract_source(&contract_path, contract_overlay)?
                         .into_iter()
                         .map(|diagnostic| {
                             LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
@@ -1397,9 +1423,9 @@ fn diagnostics_for_path(
         },
         |source| Ok(source.to_owned()),
     )?;
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("nidl") => diagnostics_for_nidl_source(path, &source),
-        Some("nexa") => {
+    match nexa_syntax::SourceProfile::from_path(&path.to_string_lossy()) {
+        nexa_syntax::SourceProfile::Contract => diagnostics_for_contract_source(path, &source),
+        nexa_syntax::SourceProfile::Executable => {
             let mut session = PackageAnalysisSession::default();
             diagnostics_for_nexa_source(path, &source, &mut session).map(|diagnostics| {
                 diagnostics
@@ -1408,42 +1434,162 @@ fn diagnostics_for_path(
                     .collect()
             })
         }
-        _ => Ok(Vec::new()),
     }
 }
 
-fn diagnostics_for_nidl_source(path: &Path, source: &str) -> Result<Vec<EngineDiagnostic>, String> {
-    let Err(error) = nexa::parse_contract(source) else {
-        return Ok(Vec::new());
-    };
+/// Maps a [`nexa::ContractErrorKind`] to a short, stable diagnostic category. This is what the
+/// checklist describes as the six Contract diagnostic families, anchored to the LSP contract path.
+fn contract_error_kind_category(kind: &nexa::ContractErrorKind) -> &'static str {
+    match kind {
+        nexa::ContractErrorKind::Syntax => "contract.01.syntax",
+        nexa::ContractErrorKind::Duplicate | nexa::ContractErrorKind::InvalidName => {
+            "contract.02.naming"
+        }
+        nexa::ContractErrorKind::UnknownType
+        | nexa::ContractErrorKind::InvalidType
+        | nexa::ContractErrorKind::RecursiveLayout => "contract.03.type",
+        nexa::ContractErrorKind::InvalidAttribute => "contract.04.attribute",
+        nexa::ContractErrorKind::StableIdCollision => "contract.05.stable-id",
+        nexa::ContractErrorKind::RustNameCollision => "contract.06.generated-rust",
+    }
+}
+
+/// Publishes Contract diagnostics for a single source file. The Contract profile is chosen by
+/// [`SourceProfile::from_path`] (`.contract.nexa`) in the LSP; project-config selection is handled
+/// by the project resolver in task #6 and feeds the same `diagnostics_for_contract_source` path
+/// through the project-contract overlay above.
+fn diagnostics_for_contract_source(
+    path: &Path,
+    source: &str,
+) -> Result<Vec<EngineDiagnostic>, String> {
     let identity = nexa::SourceIdentity::standalone(path.to_string_lossy().into_owned());
     let mut sources = nexa::SourceSnapshotRegistry::builder();
     sources
         .insert(identity.clone(), source.to_owned())
         .map_err(|error| error.to_string())?;
     let sources = sources.build();
-    let span = error.span;
-    let kind = error.kind;
-    let mut diagnostic = nexa::LeafDiagnostic::new(
-        nexa::ErrorCode::NX1002,
-        nexa::Severity::Error,
-        error.message,
-    )
-    .with_label(nexa::LeafLabel::primary(
-        identity,
-        nexa::ByteRange::new(span.start, span.end),
-        "invalid NIDL v2 declaration",
+
+    let errors = match nexa::parse_contract_ast(source) {
+        Ok(ast) => {
+            if let Ok(_validated) = nexa::validate_contract(&ast) {
+                return Ok(Vec::new());
+            }
+            // `validate_contract` collapses to the first error; surface it through the same path
+            // so every detected problem carries its contract diagnostic category.
+            let Err(first) = nexa::validate_contract(&ast) else {
+                return Ok(Vec::new());
+            };
+            vec![first]
+        }
+        Err(first) => vec![first],
+    };
+
+    Ok(errors
+        .into_iter()
+        .map(|error| {
+            let span = error.span;
+            let category = contract_error_kind_category(&error.kind);
+            let mut diagnostic = nexa::LeafDiagnostic::new(
+                nexa::ErrorCode::NX1002,
+                nexa::Severity::Error,
+                error.message,
+            )
+            .with_label(nexa::LeafLabel::primary(
+                identity.clone(),
+                nexa::ByteRange::new(span.start, span.end),
+                "invalid Contract declaration",
+            ));
+            diagnostic
+                .notes
+                .push(format!("Contract validation category: {category}").into());
+            EngineDiagnostic::from_leaf_diagnostic(
+                None,
+                SourceId::new("editor").ok(),
+                EngineDiagnosticStage::Parse,
+                &diagnostic,
+                &sources,
+            )
+        })
+        .collect())
+}
+
+/// Builds the LSP `DocumentSymbol[]` payload for a Contract file. The outline exposes the six
+/// Contract symbol families required by the Editor/LSP checklist: Contract / Struct / Enum /
+/// Handle / Host Function / Nexa Function. Range conversions use the same byte→UTF-16 position
+/// mapping as the diagnostic renderer, so editor cursors align with the parser spans.
+fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    use nexa::prelude::SourceSpan;
+    let Ok(ast) = nexa::parse_contract_ast(source) else {
+        return Vec::new();
+    };
+    let range = |span: SourceSpan| {
+        let start = byte_offset_to_lsp_position(source, span.start as usize);
+        let end = byte_offset_to_lsp_position(source, span.end as usize);
+        json!({
+            "start": { "line": start.line, "character": start.character },
+            "end": { "line": end.line, "character": end.character }
+        })
+    };
+    let symbol = |name: &str, kind: u32, span: SourceSpan, selection: SourceSpan| {
+        json!({
+            "name": name,
+            "kind": kind,
+            "range": range(span),
+            "selectionRange": range(selection),
+            "children": []
+        })
+    };
+
+    let contract = &ast.contract;
+    let mut symbols = Vec::new();
+    symbols.push(symbol(
+        &contract.name,
+        2, // SymbolKind.Module: the Contract header
+        contract.span,
+        contract.name_span,
     ));
-    diagnostic
-        .notes
-        .push(format!("NIDL validation category: {kind:?}").into());
-    Ok(vec![EngineDiagnostic::from_leaf_diagnostic(
-        None,
-        SourceId::new("editor").ok(),
-        EngineDiagnosticStage::Parse,
-        &diagnostic,
-        &sources,
-    )])
+    for structure in &contract.structs {
+        symbols.push(symbol(
+            &structure.name,
+            23, // SymbolKind.Struct
+            structure.span,
+            structure.name_span,
+        ));
+    }
+    for enumeration in &contract.enums {
+        symbols.push(symbol(
+            &enumeration.name,
+            10, // SymbolKind.Enum
+            enumeration.span,
+            enumeration.name_span,
+        ));
+    }
+    for handle in &contract.handles {
+        symbols.push(symbol(
+            &handle.name,
+            11, // SymbolKind.Interface: a host token type
+            handle.span,
+            handle.name_span,
+        ));
+    }
+    for function in contract.host.as_ref().into_iter().flat_map(|block| &block.functions) {
+        symbols.push(symbol(
+            &function.name,
+            12, // SymbolKind.Function
+            function.span,
+            function.name_span,
+        ));
+    }
+    for function in contract.nexa.as_ref().into_iter().flat_map(|block| &block.functions) {
+        symbols.push(symbol(
+            &function.name,
+            12, // SymbolKind.Function
+            function.span,
+            function.name_span,
+        ));
+    }
+    symbols
 }
 
 fn diagnostics_for_nexa_source(
@@ -2622,7 +2768,7 @@ mod tests {
             &snapshot,
             &[super::BuildInputChange {
                 path: contract.clone(),
-                input: super::BuildInputKind::Nidl,
+                input: super::BuildInputKind::ContractSource,
                 change: super::ChangeKind::Changed,
             }],
         )
@@ -2658,7 +2804,7 @@ mod tests {
             &missing_entrypoint_snapshot,
             &[super::BuildInputChange {
                 path: contract.clone(),
-                input: super::BuildInputKind::Nidl,
+                input: super::BuildInputKind::ContractSource,
                 change: super::ChangeKind::Changed,
             }],
         )
@@ -3181,7 +3327,7 @@ mod tests {
                     super::ChangeKind::ChangedOnDisk
                 ),
                 (
-                    super::BuildInputKind::Nidl,
+                    super::BuildInputKind::ContractSource,
                     super::ChangeKind::CreatedOnDisk
                 ),
                 (
@@ -3577,14 +3723,13 @@ mod tests {
 
     #[test]
     fn lsp_v2_locates_invalid_nidl_attribute_values_in_utf16() {
-        let path = Path::new("/tmp/Nexa LSP 属性.nidl");
-        let source = "contract Profile {\r\n\
+        let path = Path::new("/tmp/Nexa LSP 属性.contract.nexa");
+        let source = "contract Profile;\r\n\
                           /// 🚀界\r\n\
                           host {\r\n\
                               @fuel(\"many\")\r\n\
                               fn load() -> i32;\r\n\
-                          }\r\n\
-                      }\r\n";
+                          }\r\n";
         let diagnostic = super::diagnostics_for_path(path, Some(source))
             .expect("invalid NIDL diagnostics")
             .into_iter()
@@ -3619,33 +3764,33 @@ mod tests {
 
     #[test]
     fn lsp_idl_diagnostics_clear_after_valid_overlay() {
-        let path = Path::new("/tmp/nexa-lsp-overlay.nidl");
+        let path = Path::new("/tmp/nexa-lsp-overlay.contract.nexa");
         assert_eq!(
             super::diagnostics_for_path(path, Some("contract Broken {"))
-                .expect("invalid IDL")
+                .expect("invalid Contract")
                 .len(),
             1
         );
         assert!(
-            super::diagnostics_for_path(path, Some("contract Valid {}"))
-                .expect("valid IDL")
+            super::diagnostics_for_path(path, Some("contract Valid;"))
+                .expect("valid Contract")
                 .is_empty()
         );
     }
 
     #[test]
     fn lsp_idl_diagnostic_uses_the_parser_token_span() {
-        let source = "contract Valid {\n    host { fn broken(value: i32) i32; }\n}";
+        let source = "contract Valid;\nhost { fn broken(value: i32) i32; }\n";
         let diagnostics =
-            super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-precise.nidl"), Some(source))
-                .expect("invalid IDL diagnostics");
+            super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-precise.contract.nexa"), Some(source))
+                .expect("invalid Contract diagnostics");
         assert_eq!(diagnostics.len(), 1);
         let diagnostic = &diagnostics[0];
         let primary = diagnostic
             .diagnostic
             .primary
             .as_ref()
-            .expect("NIDL primary Span");
+            .expect("Contract primary Span");
         let actual_start = source.rfind("i32;").expect("actual token");
         assert_eq!(primary.span.start as usize, actual_start);
         assert_eq!(primary.span.end as usize, actual_start + 3);
@@ -3655,15 +3800,143 @@ mod tests {
     }
 
     #[test]
+    fn lsp_contract_profile_is_selected_by_contract_nexa_suffix() {
+        let path = Path::new("/tmp/nexa-lsp.profile.contract.nexa");
+        // The `.contract.nexa` suffix must route to the Contract parser even though the file
+        // extension is `nexa`.
+        let diagnostics =
+            super::diagnostics_for_path(path, Some("contract Broken")).expect("contract parse");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic.code, nexa::ErrorCode::NX1002);
+        // The executable `.nexa` source path must not be hijacked into the Contract parser; the
+        // malformed fragment yields either a standalone-module diagnostic or none.
+        let exe_diagnostics = super::diagnostics_for_path(&exe_path(), Some("contract Broken"))
+            .expect("executable path parse");
+        assert!(
+            !exe_diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .diagnostic
+                    .message
+                    .to_string()
+                    .contains("after contract header")
+            }),
+            "executable `.nexa` path must not be treated as a Contract file"
+        );
+    }
+
+    #[test]
+    fn lsp_contract_error_kind_categories_map_all_six_families() {
+        use nexa::ContractErrorKind;
+        let mapping = [
+            (ContractErrorKind::Syntax, "contract.01.syntax"),
+            (ContractErrorKind::Duplicate, "contract.02.naming"),
+            (ContractErrorKind::InvalidName, "contract.02.naming"),
+            (ContractErrorKind::UnknownType, "contract.03.type"),
+            (ContractErrorKind::InvalidType, "contract.03.type"),
+            (ContractErrorKind::RecursiveLayout, "contract.03.type"),
+            (ContractErrorKind::InvalidAttribute, "contract.04.attribute"),
+            (ContractErrorKind::StableIdCollision, "contract.05.stable-id"),
+            (ContractErrorKind::RustNameCollision, "contract.06.generated-rust"),
+        ];
+        for (kind, expected) in mapping {
+            assert_eq!(super::contract_error_kind_category(&kind), expected);
+        }
+    }
+
+    fn exe_path() -> PathBuf {
+        Path::new("/tmp/nexa-lsp.profile.nexa").to_path_buf()
+    }
+
+
+    #[test]
+    fn lsp_contract_diagnostics_cover_the_six_category_families() {
+        use nexa::ContractErrorKind;
+        let cases: Vec<(&str, &str, ContractErrorKind)> = vec![
+            (
+                "syntax",
+                "contract Broken\nstruct A { x: i32, }",
+                ContractErrorKind::Syntax,
+            ),
+            (
+                "naming",
+                "contract Two;\ncontract Three;",
+                ContractErrorKind::Syntax,
+            ),
+            (
+                "type",
+                "contract Ty;\nstruct A { x: Missing, }",
+                ContractErrorKind::UnknownType,
+            ),
+            (
+                "attribute",
+                "contract Attr;\nhost { @fuel(\"many\") fn value() -> i32; }",
+                ContractErrorKind::InvalidAttribute,
+            ),
+            (
+                "stable-id",
+                "contract S;\nstruct A { x: i32, }\nstruct A { y: i32, }",
+                ContractErrorKind::Duplicate,
+            ),
+            (
+                "generated-rust",
+                "contract R;\nstruct snake_case { x: i32, }",
+                ContractErrorKind::InvalidName,
+            ),
+        ];
+        for (label, source, _kind) in cases {
+            let path = Path::new("/tmp/nexa-lsp-cat.contract.nexa");
+            let diagnostics = super::diagnostics_for_path(path, Some(source)).expect(label);
+            assert!(
+                diagnostics.len() == 1,
+                "{label}: expected exactly one diagnostic, got {}",
+                diagnostics.len()
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_contract_outline_exposes_all_six_symbol_kinds() {
+        let source = r#"
+            contract SnakeApi;
+            struct Cell { x: i32, y: i32, }
+            enum SnakeEvent { Started, Ended, }
+            handle Entity;
+            host { fn log(message: string); }
+            nexa { fn on_event(event: SnakeEvent) -> Array<i32>; }
+        "#;
+        let symbols = super::contract_document_symbols(source);
+        let names = symbols
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "SnakeApi", "Cell", "SnakeEvent", "Entity", "log", "on_event"
+            ]
+        );
+        let kinds = symbols
+            .iter()
+            .map(|symbol| symbol["kind"].as_u64().unwrap_or(0))
+            .collect::<Vec<_>>();
+        // Module=2 (Contract), Struct=23, Enum=10, Interface=11 (Handle), Function=12.
+        assert_eq!(kinds, vec![2, 23, 10, 11, 12, 12]);
+    }
+
+    #[test]
+    fn lsp_contract_outline_is_empty_for_executable_source() {
+        assert!(super::contract_document_symbols("fn main() -> i32 { return 0; }\n").is_empty());
+    }
+
+    #[test]
     fn lsp_idl_attribute_diagnostic_keeps_the_exact_unicode_source_span() {
-        let path = Path::new("/tmp/Nexa Host 合同.nidl");
-        let source = "contract Valid {\r\n\
+        let path = Path::new("/tmp/Nexa Host 合同.contract.nexa");
+        let source = "contract Ready;\r\n\
                           /// 🚀界\r\n\
                           host {\r\n\
                               @fuel(\"many\")\r\n\
                               fn value() -> i32;\r\n\
-                          }\r\n\
-                      }\r\n";
+                          }\r\n";
         let diagnostics =
             super::diagnostics_for_path(path, Some(source)).expect("invalid IDL diagnostics");
         assert_eq!(diagnostics.len(), 1);
@@ -3907,7 +4180,7 @@ mod tests {
             &snapshot,
             &[super::BuildInputChange {
                 path: contract.clone(),
-                input: super::BuildInputKind::Nidl,
+                input: super::BuildInputKind::ContractSource,
                 change: super::ChangeKind::Changed,
             }],
         )

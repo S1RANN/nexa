@@ -3,9 +3,9 @@ name = "Nexa"
 version = "0.2.0"
 schema_version = 1
 authors = ["Nexa Contributors"]
-description = "Syntax highlighting, outlines, and diagnostics for Nexa v2 and NIDL v2."
+description = "Syntax highlighting, outlines, and diagnostics for Nexa v2 and Host Contracts."
 repository = "https://github.com/S1RANN/nexa"
-languages = ["languages/nexa", "languages/nexa-idl"]
+languages = ["languages/nexa", "languages/nexa-contract"]
 
 [grammars.nexa]
 repository = "{{GRAMMAR_REPOSITORY}}"
@@ -17,8 +17,8 @@ rev = "{{IDL_GRAMMAR_REVISION}}"
 
 [language_servers.nexa]
 name = "Nexa Language Server"
-languages = ["Nexa", "Nexa IDL"]
+languages = ["Nexa", "Nexa Contract"]
 
 [language_servers.nexa.language_ids]
 "Nexa" = "nexa"
-"Nexa IDL" = "nexa-idl"
+"Nexa Contract" = "nexa-contract"

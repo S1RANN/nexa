@@ -2,18 +2,18 @@
   "name": "tree-sitter-nexa-idl",
   "version": "0.2.0",
   "private": true,
-  "description": "Tree-sitter grammar for NIDL v2 contracts.",
+  "description": "Tree-sitter grammar for Host Contract files (Contract syntax v3).",
   "license": "MIT OR Apache-2.0",
   "keywords": [
     "tree-sitter",
     "nexa",
-    "nidl"
+    "contract"
   ],
   "tree-sitter": [
     {
-      "scope": "source.nexa-idl",
+      "scope": "source.nexa-contract",
       "file-types": [
-        "nidl"
+        "contract.nexa"
       ],
       "highlights": "queries/highlights.scm"
     }

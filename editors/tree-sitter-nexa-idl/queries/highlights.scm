@@ -19,7 +19,7 @@
 (nidl_builtin_type) @type.builtin
 (nidl_type_identifier) @type
 
-(nidl_document
+(contract_header
   name: (nidl_type_identifier) @type)
 
 (handle_declaration

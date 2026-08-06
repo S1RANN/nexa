@@ -2,7 +2,7 @@ const cp = require("node:child_process");
 const vscode = require("vscode");
 
 const BUILD_INPUT_GLOB =
-  "**/{*.nexa,*.nidl,package.toml,nexa.lock,nexa.dev.toml}";
+  "**/{*.nexa,*.contract.nexa,package.toml,nexa.lock,nexa.dev.toml}";
 const BUILD_INPUT_NAMES = new Set([
   "package.toml",
   "nexa.lock",
@@ -20,8 +20,8 @@ function isBuildInputUri(uri) {
   if (uri.scheme !== "file") return false;
   const name = uri.path.slice(uri.path.lastIndexOf("/") + 1);
   return (
+    name.endsWith(".contract.nexa") ||
     name.endsWith(".nexa") ||
-    name.endsWith(".nidl") ||
     BUILD_INPUT_NAMES.has(name)
   );
 }

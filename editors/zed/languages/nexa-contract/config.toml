@@ -1,6 +1,6 @@
-name = "Nexa IDL"
+name = "Nexa Contract"
 grammar = "nexa_idl"
-path_suffixes = ["nidl"]
+path_suffixes = ["contract.nexa"]
 tab_size = 4
 hard_tabs = false
 line_comments = ["// "]

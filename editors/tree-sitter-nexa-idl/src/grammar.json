@@ -54,6 +54,26 @@
       "members": [
         {
           "type": "FIELD",
+          "name": "header",
+          "content": {
+            "type": "SYMBOL",
+            "name": "contract_header"
+          }
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "contract_member"
+          }
+        }
+      ]
+    },
+    "contract_header": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
@@ -70,18 +90,7 @@
         },
         {
           "type": "STRING",
-          "value": "{"
-        },
-        {
-          "type": "REPEAT",
-          "content": {
-            "type": "SYMBOL",
-            "name": "contract_member"
-          }
-        },
-        {
-          "type": "STRING",
-          "value": "}"
+          "value": ";"
         }
       ]
     },

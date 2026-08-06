@@ -1,0 +1,6 @@
+// Ordinary Contract comments are part of the v3 language surface.
+contract CommentFixture;
+
+host {
+    fn value() -> i32;
+}
