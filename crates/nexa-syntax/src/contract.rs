@@ -6,36 +6,36 @@
 use crate::{SourceText, SyntaxLanguage, SyntaxTree, TextRange, Token, TokenKind, ast::Identifier};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlAst {
+pub struct ContractAst {
     pub source: SourceText,
-    pub contract: NidlContract,
+    pub contract: ContractHeader,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlAstError {
+pub struct ContractAstError {
     pub range: TextRange,
     pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlContract {
+pub struct ContractHeader {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub items: Vec<NidlContractItem>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub items: Vec<ContractItem>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NidlContractItem {
-    Handle(NidlHandle),
-    Struct(NidlStruct),
-    Enum(NidlEnum),
-    FunctionBlock(NidlFunctionBlock),
+pub enum ContractItem {
+    Handle(ContractHandleDecl),
+    Struct(ContractStructDecl),
+    Enum(ContractEnumDecl),
+    FunctionBlock(ContractFunctionBlock),
 }
 
-impl NidlContractItem {
+impl ContractItem {
     #[must_use]
     pub const fn range(&self) -> TextRange {
         match self {
@@ -48,113 +48,113 @@ impl NidlContractItem {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NidlFunctionBlockKind {
+pub enum ContractFunctionBlockKind {
     Host,
     Nexa,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlFunctionBlock {
-    pub kind: NidlFunctionBlockKind,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub functions: Vec<NidlFunction>,
+pub struct ContractFunctionBlock {
+    pub kind: ContractFunctionBlockKind,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub functions: Vec<ContractFunction>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlHandle {
+pub struct ContractHandleDecl {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlStruct {
+pub struct ContractStructDecl {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub fields: Vec<NidlField>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub fields: Vec<ContractField>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlField {
+pub struct ContractField {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub ty: NidlTypeRef,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub ty: ContractTypeRef,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlEnum {
+pub struct ContractEnumDecl {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub variants: Vec<NidlVariant>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub variants: Vec<ContractVariant>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlVariant {
+pub struct ContractVariant {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub payload: Option<NidlTypeRef>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub payload: Option<ContractTypeRef>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlFunction {
+pub struct ContractFunction {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
     pub is_async: bool,
-    pub parameters: Vec<NidlParameter>,
-    pub result: Option<NidlTypeRef>,
+    pub parameters: Vec<ContractParameter>,
+    pub result: Option<ContractTypeRef>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlParameter {
+pub struct ContractParameter {
     pub name: Identifier,
-    pub docs: Vec<NidlDocComment>,
-    pub attributes: Vec<NidlAttribute>,
-    pub ty: NidlTypeRef,
+    pub docs: Vec<ContractDocComment>,
+    pub attributes: Vec<ContractAttribute>,
+    pub ty: ContractTypeRef,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlTypeRef {
+pub struct ContractTypeRef {
     pub name: Identifier,
-    pub arguments: Vec<NidlTypeRef>,
+    pub arguments: Vec<ContractTypeRef>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlDocComment {
+pub struct ContractDocComment {
     pub text: String,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlAttribute {
+pub struct ContractAttribute {
     pub name: Identifier,
-    pub arguments: Vec<NidlAttributeArgument>,
+    pub arguments: Vec<ContractAttributeArgument>,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NidlAttributeArgument {
+pub struct ContractAttributeArgument {
     pub name: Option<Identifier>,
-    pub value: NidlAttributeValue,
+    pub value: ContractAttributeValue,
     pub range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NidlAttributeValue {
+pub enum ContractAttributeValue {
     Identifier(Identifier),
     String {
         raw: String,
@@ -167,7 +167,7 @@ pub enum NidlAttributeValue {
     },
 }
 
-impl NidlAttributeValue {
+impl ContractAttributeValue {
     #[must_use]
     pub const fn range(&self) -> TextRange {
         match self {
@@ -181,9 +181,13 @@ impl NidlAttributeValue {
 ///
 /// Lexical and delimiter errors from the tree are returned before typed
 /// parsing, so downstream crates receive one syntax-diagnostic stream.
-pub fn parse_nidl_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
-    if tree.language != SyntaxLanguage::Nidl {
-        return Err(vec![NidlAstError {
+/// Parses one Contract file's lossless [`SyntaxTree`] into the flat `ContractAst` model.
+///
+/// Lexical and delimiter errors from the tree are returned before typed parsing, so downstream
+/// crates receive one syntax-diagnostic stream.
+pub fn parse_contract_ast(tree: &SyntaxTree) -> Result<ContractAst, Vec<ContractAstError>> {
+    if tree.language != SyntaxLanguage::Contract {
+        return Err(vec![ContractAstError {
             range: tree.root.range,
             message: "a NIDL AST requires NIDL source".into(),
         }]);
@@ -192,7 +196,7 @@ pub fn parse_nidl_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
         return Err(tree
             .errors
             .iter()
-            .map(|error| NidlAstError {
+            .map(|error| ContractAstError {
                 range: error.range,
                 message: error.message.clone(),
             })
@@ -204,78 +208,80 @@ pub fn parse_nidl_ast(tree: &SyntaxTree) -> Result<NidlAst, Vec<NidlAstError>> {
 struct Parser<'a> {
     tree: &'a SyntaxTree,
     cursor: usize,
+    previous: Option<TextRange>,
 }
 
 struct Prefix {
-    docs: Vec<NidlDocComment>,
-    attributes: Vec<NidlAttribute>,
+    docs: Vec<ContractDocComment>,
+    attributes: Vec<ContractAttribute>,
     start: Option<TextRange>,
 }
 
 impl<'a> Parser<'a> {
     const fn new(tree: &'a SyntaxTree) -> Self {
-        Self { tree, cursor: 0 }
+        Self {
+            tree,
+            cursor: 0,
+            previous: None,
+        }
     }
 
-    fn parse(mut self) -> Result<NidlAst, NidlAstError> {
-        let prefix = self.prefix()?;
-        let start = prefix.start.unwrap_or_else(|| self.current_range());
+    fn parse(mut self) -> Result<ContractAst, ContractAstError> {
+        let header_prefix = self.prefix()?;
+        let start = header_prefix.start.unwrap_or_else(|| self.current_range());
         self.expect_keyword(crate::Keyword::Contract, "expected `contract`")?;
         let name = self.identifier("contract name")?;
-        self.expect(TokenKind::LBrace, "expected `{` after contract name")?;
+        // Flat header: `contract Name;` — every declaration after it belongs to the
+        // contract until end of file.
+        self.expect(TokenKind::Semicolon, "expected `;` after contract header")?;
         let mut items = Vec::new();
-        while !self.at(TokenKind::RBrace) {
+        loop {
+            self.skip_ordinary_trivia();
             if self.at_end() {
-                return Err(self.error_here("expected a contract item or `}`"));
+                break;
             }
             let item_prefix = self.prefix()?;
             let item_start = item_prefix.start.unwrap_or_else(|| self.current_range());
             let item = match self.current_kind() {
-                Some(TokenKind::Keyword(crate::Keyword::Handle)) => NidlContractItem::Handle(
+                Some(TokenKind::Keyword(crate::Keyword::Handle)) => ContractItem::Handle(
                     self.handle(item_prefix.docs, item_prefix.attributes, item_start)?,
                 ),
-                Some(TokenKind::Keyword(crate::Keyword::Struct)) => NidlContractItem::Struct(
+                Some(TokenKind::Keyword(crate::Keyword::Struct)) => ContractItem::Struct(
                     self.structure(item_prefix.docs, item_prefix.attributes, item_start)?,
                 ),
-                Some(TokenKind::Keyword(crate::Keyword::Enum)) => NidlContractItem::Enum(
+                Some(TokenKind::Keyword(crate::Keyword::Enum)) => ContractItem::Enum(
                     self.enumeration(item_prefix.docs, item_prefix.attributes, item_start)?,
                 ),
                 Some(TokenKind::Keyword(crate::Keyword::Host)) => {
-                    NidlContractItem::FunctionBlock(self.function_block(
-                        NidlFunctionBlockKind::Host,
+                    ContractItem::FunctionBlock(self.function_block(
+                        ContractFunctionBlockKind::Host,
                         item_prefix.docs,
                         item_prefix.attributes,
                         item_start,
                     )?)
                 }
                 Some(TokenKind::Keyword(crate::Keyword::Nexa)) => {
-                    NidlContractItem::FunctionBlock(self.function_block(
-                        NidlFunctionBlockKind::Nexa,
+                    ContractItem::FunctionBlock(self.function_block(
+                        ContractFunctionBlockKind::Nexa,
                         item_prefix.docs,
                         item_prefix.attributes,
                         item_start,
                     )?)
                 }
                 _ => {
-                    return Err(
-                        self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`")
-                    );
+                    return Err(self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`"));
                 }
             };
             items.push(item);
         }
-        let end = self.expect(TokenKind::RBrace, "expected `}` after contract")?;
-        self.skip_ordinary_trivia();
-        if !self.at_end() {
-            return Err(self.error_here("unexpected token after contract"));
-        }
+        let end = self.previous_end().unwrap_or(start);
         let range = cover(start, end);
-        Ok(NidlAst {
+        Ok(ContractAst {
             source: self.tree.source.clone(),
-            contract: NidlContract {
+            contract: ContractHeader {
                 name,
-                docs: prefix.docs,
-                attributes: prefix.attributes,
+                docs: header_prefix.docs,
+                attributes: header_prefix.attributes,
                 items,
                 range,
             },
@@ -285,14 +291,14 @@ impl<'a> Parser<'a> {
 
     fn handle(
         &mut self,
-        docs: Vec<NidlDocComment>,
-        attributes: Vec<NidlAttribute>,
+        docs: Vec<ContractDocComment>,
+        attributes: Vec<ContractAttribute>,
         start: TextRange,
-    ) -> Result<NidlHandle, NidlAstError> {
+    ) -> Result<ContractHandleDecl, ContractAstError> {
         self.expect_keyword(crate::Keyword::Handle, "expected `handle`")?;
         let name = self.identifier("handle name")?;
         let end = self.expect(TokenKind::Semicolon, "expected `;` after handle")?;
-        Ok(NidlHandle {
+        Ok(ContractHandleDecl {
             name,
             docs,
             attributes,
@@ -302,10 +308,10 @@ impl<'a> Parser<'a> {
 
     fn structure(
         &mut self,
-        docs: Vec<NidlDocComment>,
-        attributes: Vec<NidlAttribute>,
+        docs: Vec<ContractDocComment>,
+        attributes: Vec<ContractAttribute>,
         start: TextRange,
-    ) -> Result<NidlStruct, NidlAstError> {
+    ) -> Result<ContractStructDecl, ContractAstError> {
         self.expect_keyword(crate::Keyword::Struct, "expected `struct`")?;
         let name = self.identifier("struct name")?;
         self.expect(TokenKind::LBrace, "expected `{` after struct name")?;
@@ -326,7 +332,7 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.error_here("expected `,` or `}` after struct field"));
             };
-            fields.push(NidlField {
+            fields.push(ContractField {
                 name: field_name,
                 docs: prefix.docs,
                 attributes: prefix.attributes,
@@ -335,7 +341,7 @@ impl<'a> Parser<'a> {
             });
         }
         let end = self.expect(TokenKind::RBrace, "expected `}` after struct")?;
-        Ok(NidlStruct {
+        Ok(ContractStructDecl {
             name,
             docs,
             attributes,
@@ -346,10 +352,10 @@ impl<'a> Parser<'a> {
 
     fn enumeration(
         &mut self,
-        docs: Vec<NidlDocComment>,
-        attributes: Vec<NidlAttribute>,
+        docs: Vec<ContractDocComment>,
+        attributes: Vec<ContractAttribute>,
         start: TextRange,
-    ) -> Result<NidlEnum, NidlAstError> {
+    ) -> Result<ContractEnumDecl, ContractAstError> {
         self.expect_keyword(crate::Keyword::Enum, "expected `enum`")?;
         let name = self.identifier("enum name")?;
         self.expect(TokenKind::LBrace, "expected `{` after enum name")?;
@@ -378,7 +384,7 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.error_here("expected `,` or `}` after enum variant"));
             };
-            variants.push(NidlVariant {
+            variants.push(ContractVariant {
                 name: variant_name,
                 docs: prefix.docs,
                 attributes: prefix.attributes,
@@ -387,7 +393,7 @@ impl<'a> Parser<'a> {
             });
         }
         let end = self.expect(TokenKind::RBrace, "expected `}` after enum")?;
-        Ok(NidlEnum {
+        Ok(ContractEnumDecl {
             name,
             docs,
             attributes,
@@ -398,11 +404,11 @@ impl<'a> Parser<'a> {
 
     fn function_block(
         &mut self,
-        kind: NidlFunctionBlockKind,
-        docs: Vec<NidlDocComment>,
-        attributes: Vec<NidlAttribute>,
+        kind: ContractFunctionBlockKind,
+        docs: Vec<ContractDocComment>,
+        attributes: Vec<ContractAttribute>,
         start: TextRange,
-    ) -> Result<NidlFunctionBlock, NidlAstError> {
+    ) -> Result<ContractFunctionBlock, ContractAstError> {
         self.bump();
         self.expect(TokenKind::LBrace, "expected `{` after function block")?;
         let mut functions = Vec::new();
@@ -415,7 +421,7 @@ impl<'a> Parser<'a> {
             functions.push(self.function(prefix.docs, prefix.attributes, function_start)?);
         }
         let end = self.expect(TokenKind::RBrace, "expected `}` after function block")?;
-        Ok(NidlFunctionBlock {
+        Ok(ContractFunctionBlock {
             kind,
             docs,
             attributes,
@@ -426,10 +432,10 @@ impl<'a> Parser<'a> {
 
     fn function(
         &mut self,
-        docs: Vec<NidlDocComment>,
-        attributes: Vec<NidlAttribute>,
+        docs: Vec<ContractDocComment>,
+        attributes: Vec<ContractAttribute>,
         start: TextRange,
-    ) -> Result<NidlFunction, NidlAstError> {
+    ) -> Result<ContractFunction, ContractAstError> {
         let is_async = self.take_keyword(crate::Keyword::Async).is_some();
         self.expect_keyword(crate::Keyword::Fn, "expected `fn`")?;
         let name = self.identifier("function name")?;
@@ -451,7 +457,7 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.error_here("expected `,` or `)` after parameter"));
             };
-            parameters.push(NidlParameter {
+            parameters.push(ContractParameter {
                 name: parameter_name,
                 docs: prefix.docs,
                 attributes: prefix.attributes,
@@ -466,7 +472,7 @@ impl<'a> Parser<'a> {
             None
         };
         let end = self.expect(TokenKind::Semicolon, "expected `;` after function")?;
-        Ok(NidlFunction {
+        Ok(ContractFunction {
             name,
             docs,
             attributes,
@@ -477,7 +483,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn ty(&mut self) -> Result<NidlTypeRef, NidlAstError> {
+    fn ty(&mut self) -> Result<ContractTypeRef, ContractAstError> {
         let name = self.identifier("type name")?;
         let start = name.range;
         let mut arguments = Vec::new();
@@ -495,14 +501,14 @@ impl<'a> Parser<'a> {
         } else {
             name.range
         };
-        Ok(NidlTypeRef {
+        Ok(ContractTypeRef {
             name,
             arguments,
             range: cover(start, end),
         })
     }
 
-    fn prefix(&mut self) -> Result<Prefix, NidlAstError> {
+    fn prefix(&mut self) -> Result<Prefix, ContractAstError> {
         let mut docs = Vec::new();
         let mut attributes = Vec::new();
         let mut start = None;
@@ -511,7 +517,7 @@ impl<'a> Parser<'a> {
             if self.current_kind() == Some(TokenKind::DocComment) {
                 let token = self.bump().expect("peeked doc comment");
                 start.get_or_insert(token.range);
-                docs.push(NidlDocComment {
+                docs.push(ContractDocComment {
                     text: self.text(token).to_owned(),
                     range: token.range,
                 });
@@ -532,7 +538,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn attribute(&mut self) -> Result<NidlAttribute, NidlAstError> {
+    fn attribute(&mut self) -> Result<ContractAttribute, ContractAstError> {
         let start = self.expect(TokenKind::At, "expected `@`")?;
         let name = self.identifier("attribute name")?;
         self.expect(TokenKind::LParen, "expected `(` after attribute name")?;
@@ -558,29 +564,29 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.error_here("expected `,` or `)` after attribute argument"));
             };
-            arguments.push(NidlAttributeArgument {
+            arguments.push(ContractAttributeArgument {
                 name: named,
                 value,
                 range: cover(argument_start, end),
             });
         }
         let end = self.expect(TokenKind::RParen, "expected `)` after attribute arguments")?;
-        Ok(NidlAttribute {
+        Ok(ContractAttribute {
             name,
             arguments,
             range: cover(start, end),
         })
     }
 
-    fn attribute_value(&mut self) -> Result<NidlAttributeValue, NidlAstError> {
+    fn attribute_value(&mut self) -> Result<ContractAttributeValue, ContractAstError> {
         self.skip_ordinary_trivia();
         match self.current_kind() {
-            Some(TokenKind::Identifier) => Ok(NidlAttributeValue::Identifier(
+            Some(TokenKind::Identifier) => Ok(ContractAttributeValue::Identifier(
                 self.identifier("attribute value")?,
             )),
             Some(TokenKind::Integer) => {
                 let token = self.bump().expect("peeked integer");
-                Ok(NidlAttributeValue::Integer {
+                Ok(ContractAttributeValue::Integer {
                     raw: self.text(token).to_owned(),
                     range: token.range,
                 })
@@ -590,12 +596,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn string_value(&mut self) -> Result<NidlAttributeValue, NidlAstError> {
+    fn string_value(&mut self) -> Result<ContractAttributeValue, ContractAstError> {
         let start = self.expect(TokenKind::StringStart, "expected string")?;
         let mut raw = String::new();
         while !self.at(TokenKind::StringEnd) {
             let Some(token) = self.bump() else {
-                return Err(NidlAstError {
+                return Err(ContractAstError {
                     range: TextRange::new(start.start, self.tree.source.len()),
                     message: "unterminated string attribute argument".into(),
                 });
@@ -604,7 +610,7 @@ impl<'a> Parser<'a> {
                 token.kind,
                 TokenKind::InterpolationStart | TokenKind::InterpolationEnd
             ) {
-                return Err(NidlAstError {
+                return Err(ContractAstError {
                     range: token.range,
                     message: "string interpolation is not allowed in NIDL attributes".into(),
                 });
@@ -612,24 +618,24 @@ impl<'a> Parser<'a> {
             raw.push_str(self.text(token));
         }
         let end = self.expect(TokenKind::StringEnd, "expected closing quote")?;
-        let cooked = decode_string(&raw).map_err(|message| NidlAstError {
+        let cooked = decode_string(&raw).map_err(|message| ContractAstError {
             range: cover(start, end),
             message: format!("invalid string: {message}"),
         })?;
-        Ok(NidlAttributeValue::String {
+        Ok(ContractAttributeValue::String {
             raw,
             cooked,
             range: cover(start, end),
         })
     }
 
-    fn identifier(&mut self, role: &str) -> Result<Identifier, NidlAstError> {
+    fn identifier(&mut self, role: &str) -> Result<Identifier, ContractAstError> {
         self.skip_ordinary_trivia();
         let Some(token) = self.bump() else {
             return Err(self.error_here(&format!("expected {role}")));
         };
         if token.kind != TokenKind::Identifier {
-            return Err(NidlAstError {
+            return Err(ContractAstError {
                 range: token.range,
                 message: format!("expected {role}"),
             });
@@ -644,11 +650,11 @@ impl<'a> Parser<'a> {
         &mut self,
         keyword: crate::Keyword,
         message: &str,
-    ) -> Result<TextRange, NidlAstError> {
+    ) -> Result<TextRange, ContractAstError> {
         self.expect(TokenKind::Keyword(keyword), message)
     }
 
-    fn expect(&mut self, kind: TokenKind, message: &str) -> Result<TextRange, NidlAstError> {
+    fn expect(&mut self, kind: TokenKind, message: &str) -> Result<TextRange, ContractAstError> {
         self.skip_ordinary_trivia();
         self.take(kind).ok_or_else(|| self.error_here(message))
     }
@@ -699,7 +705,12 @@ impl<'a> Parser<'a> {
     fn bump(&mut self) -> Option<Token> {
         let token = *self.tree.tokens.get(self.cursor)?;
         self.cursor += 1;
+        self.previous = Some(token.range);
         Some(token)
+    }
+
+    fn previous_end(&self) -> Option<TextRange> {
+        self.previous
     }
 
     fn current_range(&self) -> TextRange {
@@ -713,8 +724,8 @@ impl<'a> Parser<'a> {
         self.tree.token_text(&token)
     }
 
-    fn error_here(&self, message: &str) -> NidlAstError {
-        NidlAstError {
+    fn error_here(&self, message: &str) -> ContractAstError {
+        ContractAstError {
             range: self.current_range(),
             message: message.into(),
         }

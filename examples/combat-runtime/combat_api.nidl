@@ -1,48 +1,47 @@
-contract Game {
-    handle ActionLock;
+contract Game;
+handle ActionLock;
 
-    struct EnemyView {
-        health: i32,
-    }
+struct EnemyView {
+    health: i32,
+}
 
-    enum AnimationError {
-        MissingClip,
-        EntityGone,
-        Interrupted,
-        Internal,
-        Cancelled,
-    }
+enum AnimationError {
+    MissingClip,
+    EntityGone,
+    Interrupted,
+    Internal,
+    Cancelled,
+}
 
-    host {
-        fn update(
-            entity: i32,
-            delta: i32,
-        ) -> i32;
+host {
+    fn update(
+        entity: i32,
+        delta: i32,
+    ) -> i32;
 
-        @cancel(return_error)
-        @abandon(trap)
-        async fn animation(
-            entity: i32,
-        ) -> Result<i32, AnimationError>;
+    @cancel(return_error)
+    @abandon(trap)
+    async fn animation(
+        entity: i32,
+    ) -> Result<i32, AnimationError>;
 
-        fn action_lock(
-            entity: i32,
-        ) -> Token<ActionLock>;
+    fn action_lock(
+        entity: i32,
+    ) -> Token<ActionLock>;
 
-        fn world_snapshot() -> Snapshot<EnemyView>;
-    }
+    fn world_snapshot() -> Snapshot<EnemyView>;
+}
 
-    nexa {
-        async fn update(
-            entity: i32,
-        ) -> i32;
+nexa {
+    async fn update(
+        entity: i32,
+    ) -> i32;
 
-        async fn animation_checked(
-            value: i32,
-        ) -> Result<i32, AnimationError>;
+    async fn animation_checked(
+        value: i32,
+    ) -> Result<i32, AnimationError>;
 
-        fn feature_probe(
-            input: Buffer<i32>,
-        ) -> i32;
-    }
+    fn feature_probe(
+        input: Buffer<i32>,
+    ) -> i32;
 }

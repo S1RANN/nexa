@@ -3,26 +3,56 @@
 //! This crate deliberately stops at syntax. Package paths, module graphs, name
 //! resolution and type checking belong to `nexa-analysis`.
 
+/// The source profile of a file. Contract files use the flat `contract Name;`
+/// grammar and never join the ordinary source module graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceProfile {
+    /// A normal executable source unit (`*.nexa` or extensionless module source).
+    Executable,
+    /// A Host Contract source unit (`*.contract.nexa`).
+    Contract,
+}
+
+impl SourceProfile {
+    /// The file-extension suffix that marks a source file as a Contract.
+    pub const CONTRACT_SUFFIX: &'static str = ".contract.nexa";
+
+    /// Infers the profile from a source path. A `.contract.nexa` suffix selects
+    /// [`SourceProfile::Contract`]; everything else is [`SourceProfile::Executable`].
+    ///
+    /// Suffix matching is exact and case-sensitive, so `snake.contract.nexa` is a
+    /// Contract while `snake.Contract.Nexa` or `snake.contract_nexa` are not.
+    #[must_use]
+    pub fn from_path(path: &str) -> Self {
+        if path.ends_with(Self::CONTRACT_SUFFIX) {
+            Self::Contract
+        } else {
+            Self::Executable
+        }
+    }
+}
+
 pub mod ast;
 mod lexer;
-pub mod nidl;
+pub mod contract;
 mod text;
 mod tree;
 
-pub use lexer::{Lexed, lex_nexa, lex_nidl};
-pub use nidl::{
-    NidlAst, NidlAstError, NidlAttribute, NidlAttributeArgument, NidlAttributeValue, NidlContract,
-    NidlContractItem, NidlDocComment, NidlEnum, NidlField, NidlFunction, NidlFunctionBlock,
-    NidlFunctionBlockKind, NidlHandle, NidlParameter, NidlStruct, NidlTypeRef, NidlVariant,
-    parse_nidl_ast,
+pub use lexer::{Lexed, lex_contract, lex_nexa};
+pub use contract::{
+    ContractAst, ContractAstError, ContractAttribute, ContractAttributeArgument,
+    ContractAttributeValue, ContractHeader, ContractItem, ContractDocComment, ContractEnumDecl,
+    ContractField, ContractFunction, ContractFunctionBlock, ContractFunctionBlockKind,
+    ContractHandleDecl, ContractParameter, ContractStructDecl, ContractTypeRef, ContractVariant,
+    parse_contract_ast,
 };
 pub use text::{
     LineColumn, LineIndex, SourceText, SourceTooLarge, TextEncoding, TextRange, TextSize,
 };
 pub use tree::{
-    AstRoot, CellCompleteness, Declaration, DeclarationKind, NidlRoot, NodeKind, SyntaxError,
+    AstRoot, CellCompleteness, Declaration, DeclarationKind, ContractRoot, NodeKind, SyntaxError,
     SyntaxErrorKind, SyntaxLanguage, SyntaxNode, SyntaxTree, UseDeclaration, Visibility,
-    classify_cell_completeness, parse_nexa, parse_nidl,
+    classify_cell_completeness, parse_contract, parse_nexa,
 };
 
 /// A lossless lexical category.

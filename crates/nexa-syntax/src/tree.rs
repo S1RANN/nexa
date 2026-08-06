@@ -2,13 +2,13 @@ use std::ops::Range;
 
 use crate::{
     Keyword, Lexed, SourceText, SourceTooLarge, TextRange, TextSize, Token, TokenKind, lex_nexa,
-    lex_nidl,
+    lex_contract,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SyntaxLanguage {
     Nexa,
-    Nidl,
+    Contract,
 }
 
 /// Whether a REPL submission is structurally complete enough to analyze.
@@ -36,6 +36,11 @@ pub enum SyntaxErrorKind {
     ExpectedIdentifier,
     ExpectedSemicolon,
     MissingContract,
+    DuplicateContractHeader,
+    ContractHeaderNotFirst,
+    ContractHeaderSemicolon,
+    UnsupportedContractItem,
+    ContractInNexa,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +61,9 @@ pub enum NodeKind {
     ConstDeclaration,
     TopLevelStatement,
     ContractDeclaration,
+    ContractHandleDeclaration,
+    ContractHostDeclaration,
+    ContractNexaDeclaration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,8 +111,8 @@ impl SyntaxTree {
     }
 
     #[must_use]
-    pub const fn nidl(&self) -> NidlRoot<'_> {
-        NidlRoot { tree: self }
+    pub const fn contract(&self) -> ContractRoot<'_> {
+        ContractRoot { tree: self }
     }
 
     #[must_use]
@@ -124,9 +132,9 @@ pub fn parse_nexa(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
     Ok(parse_lexed(lexed, SyntaxLanguage::Nexa))
 }
 
-pub fn parse_nidl(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
-    let lexed = lex_nidl(source)?;
-    Ok(parse_lexed(lexed, SyntaxLanguage::Nidl))
+pub fn parse_contract(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
+    let lexed = lex_contract(source)?;
+    Ok(parse_lexed(lexed, SyntaxLanguage::Contract))
 }
 
 /// Classifies one Nexa REPL submission using the canonical lexer and delimiter validator.
@@ -180,7 +188,7 @@ fn parse_lexed(lexed: Lexed, language: SyntaxLanguage) -> SyntaxTree {
         parser.validate_delimiters();
         let root = match language {
             SyntaxLanguage::Nexa => parser.nexa_root(),
-            SyntaxLanguage::Nidl => parser.nidl_root(),
+            SyntaxLanguage::Contract => parser.contract_root(),
         };
         (root, parser.errors)
     };
@@ -243,6 +251,17 @@ impl Parser<'_> {
             let Some(&token_index) = self.significant.get(cursor) else {
                 break;
             };
+            if self.is_contract_header(cursor) {
+                // `contract Name;` at the top level of an executable file signals a contract
+                // header that is only valid in Contract (`*.contract.nexa`) files.
+                self.errors.push(SyntaxError {
+                    kind: SyntaxErrorKind::ContractInNexa,
+                    range: self.tokens[token_index].range,
+                    message: "`contract` headers are only valid in Contract (\".contract.nexa\") \
+                               files"
+                        .into(),
+                });
+            }
             let kind = match self.tokens[token_index].kind {
                 TokenKind::Keyword(Keyword::Use) => NodeKind::UseDeclaration,
                 TokenKind::Keyword(Keyword::Fn) => NodeKind::FunctionDeclaration,
@@ -250,6 +269,7 @@ impl Parser<'_> {
                 TokenKind::Keyword(Keyword::Enum) => NodeKind::EnumDeclaration,
                 TokenKind::Keyword(Keyword::Class) => NodeKind::ClassDeclaration,
                 TokenKind::Keyword(Keyword::Const) => NodeKind::ConstDeclaration,
+                TokenKind::Keyword(Keyword::Contract) => NodeKind::ContractDeclaration,
                 _ if declaration_keyword.is_some() => declaration_keyword.expect("checked"),
                 _ => NodeKind::TopLevelStatement,
             };
@@ -334,23 +354,134 @@ impl Parser<'_> {
         });
     }
 
-    fn nidl_root(&mut self) -> SyntaxNode {
-        let Some(contract_cursor) = self
-            .significant
-            .iter()
-            .position(|index| self.tokens[*index].kind == TokenKind::Keyword(Keyword::Contract))
-        else {
+    fn contract_root(&mut self) -> SyntaxNode {
+        // Leading attributes attach to the contract header (`@stable(...) contract Name;`).
+        let mut prefix_end = 0;
+        while self.kind_at(prefix_end) == Some(TokenKind::At) {
+            prefix_end = self.skip_attribute(prefix_end);
+        }
+
+        let header_cursor = if self.kind_at(prefix_end) == Some(TokenKind::Keyword(Keyword::Contract))
+        {
+            Some(prefix_end)
+        } else if let Some(position) = self.significant.iter().position(|&index| {
+            self.tokens[index].kind == TokenKind::Keyword(Keyword::Contract)
+        }) {
+            // A `contract` keyword exists but is not the first declaration in the file.
+            self.errors.push(SyntaxError {
+                kind: SyntaxErrorKind::ContractHeaderNotFirst,
+                range: self.tokens[self.significant[position]].range,
+                message: "`contract` header must be the first declaration in a Contract file".into(),
+            });
+            Some(position)
+        } else {
             self.errors.push(SyntaxError {
                 kind: SyntaxErrorKind::MissingContract,
                 range: TextRange::new(TextSize::ZERO, TextSize::ZERO),
-                message: "expected an NIDL `contract` declaration".into(),
+                message: "expected a `contract` header declaration".into(),
             });
+            None
+        };
+
+        let Some(mut cursor) = header_cursor else {
             return self.root(Vec::new());
         };
-        let first = self.significant[contract_cursor];
-        let last_cursor = self.item_end(contract_cursor, NodeKind::ContractDeclaration);
-        let last = self.significant[last_cursor.saturating_sub(1).max(contract_cursor)];
-        self.root(vec![self.node(NodeKind::ContractDeclaration, first, last)])
+
+        let mut children = Vec::new();
+        // --- header: (attributes) contract Name [;] ---
+        let header_first = self.attached_doc_start(self.significant[cursor]);
+        let name_cursor = cursor + 1;
+        let after_name = cursor + 2;
+        let ends_with_semicolon = self.kind_at(after_name) == Some(TokenKind::Semicolon);
+        let header_end = if ends_with_semicolon {
+            after_name + 1
+        } else {
+            if self.kind_at(after_name).is_some() {
+                self.errors.push(SyntaxError {
+                    kind: SyntaxErrorKind::ContractHeaderSemicolon,
+                    range: self.tokens[self.significant[name_cursor.min(self.significant.len() - 1)]]
+                        .range,
+                    message: "expected `;` after contract header".into(),
+                });
+            }
+            after_name.min(self.significant.len())
+        };
+        let header_last = self.significant[header_end.saturating_sub(1).max(cursor)];
+        children.push(self.node(NodeKind::ContractDeclaration, header_first, header_last));
+        cursor = header_end;
+
+        // --- flat contract items until end of file ---
+        while cursor < self.significant.len() {
+            let first = self.attached_doc_start(self.significant[cursor]);
+            if let Some((kind, keyword_cursor)) = self.contract_item_kind(cursor) {
+                let end_cursor = self
+                    .item_end(keyword_cursor, kind)
+                    .max(keyword_cursor + 1)
+                    .min(self.significant.len());
+                let last = self.significant[end_cursor - 1];
+                children.push(self.node(kind, first, last));
+                cursor = end_cursor;
+            } else {
+                let here = self.significant[cursor];
+                let duplicate = self.tokens[here].kind == TokenKind::Keyword(Keyword::Contract);
+                self.errors.push(SyntaxError {
+                    kind: if duplicate {
+                        SyntaxErrorKind::DuplicateContractHeader
+                    } else {
+                        SyntaxErrorKind::UnsupportedContractItem
+                    },
+                    range: self.tokens[here].range,
+                    message: if duplicate {
+                        "a Contract file may contain only one `contract` header".into()
+                    } else {
+                        "expected `handle`, `struct`, `enum`, `host`, or `nexa` declaration".into()
+                    },
+                });
+                let end_cursor = self
+                    .item_end(cursor, NodeKind::TopLevelStatement)
+                    .max(cursor + 1)
+                    .min(self.significant.len());
+                cursor = end_cursor;
+            }
+        }
+        self.root(children)
+    }
+
+    /// Detects a `contract` header pattern at `cursor`: the lexical `contract` identifier
+    /// followed by a `PascalCase` type name. In the executable (Nexa) profile `contract` is not a
+    /// keyword, so this matches the header shape of a Contract file misplaced in an executable.
+    fn is_contract_header(&self, cursor: usize) -> bool {
+        let Some(&name_index) = self.significant.get(cursor) else {
+            return false;
+        };
+        if self.tokens[name_index].kind != TokenKind::Identifier
+            || self.text(name_index) != "contract"
+        {
+            return false;
+        }
+        let Some(&next_index) = self.significant.get(cursor + 1) else {
+            return false;
+        };
+        self.tokens[next_index].kind == TokenKind::Identifier
+    }
+
+    /// Classifies a flat Contract item starting at `cursor` after skipping its leading
+    /// attributes. Returns the tree node kind and the cursor of the item keyword, or `None`
+    /// when the token at the item head is not a supported Contract item.
+    fn contract_item_kind(&mut self, cursor: usize) -> Option<(NodeKind, usize)> {
+        let mut item_head = cursor;
+        while self.kind_at(item_head) == Some(TokenKind::At) {
+            item_head = self.skip_attribute(item_head);
+        }
+        let keyword = match self.kind_at(item_head) {
+            Some(TokenKind::Keyword(Keyword::Handle)) => NodeKind::ContractHandleDeclaration,
+            Some(TokenKind::Keyword(Keyword::Struct)) => NodeKind::StructDeclaration,
+            Some(TokenKind::Keyword(Keyword::Enum)) => NodeKind::EnumDeclaration,
+            Some(TokenKind::Keyword(Keyword::Host)) => NodeKind::ContractHostDeclaration,
+            Some(TokenKind::Keyword(Keyword::Nexa)) => NodeKind::ContractNexaDeclaration,
+            _ => return None,
+        };
+        Some((keyword, item_head))
     }
 
     fn declaration_prefix(&self, mut cursor: usize) -> (usize, Option<NodeKind>) {
@@ -729,11 +860,11 @@ impl<'a> Declaration<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct NidlRoot<'a> {
+pub struct ContractRoot<'a> {
     tree: &'a SyntaxTree,
 }
 
-impl<'a> NidlRoot<'a> {
+impl<'a> ContractRoot<'a> {
     #[must_use]
     pub fn contract_name(&self) -> Option<&'a str> {
         let node = self

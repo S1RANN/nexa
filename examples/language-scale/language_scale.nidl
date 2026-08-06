@@ -1,13 +1,12 @@
-contract LanguageScale {
-    host {
-        fn log(
-            message: string,
-        ) -> i32;
-    }
+contract LanguageScale;
+host {
+    fn log(
+        message: string,
+    ) -> i32;
+}
 
-    nexa {
-        fn on_event(
-            value: i32,
-        ) -> string;
-    }
+nexa {
+    fn on_event(
+        value: i32,
+    ) -> string;
 }

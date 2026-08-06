@@ -1,12 +1,12 @@
 use nexa_core::{FileId, SourceSpan};
 use nexa_syntax::{
-    NidlAst as SyntaxAst, NidlAttribute as SyntaxAttribute,
-    NidlAttributeArgument as SyntaxAttributeArgument, NidlAttributeValue as SyntaxAttributeValue,
-    NidlContractItem, NidlDocComment as SyntaxDocComment, NidlEnum as SyntaxEnum,
-    NidlField as SyntaxField, NidlFunction as SyntaxFunction,
-    NidlFunctionBlock as SyntaxFunctionBlock, NidlFunctionBlockKind, NidlHandle as SyntaxHandle,
-    NidlParameter as SyntaxParameter, NidlStruct as SyntaxStruct, NidlTypeRef as SyntaxTypeRef,
-    NidlVariant as SyntaxVariant, TextRange, parse_nidl, parse_nidl_ast,
+    ContractAst as SyntaxAst, ContractAttribute as SyntaxAttribute,
+    ContractAttributeArgument as SyntaxAttributeArgument, ContractAttributeValue as SyntaxAttributeValue,
+    ContractItem, ContractDocComment as SyntaxDocComment, ContractEnumDecl as SyntaxEnum,
+    ContractField as SyntaxField, ContractFunction as SyntaxFunction,
+    ContractFunctionBlock as SyntaxFunctionBlock, ContractFunctionBlockKind, ContractHandleDecl as SyntaxHandle,
+    ContractParameter as SyntaxParameter, ContractStructDecl as SyntaxStruct, ContractTypeRef as SyntaxTypeRef,
+    ContractVariant as SyntaxVariant, TextRange, parse_contract, parse_contract_ast,
 };
 
 use crate::model::{
@@ -20,7 +20,7 @@ pub fn parse(source: &str) -> Result<NidlAst, Vec<NidlError>> {
 }
 
 pub fn parse_with_file_id(source: &str, file: FileId) -> Result<NidlAst, Vec<NidlError>> {
-    let tree = parse_nidl(source).map_err(|error| {
+    let tree = parse_contract(source).map_err(|error| {
         vec![NidlError::syntax(
             SourceSpan::new(file, 0, 0),
             format!(
@@ -29,7 +29,7 @@ pub fn parse_with_file_id(source: &str, file: FileId) -> Result<NidlAst, Vec<Nid
             ),
         )]
     })?;
-    let syntax = parse_nidl_ast(&tree).map_err(|errors| {
+    let syntax = parse_contract_ast(&tree).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| NidlError::syntax(span(file, error.range), error.message))
@@ -48,23 +48,23 @@ fn lower_ast(ast: &SyntaxAst, file: FileId) -> Result<NidlAst, NidlError> {
 
     for item in &contract.items {
         match item {
-            NidlContractItem::Handle(handle) => handles.push(lower_handle(handle, file)?),
-            NidlContractItem::Struct(structure) => {
+            ContractItem::Handle(handle) => handles.push(lower_handle(handle, file)?),
+            ContractItem::Struct(structure) => {
                 structs.push(lower_struct(structure, file)?);
             }
-            NidlContractItem::Enum(enumeration) => {
+            ContractItem::Enum(enumeration) => {
                 enums.push(lower_enum(enumeration, file)?);
             }
-            NidlContractItem::FunctionBlock(block) => {
+            ContractItem::FunctionBlock(block) => {
                 let lowered = lower_function_block(block, file)?;
                 let target = match block.kind {
-                    NidlFunctionBlockKind::Host => &mut host,
-                    NidlFunctionBlockKind::Nexa => &mut nexa,
+                    ContractFunctionBlockKind::Host => &mut host,
+                    ContractFunctionBlockKind::Nexa => &mut nexa,
                 };
                 if target.replace(lowered).is_some() {
                     let name = match block.kind {
-                        NidlFunctionBlockKind::Host => "host",
-                        NidlFunctionBlockKind::Nexa => "nexa",
+                        ContractFunctionBlockKind::Host => "host",
+                        ContractFunctionBlockKind::Nexa => "nexa",
                     };
                     return Err(NidlError::new(
                         NidlErrorKind::Duplicate,
