@@ -667,15 +667,18 @@ impl LoadedProject {
         }
         reject_overlapping_roots(&sources)?;
 
-        let contract_path = resolve_within(&root, &config.contract)?;
-        // Validate the contract file extension.
-        let contract_basename = contract_path
+        // Validate the contract file extension on the lexical path FIRST, before
+        // resolve_within (which canonicalizes and may fail with a generic error if the
+        // file does not exist). This ensures migration diagnostics for legacy .nidl
+        // paths are emitted even when the file is missing.
+        let contract_lexical = &config.contract;
+        let contract_basename = contract_lexical
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or("");
         if !contract_basename.ends_with(".contract.nexa") {
             if contract_basename.ends_with(".nidl") {
-                let new_name = contract_path.with_extension("contract.nexa");
+                let new_name = contract_lexical.with_extension("contract.nexa");
                 let new_name_str = new_name
                     .file_name()
                     .and_then(OsStr::to_str)
@@ -690,6 +693,8 @@ impl LoadedProject {
                 "project config `contract` must point to a `*.contract.nexa` file, got `{contract_basename}`"
             )));
         }
+
+        let contract_path = resolve_within(&root, contract_lexical)?;
         let contract_source = overlay_for_path(&contract_path).map_or_else(
             || {
                 fs::read_to_string(&contract_path).map_err(|error| {
