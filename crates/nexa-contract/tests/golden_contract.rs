@@ -11,7 +11,6 @@
 use nexa_contract::{abi_descriptor, generate_rust, generate_rust_for_source_file, parse_contract};
 
 const GOLDEN_SOURCE: &str = include_str!("fixtures/golden.contract.nexa");
-
 #[test]
 fn golden_contract_and_declaration_stable_ids_are_locked() {
     let contract = parse_contract(GOLDEN_SOURCE)
@@ -64,6 +63,75 @@ fn golden_descriptor_bytes_and_fingerprint_are_locked() {
 }
 
 #[test]
+fn golden_generated_public_binding_api_snapshot_is_locked() {
+    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
+    let rust = generate_rust_for_source_file(&contract, "golden.contract.nexa")
+        .expect("codegen succeeds");
+
+    // Canonical public API snapshot from a structured syn::File walk (includes trait and
+    // inherent-impl associated items and full signatures, not just `pub fn` prefixes).
+    let public_items = public_api_snapshot(&rust);
+    let expected: Vec<&str> = GOLDEN_PUBLIC_API_SNAPSHOT
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        public_items, expected,
+        "generated public binding API drifted from the golden snapshot"
+    );
+
+    // Version metadata inside the binding stays at the frozen values.
+    assert!(rust.contains("pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;"));
+    assert!(rust.contains("pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;"));
+    assert!(rust.contains("pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;"));
+
+    // Codegen is byte-deterministic.
+    assert_eq!(
+        generate_rust_for_source_file(&contract, "golden.contract.nexa").expect("regenerate"),
+        rust,
+        "codegen must be deterministic"
+    );
+}
+
+#[test]
+fn invalid_source_file_name_fails_closed_and_cannot_inject_rust() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
+
+    // Missing basename (root path has no file name).
+    let err = generate_rust_for_source_file(&contract, "/").unwrap_err();
+    assert!(matches!(
+        err,
+        nexa_contract::CodegenError::InvalidSourceFileName { reason, .. }
+            if reason.contains("no file name")
+    ));
+
+    // CR/LF in the basename must be rejected, not emitted into the header comment.
+    let err = generate_rust_for_source_file(&contract, "evil\ncontract.contract.nexa").unwrap_err();
+    assert!(matches!(
+        err,
+        nexa_contract::CodegenError::InvalidSourceFileName { reason, .. }
+            if reason.contains("CR/LF")
+    ));
+
+    // Non-`.contract.nexa` suffix is advisory (allowed during the .nidl->.contract.nexa
+    // migration); the file still generates with its basename provenance.
+    let generated = generate_rust_for_source_file(&contract, "naughty.rs")
+        .expect("advisory suffix does not fail generation");
+    assert!(generated.starts_with("// Generated from naughty.rs. DO NOT EDIT.\n"));
+
+    // Non-UTF-8 file name is rejected.
+    let bad = std::path::PathBuf::from(OsStr::from_bytes(b"bad-\xff.contract.nexa"));
+    let err = generate_rust_for_source_file(&contract, bad).unwrap_err();
+    assert!(matches!(
+        err,
+        nexa_contract::CodegenError::InvalidSourceFileName { reason, .. }
+            if reason.contains("UTF-8")
+    ));
+}
+
+#[test]
 fn golden_provenance_header_uses_the_contract_file_basename_only() {
     let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
 
@@ -89,46 +157,141 @@ fn golden_provenance_header_uses_the_contract_file_basename_only() {
     assert!(by_name.starts_with("// @generated from Contract `Golden`. DO NOT EDIT.\n"));
 }
 
-#[test]
-fn golden_generated_public_binding_api_snapshot_is_locked() {
-    let contract = parse_contract(GOLDEN_SOURCE).expect("Golden source parses");
-    let rust = generate_rust_for_source_file(&contract, "golden.contract.nexa")
-        .expect("codegen succeeds");
+/// Canonicalizes the generated file's public API into a sorted, deduplicated signature list
+/// using a structured `syn::File` walk (public top-level items, struct fields, enum variants,
+/// and all public associated items of traits and inherent impls, with full signatures).
+fn toks(t: &dyn quote::ToTokens) -> String {
+    quote::ToTokens::to_token_stream(t).to_string()
+}
 
-    // Canonical public API digest: every generated `pub` item/signature line, sorted + deduped.
-    let mut public_items: Vec<String> = rust
-        .lines()
-        .filter(|line| line.trim_start().starts_with("pub "))
-        .map(|line| {
-            line.trim()
-                .trim_end_matches(" {")
-                .trim_end_matches('(')
-                .to_owned()
+fn public_api_snapshot(source: &str) -> Vec<String> {
+    use syn::Visibility;
+    let ast: syn::File = syn::parse_str(source).expect("generated binding parses as Rust");
+    let mut out = Vec::new();
+    for item in ast.items {
+        match item {
+            syn::Item::Const(c) if matches!(c.vis, Visibility::Public(_)) => {
+                out.push(format!("pub const {}: {}", c.ident, toks(&c.ty)));
+            }
+            syn::Item::Static(s) if matches!(s.vis, Visibility::Public(_)) => {
+                out.push(format!("pub static {}: {}", s.ident, toks(&s.ty)));
+            }
+            syn::Item::Type(t) if matches!(t.vis, Visibility::Public(_)) => {
+                out.push(format!("pub type {}{} = {}", t.ident, toks(&t.generics), toks(&t.ty)));
+            }
+            syn::Item::Struct(st) => {
+                if matches!(st.vis, Visibility::Public(_)) {
+                    out.push(format!("pub struct {}{}", st.ident, toks(&st.generics)));
+                }
+                if let syn::Fields::Named(fields) = &st.fields {
+                    for f in &fields.named {
+                        if matches!(f.vis, Visibility::Public(_)) {
+                            out.push(format!("pub {}: {}", f.ident.as_ref().unwrap(), toks(&f.ty)));
+                        }
+                    }
+                }
+            }
+            syn::Item::Enum(en) => {
+                if matches!(en.vis, Visibility::Public(_)) {
+                    out.push(format!("pub enum {}{}", en.ident, toks(&en.generics)));
+                }
+                for v in en.variants {
+                    out.push(format!("pub variant {}::{}", en.ident, v.ident));
+                }
+            }
+            syn::Item::Trait(tr) if matches!(tr.vis, Visibility::Public(_)) => {
+                out.push(format!("pub trait {}{}", tr.ident, toks(&tr.generics)));
+                for ti in tr.items {
+                    match ti {
+                        syn::TraitItem::Const(c) => out.push(format!(
+                            "pub trait {}::const {}: {}",
+                            tr.ident, c.ident, toks(&c.ty)
+                        )),
+                        syn::TraitItem::Type(t) => {
+                            out.push(format!("pub trait {}::type {}", tr.ident, t.ident));
+                        }
+                        syn::TraitItem::Fn(method) => out.push(format!(
+                            "pub trait {}::{}{}",
+                            tr.ident,
+                            method.sig.ident,
+                            method_sig_tail(&method.sig)
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            syn::Item::Impl(imp) if imp.trait_.is_none() => {
+                let self_ty = toks(&*imp.self_ty);
+                for ai in imp.items {
+                    match ai {
+                        syn::ImplItem::Const(c) if matches!(c.vis, Visibility::Public(_)) => {
+                            out.push(format!(
+                                "impl {}::const {}: {}",
+                                self_ty, c.ident, toks(&c.ty)
+                            ));
+                        }
+                        syn::ImplItem::Type(t) if matches!(t.vis, Visibility::Public(_)) => {
+                            out.push(format!("impl {}::type {}", self_ty, t.ident));
+                        }
+                        syn::ImplItem::Fn(m) if matches!(m.vis, Visibility::Public(_)) => out.push(
+                            format!("impl {}::{}{}", self_ty, m.sig.ident, method_sig_tail(&m.sig)),
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            syn::Item::Fn(f) if matches!(f.vis, Visibility::Public(_)) => {
+                out.push(format!("pub fn {}", f.sig.ident));
+            }
+            _ => {}
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Renders the tail of a function signature (generics, parameters, where clause, return type),
+/// excluding the body.
+fn method_sig_tail(sig: &syn::Signature) -> String {
+    let params: Vec<String> = sig
+        .inputs
+        .iter()
+        .map(|p| match p {
+            syn::FnArg::Typed(pt) => {
+                let name = match &*pt.pat {
+                    syn::Pat::Ident(id) => id.ident.to_string(),
+                    syn::Pat::Wild(_) => "_".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                format!("({name}: {})", toks(&pt.ty))
+            }
+            syn::FnArg::Receiver(r) => {
+                if r.reference.is_some() {
+                    if r.mutability.is_some() {
+                        "(&mut self)".into()
+                    } else {
+                        "(&self)".into()
+                    }
+                } else if r.mutability.is_some() {
+                    "(mut self)".into()
+                } else {
+                    "(self)".into()
+                }
+            }
         })
         .collect();
-    public_items.sort();
-    public_items.dedup();
-
-    let expected: Vec<&str> = GOLDEN_PUBLIC_API_SNAPSHOT
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect();
-    assert_eq!(
-        public_items, expected,
-        "generated public binding API drifted from the golden snapshot"
-    );
-
-    // Version metadata inside the binding stays at the frozen values.
-    assert!(rust.contains("pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;"));
-    assert!(rust.contains("pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;"));
-    assert!(rust.contains("pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;"));
-
-    // Codegen is byte-deterministic.
-    assert_eq!(
-        generate_rust_for_source_file(&contract, "golden.contract.nexa").expect("regenerate"),
-        rust,
-        "codegen must be deterministic"
-    );
+    let where_s = if sig.generics.where_clause.is_some() {
+        " where ..."
+    } else {
+        ""
+    };
+    let ret = match &sig.output {
+        syn::ReturnType::Default => String::new(),
+        syn::ReturnType::Type(_, ty) => format!(" -> {}", toks(&**ty)),
+    };
+    format!("{}{}{}{}", toks(&sig.generics), params.join(""), where_s, ret)
 }
 
 const GOLDEN_DESCRIPTOR_BYTES: &[u8] = &[
@@ -156,43 +319,53 @@ const GOLDEN_FINGERPRINT: [u8; 32] = [
     0xa4, 0x6a,
 ];
 
-const GOLDEN_PUBLIC_API_SNAPSHOT: &str = r#"pub const ABI_DESCRIPTOR_VERSION: u16 = 2u16;
-pub const CONTRACT_DESCRIPTOR: &[u8] = &[
-pub const CONTRACT_FINGERPRINT: [u8; 32] = [
-pub const CONTRACT_RUNTIME_ID: nexa_runtime::StableId = nexa_runtime::StableId
-pub const CONTRACT_SOURCE_NAME: &str = "Golden";
-pub const CONTRACT_SYNTAX_VERSION: u16 = 3u16;
-pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;
-pub const NAME: &'static str = "on_event";
-pub const SOURCE: &str = "\ncontract Golden;\n    handle Entity;\n\n    struct Cell {\n        x: i32,\n        y: i32,\n    }\n\n    enum Event {\n        Started,\n        Ended,\n    }\n\n    host {\n        fn log(message: string);\n    }\n\n    nexa {\n        fn on_event(event: Event) -> Array<i32>;\n    }\n";
-pub const STABLE_ID: nexa_runtime::StableId = nexa_runtime::StableId
-pub const fn contract() -> nexa_runtime::HostContract
-pub const fn is_empty(self) -> bool
-pub const fn len(self) -> usize
-pub const fn new(host: H) -> Self
-pub const fn nexa_tag(&self) -> u32
+const GOLDEN_PUBLIC_API_SNAPSHOT: &str = r"impl CellRef < 'a >::x(self) -> Result < i32 , nexa_runtime :: HostTrap >
+impl CellRef < 'a >::y(self) -> Result < i32 , nexa_runtime :: HostTrap >
+impl Event::nexa_tag(&self) -> u32
+impl GeneratedHostRegistry < H >::new(host: H) -> Self
+impl OnEvent::const NAME: & 'static str
+impl OnEvent::const STABLE_ID: nexa_runtime :: StableId
+impl __NexaArrayRef < 'a , T >::get(self)(index: usize) -> :: std :: result :: Result < T , nexa_runtime :: HostTrap >
+impl __NexaArrayRef < 'a , T >::is_empty(self) -> bool
+impl __NexaArrayRef < 'a , T >::iter(self) -> impl :: std :: iter :: ExactSizeIterator < Item = :: std :: result :: Result < T , nexa_runtime :: HostTrap > , > + 'a
+impl __NexaArrayRef < 'a , T >::len(self) -> usize
+impl __NexaBufferRef < 'a , T >::get(self)(index: usize) -> :: std :: result :: Result < T , nexa_runtime :: HostTrap >
+impl __NexaBufferRef < 'a , T >::is_empty(self) -> bool
+impl __NexaBufferRef < 'a , T >::iter(self) -> impl :: std :: iter :: ExactSizeIterator < Item = :: std :: result :: Result < T , nexa_runtime :: HostTrap > , > + 'a
+impl __NexaBufferRef < 'a , T >::len(self) -> usize
+pub const ABI_DESCRIPTOR_VERSION: u16
+pub const CONTRACT_DESCRIPTOR: & [u8]
+pub const CONTRACT_FINGERPRINT: [u8 ; 32]
+pub const CONTRACT_RUNTIME_ID: nexa_runtime :: StableId
+pub const CONTRACT_SOURCE_NAME: & str
+pub const CONTRACT_SYNTAX_VERSION: u16
+pub const HOST_CONTRACT_SCHEMA_VERSION: u32
+pub const SOURCE: & str
 pub enum Event
-pub enum EventRef<'a>
-pub enum OnEvent {}
-pub event: Event,
-pub fn get(self, index: usize) -> ::std::result::Result<T, nexa_runtime::HostTrap>
-pub fn iter
-pub fn registry<H: GoldenHost + 'static>
-pub fn x(self) -> Result<i32, nexa_runtime::HostTrap>
-pub fn y(self) -> Result<i32, nexa_runtime::HostTrap>
-pub host: H,
-pub static HOST_FUNCTION_AUTHORITIES: ::std::sync::LazyLock<
+pub enum EventRef< 'a >
+pub enum OnEvent
+pub event: Event
+pub fn contract
+pub fn registry
+pub host: H
+pub static HOST_FUNCTION_AUTHORITIES: :: std :: sync :: LazyLock < [nexa_runtime :: HostFunctionAuthority ; 1usize] , >
 pub struct Cell
-pub struct CellRef<'a>(nexa_runtime::HostStructRef<'a>);
-pub struct Entity(pub u64);
-pub struct GeneratedHostRegistry<H>
-pub struct GeneratedHostStub;
-pub struct HostError(pub ::std::string::String);
+pub struct CellRef< 'a >
+pub struct Entity
+pub struct GeneratedHostRegistry< H >
+pub struct GeneratedHostStub
+pub struct HostError
 pub struct OnEventArgs
-pub struct __NexaArrayRef<'a, T>
-pub struct __NexaBufferRef<'a, T>
+pub struct __NexaArrayRef< 'a , T >
+pub struct __NexaBufferRef< 'a , T >
 pub trait GoldenHost
-pub type OnEventOutput = ::std::vec::Vec<i32>;
-pub x: i32,
-pub y: i32,
-"#;
+pub trait GoldenHost::log< 'a >(&mut self)(context: & mut nexa_runtime :: ResourceContext < '_ >)(message: & 'a str) -> :: std :: result :: Result < () , HostError >
+pub type OnEventOutput = :: std :: vec :: Vec < i32 >
+pub variant Event::Ended
+pub variant Event::Started
+pub variant EventRef::Ended
+pub variant EventRef::Started
+pub variant EventRef::__Lifetime
+pub x: i32
+pub y: i32";
+

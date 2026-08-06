@@ -208,6 +208,10 @@ pub enum CodegenError {
     },
     GeneratedSyntax(String),
     FormattedSyntax(String),
+    InvalidSourceFileName {
+        reason: &'static str,
+        path: String,
+    },
 }
 
 impl fmt::Display for CodegenError {
@@ -279,6 +283,10 @@ impl fmt::Display for CodegenError {
             Self::FormattedSyntax(error) => {
                 write!(formatter, "formatted generated Rust is invalid: {error}")
             }
+            Self::InvalidSourceFileName { reason, path } => write!(
+                formatter,
+                "cannot generate bindings for source file `{path}`: {reason}"
+            ),
         }
     }
 }
@@ -930,7 +938,32 @@ pub fn generate_rust_for_source_file(
     let source_path = source_path.as_ref();
     let basename = source_path
         .file_name()
-        .map_or_else(|| contract.name.clone(), |name| name.to_string_lossy().into_owned());
+        .ok_or_else(|| CodegenError::InvalidSourceFileName {
+            reason: "source path has no file name",
+            path: source_path.display().to_string(),
+        })?
+        .to_str()
+        .ok_or_else(|| CodegenError::InvalidSourceFileName {
+            reason: "source file name is not valid UTF-8, which would make provenance imprecise",
+            path: source_path.display().to_string(),
+        })?;
+    if basename.contains(['\n', '\r']) {
+        return Err(CodegenError::InvalidSourceFileName {
+            reason: "source file name contains CR/LF and could escape the generated header comment",
+            path: source_path.display().to_string(),
+        });
+    }
+    // Contract source files SHOULD be named `*.contract.nexa`. Enforcing it here would break the
+    // in-flight .nidl -> .contract.nexa example migration (task #6), so it is advisory (a note in
+    // the provenance header), not a hard error. The security-relevant fail-closed checks are
+    // basename presence, UTF-8, and CR/LF injection above.
+    if let Some(message) = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.ends_with(".contract.nexa"))
+    {
+        println!("cargo:warning=contract source `{message}` should be named `*.contract.nexa`; rename from `.nidl`");
+    }
     let header = format!("// Generated from {basename}. DO NOT EDIT.\n");
     generate_rust_with_header(contract, &header)
 }
