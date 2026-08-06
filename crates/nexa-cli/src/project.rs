@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -667,6 +668,28 @@ impl LoadedProject {
         reject_overlapping_roots(&sources)?;
 
         let contract_path = resolve_within(&root, &config.contract)?;
+        // Validate the contract file extension.
+        let contract_basename = contract_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        if !contract_basename.ends_with(".contract.nexa") {
+            if contract_basename.ends_with(".nidl") {
+                let new_name = contract_path.with_extension("contract.nexa");
+                let new_name_str = new_name
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("");
+                return Err(CliError::usage(format!(
+                    "project config `contract` uses the legacy `.nidl` extension; \
+                     rename `{contract_basename}` to `{new_name_str}` and replace the outer \
+                     `contract Name {{ ... }}` block with a flat `contract Name;` header"
+                )));
+            }
+            return Err(CliError::usage(format!(
+                "project config `contract` must point to a `*.contract.nexa` file, got `{contract_basename}`"
+            )));
+        }
         let contract_source = overlay_for_path(&contract_path).map_or_else(
             || {
                 fs::read_to_string(&contract_path).map_err(|error| {

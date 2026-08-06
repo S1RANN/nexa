@@ -52,7 +52,7 @@ pub use nexa_contract::{
     CONTRACT_SYNTAX_VERSION, ContractAst, ContractError, ContractErrorKind, ValidatedContract, ValidatedFunction,
     abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
     effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
-    generate_rust as generate_rust_bindings, host_function_signature, parse_contract,
+    generate_rust as generate_rust_bindings, generate_rust_for_source_file, host_function_signature, parse_contract,
     parse_contract_ast, validate_contract,
 };
 pub use nexa_runtime::profiler;

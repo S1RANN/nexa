@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -314,10 +315,10 @@ fn dispatch_cli(parsed: cli::Cli) -> CliResult<Option<i32>> {
         } => legacy_result(migrate_check(arguments)).map(|()| None),
         cli::Command::Contract {
             command: cli::ContractCommand::Check { file },
-        } => legacy_result(check_contract(&file)).map(|()| None),
+        } => legacy_result(check_contract(&file, format)).map(|()| None),
         cli::Command::Contract {
             command: cli::ContractCommand::Generate { file },
-        } => legacy_result(generate_contract(&file)).map(|()| None),
+        } => legacy_result(generate_contract(&file, format)).map(|()| None),
         cli::Command::Qa { command } => match command {
             cli::QaCommand::Models => legacy_result(check_models()).map(|()| None),
             cli::QaCommand::ModelReplay { artifact } => {
@@ -526,6 +527,8 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
         let contract = package.contract.as_ref().ok_or_else(|| {
             CliError::usage("Package check requires `--contract` or `--manifest-only`")
         })?;
+        validate_contract_path(contract, "nexa check --contract")
+            .map_err(classify_legacy_error)?;
         let contract_source = std::fs::read_to_string(contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
@@ -965,6 +968,8 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
     if source.is_dir() {
         let contract = contract
             .ok_or_else(|| CliError::usage("Package build requires `--contract <snake_api.contract.nexa>`"))?;
+        validate_contract_path(&contract, "nexa build --contract")
+            .map_err(classify_legacy_error)?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
@@ -1171,6 +1176,8 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
         let directory = directory.expect("exclusive target was checked");
         let contract = contract
             .ok_or_else(|| CliError::usage("Package test requires `--contract <snake_api.contract.nexa>`"))?;
+        validate_contract_path(&contract, "nexa test --contract")
+            .map_err(classify_legacy_error)?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
@@ -2146,25 +2153,127 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
     Ok(())
 }
 
-fn check_contract(path: &Path) -> Result<(), String> {
+fn validate_contract_path(path: &Path, command: &str) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
+    if file_name.ends_with(".contract.nexa") {
+        return Ok(());
+    }
+    if file_name.ends_with(".nidl") {
+        // Propose a migration path for the old .nidl extension.
+        let new_name = path.with_extension("contract.nexa");
+        let new_name_str = new_name
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        return Err(format!(
+            "`{command}` accepts only `*.contract.nexa` files; \
+             `{file_name}` uses the legacy `.nidl` extension. \
+             Rename it to `{new_name_str}` and replace the outer `contract Name {{ ... }}` \
+             block with a flat `contract Name;` header at the top of the file."
+        ));
+    }
+    Err(format!(
+        "`{command}` accepts only `*.contract.nexa` files, got `{file_name}`"
+    ))
+}
+
+fn check_contract(path: &Path, format: DiagnosticFormat) -> Result<(), String> {
+    validate_contract_path(path, "nexa contract check")?;
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;
-    println!(
-        "Contract {} is valid; contract fingerprint {}",
-        path.display(),
-        nexa::contract_fingerprint(&contract)
-    );
+    let fingerprint = nexa::contract_fingerprint(&contract);
+    let syntax_version = nexa::CONTRACT_SYNTAX_VERSION;
+    match format {
+        DiagnosticFormat::Human => {
+            println!(
+                "Contract {} is valid; contract fingerprint {}",
+                path.display(),
+                fingerprint
+            );
+        }
+        DiagnosticFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "status": "ok",
+                    "command": "contract",
+                    "data": {
+                        "contractPath": path.display().to_string(),
+                        "contractSyntaxVersion": syntax_version,
+                        "contractFingerprint": fingerprint.to_string(),
+                    },
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+        DiagnosticFormat::Ndjson => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": 1,
+                    "status": "ok",
+                    "command": "contract",
+                    "data": {
+                        "contractPath": path.display().to_string(),
+                        "contractSyntaxVersion": syntax_version,
+                        "contractFingerprint": fingerprint.to_string(),
+                    },
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+    }
     Ok(())
 }
 
-fn generate_contract(path: &Path) -> Result<(), String> {
+fn generate_contract(path: &Path, format: DiagnosticFormat) -> Result<(), String> {
+    validate_contract_path(path, "nexa contract generate")?;
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let contract = nexa::parse_contract(&source).map_err(|error| error.to_string())?;
-    let generated =
-        nexa::prelude::generate_rust_bindings(&contract).map_err(|error| error.to_string())?;
-    print!("{generated}");
+    let generated = nexa::generate_rust_for_source_file(&contract, path)
+        .map_err(|error| error.to_string())?;
+    // Use the same structured output format.
+    match format {
+        DiagnosticFormat::Human => {
+            print!("{generated}");
+        }
+        DiagnosticFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "status": "ok",
+                    "command": "contract-generate",
+                    "data": {
+                        "contractPath": path.display().to_string(),
+                        "contractSyntaxVersion": nexa::CONTRACT_SYNTAX_VERSION,
+                        "generated": generated,
+                    },
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+        DiagnosticFormat::Ndjson => {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": 1,
+                    "status": "ok",
+                    "command": "contract-generate",
+                    "data": {
+                        "contractPath": path.display().to_string(),
+                        "contractSyntaxVersion": nexa::CONTRACT_SYNTAX_VERSION,
+                        "generated": generated,
+                    },
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+    }
     Ok(())
 }
 
