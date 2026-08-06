@@ -2427,7 +2427,7 @@ mod tests {
     fn fixture_project_config(source_root: &str, required_entrypoints: &str) -> String {
         format!(
             "schema = 2\n\
-             contract = \"api.nidl\"\n\
+             contract = \"api.contract.nexa\"\n\
              required_entrypoints = [{required_entrypoints}]\n\
              [[sources]]\n\
              id = \"fixture\"\n\
@@ -2475,8 +2475,8 @@ mod tests {
         )
         .expect("project configuration");
         fs::write(
-            directory.path().join("api.nidl"),
-            "contract FixtureHost {}\n",
+            directory.path().join("api.contract.nexa"),
+            "contract FixtureHost;\n",
         )
         .expect("Host contract");
         fs::write(
@@ -2627,7 +2627,7 @@ mod tests {
     fn lsp_snapshot_retains_every_overlay_and_close_restores_disk() {
         let directory = TestDirectory::new("snapshot");
         let nexa_path = directory.path().join("main.nexa");
-        let nidl_path = directory.path().join("api.nidl");
+        let nidl_path = directory.path().join("api.contract.nexa");
         fs::write(&nexa_path, "disk nexa").expect("disk Nexa");
         fs::write(&nidl_path, "disk nidl").expect("disk NIDL");
         let nexa_uri = super::path_to_file_uri(&nexa_path).expect("Nexa URI");
@@ -2700,8 +2700,8 @@ mod tests {
         )
         .expect("project configuration");
         fs::write(
-            directory.path().join("api.nidl"),
-            "contract FixtureHost {}\n",
+            directory.path().join("api.contract.nexa"),
+            "contract FixtureHost;\n",
         )
         .expect("Host contract");
         fs::write(
@@ -2810,14 +2810,14 @@ mod tests {
     fn lsp_project_load_uses_a_valid_nidl_overlay_over_invalid_disk_text() {
         let directory = TestDirectory::new("nidl-project-overlay");
         let packages = directory.path().join("packages");
-        let contract = directory.path().join("api.nidl");
+        let contract = directory.path().join("api.contract.nexa");
         let config = directory.path().join("nexa.dev.toml");
         fs::create_dir_all(&packages).expect("package source root");
-        fs::write(&contract, "contract Broken {").expect("invalid disk NIDL");
+        fs::write(&contract, "contract Broken").expect("invalid disk NIDL");
         fs::write(
             &config,
             "schema = 2\n\
-             contract = \"api.nidl\"\n\
+             contract = \"api.contract.nexa\"\n\
              required_entrypoints = [\"run\"]\n\
              [[sources]]\n\
              id = \"fixture\"\n\
@@ -2846,18 +2846,18 @@ mod tests {
         );
         let project = crate::project::LoadedProject::load_with_overlays(&config, |requested| {
             super::same_file_path(requested, &contract)
-                .then(|| "contract OverlayHost { nexa { fn run() -> i32; } }\n".to_owned())
+                .then(|| "contract OverlayHost; nexa { fn run() -> i32; }\n".to_owned())
         })
         .expect("valid editor NIDL overlay");
         assert_eq!(project.contract.name, "OverlayHost");
         assert_eq!(
             project.contract_source,
-            "contract OverlayHost { nexa { fn run() -> i32; } }\n"
+            "contract OverlayHost; nexa { fn run() -> i32; }\n"
         );
 
         fs::write(
             &contract,
-            "contract DiskHost { nexa { fn run() -> i32; } }\n",
+            "contract DiskHost; nexa { fn run() -> i32; }\n",
         )
         .expect("valid disk NIDL");
         let uri = super::path_to_file_uri(&contract).expect("contract URI");
@@ -2866,7 +2866,7 @@ mod tests {
             super::OpenDocument {
                 uri,
                 path: contract.clone(),
-                text: "contract Broken {".to_owned(),
+                text: "contract Broken".to_owned(),
                 version: 2,
             },
         )]);
@@ -2895,7 +2895,9 @@ mod tests {
         );
         assert_eq!(
             report.diagnostics[0].diagnostic.diagnostic.code,
-            nexa::ErrorCode::NX1002
+            nexa::ErrorCode::new(super::contract_error_kind_category(
+                nexa::ContractErrorKind::Syntax
+            ))
         );
 
         let missing_entrypoint_uri =
@@ -2905,7 +2907,7 @@ mod tests {
             super::OpenDocument {
                 uri: missing_entrypoint_uri,
                 path: contract.clone(),
-                text: "contract MissingExport {}\n".to_owned(),
+                text: "contract MissingExport;\n".to_owned(),
                 version: 3,
             },
         )]);
@@ -2950,8 +2952,8 @@ mod tests {
         fs::create_dir_all(source.parent().expect("source parent"))
             .expect("renamed Package source directory");
         fs::write(
-            workspace.join("api.nidl"),
-            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
+            workspace.join("api.contract.nexa"),
+            "contract FixtureHost; nexa { fn run() -> i32; }\n",
         )
         .expect("Host contract");
         fs::write(&source, "pub fn run() -> i32 { return 7; }\n").expect("Package source");
@@ -3073,7 +3075,7 @@ mod tests {
         .expect("resolved build");
         let old_fingerprint = build.build_fingerprint;
         let host_idl =
-            nexa::parse_contract("contract NexaCliEmptyHost {}\n").expect("built-in Host IDL");
+            nexa::parse_contract("contract NexaCliEmptyHost; host {}\n").expect("built-in Host IDL");
         let host_contract = nexa::HostContractInput::canonical(&host_idl);
         let dependency = build
             .packages
@@ -3216,15 +3218,15 @@ mod tests {
         )
         .expect("right source");
         fs::write(
-            directory.path().join("api.nidl"),
-            "contract OverlayHost {}\n",
+            directory.path().join("api.contract.nexa"),
+            "contract OverlayHost;\n",
         )
         .expect("Host Contract");
         let config = directory.path().join("nexa.dev.toml");
         fs::write(
             &config,
             "schema = 2\n\
-             contract = \"api.nidl\"\n\
+             contract = \"api.contract.nexa\"\n\
              [[sources]]\n\
              id = \"fixture\"\n\
              root = \"packages\"\n\
@@ -3759,10 +3761,10 @@ mod tests {
             )),
             nexa::ErrorCode::NX7010
         );
-        let expected_idl = nexa::parse_contract("contract Expected { nexa { fn run() -> i32; } }")
+        let expected_idl = nexa::parse_contract("contract Expected; nexa { fn run() -> i32; }")
             .expect("expected IDL");
         let actual_idl =
-            nexa::parse_contract("contract Actual { nexa { fn run() -> bool; } }").expect("actual IDL");
+            nexa::parse_contract("contract Actual; nexa { fn run() -> bool; }").expect("actual IDL");
         let mismatch = nexa::PackageBuildError::EntrypointSignatureMismatch {
             name: "run".to_owned(),
             expected: nexa::entrypoint_signature(&expected_idl.nexa_functions[0]),
@@ -3886,7 +3888,7 @@ mod tests {
     fn lsp_idl_diagnostics_clear_after_valid_overlay() {
         let path = Path::new("/tmp/nexa-lsp-overlay.contract.nexa");
         assert_eq!(
-            super::diagnostics_for_path(path, Some("contract Broken {"))
+            super::diagnostics_for_path(path, Some("contract Broken"))
                 .expect("invalid Contract")
                 .len(),
             1
@@ -4339,14 +4341,14 @@ mod tests {
     fn lsp_invalid_nidl_overlay_keeps_precise_diagnostics_when_disk_is_invalid_too() {
         let directory = TestDirectory::new("nidl-overlay-invalid-both");
         let packages = directory.path().join("packages");
-        let contract = directory.path().join("api.nidl");
+        let contract = directory.path().join("api.contract.nexa");
         let config = directory.path().join("nexa.dev.toml");
         fs::create_dir_all(&packages).expect("package source root");
-        fs::write(&contract, "contract Broken {").expect("invalid disk NIDL");
+        fs::write(&contract, "contract Broken").expect("invalid disk NIDL");
         fs::write(
             &config,
             "schema = 2\n\
-             contract = \"api.nidl\"\n\
+             contract = \"api.contract.nexa\"\n\
              required_entrypoints = [\"run\"]\n\
              [[sources]]\n\
              id = \"fixture\"\n\
@@ -4373,7 +4375,7 @@ mod tests {
             "the disk NIDL is intentionally invalid"
         );
 
-        let overlay = "contract AlsoBroken {";
+        let overlay = "contract AlsoBroken";
         assert!(
             nexa::parse_contract(overlay).is_err(),
             "overlay NIDL is invalid"
@@ -4419,7 +4421,9 @@ mod tests {
         );
         assert_eq!(
             report.diagnostics[0].diagnostic.diagnostic.code,
-            nexa::ErrorCode::NX1002
+            nexa::ErrorCode::new(super::contract_error_kind_category(
+                nexa::ContractErrorKind::Syntax
+            ))
         );
         assert!(
             super::same_file_path(&report.diagnostics[0].source_path(), &contract),
@@ -4435,12 +4439,12 @@ mod tests {
         let application = workspace.join("packages/app");
         let source = application.join("src/app/main.nexa");
         let config = workspace.join("nexa.dev.toml");
-        let contract = workspace.join("api.nidl");
+        let contract = workspace.join("api.contract.nexa");
         fs::create_dir_all(source.parent().expect("source parent"))
             .expect("Package source directory");
         fs::write(
             &contract,
-            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
+            "contract FixtureHost; nexa { fn run() -> i32; }\n",
         )
         .expect("Host contract");
         fs::write(&config, fixture_project_config("packages", "\"run\""))
@@ -4544,14 +4548,14 @@ mod tests {
         };
         let mapped = identity(Some("fixture.lib"), "src/helper.nexa");
         let unmapped = identity(Some("fixture.other"), "src/other.nexa");
-        let open_contract = identity(None, "api.nidl");
+        let open_contract = identity(None, "api.contract.nexa");
         let on_disk_contract = identity(None, "other.nidl");
         let mut sources = nexa::SourceSnapshotRegistry::builder();
         for (source, text) in [
             (&mapped, "pub fn value(x: i32) -> i32 { return x; }\n"),
             (&unmapped, "pub fn other() -> i32 { return 1; }\n"),
-            (&open_contract, "contract OpenHost {}\n"),
-            (&on_disk_contract, "contract DiskHost {}\n"),
+            (&open_contract, "contract OpenHost;\n"),
+            (&on_disk_contract, "contract DiskHost;\n"),
         ] {
             sources
                 .insert(source.clone(), text.to_owned())
@@ -4592,17 +4596,17 @@ mod tests {
             PathBuf::from("/tmp/packages/lib/src/helper.nexa"),
         )]));
         let diagnostic_root = PathBuf::from("/tmp/packages/app");
-        let open_uri = "file:///editor/api.nidl".to_owned();
+        let open_uri = "file:///editor/api.contract.nexa".to_owned();
         let documents = BTreeMap::from([(
             open_uri.clone(),
             super::OpenDocument {
                 uri: open_uri.clone(),
-                path: PathBuf::from("/tmp/root/api.nidl"),
-                text: "contract OpenHost {}\n".to_owned(),
+                path: PathBuf::from("/tmp/root/api.contract.nexa"),
+                text: "contract OpenHost;\n".to_owned(),
                 version: 1,
             },
         )]);
-        let known_inputs = BTreeSet::from([PathBuf::from("/tmp/root/api.nidl")]);
+        let known_inputs = BTreeSet::from([PathBuf::from("/tmp/root/api.contract.nexa")]);
         let roots = [PathBuf::from("/tmp/root")];
         let snapshot = super::WorkspaceSnapshot {
             roots: &roots,
@@ -4627,7 +4631,7 @@ mod tests {
             "mapped cross-package related location must use its true file URI: {related:?}"
         );
         assert!(
-            uris.contains(&"file:///editor/api.nidl"),
+            uris.contains(&"file:///editor/api.contract.nexa"),
             "relative standalone identity must prefer the open document URI: {related:?}"
         );
         assert!(
@@ -4656,12 +4660,12 @@ mod tests {
         let application = workspace.join("packages/app");
         let source = application.join("src/app/main.nexa");
         let config = workspace.join("nexa.dev.toml");
-        let contract = workspace.join("api.nidl");
+        let contract = workspace.join("api.contract.nexa");
         fs::create_dir_all(source.parent().expect("source parent"))
             .expect("Package source directory");
         fs::write(
             &contract,
-            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
+            "contract FixtureHost; nexa { fn run() -> i32; }\n",
         )
         .expect("Host contract");
         fs::write(&config, fixture_project_config("packages", "\"run\""))

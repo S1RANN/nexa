@@ -62,11 +62,11 @@ const contractExamples = [
   "editors/fixtures/nexa-contract-comment-invalid.contract.nexa",
   "editors/fixtures/nexa-contract-enum-comment-invalid.contract.nexa",
   "editors/fixtures/nexa-contract-header-attribute.contract.nexa",
-  "examples/combat-runtime/combat_api.nidl",
-  "examples/game.nidl",
-  "examples/hello-runtime/hello_api.nidl",
-  "examples/language-scale/language_scale.nidl",
-  "examples/snake-game/snake_api.nidl",
+  "examples/combat-runtime/combat_api.contract.nexa",
+  "examples/game.contract.nexa",
+  "examples/hello-runtime/hello_api.contract.nexa",
+  "examples/language-scale/language_scale.contract.nexa",
+  "examples/snake-game/snake_api.contract.nexa",
   "crates/nexa-contract/tests/fixtures/business_host/contract.nidl",
 ];
 
