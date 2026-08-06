@@ -61,6 +61,7 @@ const nidlExamples = [
   "editors/fixtures/m4-language.contract.nexa",
   "editors/fixtures/nexa-contract-comment-invalid.contract.nexa",
   "editors/fixtures/nexa-contract-enum-comment-invalid.contract.nexa",
+  "editors/fixtures/nexa-contract-header-attribute.contract.nexa",
   "examples/combat-runtime/combat_api.nidl",
   "examples/game.nidl",
   "examples/hello-runtime/hello_api.nidl",
@@ -129,6 +130,12 @@ const queryChecks = [
     "zed/languages/nexa-contract/outline.scm",
     "editors/fixtures/m4-language.contract.nexa",
     ["item", "name", "context"],
+  ],
+  [
+    idlGrammarDirectory,
+    "tree-sitter-nexa-idl/queries/highlights.scm",
+    "editors/fixtures/nexa-contract-header-attribute.contract.nexa",
+    ["keyword", "type", "attribute", "comment.documentation"],
   ],
 ];
 

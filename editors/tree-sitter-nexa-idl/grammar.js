@@ -36,10 +36,12 @@ module.exports = grammar({
         repeat($.contract_member),
       ),
 
-    // Contract Syntax v3 (flat): `contract <Name>;` is the file-level header, then
-    // struct/enum/handle/host/nexa items follow at the top level with no outer block.
+    // Contract Syntax v3 (flat): `@attr... contract <Name>;` is the file-level header, then
+    // struct/enum/handle/host/nexa items follow at the top level with no outer block. Header
+    // attributes (e.g. `@stable("...")`) and doc comments attach to this header.
     contract_header: ($) =>
       seq(
+        repeat($.nidl_attribute),
         field("keyword", $.contract_keyword),
         field("name", $.nidl_type_identifier),
         ";",

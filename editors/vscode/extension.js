@@ -15,6 +15,7 @@ let output;
 let receiveBuffer = Buffer.alloc(0);
 let nextRequestId = 1;
 let initializeRequestId;
+const pendingSymbolRequests = new Map();
 
 function isBuildInputUri(uri) {
   if (uri.scheme !== "file") return false;
@@ -121,6 +122,35 @@ function handleMessage(message) {
     for (const document of vscode.workspace.textDocuments) openDocument(document);
     return;
   }
+  if (message.id !== undefined && pendingSymbolRequests.has(message.id)) {
+    const resolve = pendingSymbolRequests.get(message.id);
+    pendingSymbolRequests.delete(message.id);
+    const symbols = Array.isArray(message.result) ? message.result : [];
+    resolve(
+      symbols.map((symbol) => {
+        const location = new vscode.Range(
+          symbol.range.start.line,
+          symbol.range.start.character,
+          symbol.range.end.line,
+          symbol.range.end.character,
+        );
+        const selection = new vscode.Range(
+          symbol.selectionRange.start.line,
+          symbol.selectionRange.start.character,
+          symbol.selectionRange.end.line,
+          symbol.selectionRange.end.character,
+        );
+        return new vscode.DocumentSymbol(
+          symbol.name,
+          "",
+          symbol.kind || 0,
+          location,
+          selection,
+        );
+      }),
+    );
+    return;
+  }
   if (message.method !== "textDocument/publishDiagnostics") return;
   const uri = vscode.Uri.parse(message.params.uri);
   const converted = message.params.diagnostics.map((item) => {
@@ -219,6 +249,20 @@ async function stop() {
   });
 }
 
+function provideDocumentSymbols(document) {
+  return new Promise((resolve) => {
+    if (!server || !server.stdin.writable) return resolve([]);
+    const id = nextRequestId++;
+    pendingSymbolRequests.set(id, resolve);
+    write({
+      jsonrpc: "2.0",
+      id,
+      method: "textDocument/documentSymbol",
+      params: { textDocument: { uri: document.uri.toString() } },
+    });
+  });
+}
+
 function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("nexa");
   output = vscode.window.createOutputChannel("Nexa");
@@ -226,6 +270,10 @@ function activate(context) {
     vscode.workspace.createFileSystemWatcher(BUILD_INPUT_GLOB);
   context.subscriptions.push(diagnostics, output, buildInputWatcher);
   context.subscriptions.push(
+    vscode.languages.registerDocumentSymbolProvider(
+      { scheme: "file", pattern: "**/*.contract.nexa" },
+      { provideDocumentSymbols },
+    ),
     vscode.workspace.onDidOpenTextDocument(openDocument),
     vscode.workspace.onDidChangeTextDocument(changeDocument),
     vscode.workspace.onDidSaveTextDocument((document) => {

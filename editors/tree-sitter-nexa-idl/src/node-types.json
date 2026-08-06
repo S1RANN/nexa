@@ -67,6 +67,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_attribute",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -866,6 +876,10 @@
   },
   {
     "type": "rune",
+    "named": false
+  },
+  {
+    "type": "stable",
     "named": false
   },
   {

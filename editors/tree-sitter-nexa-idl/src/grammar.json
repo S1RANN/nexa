@@ -73,6 +73,13 @@
       "type": "SEQ",
       "members": [
         {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_attribute"
+          }
+        },
+        {
           "type": "FIELD",
           "name": "keyword",
           "content": {
@@ -1065,6 +1072,10 @@
         {
           "type": "STRING",
           "value": "capability"
+        },
+        {
+          "type": "STRING",
+          "value": "stable"
         },
         {
           "type": "SYMBOL",
