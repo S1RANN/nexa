@@ -228,7 +228,6 @@ fn contract_flag_json_error_has_structured_fields() {
     // Processes: nexa check/build/test --contract <wrong.extension> --diagnostic-format json
     // must all emit structured error with contractPath/contractSyntaxVersion/contractDiagnostic.
     let dir = TestDir::new("flag");
-    let src = dir.write("main.nexa", "fn main() -> i32 { return 1; }\n");
     let bad = dir.write("bad.txt", "contract Test;\n");
     let pkg = dir.path().join("pkg");
     fs::create_dir_all(pkg.join("src/example")).expect("pkg src");
@@ -237,7 +236,7 @@ fn contract_flag_json_error_has_structured_fields() {
     fs::write(pkg.join("src/example/test.nexa"),
         "fn value() -> i32 { return 1; }\n").expect("source");
 
-    for (cmd, label) in [("check", "check"), ("build", "build"), ("test", "test")] {
+    for cmd in ["check", "build", "test"] {
         for fmt in ["json", "ndjson"] {
             let output = dir.run(&[
                 cmd, pkg.to_str().unwrap(),
