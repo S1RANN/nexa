@@ -28,7 +28,7 @@ Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa M5 Deep Performance Optimization = COMPLETE
 Nexa Language v2 = COMPLETE
-NIDL v2 = COMPLETE
+Contract Syntax v3 = IN PROGRESS
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -45,7 +45,7 @@ Rust-only gameplay language.
 Gate 1 v2.9 STOP (historical tag)
 → Internal Pivot M1
    → repository slimming
-   → .nidl single-source Host binding
+   → .contract.nexa single-source Host binding
    → stable high-level Task lifecycle
    → Restart Reload v1
    → Combat dogfood loop
@@ -68,7 +68,7 @@ shutdown failures share one bounded `EngineDiagnostic` model. `nexa check`,
 
 The revision specifically requires lossless Worker backpressure and terminal
 accounting, Engine diagnostics observed through real product paths, trustworthy
-phase metrics, real project source policies, and exact NIDL/LSP locations.
+phase metrics, real project source policies, and exact Contract/LSP locations.
 M3R3 adds the remaining freshness boundary: the Engine refreshes the desired
 source identity immediately before commit and rejects stale Candidate work at
 every development-pipeline stage.
@@ -80,7 +80,8 @@ replay, and independently observable final gates.
 ## Active product
 
 - Typed gameplay source, bytecode, verifier, and interpreter.
-- One `.nidl` schema per Host API with deterministic generated Rust binding.
+- One `.contract.nexa` schema per Host API with deterministic generated Rust
+  binding.
 - Bounded Task polling with explicit Yield, Waiting, cancellation, and traps.
 - Host Request/Token/Snapshot ownership and terminal resource invariants.
 - Typed state migration with Preserve, Replace, and Delete.
@@ -145,7 +146,8 @@ sandbox, completion/refactoring LSP features, or DAP debugging.
 ## M3R1 scope
 
 M3R1 changes only the existing M3 development loop, diagnostics, metrics,
-package-aware CLI, NIDL locations, URI handling, editor diagnostics, and their
+package-aware CLI, Contract locations, URI handling, editor diagnostics, and
+their
 finalization gates. It does not add language syntax, multi-file modules, user
 generics, JIT, interpreter optimization, a full semantic LSP, DAP, Pluie,
 remote packages, or untrusted execution.
@@ -171,6 +173,26 @@ language, Runtime, Package, LSP, editor, or optimization capability.
 
 ## Current milestone
 
+Contract Syntax v3 is the active post-M5 migration milestone. It replaces the
+old Contract file suffix and enclosing container with one flat
+`*.contract.nexa` source headed by `contract Name;`. It also unifies
+`SourceProfile::Contract`, renames the public crate/API/CLI/editor surface to
+Contract terminology, migrates all examples and fixtures, and adds dedicated
+syntax, semantics, Descriptor, codegen, CLI, LSP, and migration gates.
+
+This milestone does not change Nexa Language v2, Host Contract schema v2,
+Contract Descriptor v2 framing, Bytecode v7, Host/Nexa direction, resource
+semantics, or generated Host/Nexa binding shapes. An equivalent container
+migration preserves Stable IDs and normalized Descriptor bytes; required
+syntax-version metadata renames are provenance only. The Build Fingerprint
+records `CONTRACT_SYNTAX_VERSION = 3`.
+
+The milestone remains **IN PROGRESS** until every row in
+`baseline/abi/CONTRACT_V3_ACCEPTANCE.md` passes on one audited candidate commit.
+M6 remains deferred; M7 and M8 do not start as part of this work.
+
+## Completed M4/M4R1 foundation
+
 M3R3 completes Candidate freshness and commit safety. M4 Language Scale
 Foundation is complete and remains marked by the immutable annotated
 `language-scale-m4-complete` tag. It adds compile-time Source Modules,
@@ -189,10 +211,11 @@ foundation. It replaces source declarations from M4 with path-derived modules,
 Struct and Enum as value types, Class as a sealed GC reference type, and
 removes source-level compatibility aliases.
 
-NIDL v2 uses `contract`, `host`, `nexa`, `handle`, `fn`, and `async fn`.
-Validated contracts lower to a structured ABI Descriptor v2 and a semantic
-Binding Model before Rust is generated through token syntax trees. Generated
-bindings do not expose legacy export indexes or source-level Request types.
+The Contract surface uses `contract`, `host`, `nexa`, `handle`, `fn`, and
+`async fn`. Validated Contracts lower to a structured ABI Descriptor v2 and a
+semantic Binding Model before Rust is generated through token syntax trees.
+Generated bindings do not expose legacy export indexes or source-level Request
+types.
 
 The same release also finalizes two normal execution profiles. Standalone
 Packages expose a typed `main(args: Array<string>) -> i32`; single-file scripts

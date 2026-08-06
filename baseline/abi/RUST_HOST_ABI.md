@@ -5,7 +5,7 @@ Version: **2.0.0**
 Status: **COMPLETE**
 
 Generated Rust bindings are the sole supported internal-language Host
-integration. A validated NIDL v2 Contract lowers to ABI Descriptor v2 and a
+integration. A validated Contract v3 source lowers to ABI Descriptor v2 and a
 semantic Binding Model before code emission.
 
 The generated layer provides:
@@ -21,7 +21,7 @@ The generated layer provides:
 
 Rust names are validated and collision-checked before emission. The generator
 uses token syntax trees, validates the complete file with `syn`, formats with
-`prettyplease`, and reparses the result. It never inserts an NIDL identifier as
+`prettyplease`, and reparses the result. It never inserts a Contract identifier as
 unparsed Rust source.
 
 Hosted Realms register against a process-level `RuntimeHost`.
@@ -35,7 +35,7 @@ The Host-call bridge accepts at most eight arguments through
 `RuntimeHostArgs`. Scalar and Handle arguments are decoded directly into
 generated binding types without constructing an intermediate value vector.
 Async Host functions use generated completion tickets internally; Request
-types are not exposed in NIDL or Nexa source.
+types are not exposed in Contract or Nexa source.
 
 Each generated `HToken` is statically and dynamically bound to declared Handle
 `H`. Its Runtime value type is the domain-separated resource-token identity

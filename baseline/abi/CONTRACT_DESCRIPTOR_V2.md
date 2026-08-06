@@ -11,16 +11,19 @@ descriptor is:
 ABI_DESCRIPTOR_VERSION: u16 = 2
 ```
 
-It is independent from `NIDL_SYNTAX_VERSION` and
-`HOST_CONTRACT_SCHEMA_VERSION`; all three currently equal `2` but identify
-different protocol boundaries. The Rust constant remains `u16`; canonical
-wire framing encodes `u32::from(ABI_DESCRIPTOR_VERSION)` as four
-little-endian bytes.
+It is independent from `CONTRACT_SYNTAX_VERSION = 3` and
+`HOST_CONTRACT_SCHEMA_VERSION = 2`; the three values identify different
+protocol boundaries. Contract Syntax v3 does not renumber or reinterpret this
+wire schema. The Rust constant remains `u16`; canonical wire framing encodes
+`u32::from(ABI_DESCRIPTOR_VERSION)` as four little-endian bytes.
 
 Contract Descriptor v2 is the canonical, structured ABI identity derived from
-a valid NIDL v2 contract. It replaces formatted canonical-source strings and
-formatted canonical-hash strings. Source rendering is diagnostic material
-only and is never hash input.
+a valid Contract source. It replaces formatted canonical-source strings and
+formatted canonical-hash strings. Source rendering, the file suffix, the flat
+Header container, and `CONTRACT_SYNTAX_VERSION` are not descriptor payload.
+They are diagnostic or build-provenance data only and are never hash input
+unless an existing outer build-fingerprint envelope explicitly records the
+syntax version.
 
 ## Terms
 
@@ -132,7 +135,7 @@ Enum-payload tags are:
 ```text
 0x00 no payload
 0x01 tuple payload
-0x02 reserved; NIDL v2 does not emit or accept it
+0x02 reserved; Contract v3 does not emit or accept it
 ```
 
 Attribute tags are:
@@ -388,7 +391,7 @@ descriptors and fingerprints. The following are forbidden as fingerprint
 inputs:
 
 ```text
-formatted NIDL source
+formatted Contract source
 canonical source strings
 Rust Debug or Display output
 generated Rust source
@@ -400,5 +403,13 @@ legacy function index
 ```
 
 Descriptor construction is total only for `ValidatedContract`. Syntax trees
-and `NidlAst` cannot bypass validation, and binding codegen cannot manufacture
-or reinterpret descriptor identity.
+and `ContractAst` cannot bypass validation, and binding codegen cannot
+manufacture or reinterpret descriptor identity.
+
+For an equivalent migration from the enclosing source container to the flat
+Contract v3 Header, Contract Stable ID, declaration Stable IDs, normalized
+descriptor payload, canonical descriptor bytes, and the Descriptor v2
+fingerprint remain unchanged. The only permitted fingerprint difference is in
+a distinct build-fingerprint envelope that already encodes
+`CONTRACT_SYNTAX_VERSION`; that one-time difference must be Golden-locked and
+must not change Descriptor v2 framing or payload.

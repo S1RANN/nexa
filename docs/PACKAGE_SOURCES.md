@@ -47,6 +47,10 @@ sources. Duplicate candidates are all marked `Incompatible`; source order does
 not select a winner.
 
 Development mode scans the complete Manifest, Lockfile, Source Module set,
-dependency closure, and Host Contract. It uses the shared resolved build input
+dependency closure, and selected `.contract.nexa` Host Contract. The Contract
+uses `SourceProfile::Contract`, remains outside the Source Module Graph, and
+does not derive module identity from its path. Contract resolution validates
+the suffix, root containment, symbolic-link/`..` safety, and one-current-
+Contract rule. It uses the shared resolved build input
 and commit-time Build Fingerprint freshness guard, so additions, deletion,
 renames, dependency changes, and ABA writes cannot commit stale candidates.

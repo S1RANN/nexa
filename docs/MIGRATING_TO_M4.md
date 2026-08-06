@@ -1,8 +1,9 @@
 # Migrating an M4 Package to Language v2
 
 M4R1 is a source-breaking reset. It retains the M4 schema 2 Package and static
-Library model, but it does not retain aliases for the M4 language surface or
-NIDL v1.
+Library model, but it does not retain aliases for the M4 language or former
+Contract surface. After completing this historical migration, also follow
+[Migrating to Contract v3](MIGRATING_TO_CONTRACT_V3.md).
 
 For each Package:
 
@@ -32,7 +33,7 @@ For each Package:
 11. Spell generic built-ins as `Array<T>`, `Buffer<T>`, `Option<T>`,
     `Result<T, E>`, `Token<T>`, and `Snapshot<T>`. Use `::` for namespaces,
     associated functions, and Enum Variants.
-12. Convert NIDL to `contract` with `host {}` and `nexa {}` blocks, `handle`,
+12. Convert the former IDL source to `contract` with `host {}` and `nexa {}` blocks, `handle`,
     `fn`, and `async fn`. Move async policies to attributes and remove
     source-level Request types.
 13. Regenerate Rust bindings and Bytecode v7. Descriptor v2, generated marker
@@ -43,5 +44,5 @@ Application Package modules contain declarations only. A Standalone single
 file may instead contain ordered top-level statements; the compiler lowers
 them to a synthetic `main`, and the file cannot also declare an explicit main.
 
-Schema 1 Packages, old source syntax, NIDL v1, Bytecode v5, implicit Host
+Schema 1 Packages, old source syntax, the former Contract surface, Bytecode v5, implicit Host
 access, entry file paths, and compatibility aliases are not retained.

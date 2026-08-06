@@ -53,7 +53,7 @@ cycle chain.
 - `pub`: visible to the Package and static dependency consumers.
 
 Members inherit the visibility of their enclosing nominal type. A public
-signature cannot expose a less-visible type. NIDL-declared Nexa entrypoints
+signature cannot expose a less-visible type. Contract-declared Nexa entrypoints
 and lifecycle-attributed functions can only be implemented by the Application
 Entry Module and must be `pub`.
 
@@ -84,7 +84,7 @@ canonical identities that truncate to the same Runtime 64-bit ID.
 
 Function signatures are not part of `StableSymbolId`. Public signatures,
 effects, type kind, field mutability, layouts, evaluated public Const values,
-and NIDL entrypoint signatures instead contribute to the 256-bit Public API
+and Contract entrypoint signatures instead contribute to the 256-bit Public API
 Fingerprint.
 
 ## Runtime boundary

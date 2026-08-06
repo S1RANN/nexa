@@ -25,8 +25,14 @@ cargo xtask test-candidate-freshness
 cargo xtask test-language-v2
 cargo xtask test-object-model-v2
 cargo xtask test-async-v2
-cargo xtask test-nidl-v2
 cargo xtask test-structured-codegen
+cargo xtask test-contract-syntax
+cargo xtask test-contract-semantics
+cargo xtask test-contract-descriptor
+cargo xtask test-contract-codegen
+cargo xtask test-contract-cli
+cargo xtask test-contract-lsp
+cargo xtask contract-migration-check
 cargo xtask test-standalone
 cargo xtask test-repl
 cargo xtask test-entrypoints
@@ -55,7 +61,7 @@ Generated artifacts belong in `target/nexa-artifacts/`.
 
 `finalize-m3-r1` independently reruns workspace fmt/check/clippy/test/doc,
 M1/M2 regressions, real Engine diagnostic evidence, Worker queue and Result
-backpressure races, Reload stress, metric consistency, CLI Source Policy, NIDL
+backpressure races, Reload stress, metric consistency, CLI Source Policy, Contract
 Span and URI/LSP coverage, editor checks, repository audits, clean-worktree
 validation, and annotated-tag validation. Its report is written to
 `target/nexa-artifacts/m3r1-finalize/final-report.json`.
@@ -96,9 +102,14 @@ status documents and immutable predecessor tags, and requires the annotated
 `developer-loop-m3-complete-r3` tag at the final commit. Its report is written
 to `target/nexa-artifacts/m3r3-finalize/final-report.json`.
 
-`test-nidl-v2` mutates Contracts, `host`/`nexa` blocks, attributes, types,
-names, declaration uniqueness, recursive layouts, async declarations,
-comments, and source spans. `test-structured-codegen` sends every Binding Model
+The seven Contract gates separate syntax/profile, semantic ownership,
+Descriptor identity, generated bindings, CLI/discovery, LSP/editor, and final
+migration coverage. `contract-migration-check` rejects an active old-extension
+file, old public API name, old CLI command, or old editor association. The full
+acceptance and Golden requirements are in
+[`../baseline/abi/CONTRACT_V3_ACCEPTANCE.md`](../baseline/abi/CONTRACT_V3_ACCEPTANCE.md).
+
+`test-structured-codegen` sends every Binding Model
 through TokenStream, `syn`, `prettyplease`, a second `syn` parse, and
 `cargo check`; it also checks identifier-injection rejection and byte-for-byte
 determinism. `test-binding` retains the generated Combat Host binding lifecycle

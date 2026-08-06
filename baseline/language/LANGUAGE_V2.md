@@ -648,7 +648,7 @@ field order, type, and mutability
 Enum variant order and payload
 function signature and async effect
 public const type and evaluated value
-required NIDL entry signature
+required Contract entry signature
 ```
 
 The state-schema fingerprint includes `@state` metadata and stable field

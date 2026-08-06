@@ -38,6 +38,6 @@ instruction count, and Fuel. Test sources do not contribute to product Source
 or Build Fingerprints, Public API, State Schema, or Runtime Artifacts.
 
 ```bash
-nexa test <package-directory> --contract app_api.nidl
+nexa test <package-directory> --contract app_api.contract.nexa
 nexa test --project nexa.dev.toml
 ```

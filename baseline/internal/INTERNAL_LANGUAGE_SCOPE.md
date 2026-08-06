@@ -12,7 +12,7 @@ owned host resources, typed `@state`, and Restart Reload.
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa Language v2 = COMPLETE
-NIDL v2 = COMPLETE
+Contract Syntax v3 = IN PROGRESS
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -22,7 +22,7 @@ Multiple Entrypoint Model = COMPLETE
 In scope:
 
 - Lexer, parser, type checker, compiler, bytecode verifier, and interpreter.
-- Rust-only generated host bindings from one `.nidl` source.
+- Rust-only generated Host bindings from one `.contract.nexa` source.
 - Fuel-bounded tasks, explicit async host requests, cancellation, and inspection.
 - Pure state migration with Preserve, Replace, and Delete.
 - Stop-the-module Restart Reload with commit-before-activation semantics.
@@ -34,7 +34,7 @@ In scope:
 - Language v2 with path-derived modules, `use`, `let mut`, field-level `mut`,
   Struct/Enum value semantics, sealed Class reference semantics, `async fn`,
   postfix `.await`, and attribute-based state and lifecycle metadata.
-- NIDL v2 Contracts with explicit `host` and `nexa` surfaces, structured ABI
+- Contract v3 sources with explicit `host` and `nexa` surfaces, structured ABI
   Descriptor v2 fingerprints, and token-based deterministic Rust generation.
 - Typed Required and Optional entrypoint selection without function indexes in
   normal product APIs.
@@ -60,9 +60,9 @@ create extra Realms or independently reloadable Runtime Modules: an Application
 and its resolved static dependency closure always produce one Artifact, one
 Realm, one Epoch, and one Package-level Restart Reload boundary.
 
-Language v2 and NIDL v2 are intentional breaking surfaces. Active parsers,
+Language v2 and Contract Syntax v3 are intentional breaking surfaces. Active parsers,
 descriptors, bytecode products, generated bindings, examples, and tools do not
-provide aliases or decoders for the former source syntax, NIDL syntax,
+provide aliases or decoders for former executable or Contract syntax,
 canonical string hashes, legacy function indexes, schema 1 Packages, or
 Bytecode v5. Historical documents and immutable tags remain archival evidence,
 not compatibility contracts.

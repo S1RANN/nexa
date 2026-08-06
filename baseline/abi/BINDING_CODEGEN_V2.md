@@ -4,18 +4,18 @@ Version: **2.0.0**
 
 Status: **COMPLETE**
 
-Structured Binding Codegen v2 is the only Rust generation path for NIDL
+Structured Binding Codegen v2 is the only Rust generation path for Contract
 bindings and `nexa-machine` generated Rust. It consumes validated semantic
 models and constructs Rust syntax with token ASTs. It does not concatenate
 Rust source or Rust expressions.
 
 ## Required pipeline
 
-NIDL binding generation is:
+Contract binding generation is:
 
 ```text
-nexa-syntax NIDL SyntaxTree
-→ NidlAst
+nexa-syntax ContractSyntaxTree
+→ ContractAst
 → ValidatedContract
 → BindingModel
 → proc_macro2::TokenStream
@@ -27,7 +27,7 @@ nexa-syntax NIDL SyntaxTree
 
 The first `syn` parse validates the token backend before formatting. The second
 parse validates the exact pretty-printed bytes that will be written. A failure
-at either step is a generator error associated with the originating NIDL
+at either step is a generator error associated with the originating Contract
 declaration. Invalid output is never written over the previous generated file.
 
 The generator dependencies are:
@@ -47,7 +47,7 @@ or statement.
 
 `BindingModel` is the complete, backend-neutral Rust generation input. It is
 constructed only from `ValidatedContract` and Descriptor v2 identities. The
-Rust backend does not traverse `NidlAst` and does not make late semantic
+Rust backend does not traverse `ContractAst` and does not make late semantic
 decisions.
 
 Every generated declaration model retains at least:
@@ -82,7 +82,7 @@ BindingModel
 as a Host return, encoded as a Nexa-call argument, and decoded as a Nexa-call
 output. `BorrowStrategy` states whether a Host input is scalar-by-value,
 borrowed string, borrowed aggregate view, typed handle, or owned value.
-`SourceOrigin` carries the `.nidl` URI and declaration/name range for
+`SourceOrigin` carries the `.contract.nexa` URI and declaration/name range for
 diagnostics only; it is not emitted into ABI identity.
 
 An unsupported type/codec/borrow combination is rejected while constructing
@@ -102,7 +102,7 @@ load_profile ticket  → LoadProfileCompletionTicket
 Snake contract       → SnakeHost
 ```
 
-NIDL function and field names remain snake_case Rust method and field
+Contract function and field names remain snake_case Rust method and field
 identifiers. Contract, type, variant, marker, wrapper, argument, output, and
 ticket names are PascalCase.
 
@@ -135,7 +135,7 @@ Entrypoint Output
 
 The ABI-to-Rust mapping begins with:
 
-| NIDL | Generated Rust surface |
+| Contract | Generated Rust surface |
 | --- | --- |
 | `i32`, `i64`, `f32`, `f64`, `bool` | corresponding Rust scalar |
 | `rune` | `char` |
@@ -170,12 +170,12 @@ visible on failure.
 
 For:
 
-```nidl
-contract Snake {
-    host {
-        fn format_score(score: i32) -> string;
-        async fn load_profile(id: string) -> Result<Profile, LoadError>;
-    }
+```nexa
+contract Snake;
+
+host {
+    fn format_score(score: i32) -> string;
+    async fn load_profile(id: string) -> Result<Profile, LoadError>;
 }
 ```
 
@@ -188,16 +188,16 @@ pub trait SnakeHost {
 }
 ```
 
-Method names and typed argument order match NIDL. Borrowed inputs receive a
-generated lifetime only where the `BorrowStrategy` requires one. Host errors,
-Runtime resource context, and return conversion use the generated ABI
-adapters; application code does not decode raw argument slots.
+Method names and typed argument order match the Contract. Borrowed inputs
+receive a generated lifetime only where the `BorrowStrategy` requires one.
+Host errors, Runtime resource context, and return conversion use the generated
+ABI adapters; application code does not decode raw argument slots.
 
 An asynchronous Host function generates a typed completion-ticket wrapper and
 request dispatch metadata. The wrapper exposes completion in terms of the
 declared result, for example `Result<Profile, LoadError>`. Request handles,
 request result wrappers, cancellation internals, and abandonment internals are
-Rust ABI/Runtime details and never reappear in NIDL source.
+Rust ABI/Runtime details and never reappear in Contract source.
 
 ## Generated Host registry
 
@@ -226,7 +226,7 @@ an arbitrary Rust expression string.
 
 For:
 
-```nidl
+```nexa
 nexa {
     fn on_event(event: SnakeEvent) -> Array<SnakeCommand>;
 }
@@ -253,7 +253,7 @@ OnEvent::NAME == "on_event"
 It also carries the Descriptor v2 Stable ID and exact signature, computes
 transactional argument requirements, encodes typed arguments, and decodes the
 owned output. A no-argument entrypoint still receives a zero-sized
-`NameArgs`. An omitted NIDL return becomes `type NameOutput = ();`.
+`NameArgs`. An omitted Contract return becomes `type NameOutput = ();`.
 
 The marker itself does not encode required versus optional. The same marker is
 used by typed APIs such as global requirement, existence query, optional
@@ -266,10 +266,10 @@ Generated bindings expose typed contract metadata derived from Descriptor v2:
 
 ```text
 contract source name
-NIDL syntax version = 2
+Contract syntax version = 3
 Host Contract schema version = 2
 ABI Descriptor version = 2
-SOURCE = exact UTF-8 NIDL source snapshot
+SOURCE = exact UTF-8 Contract source snapshot
 CONTRACT_DESCRIPTOR = complete canonical full-contract framed bytes
 CONTRACT_FINGERPRINT = BLAKE3(CONTRACT_DESCRIPTOR)
 CONTRACT_RUNTIME_ID = compact Runtime identity derived from the fingerprint
@@ -295,7 +295,7 @@ validated machine semantic model
 → output
 ```
 
-It may share token helpers with `nexa-idl`, but cannot preserve a second large
+It may share token helpers with `nexa-contract`, but cannot preserve a second large
 `String`, `write!`, `writeln!`, or `format!` Rust generator. Machine transition
 arms, state types, dispatch, and codecs are token nodes built from validated
 model values.
@@ -303,13 +303,25 @@ model values.
 ## Determinism
 
 Generation order follows Descriptor v2 canonical top-level ordering.
-Semantically identical NIDL produces byte-identical pretty-printed Rust across
-runs. Output does not depend on hash-map iteration, absolute paths, process
-state, locale, source declaration order where the descriptor says order is
-irrelevant, or comments.
+Semantically identical Contract source produces byte-identical pretty-printed
+Rust across runs. Output does not depend on hash-map iteration, absolute paths,
+process state, locale, source declaration order where the descriptor says
+order is irrelevant, or comments.
 
-Generated source begins with a deterministic do-not-edit marker. It contains
-no timestamp, host path, random identifier, or compiler debug rendering.
+Generated source begins with a deterministic do-not-edit marker followed by
+the normalized source file name:
+
+```rust
+// Generated from snake_api.contract.nexa.
+```
+
+Only the final source file name is emitted; no absolute path is allowed.
+Generated output contains no timestamp, host path, random identifier, or
+compiler debug rendering. Apart from this audited provenance comment and a
+syntax-version field already exposed by generated metadata, migrating an
+equivalent Contract must preserve the generated Host trait, ABI type, wrapper,
+registry, and Nexa entrypoint API. The required syntax-version metadata rename
+is provenance, not permission to alter those binding shapes.
 
 ## Removed legacy output
 
@@ -333,7 +345,7 @@ fixtures and consumers compile only against the v2 names and typed markers.
 
 The structured-codegen gate must demonstrate:
 
-1. every repository `.nidl` reaches `ValidatedContract`;
+1. every repository `.contract.nexa` reaches `ValidatedContract`;
 2. every generated file passes both required `syn` parses;
 3. repeated generation is byte-for-byte deterministic;
 4. generated bindings compile in their real Host consumers;

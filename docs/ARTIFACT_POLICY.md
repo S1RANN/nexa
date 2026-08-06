@@ -26,7 +26,8 @@ and confirming a clean working tree. A generated report never changes the Git
 tree.
 
 `cargo xtask finalize-m4-r1` follows the same rule after the Language v2,
-Object Model v2, Async v2, NIDL v2, structured Codegen, Standalone, REPL,
+Object Model v2, Async v2, the then-active Contract surface, structured
+Codegen, Standalone, REPL,
 multiple-entrypoint, scale, and repository gates. Its completion report is
 `target/nexa-artifacts/m4r1-finalize/final-report.json`.
 
