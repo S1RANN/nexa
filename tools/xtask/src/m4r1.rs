@@ -95,7 +95,7 @@ const EMBEDDED_NEGATIVE_TESTS: [(&str, &str, usize); 11] = [
         2,
     ),
     (
-        "crates/nexa-idl/tests/nidl_v2.rs",
+        "crates/nexa-contract/tests/nidl_v2.rs",
         "rejects_every_removed_nidl_spelling",
         15,
     ),
@@ -174,16 +174,16 @@ const TEST_GATES: [TestGateSpec; 8] = [
     },
     TestGateSpec {
         name: "test-nidl-v2",
-        package: "nexa-idl",
+        package: "nexa-contract",
         target: "nidl_v2",
-        source: "crates/nexa-idl/tests/nidl_v2.rs",
+        source: "crates/nexa-contract/tests/nidl_v2.rs",
         editor: false,
     },
     TestGateSpec {
         name: "test-structured-codegen",
-        package: "nexa-idl",
+        package: "nexa-contract",
         target: "structured_codegen",
-        source: "crates/nexa-idl/tests/structured_codegen.rs",
+        source: "crates/nexa-contract/tests/structured_codegen.rs",
         editor: false,
     },
     TestGateSpec {
@@ -1500,7 +1500,7 @@ fn run_nidl_mutation_gate(runner: &mut CommandRunner) -> Result<PathBuf, DynErro
     let args = [
         "test",
         "-p",
-        "nexa-idl",
+        "nexa-contract",
         "--test",
         "nidl_v2",
         "m4r1_nidl_mutation_stress",
@@ -1530,7 +1530,7 @@ fn run_structured_codegen_cargo_check(runner: &mut CommandRunner) -> Result<(), 
     let args = [
         "test",
         "-p",
-        "nexa-idl",
+        "nexa-contract",
         "--test",
         "structured_codegen",
         "generated_fixture_cargo_checks",
@@ -1798,7 +1798,7 @@ fn validate_frozen_versions(
             "pub const PACKAGE_MANIFEST_SCHEMA: u32 = 2;",
         ),
         (
-            "crates/nexa-idl/src/descriptor.rs",
+            "crates/nexa-contract/src/descriptor.rs",
             "pub const CONTRACT_SYNTAX_VERSION: u16 = 3;",
         ),
         (
@@ -1806,7 +1806,7 @@ fn validate_frozen_versions(
             "pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;",
         ),
         (
-            "crates/nexa-idl/src/descriptor.rs",
+            "crates/nexa-contract/src/descriptor.rs",
             "pub const ABI_DESCRIPTOR_VERSION: u16 = 2;",
         ),
         (
@@ -1864,7 +1864,7 @@ fn validate_structured_codegen_backends(
 ) {
     for (path, required) in [
         (
-            "crates/nexa-idl/src/codegen.rs",
+            "crates/nexa-contract/src/codegen.rs",
             &[
                 "pub fn generate_rust_tokens(",
                 "Result<TokenStream, CodegenError>",
@@ -2142,7 +2142,7 @@ fn negative_test_evidence(path: &str, test: &str, source: &str) -> bool {
             ".any(|error| error.message.contains(\"prefix `await`\"))",
             "${await load()}",
         ],
-        ("crates/nexa-idl/tests/nidl_v2.rs", "rejects_every_removed_nidl_spelling") => &[
+        ("crates/nexa-contract/tests/nidl_v2.rs", "rejects_every_removed_nidl_spelling") => &[
             "let cases = [",
             "for source in cases",
             "parse(source).is_err()",
@@ -2388,7 +2388,7 @@ fn run_legacy_audit() -> LegacyAudit {
                 }
             }
         }
-        if relative.starts_with("crates/nexa-idl/src/") {
+        if relative.starts_with("crates/nexa-contract/src/") {
             for needle in ["fn tokenize(", "struct Parser ", "struct Parser<"] {
                 record_literal_matches(
                     &mut counts,
@@ -4137,7 +4137,7 @@ fn gate_command_matrix_matches(receipt: &GateReceipt) -> bool {
                     &[
                         "test",
                         "-p",
-                        "nexa-idl",
+                        "nexa-contract",
                         "--test",
                         "structured_codegen",
                         "generated_fixture_cargo_checks",
@@ -4153,7 +4153,7 @@ fn gate_command_matrix_matches(receipt: &GateReceipt) -> bool {
                     &[
                         "test",
                         "-p",
-                        "nexa-idl",
+                        "nexa-contract",
                         "--test",
                         "structured_codegen",
                         "generated_fixture_cargo_checks",
@@ -4172,7 +4172,7 @@ fn gate_command_matrix_matches(receipt: &GateReceipt) -> bool {
                     &[
                         "test",
                         "-p",
-                        "nexa-idl",
+                        "nexa-contract",
                         "--test",
                         "nidl_v2",
                         "m4r1_nidl_mutation_stress",
@@ -4188,7 +4188,7 @@ fn gate_command_matrix_matches(receipt: &GateReceipt) -> bool {
                     &[
                         "test",
                         "-p",
-                        "nexa-idl",
+                        "nexa-contract",
                         "--test",
                         "nidl_v2",
                         "m4r1_nidl_mutation_stress",
