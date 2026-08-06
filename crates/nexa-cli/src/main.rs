@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2221,31 +2220,7 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
 /// Validates that `path` has a `.contract.nexa` extension, returning a consistent
 /// `CliError::usage` on failure (including migration diagnostics for legacy `.nidl`).
 fn validate_contract_path(path: &Path, command: &str) -> CliResult<()> {
-    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-        return Err(CliError::usage(format!(
-            "`{command}` requires a file with a valid name; got `{}`",
-            path.display()
-        )));
-    };
-    if file_name.ends_with(".contract.nexa") {
-        return Ok(());
-    }
-    if file_name.ends_with(".nidl") {
-        let new_name = path.with_extension("contract.nexa");
-        let new_name_str = new_name
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("");
-        return Err(CliError::usage(format!(
-            "`{command}` accepts only `*.contract.nexa` files; \
-             `{file_name}` uses the legacy `.nidl` extension. \
-             Rename it to `{new_name_str}` and replace the outer `contract Name {{ ... }}` \
-             block with a flat `contract Name;` header at the top of the file."
-        )));
-    }
-    Err(CliError::usage(format!(
-        "`{command}` accepts only `*.contract.nexa` files, got `{file_name}`"
-    )))
+    project::validate_contract_path(path, command)
 }
 
 fn check_contract(path: &Path, format: DiagnosticFormat) -> CliResult<()> {

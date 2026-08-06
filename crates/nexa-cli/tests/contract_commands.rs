@@ -222,3 +222,46 @@ fn contract_check_project_config_legacy_nidl_gives_migration_diagnostic() {
     assert!(stderr["data"]["contractPath"].as_str().unwrap_or("").contains("missing.nidl"),
         "contractPath includes the legacy path");
 }
+
+#[test]
+fn contract_flag_json_error_has_structured_fields() {
+    // Processes: nexa check/build/test --contract <wrong.extension> --diagnostic-format json
+    // must all emit structured error with contractPath/contractSyntaxVersion/contractDiagnostic.
+    let dir = TestDir::new("flag");
+    let src = dir.write("main.nexa", "fn main() -> i32 { return 1; }\n");
+    let bad = dir.write("bad.txt", "contract Test;\n");
+    let pkg = dir.path().join("pkg");
+    fs::create_dir_all(pkg.join("src/example")).expect("pkg src");
+    fs::write(pkg.join("package.toml"),
+        "schema = 2\nkind = \"application\"\nid = \"example.test\"\nname = \"Test\"\nversion = \"1.0.0\"\nsource_root = \"src\"\nentry = \"example.test\"\nactivation = \"default-enabled\"\nhandler_fuel = 20000\ncapabilities = []\n").expect("manifest");
+    fs::write(pkg.join("src/example/test.nexa"),
+        "fn value() -> i32 { return 1; }\n").expect("source");
+
+    for (cmd, label) in [("check", "check"), ("build", "build"), ("test", "test")] {
+        for fmt in ["json", "ndjson"] {
+            let output = dir.run(&[
+                cmd, pkg.to_str().unwrap(),
+                "--contract", bad.to_str().unwrap(),
+                "--diagnostic-format", fmt,
+            ]);
+            // Wrong suffix is a usage error (exit 2).
+            assert_eq!(output.status.code(), Some(2),
+                "{} --contract bad.txt --diagnostic-format {}: stderr={}",
+                cmd, fmt, text(&output.stderr));
+            assert!(output.stdout.is_empty(),
+                "{} stdout must be empty on error: {}", cmd, text(&output.stdout));
+            let stderr: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("stderr JSON");
+            assert_eq!(stderr["status"], "error", "{cmd} {fmt}");
+            assert!(stderr["data"]["contractPath"].as_str().unwrap_or("").contains("bad.txt"),
+                "{cmd} {fmt} contractPath");
+            assert!(stderr["data"]["contractSyntaxVersion"].as_u64().unwrap_or(0) >= 3,
+                "{cmd} {fmt} version");
+            assert!(stderr["data"]["contractDiagnostic"]["message"]
+                .as_str().unwrap_or("").contains("*.contract.nexa"),
+                "{cmd} {fmt} diagnostic");
+            assert_eq!(stderr["data"]["contractDiagnostic"]["exitCode"], 2,
+                "{cmd} {fmt} exitCode");
+        }
+    }
+}
