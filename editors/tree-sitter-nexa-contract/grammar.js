@@ -2,15 +2,15 @@ const syntax = require("../language-syntax.json");
 
 const keywords = Object.fromEntries(
   [
-    ...syntax.nidl.declarationKeywords,
-    ...syntax.nidl.modeKeywords,
-    ...syntax.nidl.attributeKeywords,
-    ...syntax.nidl.policyKeywords,
+    ...syntax.contract.declarationKeywords,
+    ...syntax.contract.modeKeywords,
+    ...syntax.contract.attributeKeywords,
+    ...syntax.contract.policyKeywords,
   ].map((keyword) => [keyword, keyword]),
 );
 
 module.exports = grammar({
-  name: "nexa_idl",
+  name: "nexa_contract",
 
   extras: ($) => [
     /\s/,
@@ -32,11 +32,19 @@ module.exports = grammar({
 
     nidl_document: ($) =>
       seq(
+        field("header", $.contract_header),
+        repeat($.contract_member),
+      ),
+
+    // Contract Syntax v3 (flat): `@attr... contract <Name>;` is the file-level header, then
+    // struct/enum/handle/host/nexa items follow at the top level with no outer block. Header
+    // attributes (e.g. `@stable("...")`) and doc comments attach to this header.
+    contract_header: ($) =>
+      seq(
+        repeat($.nidl_attribute),
         field("keyword", $.contract_keyword),
         field("name", $.nidl_type_identifier),
-        "{",
-        repeat($.contract_member),
-        "}",
+        ";",
       ),
 
     contract_member: ($) =>
@@ -220,9 +228,9 @@ module.exports = grammar({
     async_keyword: (_) => keywords.async,
     nidl_function_keyword: (_) => keywords.fn,
     nidl_attribute_name: ($) =>
-      choice(...syntax.nidl.attributeKeywords, $.nidl_identifier),
-    policy_value: (_) => choice(...syntax.nidl.policyKeywords),
-    nidl_builtin_type: (_) => choice(...syntax.nidl.builtinTypes),
+      choice(...syntax.contract.attributeKeywords, $.nidl_identifier),
+    policy_value: (_) => choice(...syntax.contract.policyKeywords),
+    nidl_builtin_type: (_) => choice(...syntax.contract.builtinTypes),
 
     string_literal: ($) =>
       seq('"', repeat(choice($.string_content, $.escape_sequence)), '"'),

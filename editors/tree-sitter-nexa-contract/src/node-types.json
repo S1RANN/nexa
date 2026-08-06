@@ -44,6 +44,42 @@
     ]
   },
   {
+    "type": "contract_header",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "contract_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_attribute",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "handle_declaration",
     "named": true,
     "fields": {
@@ -376,22 +412,12 @@
     "type": "nidl_document",
     "named": true,
     "fields": {
-      "keyword": {
+      "header": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "contract_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_identifier",
+            "type": "contract_header",
             "named": true
           }
         ]
@@ -850,6 +876,10 @@
   },
   {
     "type": "rune",
+    "named": false
+  },
+  {
+    "type": "stable",
     "named": false
   },
   {

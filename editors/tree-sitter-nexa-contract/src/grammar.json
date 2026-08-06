@@ -1,6 +1,6 @@
 {
   "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
-  "name": "nexa_idl",
+  "name": "nexa_contract",
   "word": "nidl_identifier",
   "rules": {
     "source_file": {
@@ -54,6 +54,33 @@
       "members": [
         {
           "type": "FIELD",
+          "name": "header",
+          "content": {
+            "type": "SYMBOL",
+            "name": "contract_header"
+          }
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "contract_member"
+          }
+        }
+      ]
+    },
+    "contract_header": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_attribute"
+          }
+        },
+        {
+          "type": "FIELD",
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
@@ -70,18 +97,7 @@
         },
         {
           "type": "STRING",
-          "value": "{"
-        },
-        {
-          "type": "REPEAT",
-          "content": {
-            "type": "SYMBOL",
-            "name": "contract_member"
-          }
-        },
-        {
-          "type": "STRING",
-          "value": "}"
+          "value": ";"
         }
       ]
     },
@@ -1056,6 +1072,10 @@
         {
           "type": "STRING",
           "value": "capability"
+        },
+        {
+          "type": "STRING",
+          "value": "stable"
         },
         {
           "type": "SYMBOL",

@@ -262,12 +262,12 @@ fn write_package_fixture(root: &Path) -> PathBuf {
         "fn main(args: Array<string>) -> i32 { return args.len(); }\n",
     )
     .expect("standalone Package entry module");
-    fs::write(root.join("app_api.nidl"), "contract EmptyHost {}\n")
+    fs::write(root.join("app_api.contract.nexa"), "contract EmptyHost;\n")
         .expect("standalone project Contract");
     fs::write(
         root.join("nexa.dev.toml"),
         "schema = 2\n\
-         contract = \"app_api.nidl\"\n\
+         contract = \"app_api.contract.nexa\"\n\
          required_entrypoints = []\n\
          [[sources]]\n\
          id = \"fixture\"\n\

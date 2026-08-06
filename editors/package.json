@@ -2,7 +2,7 @@
   "name": "nexa-editor-support",
   "version": "0.2.0",
   "private": true,
-  "description": "Local editor support tooling for Nexa v2 and NIDL v2.",
+  "description": "Local editor support tooling for Nexa v2 and Host Contracts (v3).",
   "license": "MIT OR Apache-2.0",
   "scripts": {
     "generate": "node scripts/generate.mjs",

@@ -2,7 +2,7 @@ const cp = require("node:child_process");
 const vscode = require("vscode");
 
 const BUILD_INPUT_GLOB =
-  "**/{*.nexa,*.nidl,package.toml,nexa.lock,nexa.dev.toml}";
+  "**/{*.nexa,*.contract.nexa,package.toml,nexa.lock,nexa.dev.toml}";
 const BUILD_INPUT_NAMES = new Set([
   "package.toml",
   "nexa.lock",
@@ -15,13 +15,14 @@ let output;
 let receiveBuffer = Buffer.alloc(0);
 let nextRequestId = 1;
 let initializeRequestId;
+const pendingSymbolRequests = new Map();
 
 function isBuildInputUri(uri) {
   if (uri.scheme !== "file") return false;
   const name = uri.path.slice(uri.path.lastIndexOf("/") + 1);
   return (
+    name.endsWith(".contract.nexa") ||
     name.endsWith(".nexa") ||
-    name.endsWith(".nidl") ||
     BUILD_INPUT_NAMES.has(name)
   );
 }
@@ -121,6 +122,35 @@ function handleMessage(message) {
     for (const document of vscode.workspace.textDocuments) openDocument(document);
     return;
   }
+  if (message.id !== undefined && pendingSymbolRequests.has(message.id)) {
+    const resolve = pendingSymbolRequests.get(message.id);
+    pendingSymbolRequests.delete(message.id);
+    const symbols = Array.isArray(message.result) ? message.result : [];
+    resolve(
+      symbols.map((symbol) => {
+        const location = new vscode.Range(
+          symbol.range.start.line,
+          symbol.range.start.character,
+          symbol.range.end.line,
+          symbol.range.end.character,
+        );
+        const selection = new vscode.Range(
+          symbol.selectionRange.start.line,
+          symbol.selectionRange.start.character,
+          symbol.selectionRange.end.line,
+          symbol.selectionRange.end.character,
+        );
+        return new vscode.DocumentSymbol(
+          symbol.name,
+          "",
+          symbol.kind || 0,
+          location,
+          selection,
+        );
+      }),
+    );
+    return;
+  }
   if (message.method !== "textDocument/publishDiagnostics") return;
   const uri = vscode.Uri.parse(message.params.uri);
   const converted = message.params.diagnostics.map((item) => {
@@ -177,12 +207,14 @@ function start() {
   server.stdout.on("data", parseMessages);
   server.stderr.on("data", (chunk) => output.append(chunk.toString("utf8")));
   server.on("error", (error) => {
+    settlePendingSymbolRequests();
     output.appendLine(`Could not start Nexa language server: ${error.message}`);
     vscode.window.showErrorMessage(
       `Could not start Nexa language server (${executable}): ${error.message}`,
     );
   });
   server.on("exit", (code, signal) => {
+    settlePendingSymbolRequests();
     output.appendLine(`Nexa language server exited: code=${code} signal=${signal}`);
   });
   const workspaceFolders = vscode.workspace.workspaceFolders || [];
@@ -203,6 +235,7 @@ function start() {
 
 async function stop() {
   if (!server) return;
+  settlePendingSymbolRequests();
   request("shutdown", null);
   notify("exit", null);
   const old = server;
@@ -219,6 +252,29 @@ async function stop() {
   });
 }
 
+function provideDocumentSymbols(document) {
+  return new Promise((resolve) => {
+    if (!server || !server.stdin.writable) {
+      return resolve([]);
+    }
+    const id = nextRequestId++;
+    pendingSymbolRequests.set(id, resolve);
+    write({
+      jsonrpc: "2.0",
+      id,
+      method: "textDocument/documentSymbol",
+      params: { textDocument: { uri: document.uri.toString() } },
+    });
+  });
+}
+
+function settlePendingSymbolRequests() {
+  for (const resolve of pendingSymbolRequests.values()) {
+    resolve([]);
+  }
+  pendingSymbolRequests.clear();
+}
+
 function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("nexa");
   output = vscode.window.createOutputChannel("Nexa");
@@ -226,6 +282,10 @@ function activate(context) {
     vscode.workspace.createFileSystemWatcher(BUILD_INPUT_GLOB);
   context.subscriptions.push(diagnostics, output, buildInputWatcher);
   context.subscriptions.push(
+    vscode.languages.registerDocumentSymbolProvider(
+      { scheme: "file", pattern: "**/*.contract.nexa" },
+      { provideDocumentSymbols },
+    ),
     vscode.workspace.onDidOpenTextDocument(openDocument),
     vscode.workspace.onDidChangeTextDocument(changeDocument),
     vscode.workspace.onDidSaveTextDocument((document) => {

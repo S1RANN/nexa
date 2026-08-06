@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-  "name": "Nexa IDL",
-  "scopeName": "source.nexa-idl",
+  "name": "Nexa Contract",
+  "scopeName": "source.nexa-contract",
   "fileTypes": [
-    "nidl"
+    "contract.nexa"
   ],
   "patterns": [
     {
@@ -50,39 +50,39 @@
     "comments": {
       "patterns": [
         {
-          "name": "comment.line.documentation.nexa-idl",
+          "name": "comment.line.documentation.nexa-contract",
           "match": "///.*$"
         },
         {
-          "name": "comment.line.double-slash.nexa-idl",
+          "name": "comment.line.double-slash.nexa-contract",
           "match": "//.*$"
         },
         {
-          "name": "comment.block.nexa-idl",
+          "name": "comment.block.nexa-contract",
           "begin": "/\\*",
           "end": "\\*/"
         }
       ]
     },
     "strings": {
-      "name": "string.quoted.double.nexa-idl",
+      "name": "string.quoted.double.nexa-contract",
       "begin": "\"",
       "end": "\"",
       "patterns": [
         {
-          "name": "constant.character.escape.nexa-idl",
+          "name": "constant.character.escape.nexa-contract",
           "match": "\\\\[nrt\\\\\"]"
         }
       ]
     },
     "attributes": {
-      "match": "(@)(fuel|cancel|abandon|capability)\\b",
+      "match": "(@)(fuel|cancel|abandon|capability|stable)\\b",
       "captures": {
         "1": {
-          "name": "punctuation.definition.annotation.nexa-idl"
+          "name": "punctuation.definition.annotation.nexa-contract"
         },
         "2": {
-          "name": "entity.name.tag.nexa-idl"
+          "name": "entity.name.tag.nexa-contract"
         }
       }
     },
@@ -92,10 +92,10 @@
           "match": "\\b(contract|handle|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
-              "name": "storage.type.nexa-idl"
+              "name": "storage.type.nexa-contract"
             },
             "2": {
-              "name": "entity.name.type.nexa-idl"
+              "name": "entity.name.type.nexa-contract"
             }
           }
         },
@@ -103,60 +103,60 @@
           "match": "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
-              "name": "storage.modifier.async.nexa-idl"
+              "name": "storage.modifier.async.nexa-contract"
             },
             "2": {
-              "name": "storage.type.function.nexa-idl"
+              "name": "storage.type.function.nexa-contract"
             },
             "3": {
-              "name": "entity.name.function.nexa-idl"
+              "name": "entity.name.function.nexa-contract"
             }
           }
         }
       ]
     },
     "policies": {
-      "name": "constant.language.policy.nexa-idl",
+      "name": "constant.language.policy.nexa-contract",
       "match": "\\b(?:return_error|cancel_task|trap)\\b"
     },
     "builtin-types": {
-      "name": "support.type.builtin.nexa-idl",
+      "name": "support.type.builtin.nexa-contract",
       "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Buffer|Option|Result|Token|Snapshot)\\b"
     },
     "keywords": {
-      "name": "keyword.control.nexa-idl",
+      "name": "keyword.control.nexa-contract",
       "match": "\\b(?:contract|struct|enum|handle|host|nexa|fn|async)\\b"
     },
     "function-names": {
-      "name": "entity.name.function.call.nexa-idl",
+      "name": "entity.name.function.call.nexa-contract",
       "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
     },
     "field-names": {
-      "name": "variable.other.property.nexa-idl",
+      "name": "variable.other.property.nexa-contract",
       "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*:)"
     },
     "type-names": {
-      "name": "entity.name.type.nexa-idl",
+      "name": "entity.name.type.nexa-contract",
       "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
     },
     "numbers": {
-      "name": "constant.numeric.integer.nexa-idl",
+      "name": "constant.numeric.integer.nexa-contract",
       "match": "\\b[0-9]+\\b"
     },
     "operators": {
       "patterns": [
         {
-          "name": "keyword.operator.arrow.nexa-idl",
+          "name": "keyword.operator.arrow.nexa-contract",
           "match": "->"
         },
         {
-          "name": "keyword.operator.nexa-idl",
+          "name": "keyword.operator.nexa-contract",
           "match": "[=:<>]"
         }
       ]
     },
     "punctuation": {
-      "name": "punctuation.separator.nexa-idl",
+      "name": "punctuation.separator.nexa-contract",
       "match": "[{},();@]"
     }
   }

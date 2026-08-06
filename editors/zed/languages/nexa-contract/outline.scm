@@ -1,4 +1,4 @@
-(nidl_document
+(contract_header
   keyword: (_) @context
   name: (_) @name) @item
 

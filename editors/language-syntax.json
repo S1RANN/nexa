@@ -81,7 +81,7 @@
       "finish_migration"
     ]
   },
-  "nidl": {
+  "contract": {
     "declarationKeywords": [
       "contract",
       "struct",
@@ -98,7 +98,8 @@
       "fuel",
       "cancel",
       "abandon",
-      "capability"
+      "capability",
+      "stable"
     ],
     "policyKeywords": [
       "return_error",

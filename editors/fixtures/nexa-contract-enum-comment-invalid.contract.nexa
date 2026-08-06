@@ -1,0 +1,7 @@
+contract EnumCommentFixture;
+
+enum State {
+    // Comments are accepted between enum variants.
+    Ready,
+    Waiting,
+}

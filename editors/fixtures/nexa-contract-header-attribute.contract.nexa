@@ -1,0 +1,24 @@
+/// Snake 游戏 Host ABI。
+@stable("snake-api")
+contract SnakeApi;
+
+struct Cell {
+    x: i32,
+    y: i32,
+}
+
+enum SnakeEvent {
+    Started,
+    Ended,
+}
+
+handle Entity;
+
+host {
+    @fuel(5)
+    fn log(message: string);
+}
+
+nexa {
+    fn on_event(event: SnakeEvent) -> Array<i32>;
+}

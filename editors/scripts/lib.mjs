@@ -9,7 +9,7 @@ export const repositoryDirectory = path.resolve(editorsDirectory, "..");
 export const grammarDirectory = path.join(editorsDirectory, "tree-sitter-nexa");
 export const idlGrammarDirectory = path.join(
   editorsDirectory,
-  "tree-sitter-nexa-idl",
+  "tree-sitter-nexa-contract",
 );
 export const vscodeDirectory = path.join(editorsDirectory, "vscode");
 export const zedDirectory = path.join(editorsDirectory, "zed");
@@ -47,7 +47,7 @@ function capture(name) {
 
 export function textMateGrammars(syntax = readSyntax()) {
   const nexa = syntax.nexa;
-  const nidl = syntax.nidl;
+  const contract = syntax.contract;
   const nexaKeywordGroups = [
     nexa.declarationKeywords,
     nexa.visibilityKeywords,
@@ -246,12 +246,12 @@ export function textMateGrammars(syntax = readSyntax()) {
     },
   };
 
-  const nidlGrammar = {
+  const contractGrammar = {
     $schema:
       "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-    name: "Nexa IDL",
-    scopeName: "source.nexa-idl",
-    fileTypes: ["nidl"],
+    name: "Nexa Contract",
+    scopeName: "source.nexa-contract",
+    fileTypes: ["contract.nexa"],
     patterns: [
       { include: "#comments" },
       { include: "#strings" },
@@ -271,38 +271,38 @@ export function textMateGrammars(syntax = readSyntax()) {
       comments: {
         patterns: [
           {
-            name: "comment.line.documentation.nexa-idl",
+            name: "comment.line.documentation.nexa-contract",
             match: "///.*$",
           },
           {
-            name: "comment.line.double-slash.nexa-idl",
+            name: "comment.line.double-slash.nexa-contract",
             match: "//.*$",
           },
           {
-            name: "comment.block.nexa-idl",
+            name: "comment.block.nexa-contract",
             begin: "/\\*",
             end: "\\*/",
           },
         ],
       },
       strings: {
-        name: "string.quoted.double.nexa-idl",
+        name: "string.quoted.double.nexa-contract",
         begin: "\"",
         end: "\"",
         patterns: [
           {
-            name: "constant.character.escape.nexa-idl",
+            name: "constant.character.escape.nexa-contract",
             match: "\\\\[nrt\\\\\"]",
           },
         ],
       },
       attributes: {
-        match: `(@)(${nidl.attributeKeywords
+        match: `(@)(${contract.attributeKeywords
           .map(escapeRegex)
           .join("|")})\\b`,
         captures: {
-          1: capture("punctuation.definition.annotation.nexa-idl"),
-          2: capture("entity.name.tag.nexa-idl"),
+          1: capture("punctuation.definition.annotation.nexa-contract"),
+          2: capture("entity.name.tag.nexa-contract"),
         },
       },
       declarations: {
@@ -311,66 +311,66 @@ export function textMateGrammars(syntax = readSyntax()) {
             match:
               "\\b(contract|handle|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
             captures: {
-              1: capture("storage.type.nexa-idl"),
-              2: capture("entity.name.type.nexa-idl"),
+              1: capture("storage.type.nexa-contract"),
+              2: capture("entity.name.type.nexa-contract"),
             },
           },
           {
             match:
               "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
             captures: {
-              1: capture("storage.modifier.async.nexa-idl"),
-              2: capture("storage.type.function.nexa-idl"),
-              3: capture("entity.name.function.nexa-idl"),
+              1: capture("storage.modifier.async.nexa-contract"),
+              2: capture("storage.type.function.nexa-contract"),
+              3: capture("entity.name.function.nexa-contract"),
             },
           },
         ],
       },
       policies: {
-        name: "constant.language.policy.nexa-idl",
-        match: wordPattern(nidl.policyKeywords),
+        name: "constant.language.policy.nexa-contract",
+        match: wordPattern(contract.policyKeywords),
       },
       "builtin-types": {
-        name: "support.type.builtin.nexa-idl",
-        match: wordPattern(nidl.builtinTypes),
+        name: "support.type.builtin.nexa-contract",
+        match: wordPattern(contract.builtinTypes),
       },
       keywords: {
-        name: "keyword.control.nexa-idl",
+        name: "keyword.control.nexa-contract",
         match: wordPattern([
-          ...nidl.declarationKeywords,
-          ...nidl.modeKeywords,
+          ...contract.declarationKeywords,
+          ...contract.modeKeywords,
         ]),
       },
       "function-names": {
-        name: "entity.name.function.call.nexa-idl",
+        name: "entity.name.function.call.nexa-contract",
         match: "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()",
       },
       "field-names": {
-        name: "variable.other.property.nexa-idl",
+        name: "variable.other.property.nexa-contract",
         match: "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*:)",
       },
       "type-names": {
-        name: "entity.name.type.nexa-idl",
+        name: "entity.name.type.nexa-contract",
         match: "\\b[A-Z][A-Za-z0-9_]*\\b",
       },
       numbers: {
-        name: "constant.numeric.integer.nexa-idl",
+        name: "constant.numeric.integer.nexa-contract",
         match: "\\b[0-9]+\\b",
       },
       operators: {
         patterns: [
           {
-            name: "keyword.operator.arrow.nexa-idl",
+            name: "keyword.operator.arrow.nexa-contract",
             match: "->",
           },
           {
-            name: "keyword.operator.nexa-idl",
+            name: "keyword.operator.nexa-contract",
             match: "[=:<>]",
           },
         ],
       },
       punctuation: {
-        name: "punctuation.separator.nexa-idl",
+        name: "punctuation.separator.nexa-contract",
         match: "[{},();@]",
       },
     },
@@ -378,7 +378,7 @@ export function textMateGrammars(syntax = readSyntax()) {
 
   return new Map([
     ["nexa.tmLanguage.json", nexaGrammar],
-    ["nexa-idl.tmLanguage.json", nidlGrammar],
+    ["nexa-contract.tmLanguage.json", contractGrammar],
   ]);
 }
 
