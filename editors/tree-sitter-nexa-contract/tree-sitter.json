@@ -1,8 +1,8 @@
 {
   "grammars": [
     {
-      "name": "nexa_idl",
-      "camelcase": "NexaIdl",
+      "name": "nexa_contract",
+      "camelcase": "NexaContract",
       "scope": "source.nexa-contract",
       "path": ".",
       "file-types": [

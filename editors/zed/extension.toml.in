@@ -11,7 +11,7 @@ languages = ["languages/nexa", "languages/nexa-contract"]
 repository = "{{GRAMMAR_REPOSITORY}}"
 rev = "{{GRAMMAR_REVISION}}"
 
-[grammars.nexa_idl]
+[grammars.nexa_contract]
 repository = "{{IDL_GRAMMAR_REPOSITORY}}"
 rev = "{{IDL_GRAMMAR_REVISION}}"
 

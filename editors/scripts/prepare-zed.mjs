@@ -142,7 +142,7 @@ const packagedGrammar = packageGrammar(
 );
 const packagedIdlGrammar = packageGrammar(
   idlGrammarDirectory,
-  "tree-sitter-nexa-idl",
+  "tree-sitter-nexa-contract",
   "Package Nexa IDL Tree-sitter grammar",
 );
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
-  "name": "nexa_idl",
+  "name": "nexa_contract",
   "word": "nidl_identifier",
   "rules": {
     "source_file": {

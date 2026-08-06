@@ -57,7 +57,7 @@ const nexaExamples = [
   "examples/snake-game/packages/mods/score-overlay/src/snake/score_overlay.nexa",
   "examples/snake-game/packages/mods/weird-foods/src/snake/weird_foods.nexa",
 ];
-const nidlExamples = [
+const contractExamples = [
   "editors/fixtures/m4-language.contract.nexa",
   "editors/fixtures/nexa-contract-comment-invalid.contract.nexa",
   "editors/fixtures/nexa-contract-enum-comment-invalid.contract.nexa",
@@ -103,7 +103,7 @@ const queryChecks = [
   ],
   [
     idlGrammarDirectory,
-    "tree-sitter-nexa-idl/queries/highlights.scm",
+    "tree-sitter-nexa-contract/queries/highlights.scm",
     "editors/fixtures/m4-language.contract.nexa",
     ["keyword", "function", "type", "type.builtin", "attribute"],
   ],
@@ -133,7 +133,7 @@ const queryChecks = [
   ],
   [
     idlGrammarDirectory,
-    "tree-sitter-nexa-idl/queries/highlights.scm",
+    "tree-sitter-nexa-contract/queries/highlights.scm",
     "editors/fixtures/nexa-contract-header-attribute.contract.nexa",
     ["keyword", "type", "attribute", "comment.documentation"],
   ],
@@ -182,10 +182,10 @@ function validateJsonFiles() {
     "tree-sitter-nexa/tree-sitter.json",
     "tree-sitter-nexa/src/grammar.json",
     "tree-sitter-nexa/src/node-types.json",
-    "tree-sitter-nexa-idl/package.json",
-    "tree-sitter-nexa-idl/tree-sitter.json",
-    "tree-sitter-nexa-idl/src/grammar.json",
-    "tree-sitter-nexa-idl/src/node-types.json",
+    "tree-sitter-nexa-contract/package.json",
+    "tree-sitter-nexa-contract/tree-sitter.json",
+    "tree-sitter-nexa-contract/src/grammar.json",
+    "tree-sitter-nexa-contract/src/node-types.json",
     "vscode/package.json",
     "vscode/language-configuration/nexa.json",
     "vscode/language-configuration/nexa-contract.json",
@@ -242,6 +242,9 @@ function validateContributions() {
     "workspaceFolders.map(workspaceFolder)",
     "return isBuildInputUri(document.uri)",
     "dynamicRegistration: false",
+    "registerDocumentSymbolProvider",
+    "textDocument/documentSymbol",
+    "settlePendingSymbolRequests",
   ]) {
     assert(
       extensionSource.includes(required),
@@ -286,19 +289,19 @@ function validateContributions() {
       nexaConfig.comments?.blockComment?.[1] === "*/",
     "Nexa must register its line and block comments",
   );
-  const nidlConfig = parseJson(
+  const contractConfig = parseJson(
     path.join(vscodeDirectory, "language-configuration", "nexa-contract.json"),
   );
   assert(
-    nidlConfig.comments?.lineComment === "//" &&
-      nidlConfig.comments?.blockComment?.[0] === "/*" &&
-      nidlConfig.comments?.blockComment?.[1] === "*/",
+    contractConfig.comments?.lineComment === "//" &&
+      contractConfig.comments?.blockComment?.[0] === "/*" &&
+      contractConfig.comments?.blockComment?.[1] === "*/",
     "Contract must register its line, block, and documentation comments",
   );
 
   for (const [language, config] of [
     ["nexa", nexaConfig],
-    ["nexa-contract", nidlConfig],
+    ["nexa-contract", contractConfig],
   ]) {
     const configuredPairs = [
       ...config.brackets,
@@ -330,8 +333,8 @@ function validateZedFiles() {
   );
   const idlConfig = TOML.parse(idlSource);
   assert(
-    idlConfig.grammar === "nexa_idl",
-    "Nexa Contract must use grammar nexa_idl",
+    idlConfig.grammar === "nexa_contract",
+    "Nexa Contract must use grammar nexa_contract",
   );
   assert(
     idlConfig.line_comments?.includes("// "),
@@ -344,13 +347,13 @@ function validateZedFiles() {
     "Zed Nexa grammar URL is not the canonical absolute file URL",
   );
   assert(
-    manifest.grammars.nexa_idl.repository ===
+    manifest.grammars.nexa_contract.repository ===
       pathToFileURL(idlGrammarDirectory).href,
-    "Zed NIDL grammar URL is not the canonical absolute file URL",
+    "Zed Contract grammar URL is not the canonical absolute file URL",
   );
   assert(
     manifest.grammars.nexa.rev === "local" &&
-      manifest.grammars.nexa_idl.rev === "local",
+      manifest.grammars.nexa_contract.rev === "local",
     "Zed local grammar revisions are invalid",
   );
   assert(
@@ -408,7 +411,7 @@ function validateSyntaxContract() {
     idlGrammar.rules.line_comment &&
       idlGrammar.rules.block_comment &&
       idlGrammar.rules.doc_comment,
-    "NIDL Tree-sitter grammar must define v2 comments",
+    "Contract Tree-sitter grammar must define v2 comments",
   );
   for (const rule of [
     "nidl_document",
@@ -421,7 +424,7 @@ function validateSyntaxContract() {
   ]) {
     assert(
       idlGrammar.rules[rule],
-      `NIDL v2 Tree-sitter grammar is missing ${rule}`,
+      `Contract Tree-sitter grammar is missing ${rule}`,
     );
   }
   for (const rule of [
@@ -432,7 +435,7 @@ function validateSyntaxContract() {
   ]) {
     assert(
       !idlGrammar.rules[rule],
-      `legacy NIDL Tree-sitter rule ${rule} remains active`,
+      `legacy Contract Tree-sitter rule ${rule} remains active`,
     );
   }
   assert(
@@ -471,14 +474,14 @@ function validateSyntaxContract() {
   assert(
     ["contract", "host", "nexa", "handle", "async", "fn"].every((keyword) =>
       [
-        ...syntax.nidl.declarationKeywords,
-        ...syntax.nidl.modeKeywords,
+        ...syntax.contract.declarationKeywords,
+        ...syntax.contract.modeKeywords,
       ].includes(keyword),
     ) &&
       ["void", "request", "host_request", "array", "buffer"].every(
-        (type) => !syntax.nidl.builtinTypes.includes(type),
+        (type) => !syntax.contract.builtinTypes.includes(type),
       ),
-    "NIDL v2 keywords or generic type spelling are invalid",
+    "Contract v3 keywords or generic type spelling are invalid",
   );
 
   const nexaTextMate = parseJson(
@@ -639,7 +642,7 @@ function checkGeneratedFiles(temporaryDirectory) {
   );
   const generatedGrammars = {
     nexa: generateAndCompare(grammarDirectory, temporaryDirectory, false),
-    nidl: generateAndCompare(idlGrammarDirectory, temporaryDirectory, true),
+    contract: generateAndCompare(idlGrammarDirectory, temporaryDirectory, true),
   };
 
   for (const [file, grammar] of textMateGrammars()) {
@@ -694,13 +697,13 @@ function validateExamplesAndQueries(temporaryDirectory, generatedGrammars) {
     XDG_CACHE_HOME: path.join(temporaryDirectory, "cache"),
   };
   parseExamples(generatedGrammars.nexa, nexaExamples, environment);
-  parseExamples(generatedGrammars.nidl, nidlExamples, environment);
+  parseExamples(generatedGrammars.contract, contractExamples, environment);
 
   for (const [grammar, query, example, expectedCaptures] of queryChecks) {
     const generatedGrammar =
       grammar === grammarDirectory
         ? generatedGrammars.nexa
-        : generatedGrammars.nidl;
+        : generatedGrammars.contract;
     const result = run(
       "tree-sitter",
       [
@@ -739,7 +742,7 @@ try {
   const generatedGrammars = checkGeneratedFiles(temporaryDirectory);
   validateExamplesAndQueries(temporaryDirectory, generatedGrammars);
   console.log(
-    `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${nidlExamples.length} NIDL v2 examples including comments, ${queryChecks.length} queries).`,
+    `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${contractExamples.length} Contract examples including comments, ${queryChecks.length} queries).`,
   );
 } finally {
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });

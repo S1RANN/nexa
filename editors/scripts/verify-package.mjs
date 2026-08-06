@@ -82,7 +82,7 @@ const zedArtifact = inspectArtifact(
 );
 const grammarDirectories = {
   nexa: path.join(zedDirectory, "tree-sitter-nexa"),
-  nexa_idl: path.join(zedDirectory, "tree-sitter-nexa-idl"),
+  nexa_contract: path.join(zedDirectory, "tree-sitter-nexa-contract"),
 };
 const grammarRevisions = Object.fromEntries(
   Object.entries(grammarDirectories).map(([name, directory]) => {

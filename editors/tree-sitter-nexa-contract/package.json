@@ -1,5 +1,5 @@
 {
-  "name": "tree-sitter-nexa-idl",
+  "name": "tree-sitter-nexa-contract",
   "version": "0.2.0",
   "private": true,
   "description": "Tree-sitter grammar for Host Contract files (Contract syntax v3).",

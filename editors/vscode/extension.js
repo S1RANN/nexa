@@ -207,12 +207,14 @@ function start() {
   server.stdout.on("data", parseMessages);
   server.stderr.on("data", (chunk) => output.append(chunk.toString("utf8")));
   server.on("error", (error) => {
+    settlePendingSymbolRequests();
     output.appendLine(`Could not start Nexa language server: ${error.message}`);
     vscode.window.showErrorMessage(
       `Could not start Nexa language server (${executable}): ${error.message}`,
     );
   });
   server.on("exit", (code, signal) => {
+    settlePendingSymbolRequests();
     output.appendLine(`Nexa language server exited: code=${code} signal=${signal}`);
   });
   const workspaceFolders = vscode.workspace.workspaceFolders || [];
@@ -233,6 +235,7 @@ function start() {
 
 async function stop() {
   if (!server) return;
+  settlePendingSymbolRequests();
   request("shutdown", null);
   notify("exit", null);
   const old = server;
@@ -251,7 +254,9 @@ async function stop() {
 
 function provideDocumentSymbols(document) {
   return new Promise((resolve) => {
-    if (!server || !server.stdin.writable) return resolve([]);
+    if (!server || !server.stdin.writable) {
+      return resolve([]);
+    }
     const id = nextRequestId++;
     pendingSymbolRequests.set(id, resolve);
     write({
@@ -261,6 +266,13 @@ function provideDocumentSymbols(document) {
       params: { textDocument: { uri: document.uri.toString() } },
     });
   });
+}
+
+function settlePendingSymbolRequests() {
+  for (const resolve of pendingSymbolRequests.values()) {
+    resolve([]);
+  }
+  pendingSymbolRequests.clear();
 }
 
 function activate(context) {

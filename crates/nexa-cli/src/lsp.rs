@@ -917,22 +917,21 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
 
 fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path) -> Option<String> {
     let source = snapshot.overlay_for_path(path)?;
-    if path.extension().and_then(|extension| extension.to_str()) == Some("nidl")
-        && nexa::parse_contract(source).is_err()
-    {
-        // The package analyzer turns this into one source-backed exact-span diagnostic below.
-        // Feeding the same invalid text through project loading would add a generic duplicate and
-        // prevent package discovery against the last valid contract.
+    if path.extension().and_then(|extension| extension.to_str()) == Some("nidl") {
+        // Legacy `.nidl` contract files are migrated to `*.contract.nexa`, not parsed by the
+        // Contract grammar. Feeding them to the project resolver only reproduces a stale parse
+        // error; the migration diagnostic is emitted once by `contract_nidl_load_diagnostics`.
         return None;
     }
     Some(source.to_owned())
 }
 
 /// When project loading fails because the Host Contract text the editor is working against (the
-/// unsaved overlay, falling back to disk) is not valid NIDL, the load error is only a symptom of
-/// that broken contract. Report the precise parser/validation spans at the contract URI instead
-/// of a generic NX7002 anchored at the project manifest, and return `None` when the failure must
-/// stay a generic project-load diagnostic.
+/// unsaved overlay, falling back to disk) is not valid Contract v3, the load error is only a
+/// symptom of that broken contract. Report the precise parser/validation spans (or, for a legacy
+/// `.nidl` file, a single migration diagnostic) at the contract URI instead of a generic NX7002
+/// anchored at the project manifest, and return `None` when the failure must stay a generic
+/// project-load diagnostic.
 fn contract_nidl_load_diagnostics(
     snapshot: &WorkspaceSnapshot<'_>,
     config: &Path,
@@ -955,18 +954,33 @@ fn contract_nidl_load_diagnostics(
         return None;
     }
     let source = snapshot.text_for_path(&contract_path).ok()??;
-    if nexa::parse_contract(&source).is_ok() {
-        return None;
+    if nexa_syntax::SourceProfile::from_path(&contract_path.to_string_lossy())
+        == nexa_syntax::SourceProfile::Contract
+    {
+        // A valid or invalid modern Contract file: only precise parser spans if invalid.
+        if nexa::parse_contract(&source).is_ok() {
+            return None;
+        }
+        Some(
+            diagnostics_for_contract_source(&contract_path, &source)
+                .ok()?
+                .into_iter()
+                .map(|diagnostic| {
+                    LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
+                })
+                .collect(),
+        )
+    } else {
+        // Legacy `.nidl` contract: one actionable migration diagnostic, never a Contract parse.
+        Some(
+            diagnostics_for_nidl_migration(&contract_path, &source)
+                .into_iter()
+                .map(|diagnostic| {
+                    LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
+                })
+                .collect(),
+        )
     }
-    Some(
-        diagnostics_for_contract_source(&contract_path, &source)
-            .ok()?
-            .into_iter()
-            .map(|diagnostic| {
-                LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
-            })
-            .collect(),
-    )
 }
 
 fn build_overlays(snapshot: &WorkspaceSnapshot<'_>) -> BTreeMap<PathBuf, String> {
@@ -1028,8 +1042,25 @@ fn analyze_package_snapshot(
     };
 
     let contract_path = project.contract_path.clone();
+    let is_contract_path =
+        nexa_syntax::SourceProfile::from_path(&contract_path.to_string_lossy())
+            == nexa_syntax::SourceProfile::Contract;
     let (validated_contract, contract_source) =
         if let Some(contract_overlay) = snapshot.overlay_for_path(&contract_path) {
+            if !is_contract_path {
+                // Legacy `.nidl` contract overlay: one migration diagnostic, never a Contract parse.
+                let root = contract_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+                return Ok(
+                    diagnostics_for_nidl_migration(&contract_path, contract_overlay)
+                        .into_iter()
+                        .map(|diagnostic| {
+                            LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
+                        })
+                        .collect(),
+                );
+            }
             let Ok(validated_contract) = nexa::parse_contract(contract_overlay) else {
                 let root = contract_path
                     .parent()
@@ -1573,8 +1604,11 @@ fn diagnostics_for_contract_source(
         .map(|error| {
             let span = error.span;
             let category = contract_error_kind_category(error.kind);
-            let mut diagnostic = nexa::LeafDiagnostic::new(
-                nexa::ErrorCode::NX1002,
+            // The six Contract families are surfaced as the machine error code itself (e.g.
+            // `contract.03.type`) so the client receives a structured category without any
+            // string-parsing of display text.
+            let diagnostic = nexa::LeafDiagnostic::new(
+                nexa::ErrorCode::new(category),
                 nexa::Severity::Error,
                 error.message,
             )
@@ -1583,9 +1617,6 @@ fn diagnostics_for_contract_source(
                 nexa::ByteRange::new(span.start, span.end),
                 "invalid Contract declaration",
             ));
-            diagnostic
-                .notes
-                .push(format!("Contract validation category: {category}").into());
             EngineDiagnostic::from_leaf_diagnostic(
                 None,
                 SourceId::new("editor").ok(),
@@ -1874,30 +1905,8 @@ fn lsp_diagnostic_with_paths(
         },
         "source": "nexa",
         "message": diagnostic.diagnostic.message.to_string(),
-        "relatedInformation": related_information,
-        "data": contract_diagnostic_data(diagnostic)
+        "relatedInformation": related_information
     })
-}
-
-/// Extracts the stable Contract diagnostic category (e.g. `contract.03.type`) from the facet
-/// diagnostic's notes, which hold `Contract validation category: <cat>`. This keeps the six
-/// Contract family ids observable in the real `textDocument/publishDiagnostics` payload so
-/// editors can filter/route on them without relying on the (dropped) raw leaf notes. Returns
-/// `null` for non-Contract diagnostics.
-fn contract_diagnostic_data(diagnostic: &EngineDiagnostic) -> Value {
-    let category = diagnostic
-        .diagnostic
-        .notes
-        .iter()
-        .map(ToString::to_string)
-        .find_map(|note| {
-            note.strip_prefix("Contract validation category: ")
-                .map(str::to_owned)
-        });
-    match category {
-        Some(category) => json!({"contractCategory": category}),
-        None => Value::Null,
-    }
 }
 
 fn read_message(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
@@ -3841,7 +3850,12 @@ mod tests {
             .into_iter()
             .next()
             .expect("invalid NIDL attribute diagnostic");
-        assert_eq!(diagnostic.diagnostic.code, nexa::ErrorCode::NX1002);
+        assert_eq!(
+            diagnostic.diagnostic.code,
+            nexa::ErrorCode::new(super::contract_error_kind_category(
+                nexa::ContractErrorKind::InvalidAttribute
+            ))
+        );
         let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
         let start = source.find("many").expect("invalid fuel value");
         lsp_range_contains_source_range(&rendered, source, start, start + "many".len());
@@ -3913,7 +3927,12 @@ mod tests {
         let diagnostics =
             super::diagnostics_for_path(path, Some("contract Broken")).expect("contract parse");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].diagnostic.code, nexa::ErrorCode::NX1002);
+        assert_eq!(
+            diagnostics[0].diagnostic.code,
+            nexa::ErrorCode::new(super::contract_error_kind_category(
+                nexa::ContractErrorKind::Syntax
+            ))
+        );
         // The executable `.nexa` source path must not be hijacked into the Contract parser; the
         // malformed fragment yields either a standalone-module diagnostic or none.
         let exe_diagnostics = super::diagnostics_for_path(&exe_path(), Some("contract Broken"))
@@ -3987,7 +4006,8 @@ mod tests {
     #[test]
     fn lsp_contract_diagnostics_cover_the_six_category_families() {
         // Each fixture must genuinely trigger the target `ContractErrorKind` as the first error,
-        // and the stable category must reach the rendered LSP payload's `data.contractCategory`
+        // and the stable category must reach the rendered LSP payload's machine `code`
+        // (e.g. `contract.03.type`) -- not a parsed display-note field.
         // (not merely a discarded leaf note).
         let cases: Vec<(&str, &str, &str)> = vec![
             (
@@ -4032,9 +4052,9 @@ mod tests {
             );
             let rendered = super::lsp_diagnostic(&diagnostics[0], path.parent());
             assert_eq!(
-                rendered["data"]["contractCategory"],
+                rendered["code"],
                 expected_category,
-                "{label}: rendered payload must carry the stable contract category"
+                "{label}: rendered payload must carry the stable contract category as the machine code"
             );
         }
     }
@@ -4094,13 +4114,38 @@ mod tests {
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();
         super::run_session(&mut reader, &mut output).expect("LSP session");
-        let text = String::from_utf8(output).expect("UTF-8 output");
-        // The initialize response must advertise document symbol support.
-        assert!(text.contains("\"documentSymbolProvider\":true"), "{text}");
-        // The documentSymbol response must carry all six Contract symbol kinds.
-        assert!(text.contains("\"id\":2"), "{text}");
-        for name in ["SnakeApi", "Cell", "SnakeEvent", "Entity", "log", "on_event"] {
-            assert!(text.contains(&format!("\"name\":\"{name}\"")), "missing {name}: {text}");
+        // Decode every framed message so assertions lock onto the exact request/response whose
+        // id==2 (the documentSymbol request) rather than scanning a raw blob.
+        let decoded = decoded_messages(output);
+        let initialize = decoded
+            .iter()
+            .find(|message| message["id"] == json!(1))
+            .expect("initialize response");
+        assert_eq!(initialize["result"]["capabilities"]["documentSymbolProvider"], true);
+
+        let symbols_response = decoded
+            .iter()
+            .find(|message| message["id"] == json!(2))
+            .expect("documentSymbol response");
+        let symbols = symbols_response["result"].as_array().expect("symbol array");
+        let names = symbols
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["SnakeApi", "Cell", "SnakeEvent", "Entity", "log", "on_event"]
+        );
+        // Module=2, Struct=23, Enum=10, Interface=11, Function=12.
+        let kinds = symbols
+            .iter()
+            .map(|symbol| symbol["kind"].as_u64().unwrap_or(0))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec![2, 23, 10, 11, 12, 12]);
+        // Every symbol must carry a non-empty range and selectionRange.
+        for symbol in symbols {
+            assert!(symbol["range"]["start"]["line"].is_u64(), "range: {symbol}");
+            assert!(symbol["selectionRange"]["start"]["line"].is_u64());
         }
     }
 
@@ -4163,7 +4208,7 @@ mod tests {
             expected_end.character
         );
         let rendered = super::lsp_diagnostic(diagnostic, Some(Path::new("/tmp")));
-        assert_eq!(rendered["code"], "NX1002");
+        assert_eq!(rendered["code"], "contract.04.attribute");
         assert_eq!(rendered["range"]["start"]["line"], expected_start.line);
         assert_eq!(
             rendered["range"]["start"]["character"],

@@ -9,7 +9,7 @@ export const repositoryDirectory = path.resolve(editorsDirectory, "..");
 export const grammarDirectory = path.join(editorsDirectory, "tree-sitter-nexa");
 export const idlGrammarDirectory = path.join(
   editorsDirectory,
-  "tree-sitter-nexa-idl",
+  "tree-sitter-nexa-contract",
 );
 export const vscodeDirectory = path.join(editorsDirectory, "vscode");
 export const zedDirectory = path.join(editorsDirectory, "zed");
@@ -47,7 +47,7 @@ function capture(name) {
 
 export function textMateGrammars(syntax = readSyntax()) {
   const nexa = syntax.nexa;
-  const nidl = syntax.nidl;
+  const contract = syntax.contract;
   const nexaKeywordGroups = [
     nexa.declarationKeywords,
     nexa.visibilityKeywords,
@@ -246,7 +246,7 @@ export function textMateGrammars(syntax = readSyntax()) {
     },
   };
 
-  const nidlGrammar = {
+  const contractGrammar = {
     $schema:
       "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
     name: "Nexa Contract",
@@ -297,7 +297,7 @@ export function textMateGrammars(syntax = readSyntax()) {
         ],
       },
       attributes: {
-        match: `(@)(${nidl.attributeKeywords
+        match: `(@)(${contract.attributeKeywords
           .map(escapeRegex)
           .join("|")})\\b`,
         captures: {
@@ -328,17 +328,17 @@ export function textMateGrammars(syntax = readSyntax()) {
       },
       policies: {
         name: "constant.language.policy.nexa-contract",
-        match: wordPattern(nidl.policyKeywords),
+        match: wordPattern(contract.policyKeywords),
       },
       "builtin-types": {
         name: "support.type.builtin.nexa-contract",
-        match: wordPattern(nidl.builtinTypes),
+        match: wordPattern(contract.builtinTypes),
       },
       keywords: {
         name: "keyword.control.nexa-contract",
         match: wordPattern([
-          ...nidl.declarationKeywords,
-          ...nidl.modeKeywords,
+          ...contract.declarationKeywords,
+          ...contract.modeKeywords,
         ]),
       },
       "function-names": {
@@ -378,7 +378,7 @@ export function textMateGrammars(syntax = readSyntax()) {
 
   return new Map([
     ["nexa.tmLanguage.json", nexaGrammar],
-    ["nexa-contract.tmLanguage.json", nidlGrammar],
+    ["nexa-contract.tmLanguage.json", contractGrammar],
   ]);
 }
 
