@@ -1,6 +1,6 @@
 use nexa_syntax::{
     Keyword, LineColumn, NodeKind, SourceText, SyntaxErrorKind, TextEncoding, TextSize, TokenKind,
-    Visibility, lex_nexa, lex_nidl, parse_nexa, parse_nidl,
+    Visibility, lex_nexa, lex_contract, parse_nexa, parse_contract,
 };
 
 #[test]
@@ -50,7 +50,7 @@ nexa {
     fn score() -> i32;
 }
 "#;
-    let lexed = lex_nidl(source).expect("small source");
+    let lexed = lex_contract(source).expect("small source");
     assert_eq!(lexed.reconstructed(), source);
     assert!(lexed.errors.is_empty(), "{:?}", lexed.errors);
     assert!(
@@ -71,10 +71,10 @@ nexa {
             .iter()
             .any(|token| token.kind == TokenKind::BlockComment)
     );
-    let tree = parse_nidl(source).expect("small source");
+    let tree = parse_contract(source).expect("small source");
     assert!(tree.errors.is_empty(), "{:?}", tree.errors);
     assert_eq!(tree.root.children[0].kind, NodeKind::ContractDeclaration);
-    assert_eq!(tree.nidl().contract_name(), Some("Snake"));
+    assert_eq!(tree.contract().contract_name(), Some("Snake"));
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn v2_keywords_are_language_specific_and_legacy_words_are_identifiers() {
         "{significant:?}"
     );
 
-    let nidl = lex_nidl(
+    let nidl = lex_contract(
         "contract host nexa handle async fn struct enum interface opaque sync request export",
     )
     .expect("small source");
@@ -204,7 +204,7 @@ value = value + 1;
 
 #[test]
 fn missing_contract_has_a_stable_nidl_error() {
-    let tree = parse_nidl("struct Legacy {}").expect("small source");
+    let tree = parse_contract("struct Legacy {}").expect("small source");
     assert_eq!(
         tree.errors
             .iter()

@@ -6,7 +6,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexerLanguage {
     Nexa,
-    Nidl,
+    Contract,
 }
 
 /// Lossless tokens and recoverable lexical errors for one source file.
@@ -36,17 +36,11 @@ pub fn lex_nexa(source: &str) -> Result<Lexed, SourceTooLarge> {
     Ok(Lexer::new(source, LexerLanguage::Nexa)?.lex())
 }
 
-pub fn lex_nidl(source: &str) -> Result<Lexed, SourceTooLarge> {
-    Ok(Lexer::new(source, LexerLanguage::Nidl)?.lex())
+pub fn lex_contract(source: &str) -> Result<Lexed, SourceTooLarge> {
+    Ok(Lexer::new(source, LexerLanguage::Contract)?.lex())
 }
 
-/// Lexes a Contract source file (suffix `*.contract.nexa`) with the Contract profile.
-///
-/// Contract files share the same lexical grammar as the legacy NIDL profile. This is the
-/// canonical entry for Contract profile parsing introduced with `Syntax` v3.
-pub fn lex_contract(source: &str) -> Result<Lexed, SourceTooLarge> {
-    lex_nidl(source)
-}
+
 
 struct Lexer {
     source: SourceText,
@@ -475,7 +469,7 @@ fn range(start: usize, end: usize) -> TextRange {
 fn keyword(text: &str, language: LexerLanguage) -> Option<Keyword> {
     match language {
         LexerLanguage::Nexa => nexa_keyword(text),
-        LexerLanguage::Nidl => nidl_keyword(text),
+        LexerLanguage::Contract => contract_keyword(text),
     }
 }
 
@@ -512,7 +506,7 @@ fn nexa_keyword(text: &str) -> Option<Keyword> {
     })
 }
 
-fn nidl_keyword(text: &str) -> Option<Keyword> {
+fn contract_keyword(text: &str) -> Option<Keyword> {
     Some(match text {
         "contract" => Keyword::Contract,
         "host" => Keyword::Host,

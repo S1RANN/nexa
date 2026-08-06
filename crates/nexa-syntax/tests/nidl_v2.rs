@@ -1,6 +1,6 @@
 use nexa_syntax::{
-    NidlAttributeValue, NidlContractItem, NidlFunctionBlockKind, SourceProfile, SyntaxErrorKind,
-    lex_contract, parse_contract, parse_contract_ast,
+    ContractAttributeValue, ContractItem, ContractFunctionBlockKind, NodeKind, SourceProfile,
+    SyntaxErrorKind, lex_contract, parse_contract, parse_contract_ast,
 };
 
 #[test]
@@ -49,27 +49,27 @@ nexa {
     assert_eq!(ast.contract.name.text, "Snake");
     assert_eq!(ast.contract.docs[0].text, "/// Snake ABI.");
     assert_eq!(ast.contract.attributes[0].name.text, "stable");
-    let NidlAttributeValue::String { cooked, .. } = &ast.contract.attributes[0].arguments[0].value
+    let ContractAttributeValue::String { cooked, .. } = &ast.contract.attributes[0].arguments[0].value
     else {
         panic!("stable string");
     };
     assert_eq!(cooked, "snake");
     assert_eq!(ast.contract.items.len(), 5);
 
-    let NidlContractItem::Handle(handle) = &ast.contract.items[0] else {
+    let ContractItem::Handle(handle) = &ast.contract.items[0] else {
         panic!("handle");
     };
     assert_eq!(handle.name.text, "Entity");
     assert!(handle.range.start < handle.name.range.start);
     assert!(handle.name.range.end < handle.range.end);
 
-    let NidlContractItem::Struct(structure) = &ast.contract.items[1] else {
+    let ContractItem::Struct(structure) = &ast.contract.items[1] else {
         panic!("struct");
     };
     assert_eq!(structure.fields.len(), 2);
     assert_eq!(structure.fields[0].ty.name.text, "f32");
 
-    let NidlContractItem::Enum(enumeration) = &ast.contract.items[2] else {
+    let ContractItem::Enum(enumeration) = &ast.contract.items[2] else {
         panic!("enum");
     };
     assert_eq!(enumeration.variants.len(), 2);
@@ -81,10 +81,10 @@ nexa {
         Some("string")
     );
 
-    let NidlContractItem::FunctionBlock(host) = &ast.contract.items[3] else {
+    let ContractItem::FunctionBlock(host) = &ast.contract.items[3] else {
         panic!("host block");
     };
-    assert_eq!(host.kind, NidlFunctionBlockKind::Host);
+    assert_eq!(host.kind, ContractFunctionBlockKind::Host);
     assert_eq!(host.functions.len(), 2);
     assert!(host.functions[0].is_async);
     assert_eq!(host.functions[0].attributes.len(), 3);
@@ -102,10 +102,10 @@ nexa {
     );
     assert!(host.functions[1].result.is_none());
 
-    let NidlContractItem::FunctionBlock(nexa) = &ast.contract.items[4] else {
+    let ContractItem::FunctionBlock(nexa) = &ast.contract.items[4] else {
         panic!("nexa block");
     };
-    assert_eq!(nexa.kind, NidlFunctionBlockKind::Nexa);
+    assert_eq!(nexa.kind, ContractFunctionBlockKind::Nexa);
     let snapshot = &nexa.functions[0].parameters[0].ty;
     assert_eq!(snapshot.name.text, "Snapshot");
     assert_eq!(snapshot.arguments[0].name.text, "Entity");
@@ -121,7 +121,7 @@ fn structured_ast_preserves_duplicate_blocks_for_semantic_validation() {
         ast.contract
             .items
             .iter()
-            .filter(|item| matches!(item, NidlContractItem::FunctionBlock(_)))
+            .filter(|item| matches!(item, ContractItem::FunctionBlock(_)))
             .count(),
         4
     );
@@ -141,7 +141,7 @@ contract Snake;
         arguments[0].name.as_ref().map(|name| name.text.as_str()),
         Some("version")
     );
-    let NidlAttributeValue::Integer { raw, .. } = &arguments[0].value else {
+    let ContractAttributeValue::Integer { raw, .. } = &arguments[0].value else {
         panic!("integer");
     };
     assert_eq!(raw, "2");
@@ -262,4 +262,82 @@ fn v3_lex_contract_is_available() {
             .any(|token| matches!(token.kind, nexa_syntax::TokenKind::Keyword(nexa_syntax::Keyword::Contract))),
         "lexer emits `contract` keyword"
     );
+}
+
+#[test]
+fn v3_contract_header_not_first_is_diagnosed() {
+    // The header must be the first non-comment declaration; a leading top-level item
+    // before `contract` is reported as ContractHeaderNotFirst.
+    let tree = parse_contract("struct Early { x: i32, }\ncontract Api;\n").expect("small source");
+    assert!(
+        tree.errors
+            .iter()
+            .any(|error| error.kind == SyntaxErrorKind::ContractHeaderNotFirst),
+        "expected header-not-first diagnostic: {:?}",
+        tree.errors
+    );
+}
+
+fn child_kinds(tree: &nexa_syntax::SyntaxTree) -> Vec<NodeKind> {
+    tree.root.children.iter().map(|node| node.kind).collect()
+}
+
+#[test]
+fn v3_recovery_missing_header_semicolon_preserves_later_items() {
+    // Missing `;` after the header must not drop the following valid items.
+    let tree = parse_contract("contract Api\nstruct A { x: i32, }\nenum B { X, }\nhandle H;\nhost { fn h(); }\nnexa { fn n(); }")
+        .expect("small source");
+    assert!(
+        tree.errors
+            .iter()
+            .any(|error| error.kind == SyntaxErrorKind::ContractHeaderSemicolon),
+        "expected missing-semicolon diagnostic: {:?}",
+        tree.errors
+    );
+    let kinds = child_kinds(&tree);
+    for expected in [
+        NodeKind::ContractDeclaration,
+        NodeKind::StructDeclaration,
+        NodeKind::EnumDeclaration,
+        NodeKind::ContractHandleDeclaration,
+        NodeKind::ContractHostDeclaration,
+        NodeKind::ContractNexaDeclaration,
+    ] {
+        assert!(kinds.contains(&expected), "missing {expected:?} in {kinds:?}");
+    }
+}
+
+#[test]
+fn v3_recovery_duplicate_header_preserves_later_items() {
+    // A second `contract` header must be diagnosed without dropping later valid items.
+    let tree = parse_contract("contract Api;\nstruct A { x: i32, }\ncontract Other;\nenum B { X, }")
+        .expect("small source");
+    assert!(
+        tree.errors
+            .iter()
+            .any(|error| error.kind == SyntaxErrorKind::DuplicateContractHeader),
+        "expected duplicate-header diagnostic: {:?}",
+        tree.errors
+    );
+    let kinds = child_kinds(&tree);
+    assert!(kinds.contains(&NodeKind::StructDeclaration), "{kinds:?}");
+    assert!(kinds.contains(&NodeKind::EnumDeclaration), "{kinds:?}");
+}
+
+#[test]
+fn v3_recovery_unsupported_item_preserves_later_items() {
+    // An illegal top-level declaration must be diagnosed and recovery must keep the
+    // subsequent valid Struct/Enum items in the tree.
+    let tree = parse_contract("contract Api;\npub fn run() -> i32 { return 0; }\nstruct A { x: i32, }\nenum B { X, }")
+        .expect("small source");
+    assert!(
+        tree.errors
+            .iter()
+            .any(|error| error.kind == SyntaxErrorKind::UnsupportedContractItem),
+        "expected unsupported-item diagnostic: {:?}",
+        tree.errors
+    );
+    let kinds = child_kinds(&tree);
+    assert!(kinds.contains(&NodeKind::StructDeclaration), "{kinds:?}");
+    assert!(kinds.contains(&NodeKind::EnumDeclaration), "{kinds:?}");
 }

@@ -34,24 +34,25 @@ impl SourceProfile {
 
 pub mod ast;
 mod lexer;
-pub mod nidl;
+pub mod contract;
 mod text;
 mod tree;
 
-pub use lexer::{Lexed, lex_contract, lex_nexa, lex_nidl};
-pub use nidl::{
-    NidlAst, NidlAstError, NidlAttribute, NidlAttributeArgument, NidlAttributeValue, NidlContract,
-    NidlContractItem, NidlDocComment, NidlEnum, NidlField, NidlFunction, NidlFunctionBlock,
-    NidlFunctionBlockKind, NidlHandle, NidlParameter, NidlStruct, NidlTypeRef, NidlVariant,
-    parse_contract_ast, parse_nidl_ast,
+pub use lexer::{Lexed, lex_contract, lex_nexa};
+pub use contract::{
+    ContractAst, ContractAstError, ContractAttribute, ContractAttributeArgument,
+    ContractAttributeValue, ContractHeader, ContractItem, ContractDocComment, ContractEnumDecl,
+    ContractField, ContractFunction, ContractFunctionBlock, ContractFunctionBlockKind,
+    ContractHandleDecl, ContractParameter, ContractStructDecl, ContractTypeRef, ContractVariant,
+    parse_contract_ast,
 };
 pub use text::{
     LineColumn, LineIndex, SourceText, SourceTooLarge, TextEncoding, TextRange, TextSize,
 };
 pub use tree::{
-    AstRoot, CellCompleteness, Declaration, DeclarationKind, NidlRoot, NodeKind, SyntaxError,
+    AstRoot, CellCompleteness, Declaration, DeclarationKind, ContractRoot, NodeKind, SyntaxError,
     SyntaxErrorKind, SyntaxLanguage, SyntaxNode, SyntaxTree, UseDeclaration, Visibility,
-    classify_cell_completeness, parse_contract, parse_nexa, parse_nidl,
+    classify_cell_completeness, parse_contract, parse_nexa,
 };
 
 /// A lossless lexical category.

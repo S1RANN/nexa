@@ -2,13 +2,13 @@ use std::ops::Range;
 
 use crate::{
     Keyword, Lexed, SourceText, SourceTooLarge, TextRange, TextSize, Token, TokenKind, lex_nexa,
-    lex_nidl,
+    lex_contract,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SyntaxLanguage {
     Nexa,
-    Nidl,
+    Contract,
 }
 
 /// Whether a REPL submission is structurally complete enough to analyze.
@@ -111,8 +111,8 @@ impl SyntaxTree {
     }
 
     #[must_use]
-    pub const fn nidl(&self) -> NidlRoot<'_> {
-        NidlRoot { tree: self }
+    pub const fn contract(&self) -> ContractRoot<'_> {
+        ContractRoot { tree: self }
     }
 
     #[must_use]
@@ -132,15 +132,9 @@ pub fn parse_nexa(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
     Ok(parse_lexed(lexed, SyntaxLanguage::Nexa))
 }
 
-pub fn parse_nidl(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
-    let lexed = lex_nidl(source)?;
-    Ok(parse_lexed(lexed, SyntaxLanguage::Nidl))
-}
-
-/// Parses a Contract source file (`.contract.nexa`) with the flat `contract Name;` `Syntax` v3
-/// grammar. This is the canonical contract entry point introduced with `Syntax` v3.
 pub fn parse_contract(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
-    parse_nidl(source)
+    let lexed = lex_contract(source)?;
+    Ok(parse_lexed(lexed, SyntaxLanguage::Contract))
 }
 
 /// Classifies one Nexa REPL submission using the canonical lexer and delimiter validator.
@@ -194,7 +188,7 @@ fn parse_lexed(lexed: Lexed, language: SyntaxLanguage) -> SyntaxTree {
         parser.validate_delimiters();
         let root = match language {
             SyntaxLanguage::Nexa => parser.nexa_root(),
-            SyntaxLanguage::Nidl => parser.nidl_root(),
+            SyntaxLanguage::Contract => parser.contract_root(),
         };
         (root, parser.errors)
     };
@@ -360,7 +354,7 @@ impl Parser<'_> {
         });
     }
 
-    fn nidl_root(&mut self) -> SyntaxNode {
+    fn contract_root(&mut self) -> SyntaxNode {
         // Leading attributes attach to the contract header (`@stable(...) contract Name;`).
         let mut prefix_end = 0;
         while self.kind_at(prefix_end) == Some(TokenKind::At) {
@@ -866,11 +860,11 @@ impl<'a> Declaration<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct NidlRoot<'a> {
+pub struct ContractRoot<'a> {
     tree: &'a SyntaxTree,
 }
 
-impl<'a> NidlRoot<'a> {
+impl<'a> ContractRoot<'a> {
     #[must_use]
     pub fn contract_name(&self) -> Option<&'a str> {
         let node = self
