@@ -254,11 +254,11 @@ mod tests {
         );
         assert!(evidence.true_call_site_pcs);
         assert!(evidence.true_host_call_boundary);
-        assert!(evidence.nidl_binding_verified);
-        assert!(evidence.nidl_exact_source_preserved);
+        assert!(evidence.contract_binding_verified);
+        assert!(evidence.contract_exact_source_preserved);
         assert!(evidence.crlf_preserved && evidence.astral_utf16_verified);
         assert!(
-            std::path::Path::new(&evidence.nidl_origin)
+            std::path::Path::new(&evidence.contract_origin)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("nidl"))
         );

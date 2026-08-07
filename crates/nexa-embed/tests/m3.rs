@@ -193,7 +193,7 @@ fn dev_loop_only_latest_generation_becomes_ready() {
             source_id: SourceId::new("tests").expect("source id"),
             identity: candidate.identity(generation).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }) {
             EnqueueOutcome::Accepted => {}
@@ -254,7 +254,7 @@ fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
             source_id: SourceId::new("tests").expect("source id"),
             identity: candidate.identity(generation).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }
     };
@@ -309,7 +309,7 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
                     source_id: SourceId::new("tests").expect("source id"),
                     identity: candidate.identity(generation).expect("candidate identity"),
                     build_input: candidate.build_input,
-                    idl: idl.clone(),
+                    contract: idl.clone(),
                     required_exports: vec![requirement(&idl)],
                 }
             }),
@@ -336,7 +336,7 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
                     source_id: SourceId::new("tests").expect("source id"),
                     identity: candidate.identity(generation).expect("candidate identity"),
                     build_input: candidate.build_input,
-                    idl: idl.clone(),
+                    contract: idl.clone(),
                     required_exports: vec![requirement(&idl)],
                 }
             }),
@@ -384,7 +384,7 @@ fn submit_distinct_packages(
             source_id: SourceId::new(format!("source-{index}")).expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(idl)],
         }) {
             EnqueueOutcome::Accepted => {}
@@ -506,7 +506,7 @@ fn compiler_with_saturated_result_queue(
             source_id: SourceId::new("result-buffer").expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(idl)],
         }),
         EnqueueOutcome::Accepted
@@ -541,7 +541,7 @@ fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
             source_id: SourceId::new("in-flight-disable").expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }),
         EnqueueOutcome::Accepted
@@ -576,7 +576,7 @@ fn shutdown_accounts_for_an_in_flight_generation_without_deadlock() {
             source_id: SourceId::new("in-flight-shutdown").expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
-            idl: idl.clone(),
+            contract: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }),
         EnqueueOutcome::Accepted
