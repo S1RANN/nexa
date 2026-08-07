@@ -495,10 +495,12 @@ impl StandardIntrinsic {
                 | Self::BufferFill { element: ty },
                 1,
             )
-            | (Self::MapInsert { value: ty, .. }
+            | (
+                Self::MapInsert { value: ty, .. }
                 | Self::MapGetOr { value: ty, .. }
                 | Self::MapInsertIfAbsent { value: ty, .. },
-                2) => Some(ty),
+                2,
+            ) => Some(ty),
             (
                 Self::ArrayFirst { element }
                 | Self::ArrayLast { element }
@@ -508,14 +510,15 @@ impl StandardIntrinsic {
             (Self::ArraySwap { element }, 0) => Some(array(element)),
             (Self::ArraySwap { .. }, 1 | 2) => Some(ValueType::I32),
             (Self::MapIsEmpty { key, value }, 0) => Some(map(key, value)),
-            (
-                Self::MapGetOr { key, value } | Self::MapInsertIfAbsent { key, value },
-                0,
-            ) => Some(map(key, value)),
+            (Self::MapGetOr { key, value } | Self::MapInsertIfAbsent { key, value }, 0) => {
+                Some(map(key, value))
+            }
             (Self::MapGetOr { key: ty, .. } | Self::MapInsertIfAbsent { key: ty, .. }, 1) => {
                 Some(ty)
             }
-            (Self::BufferIsEmpty { element }, 0) => Some(buffer(element)),
+            (Self::BufferIsEmpty { element } | Self::BufferFill { element }, 0) => {
+                Some(buffer(element))
+            }
             (
                 Self::F32Floor
                 | Self::F32Ceil
@@ -1186,10 +1189,19 @@ pub struct ScriptExport {
 pub enum CollectionIteratorKind {
     /// Scalar `start..end` range over `i32`; no collection reference.
     Range,
-    Array { element: ValueType },
-    Buffer { element: ValueType },
-    Map { key: ValueType, value: ValueType },
-    Set { element: ValueType },
+    Array {
+        element: ValueType,
+    },
+    Buffer {
+        element: ValueType,
+    },
+    Map {
+        key: ValueType,
+        value: ValueType,
+    },
+    Set {
+        element: ValueType,
+    },
 }
 
 /// Heap-allocation-free iterator state carried in hidden scalar registers.
@@ -4101,11 +4113,7 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, source);
             put_u16(output, dst);
         }
-        Instruction::SetContains {
-            source,
-            value,
-            dst,
-        } => {
+        Instruction::SetContains { source, value, dst } => {
             output.push(113);
             put_u16(output, source);
             put_u16(output, value);
@@ -4132,7 +4140,13 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             encode_iterator_kind(output, kind);
             encode_iterator_state(output, state);
         }
-        Instruction::IterNext { kind, state, has_value_dst, first_dst, second_dst } => {
+        Instruction::IterNext {
+            kind,
+            state,
+            has_value_dst,
+            first_dst,
+            second_dst,
+        } => {
             output.push(118);
             encode_iterator_kind(output, kind);
             encode_iterator_state(output, state);
