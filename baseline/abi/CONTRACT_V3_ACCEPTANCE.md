@@ -113,7 +113,7 @@ here and changes both this matrix and the Baseline Index milestone status to
 **COMPLETE**.
 
 ```text
-Candidate commit: PENDING (intermediate Phase 4 commit, will set final after review)
+Candidate commit: 907d34f (Phase 4 final), branch codex/contract-v3-gates, clean worktree
 Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt with one known M5 baseline exception
 Independent audit: PENDING
 Final decision: PENDING
