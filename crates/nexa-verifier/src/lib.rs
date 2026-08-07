@@ -4087,7 +4087,7 @@ fn exact_live_registers(
                     }
                 }
             }
-            if let Some(destination) = instruction_destination(module, instruction) {
+            for destination in instruction_destinations(module, instruction) {
                 live[usize::from(destination)] = false;
             }
             for source in instruction_sources(instruction) {
@@ -4323,6 +4323,36 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::Safepoint
         | Instruction::Yield
         | Instruction::Trap => Vec::new(),
+    }
+}
+
+/// Every register written by an instruction. Multi-target writes (iterator
+/// state and results) must kill their previous liveness exactly, or stale
+/// values would pollute the precise safepoint root maps.
+fn instruction_destinations(module: &Module, instruction: Instruction) -> Vec<u16> {
+    match instruction {
+        Instruction::IterNew { kind, state } => match kind {
+            CollectionIteratorKind::Range => vec![state.slot, state.epoch],
+            CollectionIteratorKind::Array { .. }
+            | CollectionIteratorKind::Buffer { .. }
+            | CollectionIteratorKind::Map { .. }
+            | CollectionIteratorKind::Set { .. } => {
+                vec![state.phase, state.slot, state.epoch]
+            }
+        },
+        Instruction::IterNext {
+            has_value_dst,
+            first_dst,
+            second_dst,
+            ..
+        } => {
+            let mut destinations = vec![has_value_dst, first_dst];
+            if let Some(second) = second_dst {
+                destinations.push(second);
+            }
+            destinations
+        }
+        other => instruction_destination(module, other).into_iter().collect(),
     }
 }
 
@@ -8378,6 +8408,232 @@ mod tests {
             verified.nominal_index_shape().set_types,
             2,
             "the nominal shape must count every declared Set type"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn iter_next_kills_stale_payload_liveness_in_exact_root_maps() {
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 3,
+            slot: 4,
+            epoch: 5,
+        };
+        let set_string = SetType::new(ValueType::String);
+        let mut set_function = language_v3_function(
+            vec![
+                Instruction::SetNew {
+                    type_id: set_string.type_id,
+                    dst: 1,
+                },
+                Instruction::LoadString { dst: 2, string: 0 },
+                Instruction::StringEqual {
+                    dst: 8,
+                    lhs: 2,
+                    rhs: 2,
+                },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::String,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::String,
+                    },
+                    state,
+                    has_value_dst: 9,
+                    first_dst: 2,
+                    second_dst: None,
+                },
+                Instruction::StringEqual {
+                    dst: 10,
+                    lhs: 2,
+                    rhs: 2,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            // pc 0 has nothing live. The old String payload (reg 2) is read
+            // at pc 2 and again at pc 5 after IterNext overwrites it via
+            // first_dst, so it stays live across pc 4: pc 4's root map must
+            // root the collection (reg 1) but NOT the pre-write payload.
+            |pc| match pc {
+                0 | 6 => Vec::new(),
+                1 | 3 | 4 => vec![1],
+                2 => vec![1, 2],
+                5 => vec![2],
+                _ => unreachable!("safepoint pc out of range"),
+            },
+        );
+        set_function.root_bitmap[1] = true;
+        set_function.root_bitmap[2] = true;
+        let mut set_module = ModuleBuilder::new();
+        set_module.string("x");
+        set_module.set_type(set_string);
+        set_module.function(set_function);
+        assert!(
+            verify(set_module.finish(), VerifierLimits::default()).is_ok(),
+            "IterNext must kill the stale payload liveness before the safepoint"
+        );
+
+        let map = MapType::new(ValueType::I32, ValueType::String);
+        let mut map_function = language_v3_function(
+            vec![
+                Instruction::MapNew {
+                    type_id: map.type_id,
+                    dst: 1,
+                },
+                Instruction::LoadString { dst: 7, string: 0 },
+                Instruction::StringEqual {
+                    dst: 8,
+                    lhs: 7,
+                    rhs: 7,
+                },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Map {
+                        key: ValueType::I32,
+                        value: ValueType::String,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Map {
+                        key: ValueType::I32,
+                        value: ValueType::String,
+                    },
+                    state,
+                    has_value_dst: 9,
+                    first_dst: 2,
+                    second_dst: Some(7),
+                },
+                Instruction::StringEqual {
+                    dst: 10,
+                    lhs: 7,
+                    rhs: 7,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            |pc| match pc {
+                0 | 6 => Vec::new(),
+                1 | 3 | 4 => vec![1],
+                2 => vec![1, 7],
+                5 => vec![7],
+                _ => unreachable!("safepoint pc out of range"),
+            },
+        );
+        map_function.root_bitmap[1] = true;
+        map_function.root_bitmap[7] = true;
+        let mut map_module = ModuleBuilder::new();
+        map_module.string("x");
+        map_module.map_type(map);
+        map_module.function(map_function);
+        assert!(
+            verify(map_module.finish(), VerifierLimits::default()).is_ok(),
+            "IterNext must kill the stale second-slot liveness before the safepoint"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn iter_new_kills_stale_state_liveness_in_exact_root_maps() {
+        let set_i32 = SetType::new(ValueType::I32);
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 3,
+            slot: 4,
+            epoch: 5,
+        };
+        let mut function = language_v3_function(
+            vec![
+                Instruction::LoadString { dst: 4, string: 0 },
+                Instruction::SetNew {
+                    type_id: set_i32.type_id,
+                    dst: 1,
+                },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 6,
+                    first_dst: 7,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2, 3, 4],
+            // IterNew writes phase/slot/epoch (3, 4, 5): the old String in
+            // the slot register (4) must not survive into the safepoint
+            // root map, but the collection (reg 1) must stay rooted.
+            |pc| {
+                if pc == 2 || pc == 3 {
+                    vec![1]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+        function.root_bitmap[1] = true;
+        function.root_bitmap[4] = true;
+        let mut module = ModuleBuilder::new();
+        module.string("x");
+        module.set_type(set_i32);
+        module.function(function);
+        assert!(
+            verify(module.finish(), VerifierLimits::default()).is_ok(),
+            "IterNew must kill stale state-register liveness before the safepoint"
+        );
+
+        // Range variant: IterNew writes slot/epoch only; phase holds the
+        // caller-set end bound and stays live as a read.
+        let range_state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 4,
+            epoch: 5,
+        };
+        let mut range_function = language_v3_function(
+            vec![
+                Instruction::LoadString { dst: 4, string: 0 },
+                Instruction::LoadI32 { dst: 1, value: 0 },
+                Instruction::LoadI32 { dst: 2, value: 8 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Range,
+                    state: range_state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Range,
+                    state: range_state,
+                    has_value_dst: 6,
+                    first_dst: 7,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 3, 4, 5],
+            |_| Vec::new(),
+        );
+        range_function.root_bitmap[4] = true;
+        let mut range_module = ModuleBuilder::new();
+        range_module.string("x");
+        range_module.function(range_function);
+        assert!(
+            verify(range_module.finish(), VerifierLimits::default()).is_ok(),
+            "Range IterNew must kill the stale slot liveness before the safepoint"
         );
     }
 
