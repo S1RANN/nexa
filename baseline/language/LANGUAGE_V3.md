@@ -76,8 +76,19 @@ mutating forms return whether the operation applied).
 
 ## 3. Minimal collection API
 
-Language v3 adds no collection API beyond the Set surface above and dynamic
-iteration (section 4). In particular it adds:
+Language v3 adds no collection API beyond the `Set<T>` surface in section 2
+and the exact extended surface listed in this section. The complete list of
+collection APIs added by Language v3 is:
+
+```text
+Set<T>          new, len, contains, insert, remove, clear      (section 2)
+Array<T>        first, last, swap, reverse
+Map<K, V>       is_empty, get_or, insert_if_absent
+Buffer<T>       is_empty, fill
+```
+
+Beyond that exact list, Language v3 adds no collection API. In particular it
+adds:
 
 ```text
 no new integer widths
@@ -87,8 +98,9 @@ no sorted/ordered Map or Set variants
 no Map/Set iteration-order guarantees
 ```
 
-The existing Array, Buffer, and Map surfaces keep exactly their Language v2
-API. `StringBuild` remains the only bounded scalar-to-string lowering surface.
+Every Array, Buffer, and Map method not listed above keeps exactly its
+Language v2 API. `StringBuild` remains the only bounded scalar-to-string
+lowering surface.
 
 ## 4. Dynamic iteration
 
@@ -132,18 +144,44 @@ iteration writes the value into `second_dst`.
 
 ### 4.3 Mutation-epoch trap
 
-Every collection keeps a mutation epoch. `IterNew` snapshots it; `IterNext`
-revalidates the live epoch against the snapshot. A `SetInsert`, `SetRemove`,
-`SetClear`, `MapInsert`, `MapRemove`, `MapClear`, `ArrayPush`, `ArrayPop`,
-`ArrayInsert`, `ArrayRemove`, or `ArrayClear` between `IterNew` and the final
-`IterNext` on the same collection MUST trap with a deterministic
+Every collection keeps a mutation epoch that counts applied content changes.
+`IterNew` snapshots it; `IterNext` revalidates the live epoch against the
+snapshot. A mutating operation between `IterNew` and the final `IterNext` on
+the same collection MUST trap with a deterministic
 collection-mutated-during-iteration error instead of iterating stale storage.
 Resuming iteration after the trap is impossible: the iterator state is
 consumed by the trap.
 
-Array and Buffer iteration may be implemented against a monotonically counted
-mutation epoch or an equivalent length/identity check; the observable contract
-is the same trap.
+The operations that increment the epoch exactly when they apply a content
+change are:
+
+```text
+Set<T>      insert (element absent), remove (element present), clear (non-empty)
+Map<K, V>   set / insert (stored value changes), insert_if_absent (key absent),
+            remove (key present), clear (non-empty)
+Array<T>    set (stored element changes), push, pop, insert, remove,
+            clear (non-empty), swap (distinct indexes), reverse (length > 1)
+Buffer<T>   set (stored element changes), copy (copied span changes),
+            fill (filled span changes)
+```
+
+Operations that leave the collection content unchanged MUST NOT increment the
+epoch: `Set::insert` of an element already present, `Set::remove` of an absent
+element, `Set::clear`/`Map::clear`/`Array::clear` on an empty collection,
+`Array::swap(a, a)` with equal indexes, `Array::reverse` on one element,
+`Map::insert_if_absent` on a present key, and any store of a value equal to
+the value already stored. "Changes" is judged by the same builtin value
+equality the collection uses for its elements and keys; a call whose content
+does not change is a no-op for the epoch even when its intrinsic returns
+`true`. Where an intrinsic reports applied-ness (`set_insert`, `set_remove`,
+`map_insert_if_absent`) its result and the epoch decision agree; where it does
+not (`map_set`, `map_insert`, `array_swap`, `array_reverse`, `buffer_fill`
+always return `true` on success), the epoch follows the content-change rules
+above, not the return value.
+
+Array and Buffer iteration may use any mechanism whose bumps exactly match
+the rules above (for example a monotonically counted epoch or a content
+fingerprint); the observable contract is the same trap.
 
 ## 5. Wire surface (bytecode v8)
 

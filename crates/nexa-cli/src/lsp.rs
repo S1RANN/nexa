@@ -9,6 +9,13 @@ use url::Url;
 
 use crate::project;
 
+#[path = "lsp_language_v3.rs"]
+mod language_v3;
+use language_v3::{
+    completion_items as language_v3_completion_items, hover as language_v3_hover,
+    semantic_tokens as language_v3_semantic_tokens,
+};
+
 #[derive(Clone)]
 struct OpenDocument {
     uri: String,
@@ -324,6 +331,26 @@ fn run_session_with_analyzer(
                                 "change": 1,
                                 "save": {"includeText": true}
                             },
+                            "completionProvider": {
+                                "triggerCharacters": [".", ":"]
+                            },
+                            "hoverProvider": true,
+                            "semanticTokensProvider": {
+                                "legend": {
+                                    "tokenTypes": [
+                                        "keyword",
+                                        "type",
+                                        "function",
+                                        "variable",
+                                        "string",
+                                        "number",
+                                        "comment",
+                                        "operator"
+                                    ],
+                                    "tokenModifiers": []
+                                },
+                                "full": true
+                            },
                             "documentSymbolProvider": true,
                             "workspace": {
                                 "workspaceFolders": {
@@ -493,6 +520,44 @@ fn run_session_with_analyzer(
                     Vec::new()
                 };
                 respond(writer, id, &Value::Array(symbols))?;
+            }
+            Some("textDocument/completion") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let items = if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+                    == nexa_syntax::SourceProfile::Executable
+                {
+                    let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                    language_v3_completion_items(&source, offset)
+                } else {
+                    Vec::new()
+                };
+                respond(writer, id, &Value::Array(items))?;
+            }
+            Some("textDocument/hover") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let hover = if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+                    == nexa_syntax::SourceProfile::Executable
+                {
+                    let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                    language_v3_hover(&source, offset)
+                } else {
+                    None
+                };
+                respond(writer, id, hover.as_ref().unwrap_or(&Value::Null))?;
+            }
+            Some("textDocument/semanticTokens/full") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let data = if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+                    == nexa_syntax::SourceProfile::Executable
+                {
+                    language_v3_semantic_tokens(&source)
+                } else {
+                    Vec::new()
+                };
+                respond(writer, id, &json!({"data": data}))?;
             }
             Some("workspace/didChangeWatchedFiles") => {
                 let changes = message["params"]["changes"]
@@ -1042,9 +1107,8 @@ fn analyze_package_snapshot(
     };
 
     let contract_path = project.contract_path.clone();
-    let is_contract_path =
-        nexa_syntax::SourceProfile::from_path(&contract_path.to_string_lossy())
-            == nexa_syntax::SourceProfile::Contract;
+    let is_contract_path = nexa_syntax::SourceProfile::from_path(&contract_path.to_string_lossy())
+        == nexa_syntax::SourceProfile::Contract;
     let (validated_contract, contract_source) =
         if let Some(contract_overlay) = snapshot.overlay_for_path(&contract_path) {
             if !is_contract_path {
@@ -1506,23 +1570,22 @@ fn diagnostics_for_nidl_migration(path: &Path, source: &str) -> Vec<EngineDiagno
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("<contract>");
-    let new_name = source_name
-        .strip_suffix(".nidl")
-        .map_or_else(|| "<name>.contract.nexa".to_owned(), |base| {
+    let new_name = source_name.strip_suffix(".nidl").map_or_else(
+        || "<name>.contract.nexa".to_owned(),
+        |base| {
             // `game.nidl` -> `game.contract.nexa`; an already-suffixed name is kept intact.
             if base.ends_with(".contract") {
                 format!("{base}.nexa")
             } else {
                 format!("{base}.contract.nexa")
             }
-        });
+        },
+    );
     let identity = nexa::SourceIdentity::standalone(path.to_string_lossy().into_owned());
     let mut diagnostic = nexa::LeafDiagnostic::new(
         nexa::ErrorCode::NX1001,
         nexa::Severity::Error,
-        format!(
-            "`.nidl` is removed; rename to `{new_name}` with flat `contract <Name>;`"
-        ),
+        format!("`.nidl` is removed; rename to `{new_name}` with flat `contract <Name>;`"),
     )
     .with_label(nexa::LeafLabel::primary(
         identity.clone(),
@@ -1633,8 +1696,8 @@ fn diagnostics_for_contract_source(
 /// Handle / Host Function / Nexa Function. Range conversions use the same byte→UTF-16 position
 /// mapping as the diagnostic renderer, so editor cursors align with the parser spans.
 fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
-    use serde_json::json;
     use nexa::prelude::SourceSpan;
+    use serde_json::json;
     let Ok(ast) = nexa::parse_contract_ast(source) else {
         return Vec::new();
     };
@@ -1688,7 +1751,12 @@ fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
             handle.name_span,
         ));
     }
-    for function in contract.host.as_ref().into_iter().flat_map(|block| &block.functions) {
+    for function in contract
+        .host
+        .as_ref()
+        .into_iter()
+        .flat_map(|block| &block.functions)
+    {
         symbols.push(symbol(
             &function.name,
             12, // SymbolKind.Function
@@ -1696,7 +1764,12 @@ fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
             function.name_span,
         ));
     }
-    for function in contract.nexa.as_ref().into_iter().flat_map(|block| &block.functions) {
+    for function in contract
+        .nexa
+        .as_ref()
+        .into_iter()
+        .flat_map(|block| &block.functions)
+    {
         symbols.push(symbol(
             &function.name,
             12, // SymbolKind.Function
@@ -1705,6 +1778,46 @@ fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
         ));
     }
     symbols
+}
+
+fn request_document_source(
+    documents: &BTreeMap<String, OpenDocument>,
+    text_document: &Value,
+) -> Result<(PathBuf, String), String> {
+    let uri = required_str(text_document, "uri")?;
+    let path = file_uri_to_path(uri)?;
+    if let Some(document) = documents.get(uri).or_else(|| {
+        documents
+            .values()
+            .find(|document| same_file_path(&document.path, &path))
+    }) {
+        return Ok((document.path.clone(), document.text.clone()));
+    }
+    let source = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read LSP document {}: {error}", path.display()))?;
+    Ok((path, source))
+}
+
+fn request_byte_offset(source: &str, position: &Value) -> Result<usize, String> {
+    let line = position
+        .get("line")
+        .and_then(Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok())
+        .ok_or("missing or invalid LSP position line")?;
+    let column = position
+        .get("character")
+        .and_then(Value::as_u64)
+        .and_then(|column| u32::try_from(column).ok())
+        .ok_or("missing or invalid LSP position character")?;
+    let source = nexa_syntax::SourceText::new(source)
+        .map_err(|error| format!("LSP source is too large: {error:?}"))?;
+    nexa_syntax::LineIndex::new(&source)
+        .offset(
+            nexa_syntax::LineColumn { line, column },
+            nexa_syntax::TextEncoding::Utf16,
+        )
+        .map(nexa_syntax::TextSize::to_usize)
+        .ok_or_else(|| format!("LSP position {line}:{column} is outside the document"))
 }
 
 fn diagnostics_for_nexa_source(
@@ -2855,11 +2968,8 @@ mod tests {
             "contract OverlayHost; nexa { fn run() -> i32; }\n"
         );
 
-        fs::write(
-            &contract,
-            "contract DiskHost; nexa { fn run() -> i32; }\n",
-        )
-        .expect("valid disk NIDL");
+        fs::write(&contract, "contract DiskHost; nexa { fn run() -> i32; }\n")
+            .expect("valid disk NIDL");
         let uri = super::path_to_file_uri(&contract).expect("contract URI");
         let documents = BTreeMap::from([(
             uri.clone(),
@@ -3074,8 +3184,8 @@ mod tests {
         )
         .expect("resolved build");
         let old_fingerprint = build.build_fingerprint;
-        let host_idl =
-            nexa::parse_contract("contract NexaCliEmptyHost; host {}\n").expect("built-in Host IDL");
+        let host_idl = nexa::parse_contract("contract NexaCliEmptyHost; host {}\n")
+            .expect("built-in Host IDL");
         let host_contract = nexa::HostContractInput::canonical(&host_idl);
         let dependency = build
             .packages
@@ -3763,8 +3873,8 @@ mod tests {
         );
         let expected_idl = nexa::parse_contract("contract Expected; nexa { fn run() -> i32; }")
             .expect("expected IDL");
-        let actual_idl =
-            nexa::parse_contract("contract Actual; nexa { fn run() -> bool; }").expect("actual IDL");
+        let actual_idl = nexa::parse_contract("contract Actual; nexa { fn run() -> bool; }")
+            .expect("actual IDL");
         let mismatch = nexa::PackageBuildError::EntrypointSignatureMismatch {
             name: "run".to_owned(),
             expected: nexa::entrypoint_signature(&expected_idl.nexa_functions[0]),
@@ -3903,9 +4013,11 @@ mod tests {
     #[test]
     fn lsp_idl_diagnostic_uses_the_parser_token_span() {
         let source = "contract Valid;\nhost { fn broken(value: i32) i32; }\n";
-        let diagnostics =
-            super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-precise.contract.nexa"), Some(source))
-                .expect("invalid Contract diagnostics");
+        let diagnostics = super::diagnostics_for_path(
+            Path::new("/tmp/nexa-lsp-precise.contract.nexa"),
+            Some(source),
+        )
+        .expect("invalid Contract diagnostics");
         assert_eq!(diagnostics.len(), 1);
         let diagnostic = &diagnostics[0];
         let primary = diagnostic
@@ -3962,8 +4074,14 @@ mod tests {
             (ContractErrorKind::InvalidType, "contract.03.type"),
             (ContractErrorKind::RecursiveLayout, "contract.03.type"),
             (ContractErrorKind::InvalidAttribute, "contract.04.attribute"),
-            (ContractErrorKind::StableIdCollision, "contract.05.stable-id"),
-            (ContractErrorKind::RustNameCollision, "contract.06.generated-rust"),
+            (
+                ContractErrorKind::StableIdCollision,
+                "contract.05.stable-id",
+            ),
+            (
+                ContractErrorKind::RustNameCollision,
+                "contract.06.generated-rust",
+            ),
         ];
         for (kind, expected) in mapping {
             assert_eq!(super::contract_error_kind_category(kind), expected);
@@ -4003,7 +4121,6 @@ mod tests {
     fn exe_path() -> PathBuf {
         Path::new("/tmp/nexa-lsp.profile.nexa").to_path_buf()
     }
-
 
     #[test]
     fn lsp_contract_diagnostics_cover_the_six_category_families() {
@@ -4054,8 +4171,7 @@ mod tests {
             );
             let rendered = super::lsp_diagnostic(&diagnostics[0], path.parent());
             assert_eq!(
-                rendered["code"],
-                expected_category,
+                rendered["code"], expected_category,
                 "{label}: rendered payload must carry the stable contract category as the machine code"
             );
         }
@@ -4079,7 +4195,12 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "SnakeApi", "Cell", "SnakeEvent", "Entity", "log", "on_event"
+                "SnakeApi",
+                "Cell",
+                "SnakeEvent",
+                "Entity",
+                "log",
+                "on_event"
             ]
         );
         let kinds = symbols
@@ -4098,8 +4219,7 @@ mod tests {
     #[test]
     fn lsp_document_symbol_request_round_trips_contract_outline() {
         let uri = "file:///tmp/nexa-lsp-symbols.contract.nexa";
-        let contract =
-            "\ncontract SnakeApi;\nstruct Cell { x: i32, y: i32, }\nenum SnakeEvent { Started, Ended, }\nhandle Entity;\nhost { fn log(message: string); }\nnexa { fn on_event(event: SnakeEvent) -> Array<i32>; }\n";
+        let contract = "\ncontract SnakeApi;\nstruct Cell { x: i32, y: i32, }\nenum SnakeEvent { Started, Ended, }\nhandle Entity;\nhost { fn log(message: string); }\nnexa { fn on_event(event: SnakeEvent) -> Array<i32>; }\n";
         let messages = [
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
@@ -4123,7 +4243,10 @@ mod tests {
             .iter()
             .find(|message| message["id"] == json!(1))
             .expect("initialize response");
-        assert_eq!(initialize["result"]["capabilities"]["documentSymbolProvider"], true);
+        assert_eq!(
+            initialize["result"]["capabilities"]["documentSymbolProvider"],
+            true
+        );
 
         let symbols_response = decoded
             .iter()
@@ -4136,7 +4259,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["SnakeApi", "Cell", "SnakeEvent", "Entity", "log", "on_event"]
+            vec![
+                "SnakeApi",
+                "Cell",
+                "SnakeEvent",
+                "Entity",
+                "log",
+                "on_event"
+            ]
         );
         // Module=2, Struct=23, Enum=10, Interface=11, Function=12.
         let kinds = symbols
@@ -4149,6 +4279,91 @@ mod tests {
             assert!(symbol["range"]["start"]["line"].is_u64(), "range: {symbol}");
             assert!(symbol["selectionRange"]["start"]["line"].is_u64());
         }
+    }
+
+    #[test]
+    fn lsp_language_v3_completion_hover_and_semantic_tokens_are_utf16_exact() {
+        let uri = "file:///tmp/nexa-language-v3-tools.nexa";
+        let source = "fn run() { let marker: string = \"😀\"; let values: Set<i32> = Set::new(); values. }\n";
+        let completion_offset =
+            source.find("values. }").expect("completion receiver") + "values.".len();
+        let completion_position = super::byte_offset_to_lsp_position(source, completion_offset);
+        let set_offset = source.find("Set<i32>").expect("Set type");
+        let hover_position = super::byte_offset_to_lsp_position(source, set_offset + 1);
+        let messages = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+            json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+                "textDocument":{"uri":uri,"languageId":"nexa","version":1,"text":source}
+            }}),
+            json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{
+                "textDocument":{"uri":uri},
+                "position":{"line":completion_position.line,"character":completion_position.character}
+            }}),
+            json!({"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{
+                "textDocument":{"uri":uri},
+                "position":{"line":hover_position.line,"character":hover_position.character}
+            }}),
+            json!({"jsonrpc":"2.0","id":4,"method":"textDocument/semanticTokens/full","params":{
+                "textDocument":{"uri":uri}
+            }}),
+            json!({"jsonrpc":"2.0","id":5,"method":"shutdown","params":null}),
+            json!({"jsonrpc":"2.0","method":"exit","params":null}),
+        ];
+        let input = messages.iter().flat_map(framed).collect::<Vec<_>>();
+        let mut output = Vec::new();
+        let mut analyzer = RecordingAnalyzer::default();
+        super::run_session_with_analyzer(&mut Cursor::new(input), &mut output, &mut analyzer)
+            .expect("LSP session");
+        let decoded = decoded_messages(output);
+
+        let initialize = decoded
+            .iter()
+            .find(|message| message["id"] == json!(1))
+            .expect("initialize response");
+        assert_eq!(initialize["result"]["capabilities"]["hoverProvider"], true);
+        assert_eq!(
+            initialize["result"]["capabilities"]["semanticTokensProvider"]["full"],
+            true
+        );
+
+        let completion = decoded
+            .iter()
+            .find(|message| message["id"] == json!(2))
+            .expect("completion response")["result"]
+            .as_array()
+            .expect("completion items");
+        let labels = completion
+            .iter()
+            .map(|item| item["label"].as_str().expect("completion label"))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["len", "contains", "insert", "remove", "clear"]);
+
+        let hover = &decoded
+            .iter()
+            .find(|message| message["id"] == json!(3))
+            .expect("hover response")["result"];
+        let expected_start = super::byte_offset_to_lsp_position(source, set_offset);
+        let expected_end = super::byte_offset_to_lsp_position(source, set_offset + 3);
+        assert_eq!(
+            hover["range"]["start"]["character"],
+            expected_start.character
+        );
+        assert_eq!(hover["range"]["end"]["character"], expected_end.character);
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .is_some_and(|contents| contents.contains("Set"))
+        );
+
+        let semantic = decoded
+            .iter()
+            .find(|message| message["id"] == json!(4))
+            .expect("semantic token response")["result"]["data"]
+            .as_array()
+            .expect("semantic token data");
+        assert_eq!(semantic.len() % 5, 0);
+        assert!(!semantic.is_empty());
     }
 
     #[test]
