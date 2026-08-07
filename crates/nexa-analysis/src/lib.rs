@@ -50,9 +50,9 @@ pub use identity::{
     NormalizedPackagePath, PackageId, SourceId, SourceKey, external_source_key,
 };
 pub use ir::{
-    BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, Definition, DefinitionId, DefinitionKind,
-    ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr, FieldLayoutIr,
-    HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
+    BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, CollectionIterationKindIr, Definition,
+    DefinitionId, DefinitionKind, ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr,
+    FieldLayoutIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
     HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr,
     IrAbandonPolicy, IrCancelPolicy, IrCompilationKind, IrEffect, IrHostFunctionMode, IrLiteral,
     IrType, LifecycleBindingsIr, MigrationIntrinsicIr, PackageSemanticMetadata, ReplEntrypointIr,

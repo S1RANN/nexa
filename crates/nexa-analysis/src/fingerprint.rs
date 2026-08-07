@@ -125,6 +125,10 @@ pub fn canonical_value_type(
             canonical_value_type(key, definitions)?,
             canonical_value_type(value, definitions)?,
         )),
+        IrType::Set(inner) => named(nexa_core::canonical_set_type_id(canonical_value_type(
+            inner,
+            definitions,
+        )?)),
         IrType::Tuple(items) => {
             let items = items
                 .iter()
@@ -260,7 +264,10 @@ impl BuildFingerprintInput {
             }
         }
         builder.field_bytes("host-contract", &self.host_contract);
-        builder.field_bytes("contract-syntax-version", &self.contract_syntax_version.to_le_bytes());
+        builder.field_bytes(
+            "contract-syntax-version",
+            &self.contract_syntax_version.to_le_bytes(),
+        );
         builder.field_bytes("host-contract-source", &self.host_contract_source);
         builder.field_bytes("host-required-entrypoints", &self.host_required_entrypoints);
         builder.field_bytes("repl-session-context", &self.repl_session_context);

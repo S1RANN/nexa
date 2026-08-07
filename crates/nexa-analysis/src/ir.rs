@@ -125,6 +125,7 @@ pub enum BuiltinVariantIr {
 pub enum BuiltinOperationIr {
     ArrayNew,
     MapNew,
+    SetNew,
     StringLen,
     StringByteLen,
     StringEqual,
@@ -158,6 +159,11 @@ pub enum BuiltinOperationIr {
     MapRemove,
     MapContains,
     MapClear,
+    SetLen,
+    SetContains,
+    SetInsert,
+    SetRemove,
+    SetClear,
     BufferLen,
     BufferGet,
     BufferSet,
@@ -205,6 +211,7 @@ pub enum IrType {
     Result(Box<Self>, Box<Self>),
     Array(Box<Self>),
     Map(Box<Self>, Box<Self>),
+    Set(Box<Self>),
     Tuple(Vec<Self>),
     HostRequest(Option<Box<Self>>),
     ResourceToken(Option<Box<Self>>),
@@ -461,6 +468,17 @@ pub struct TypedBlockIr {
     pub tail: Option<Box<TypedExpressionIr>>,
 }
 
+/// The collection a [`TypedStatementIr::CollectionFor`] iterates. Iteration
+/// order is index order for Array/Buffer and unspecified HashMap-style slot
+/// order for Map/Set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionIterationKindIr {
+    Array,
+    Buffer,
+    Map,
+    Set,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypedStatementIr {
     Let {
@@ -497,6 +515,32 @@ pub enum TypedStatementIr {
         end: TypedExpressionIr,
         body: TypedBlockIr,
         /// Analyzer-proven upper bound for the number of loop-body executions.
+        max_iterations: u32,
+    },
+    /// A `start..end` range whose endpoints are not both compile-time constants.
+    /// The runtime evaluates the endpoints once and iterates; the compile-time-only
+    /// restriction of Language v2 is removed while `max_iterations` still carries
+    /// the configured loop limit the runtime enforces.
+    DynamicRangeFor {
+        binding: DefinitionId,
+        start: TypedExpressionIr,
+        end: TypedExpressionIr,
+        body: TypedBlockIr,
+        max_iterations: u32,
+    },
+    /// Dynamic iteration over `Array<T>`, `Buffer<T>`, `Map<K, V>`, or `Set<T>`.
+    /// `iterable` is evaluated exactly once before iteration starts.
+    CollectionFor {
+        iterable: TypedExpressionIr,
+        /// Element bindings in source order: one element binding for
+        /// Array/Buffer/Set, or `(key, value)` for Map.
+        bindings: Vec<DefinitionId>,
+        /// `Some` for Map iteration; the key binding type.
+        key_type: Option<IrType>,
+        /// Element binding type: Array/Buffer/Set element or Map value.
+        element_type: IrType,
+        collection: CollectionIterationKindIr,
+        body: TypedBlockIr,
         max_iterations: u32,
     },
     Break,
@@ -1185,6 +1229,11 @@ fn canonical_host_value_type(
             canonical_host_value_type(key, host, definitions)?,
             canonical_host_value_type(value, host, definitions)?,
         )),
+        IrType::Set(inner) => named(nexa_core::canonical_set_type_id(canonical_host_value_type(
+            inner,
+            host,
+            definitions,
+        )?)),
         IrType::Tuple(items) => {
             let items = items
                 .iter()
@@ -1238,6 +1287,7 @@ fn validate_standard_signature_type(
         }
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => {
@@ -1331,9 +1381,16 @@ fn validate_standard_calls_in_block(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
             } => {
                 validate_standard_calls_in_expression(start, bindings, migration_types)?;
                 validate_standard_calls_in_expression(end, bindings, migration_types)?;
+                validate_standard_calls_in_block(body, bindings, migration_types)?;
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                validate_standard_calls_in_expression(iterable, bindings, migration_types)?;
                 validate_standard_calls_in_block(body, bindings, migration_types)?;
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -1686,6 +1743,7 @@ fn substitute_standard_type(ty: &IrType, arguments: &[IrType]) -> Result<IrType,
             Box::new(substitute_standard_type(key, arguments)?),
             Box::new(substitute_standard_type(value, arguments)?),
         ),
+        IrType::Set(inner) => IrType::Set(Box::new(substitute_standard_type(inner, arguments)?)),
         IrType::Tuple(items) => IrType::Tuple(
             items
                 .iter()
@@ -1848,9 +1906,16 @@ fn cleanup_block_is_synchronous(block: &TypedBlockIr, definitions: &[Definition]
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
+        }
+        | TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
         } => {
             cleanup_expression_is_synchronous(start, definitions)
                 && cleanup_expression_is_synchronous(end, definitions)
+                && cleanup_block_is_synchronous(body, definitions)
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            cleanup_expression_is_synchronous(iterable, definitions)
                 && cleanup_block_is_synchronous(body, definitions)
         }
         TypedStatementIr::Defer { cleanup, captures } => {
@@ -1998,6 +2063,7 @@ fn cleanup_expression_is_synchronous(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_block(
     block: &TypedBlockIr,
     limit: usize,
@@ -2063,6 +2129,56 @@ fn validate_block(
                         declared: *max_iterations,
                         exact,
                     });
+                }
+                validate_block(body, limit, constants)?;
+            }
+            TypedStatementIr::DynamicRangeFor {
+                binding,
+                start,
+                end,
+                body,
+                max_iterations,
+            } => {
+                validate_id(*binding, limit)?;
+                validate_expression(start, limit)?;
+                validate_expression(end, limit)?;
+                if *max_iterations == 0 {
+                    return Err(TypedIrError::ZeroLoopBound);
+                }
+                validate_block(body, limit, constants)?;
+            }
+            TypedStatementIr::CollectionFor {
+                iterable,
+                bindings,
+                key_type,
+                element_type,
+                collection,
+                body,
+                max_iterations,
+            } => {
+                validate_expression(iterable, limit)?;
+                for binding in bindings {
+                    validate_id(*binding, limit)?;
+                }
+                if let Some(key_type) = key_type {
+                    validate_type(key_type, limit)?;
+                }
+                validate_type(element_type, limit)?;
+                if *collection == CollectionIterationKindIr::Map {
+                    if bindings.len() != 2 || key_type.is_none() {
+                        return Err(TypedIrError::InvalidCollectionIteration {
+                            kind: *collection,
+                            binding_count: bindings.len(),
+                        });
+                    }
+                } else if bindings.len() != 1 || key_type.is_some() {
+                    return Err(TypedIrError::InvalidCollectionIteration {
+                        kind: *collection,
+                        binding_count: bindings.len(),
+                    });
+                }
+                if *max_iterations == 0 {
+                    return Err(TypedIrError::ZeroLoopBound);
                 }
                 validate_block(body, limit, constants)?;
             }
@@ -2446,6 +2562,7 @@ fn validate_type(ty: &IrType, limit: usize) -> Result<(), TypedIrError> {
         IrType::Named(id) => validate_id(*id, limit),
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => validate_type(inner, limit),
@@ -2500,6 +2617,7 @@ fn validate_resource_token_types(ty: &IrType) -> Result<(), TypedIrError> {
         }
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::HostRequest(Some(inner))
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
@@ -2534,6 +2652,7 @@ fn contains_host_request(ty: &IrType) -> bool {
         IrType::HostRequest(_) => true,
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => contains_host_request(inner),
@@ -2561,6 +2680,7 @@ fn contains_type_parameter(ty: &IrType) -> bool {
         IrType::TypeParameter(_) => true,
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => contains_type_parameter(inner),
@@ -2714,10 +2834,35 @@ fn remap_block(
                 end,
                 body,
                 ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                binding,
+                start,
+                end,
+                body,
+                ..
             } => {
                 *binding = remapped_id(*binding, mapping)?;
                 remap_expression(start, mapping)?;
                 remap_expression(end, mapping)?;
+                remap_block(body, mapping)?;
+            }
+            TypedStatementIr::CollectionFor {
+                iterable,
+                bindings,
+                key_type,
+                element_type,
+                body,
+                ..
+            } => {
+                remap_expression(iterable, mapping)?;
+                for binding in bindings {
+                    *binding = remapped_id(*binding, mapping)?;
+                }
+                if let Some(key_type) = key_type {
+                    remap_type(key_type, mapping)?;
+                }
+                remap_type(element_type, mapping)?;
                 remap_block(body, mapping)?;
             }
             TypedStatementIr::Defer { cleanup, captures } => {
@@ -2985,6 +3130,7 @@ fn remap_type(
         }
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::HostRequest(Some(inner))
         | IrType::ResourceToken(Some(inner))
         | IrType::Snapshot(inner)
@@ -3059,6 +3205,12 @@ pub enum TypedIrError {
     InvalidStaticRangeBound {
         declared: u32,
         exact: u32,
+    },
+    /// A `CollectionFor` binding arity or key-type shape does not match the
+    /// iterated collection kind.
+    InvalidCollectionIteration {
+        kind: CollectionIterationKindIr,
+        binding_count: usize,
     },
     DuplicateFieldOrder(u32),
     DuplicateVariantTag(u32),

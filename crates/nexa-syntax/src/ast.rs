@@ -248,6 +248,7 @@ pub enum TypeKind {
         key: Box<TypeRef>,
         value: Box<TypeRef>,
     },
+    Set(Box<TypeRef>),
     Option(Box<TypeRef>),
     Result {
         ok: Box<TypeRef>,
@@ -297,9 +298,8 @@ pub enum StatementKind {
         body: Block,
     },
     For {
-        binding: Identifier,
-        start: Expression,
-        end: Expression,
+        bindings: ForBindings,
+        iterable: ForIterable,
         body: Block,
     },
     Break,
@@ -314,6 +314,33 @@ pub enum StatementKind {
 pub enum ElseBranch {
     Block(Block),
     If(Box<Statement>),
+}
+
+/// The loop bindings of a `for` statement, losslessly preserving their
+/// source shape: one binding over Range/Array/Buffer/Set, two bindings
+/// over `Map<K, V>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForBindings {
+    Single(Identifier),
+    Pair {
+        key: Identifier,
+        value: Identifier,
+        range: TextRange,
+    },
+}
+
+/// The iterated expression of a `for` statement. A `start..end` range is
+/// kept as an explicit Range so analysis can still apply the static-range
+/// optimization when both endpoints are compile-time constants; every other
+/// iterable is preserved as the lossless expression itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForIterable {
+    Range {
+        start: Expression,
+        end: Expression,
+        range: TextRange,
+    },
+    Expression(Expression),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1133,12 +1160,13 @@ impl<'a> Parser<'a> {
                 key: Box::new(key.clone()),
                 value: Box::new(value.clone()),
             },
+            ("Set", [element]) => TypeKind::Set(Box::new(element.clone())),
             ("Option", [inner]) => TypeKind::Option(Box::new(inner.clone())),
             ("Result", [ok, error]) => TypeKind::Result {
                 ok: Box::new(ok.clone()),
                 error: Box::new(error.clone()),
             },
-            (_, []) if matches!(name.as_str(), "Array" | "Map" | "Option" | "Result") => {
+            (_, []) if matches!(name.as_str(), "Array" | "Map" | "Set" | "Option" | "Result") => {
                 // Keep empty built-in generics as Generic so arity checking reports one
                 // root-cause error instead of falling back to an unknown-name lookup.
                 TypeKind::Generic { base, arguments }
@@ -1236,18 +1264,14 @@ impl<'a> Parser<'a> {
             });
         }
         if self.take_keyword(Keyword::For).is_some() {
-            let binding = self.identifier();
-            self.require_snake_case(&binding, "loop binding");
+            let bindings = self.for_bindings();
             self.expect_keyword(Keyword::In, "expected `in` after loop binding");
-            let range_start = self.expression(0);
-            self.expect(TokenKind::DotDot, "expected `..` in static range");
-            let range_end = self.expression(0);
+            let iterable = self.for_iterable();
             let body = self.block();
             return ParsedStatement::Statement(Statement {
                 kind: StatementKind::For {
-                    binding,
-                    start: range_start,
-                    end: range_end,
+                    bindings,
+                    iterable,
                     body,
                 },
                 range: cover(start, self.previous_range()),
@@ -2113,6 +2137,46 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn for_bindings(&mut self) -> ForBindings {
+        let start = self.current_range();
+        if self.take(TokenKind::LParen).is_none() {
+            let binding = self.identifier();
+            self.require_snake_case(&binding, "loop binding");
+            return ForBindings::Single(binding);
+        }
+        let key = self.identifier();
+        self.require_snake_case(&key, "loop binding");
+        self.expect(
+            TokenKind::Comma,
+            "expected `,` between the two loop bindings",
+        );
+        let value = self.identifier();
+        self.require_snake_case(&value, "loop binding");
+        let end = self.expect(
+            TokenKind::RParen,
+            "expected `)` after the two loop bindings",
+        );
+        ForBindings::Pair {
+            key,
+            value,
+            range: cover(start, end),
+        }
+    }
+
+    fn for_iterable(&mut self) -> ForIterable {
+        let start = self.current_range();
+        let first = self.expression(0);
+        if self.take(TokenKind::DotDot).is_none() {
+            return ForIterable::Expression(first);
+        }
+        let end = self.expression(0);
+        ForIterable::Range {
+            range: cover(start, end.range),
+            start: first,
+            end,
+        }
+    }
+
     fn member_identifier(&mut self) -> Identifier {
         let Some(token) = self.bump() else {
             let range = self.current_range();
@@ -2451,6 +2515,7 @@ impl<'a> Parser<'a> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ParsedStatement {
     Statement(Statement),
     Tail(Expression),

@@ -20,13 +20,14 @@ use nexa_diagnostics::{
 };
 use nexa_syntax::ast::{
     self, AstErrorKind, Attribute, AttributeArgumentClassification, AttributeArgumentKind,
-    BinaryOperatorKind, DeclarationKind, ElseBranch, Expression, ExpressionKind, InterpolationPart,
-    LiteralKind, Pattern, PatternKind, Statement, StatementKind, TypeDeclarationKind, TypeKind,
-    TypeRef, UnaryOperatorKind, UsePathRootKind, Visibility, parse_nexa_ast,
+    BinaryOperatorKind, DeclarationKind, ElseBranch, Expression, ExpressionKind, ForBindings,
+    ForIterable, InterpolationPart, LiteralKind, Pattern, PatternKind, Statement, StatementKind,
+    TypeDeclarationKind, TypeKind, TypeRef, UnaryOperatorKind, UsePathRootKind, Visibility,
+    parse_nexa_ast,
 };
 use nexa_syntax::{TextRange, TextSize};
 
-use crate::ir::MigrationIntrinsicIr;
+use crate::ir::{CollectionIterationKindIr, MigrationIntrinsicIr};
 use crate::query::{
     linked_input_query_keys, module_header_query_keys, semantic_input_query_keys,
     typed_module_semantic_context,
@@ -71,6 +72,7 @@ pub enum SurfaceType {
     Result(Box<Self>, Box<Self>),
     Array(Box<Self>),
     Map(Box<Self>, Box<Self>),
+    Set(Box<Self>),
     Tuple(Vec<Self>),
     Token(Box<Self>),
     Snapshot(Box<Self>),
@@ -94,6 +96,7 @@ impl std::fmt::Display for SurfaceType {
             Self::Result(ok, error) => write!(formatter, "Result<{ok}, {error}>"),
             Self::Array(inner) => write!(formatter, "Array<{inner}>"),
             Self::Map(key, value) => write!(formatter, "Map<{key}, {value}>"),
+            Self::Set(inner) => write!(formatter, "Set<{inner}>"),
             Self::Tuple(values) => {
                 formatter.write_str("(")?;
                 for (index, value) in values.iter().enumerate() {
@@ -4474,6 +4477,9 @@ impl<'a> Analyzer<'a> {
                 Box::new(self.resolve_standard_surface_type(key, type_parameters)),
                 Box::new(self.resolve_standard_surface_type(value, type_parameters)),
             ),
+            SurfaceType::Set(inner) => IrType::Set(Box::new(
+                self.resolve_standard_surface_type(inner, type_parameters),
+            )),
             SurfaceType::Tuple(values) => IrType::Tuple(
                 values
                     .iter()
@@ -4556,6 +4562,7 @@ impl<'a> Analyzer<'a> {
                 Box::new(self.resolve_surface_type(key)),
                 Box::new(self.resolve_surface_type(value)),
             ),
+            SurfaceType::Set(inner) => IrType::Set(Box::new(self.resolve_surface_type(inner))),
             SurfaceType::Tuple(values) => IrType::Tuple(
                 values
                     .iter()
@@ -4610,6 +4617,9 @@ impl<'a> Analyzer<'a> {
                 Box::new(self.instantiate_surface_type(key, bindings)),
                 Box::new(self.instantiate_surface_type(value, bindings)),
             ),
+            SurfaceType::Set(inner) => {
+                IrType::Set(Box::new(self.instantiate_surface_type(inner, bindings)))
+            }
             SurfaceType::Tuple(values) => IrType::Tuple(
                 values
                     .iter()
@@ -5336,6 +5346,7 @@ impl<'a> Analyzer<'a> {
                         Box::new(self.resolve_type_ref(module, key)),
                         Box::new(self.resolve_type_ref(module, value)),
                     ),
+                    ("Set", [inner]) => IrType::Set(Box::new(self.resolve_type_ref(module, inner))),
                     ("HostRequest", [_]) => {
                         self.push_source_error(
                             ErrorCode::NX2101,
@@ -5369,7 +5380,7 @@ impl<'a> Analyzer<'a> {
                         IrType::StateHandle(Box::new(self.resolve_type_ref(module, inner)))
                     }
                     (
-                        "Option" | "Result" | "Array" | "Map" | "HostRequest" | "Token"
+                        "Option" | "Result" | "Array" | "Map" | "Set" | "HostRequest" | "Token"
                         | "Snapshot" | "Buffer" | "StateHandle",
                         _,
                     ) => {
@@ -5405,6 +5416,7 @@ impl<'a> Analyzer<'a> {
                 Box::new(self.resolve_type_ref(module, key)),
                 Box::new(self.resolve_type_ref(module, value)),
             ),
+            TypeKind::Set(inner) => IrType::Set(Box::new(self.resolve_type_ref(module, inner))),
             TypeKind::Option(inner) => {
                 IrType::Option(Box::new(self.resolve_type_ref(module, inner)))
             }
@@ -5436,6 +5448,7 @@ impl<'a> Analyzer<'a> {
                 TypeKind::Generic { arguments, .. },
                 IrType::Option(inner)
                 | IrType::Array(inner)
+                | IrType::Set(inner)
                 | IrType::Snapshot(inner)
                 | IrType::Buffer(inner)
                 | IrType::StateHandle(inner),
@@ -5461,6 +5474,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             (TypeKind::Array(syntax), IrType::Array(resolved))
+            | (TypeKind::Set(syntax), IrType::Set(resolved))
             | (TypeKind::Option(syntax), IrType::Option(resolved)) => {
                 self.validate_public_type_ref(module, owner, syntax, resolved);
             }
@@ -7100,6 +7114,11 @@ struct BodyChecker<'analyzer, 'input> {
     locals: Vec<DefinitionId>,
     mutable_bindings: BTreeSet<DefinitionId>,
     readonly_loop_bindings: BTreeSet<DefinitionId>,
+    /// Local bindings whose collection value is iterated by an active `for`
+    /// loop. Reassignment or a direct mutating method call on them inside the
+    /// body is a statically provable mutation hazard and rejected; indirect
+    /// mutation is left to the runtime mutation-epoch trap.
+    iterated_collections: BTreeSet<DefinitionId>,
     loop_depth: usize,
     defer_count: usize,
     migration_expression_returns: MigrationPaths,
@@ -7131,6 +7150,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             locals: Vec::new(),
             mutable_bindings: BTreeSet::new(),
             readonly_loop_bindings: BTreeSet::new(),
+            iterated_collections: BTreeSet::new(),
             loop_depth: 0,
             defer_count: 0,
             migration_expression_returns: MigrationPaths::new(),
@@ -7153,6 +7173,234 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         });
         self.scopes.pop();
         TypedBlockIr { statements, tail }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn check_for_statement(
+        &mut self,
+        statement: &Statement,
+        bindings: &ForBindings,
+        iterable: &ForIterable,
+        body: &ast::Block,
+    ) -> Option<TypedStatementIr> {
+        match iterable {
+            ForIterable::Range { start, end, .. } => {
+                let start = self.check_expression(start, Some(&IrType::I32));
+                let end = self.check_expression(end, Some(&IrType::I32));
+                self.expect_type(&start.ty, &IrType::I32, &start.span);
+                self.expect_type(&end.ty, &IrType::I32, &end.span);
+                let ForBindings::Single(binding) = bindings else {
+                    let ForBindings::Pair { range, .. } = bindings else {
+                        unreachable!("ForBindings is Single or Pair");
+                    };
+                    self.analyzer.push_source_error(
+                        ErrorCode::NX2101,
+                        &self.module.source,
+                        byte_range(*range),
+                        "a two-binding `for` loop requires a Map iterable",
+                        "a range iterates a single i32 value; use one binding",
+                    );
+                    return None;
+                };
+                self.scopes.push(BTreeMap::new());
+                let definition =
+                    self.allocate_local(binding.text.clone(), IrType::I32, binding.range);
+                self.scopes
+                    .last_mut()
+                    .expect("for scope exists")
+                    .insert(binding.text.clone(), definition);
+                self.readonly_loop_bindings.insert(definition);
+                self.loop_depth += 1;
+                let body = self.check_block(body);
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                self.readonly_loop_bindings.remove(&definition);
+                self.scopes.pop();
+                let loop_limit = self
+                    .analyzer
+                    .input
+                    .compilation_options
+                    .limits
+                    .max_loop_iterations;
+                if let (Some(start_value), Some(end_value)) = (
+                    constant_i32_expression(&start, &self.analyzer.const_values),
+                    constant_i32_expression(&end, &self.analyzer.const_values),
+                ) {
+                    let iterations = i64::from(end_value)
+                        .saturating_sub(i64::from(start_value))
+                        .max(0);
+                    let max_iterations = u32::try_from(iterations).unwrap_or(u32::MAX);
+                    if max_iterations > loop_limit {
+                        self.analyzer.push_source_error(
+                            ErrorCode::NX2101,
+                            &self.module.source,
+                            byte_range(statement.range),
+                            format!(
+                                "static range has {max_iterations} iterations, exceeding the limit of {loop_limit}"
+                            ),
+                            "reduce the static range",
+                        );
+                    }
+                    Some(TypedStatementIr::StaticRangeFor {
+                        binding: definition,
+                        start,
+                        end,
+                        body,
+                        max_iterations,
+                    })
+                } else {
+                    Some(TypedStatementIr::DynamicRangeFor {
+                        binding: definition,
+                        start,
+                        end,
+                        body,
+                        max_iterations: loop_limit,
+                    })
+                }
+            }
+            ForIterable::Expression(expression) => {
+                let iterable_expr = self.check_expression(expression, None);
+                let iterable_ty = iterable_expr.ty.clone();
+                match &iterable_ty {
+                    IrType::Array(element) => self.check_collection_for(
+                        bindings,
+                        iterable_expr,
+                        CollectionIterationKindIr::Array,
+                        element.as_ref().clone(),
+                        None,
+                        body,
+                    ),
+                    IrType::Buffer(element) => self.check_collection_for(
+                        bindings,
+                        iterable_expr,
+                        CollectionIterationKindIr::Buffer,
+                        element.as_ref().clone(),
+                        None,
+                        body,
+                    ),
+                    IrType::Set(element) => self.check_collection_for(
+                        bindings,
+                        iterable_expr,
+                        CollectionIterationKindIr::Set,
+                        element.as_ref().clone(),
+                        None,
+                        body,
+                    ),
+                    IrType::Map(key, value) => self.check_collection_for(
+                        bindings,
+                        iterable_expr,
+                        CollectionIterationKindIr::Map,
+                        value.as_ref().clone(),
+                        Some(key.as_ref().clone()),
+                        body,
+                    ),
+                    _ => {
+                        if contains_ir_error(&iterable_expr.ty) {
+                            self.record_suppressed();
+                            None
+                        } else {
+                            self.analyzer.push_source_error(
+                                ErrorCode::NX2101,
+                                &self.module.source,
+                                byte_range(expression.range),
+                                "expression is not iterable",
+                                "`for` iterates a Range, Array, Buffer, Map, or Set",
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_collection_for(
+        &mut self,
+        bindings: &ForBindings,
+        iterable_expr: TypedExpressionIr,
+        collection: CollectionIterationKindIr,
+        element_type: IrType,
+        key_type: Option<IrType>,
+        body: &ast::Block,
+    ) -> Option<TypedStatementIr> {
+        let binding_shapes = match bindings {
+            ForBindings::Single(binding) => {
+                if collection == CollectionIterationKindIr::Map {
+                    self.analyzer.push_source_error(
+                        ErrorCode::NX2101,
+                        &self.module.source,
+                        byte_range(binding.range),
+                        "iterating a `Map` requires two bindings `(key, value)`",
+                        "write `for (key, value) in map { ... }`",
+                    );
+                    return None;
+                }
+                vec![(binding.text.clone(), element_type.clone(), binding.range)]
+            }
+            ForBindings::Pair { key, value, range } => {
+                if collection != CollectionIterationKindIr::Map {
+                    self.analyzer.push_source_error(
+                        ErrorCode::NX2101,
+                        &self.module.source,
+                        byte_range(*range),
+                        "a two-binding `for` loop requires a Map iterable",
+                        "Array, Buffer, Set, and Range iterate a single element; use one binding",
+                    );
+                    return None;
+                }
+                let key_type = key_type
+                    .as_ref()
+                    .expect("Map iteration carries a key type")
+                    .clone();
+                vec![
+                    (key.text.clone(), key_type, key.range),
+                    (value.text.clone(), element_type.clone(), value.range),
+                ]
+            }
+        };
+        let guarded = match &iterable_expr.kind {
+            TypedExpressionKind::Reference(definition) => Some(*definition),
+            _ => None,
+        };
+        self.scopes.push(BTreeMap::new());
+        let definitions = binding_shapes
+            .into_iter()
+            .map(|(name, ty, range)| {
+                let definition = self.allocate_local(name.clone(), ty, range);
+                self.scopes
+                    .last_mut()
+                    .expect("for scope exists")
+                    .insert(name, definition);
+                self.readonly_loop_bindings.insert(definition);
+                definition
+            })
+            .collect::<Vec<_>>();
+        if let Some(guarded) = guarded {
+            self.iterated_collections.insert(guarded);
+        }
+        self.loop_depth += 1;
+        let body = self.check_block(body);
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        if let Some(guarded) = guarded {
+            self.iterated_collections.remove(&guarded);
+        }
+        for definition in &definitions {
+            self.readonly_loop_bindings.remove(definition);
+        }
+        self.scopes.pop();
+        Some(TypedStatementIr::CollectionFor {
+            iterable: iterable_expr,
+            bindings: definitions,
+            key_type,
+            element_type,
+            collection,
+            body,
+            max_iterations: self
+                .analyzer
+                .input
+                .compilation_options
+                .limits
+                .max_loop_iterations,
+        })
     }
 
     fn check_repl_entry_block(&mut self, block: &ast::Block) -> TypedBlockIr {
@@ -7383,76 +7631,10 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 })
             }
             StatementKind::For {
-                binding,
-                start,
-                end,
+                bindings,
+                iterable,
                 body,
-            } => {
-                let start = self.check_expression(start, Some(&IrType::I32));
-                let end = self.check_expression(end, Some(&IrType::I32));
-                self.expect_type(&start.ty, &IrType::I32, &start.span);
-                self.expect_type(&end.ty, &IrType::I32, &end.span);
-                self.scopes.push(BTreeMap::new());
-                let definition =
-                    self.allocate_local(binding.text.clone(), IrType::I32, binding.range);
-                self.scopes
-                    .last_mut()
-                    .expect("for scope exists")
-                    .insert(binding.text.clone(), definition);
-                self.readonly_loop_bindings.insert(definition);
-                self.loop_depth += 1;
-                let body = self.check_block(body);
-                self.loop_depth = self.loop_depth.saturating_sub(1);
-                self.readonly_loop_bindings.remove(&definition);
-                self.scopes.pop();
-                let max_iterations = if let (Some(start), Some(end)) = (
-                    constant_i32_expression(&start, &self.analyzer.const_values),
-                    constant_i32_expression(&end, &self.analyzer.const_values),
-                ) {
-                    let iterations = i64::from(end).saturating_sub(i64::from(start)).max(0);
-                    u32::try_from(iterations).unwrap_or(u32::MAX)
-                } else {
-                    self.analyzer.push_source_error(
-                        ErrorCode::NX2101,
-                        &self.module.source,
-                        byte_range(statement.range),
-                        "static range endpoints must be compile-time i32 constants",
-                        "use integer literals or top-level i32 const values",
-                    );
-                    0
-                };
-                if max_iterations
-                    > self
-                        .analyzer
-                        .input
-                        .compilation_options
-                        .limits
-                        .max_loop_iterations
-                {
-                    self.analyzer.push_source_error(
-                        ErrorCode::NX2101,
-                        &self.module.source,
-                        byte_range(statement.range),
-                        format!(
-                            "static range has {max_iterations} iterations, exceeding the limit of {}",
-                            self
-                                .analyzer
-                                .input
-                                .compilation_options
-                                .limits
-                                .max_loop_iterations
-                        ),
-                        "reduce the static range",
-                    );
-                }
-                Some(TypedStatementIr::StaticRangeFor {
-                    binding: definition,
-                    start,
-                    end,
-                    body,
-                    max_iterations,
-                })
-            }
+            } => self.check_for_statement(statement, bindings, iterable, body),
             StatementKind::Break => {
                 self.validate_loop_control(statement.range, "break");
                 Some(TypedStatementIr::Break)
@@ -8335,6 +8517,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         let (operation, arity) = match segments.as_slice() {
             ["Array", "new"] => (BuiltinOperationIr::ArrayNew, 1),
             ["Map", "new"] => (BuiltinOperationIr::MapNew, 2),
+            ["Set", "new"] => (BuiltinOperationIr::SetNew, 1),
             _ => return None,
         };
         let span = source_range(&self.module.source, whole.range);
@@ -8365,7 +8548,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 .collect::<Vec<_>>()
         } else if type_arguments.is_empty() {
             match (operation, expected) {
-                (BuiltinOperationIr::ArrayNew, Some(IrType::Array(element))) => {
+                (BuiltinOperationIr::ArrayNew, Some(IrType::Array(element)))
+                | (BuiltinOperationIr::SetNew, Some(IrType::Set(element))) => {
                     vec![element.as_ref().clone()]
                 }
                 (BuiltinOperationIr::MapNew, Some(IrType::Map(key, value))) => {
@@ -8397,6 +8581,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 Box::new(resolved_type_arguments[0].clone()),
                 Box::new(resolved_type_arguments[1].clone()),
             ),
+            BuiltinOperationIr::SetNew => IrType::Set(Box::new(resolved_type_arguments[0].clone())),
             _ => unreachable!("constructor operation is fixed above"),
         };
         let arguments = arguments
@@ -8688,6 +8873,48 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         _ => return None,
                     }
                 }
+                IrType::Set(element) => {
+                    let element = element.as_ref().clone();
+                    let operation_type_arguments = vec![element.clone()];
+                    match method {
+                        "len" => (
+                            BuiltinOperationIr::SetLen,
+                            IrType::I32,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "contains" => (
+                            BuiltinOperationIr::SetContains,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![element.clone()],
+                            false,
+                        ),
+                        "insert" => (
+                            BuiltinOperationIr::SetInsert,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![element.clone()],
+                            false,
+                        ),
+                        "remove" => (
+                            BuiltinOperationIr::SetRemove,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![element],
+                            false,
+                        ),
+                        "clear" => (
+                            BuiltinOperationIr::SetClear,
+                            IrType::Unit,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        _ => return None,
+                    }
+                }
                 IrType::Buffer(element) => {
                     let element = element.as_ref().clone();
                     let operation_type_arguments = vec![element.clone()];
@@ -8901,6 +9128,15 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 _ => return None,
             };
         let span = source_range(&self.module.source, whole.range);
+        if builtin_operation_mutates(operation)
+            && let TypedExpressionKind::Reference(receiver_definition) = &receiver.kind
+            && self.iterated_collections.contains(receiver_definition)
+        {
+            self.type_error(
+                span.clone(),
+                "the iterated collection is mutated inside its own `for` loop; this mutation is statically provable and rejected (indirect mutation is guarded by the runtime mutation-epoch trap)",
+            );
+        }
         if !type_arguments.is_empty() {
             self.type_error(
                 span.clone(),
@@ -9059,6 +9295,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             | SurfaceType::Rune
             | SurfaceType::Named { .. }
             | SurfaceType::Map(_, _)
+            | SurfaceType::Set(_)
             | SurfaceType::Token(_)
             | SurfaceType::Snapshot(_)
             | SurfaceType::Buffer(_)
@@ -9237,6 +9474,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     | IrType::Named(_)
                     | IrType::Option(_)
                     | IrType::Result(_, _)
+                    | IrType::Set(_)
                     | IrType::Tuple(_)
                     | IrType::HostRequest(_)
                     | IrType::ResourceToken(_)
@@ -9269,6 +9507,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     | IrType::Option(_)
                     | IrType::Array(_)
                     | IrType::Map(_, _)
+                    | IrType::Set(_)
                     | IrType::Tuple(_)
                     | IrType::HostRequest(_)
                     | IrType::ResourceToken(_)
@@ -9322,6 +9561,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ("Map", [key, value]) => {
                         Some(IrType::Map(Box::new(key.clone()), Box::new(value.clone())))
                     }
+                    ("Set", [inner]) => Some(IrType::Set(Box::new(inner.clone()))),
                     ("Token", [inner]) => {
                         Some(IrType::ResourceToken(Some(Box::new(inner.clone()))))
                     }
@@ -9341,6 +9581,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 Box::new(self.infer_type_ref(key)?),
                 Box::new(self.infer_type_ref(value)?),
             )),
+            TypeKind::Set(inner) => Some(IrType::Set(Box::new(self.infer_type_ref(inner)?))),
             TypeKind::Option(inner) => Some(IrType::Option(Box::new(self.infer_type_ref(inner)?))),
             TypeKind::Result { ok, error } => Some(IrType::Result(
                 Box::new(self.infer_type_ref(ok)?),
@@ -10017,6 +10258,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn analyze_migration_statement(
         &mut self,
         statement: &TypedStatementIr,
@@ -10096,6 +10338,35 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 self.apply_migration_expression(&mut paths, end);
                 let start = constant_i32_expression(start, &self.analyzer.const_values);
                 self.analyze_migration_static_loop(*binding, start, body, *max_iterations, paths)
+            }
+            TypedStatementIr::DynamicRangeFor {
+                binding,
+                start,
+                end,
+                body,
+                max_iterations,
+            } => {
+                self.apply_migration_expression(&mut paths, start);
+                self.apply_migration_expression(&mut paths, end);
+                let start = constant_i32_expression(start, &self.analyzer.const_values);
+                self.analyze_migration_dynamic_loop(
+                    Some(*binding),
+                    start,
+                    body,
+                    *max_iterations,
+                    paths,
+                )
+            }
+            TypedStatementIr::CollectionFor {
+                iterable,
+                body,
+                max_iterations,
+                ..
+            } => {
+                self.apply_migration_expression(&mut paths, iterable);
+                // Collection elements are runtime values with no compile-time constant
+                // binding; iterate the body conservatively up to the loop limit.
+                self.analyze_migration_dynamic_loop(None, None, body, *max_iterations, paths)
             }
             TypedStatementIr::Break => MigrationFlow {
                 breaks: paths,
@@ -10188,6 +10459,55 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             active.extend(body_flow.continues);
         }
         flow.normal.extend(active);
+        flow
+    }
+
+    /// Conservative migration flow for a loop whose iteration count is a
+    /// runtime value: every iteration may exit normally and the loop limit is
+    /// the fixed upper bound, deduplicating paths like `analyze_migration_while`.
+    fn analyze_migration_dynamic_loop(
+        &mut self,
+        binding: Option<DefinitionId>,
+        start: Option<i32>,
+        body: &TypedBlockIr,
+        max_iterations: u32,
+        input: MigrationPaths,
+    ) -> MigrationFlow {
+        let mut flow = MigrationFlow::default();
+        let mut heads = input;
+        let mut seen = MigrationPaths::new();
+        for iteration in 0..=max_iterations {
+            heads.retain(|path| seen.insert(path.clone()));
+            if heads.is_empty() {
+                break;
+            }
+            flow.normal.extend(heads.iter().cloned());
+            if iteration == max_iterations {
+                break;
+            }
+            let previous = binding.zip(start).and_then(|(binding, start)| {
+                i32::try_from(iteration)
+                    .ok()
+                    .and_then(|offset| start.checked_add(offset))
+                    .map(|value| {
+                        self.analyzer
+                            .const_values
+                            .insert(binding, ConstValue::I32(value))
+                    })
+            });
+            let body_flow = self.analyze_migration_block(body, heads);
+            if let (Some(binding), Some(previous)) = (binding, previous) {
+                if let Some(previous) = previous {
+                    self.analyzer.const_values.insert(binding, previous);
+                } else {
+                    self.analyzer.const_values.remove(&binding);
+                }
+            }
+            flow.normal.extend(body_flow.breaks);
+            flow.returns.extend(body_flow.returns);
+            heads = body_flow.normal;
+            heads.extend(body_flow.continues);
+        }
         flow
     }
 
@@ -11335,6 +11655,16 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     );
                     return None;
                 }
+                if self.iterated_collections.contains(&definition) {
+                    self.type_error(
+                        source_range(&self.module.source, expression.range),
+                        &format!(
+                            "the iterated collection `{}` cannot be reassigned inside its own `for` loop",
+                            path.segments[0].text
+                        ),
+                    );
+                    return None;
+                }
                 if !self.mutable_bindings.contains(&definition) {
                     self.analyzer.push_source_error(
                         ErrorCode::NX2501,
@@ -11408,6 +11738,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     | IrType::Named(_)
                     | IrType::Option(_)
                     | IrType::Result(_, _)
+                    | IrType::Set(_)
                     | IrType::Tuple(_)
                     | IrType::HostRequest(_)
                     | IrType::ResourceToken(_)
@@ -12141,6 +12472,29 @@ fn use_path_range(usage: &ast::UseDeclaration) -> TextRange {
     )
 }
 
+/// Collection-mutating builtin operations. Directly calling one on the local
+/// binding iterated by an active `for` loop is a statically provable
+/// mutation hazard; the runtime mutation-epoch trap covers every other path.
+fn builtin_operation_mutates(operation: BuiltinOperationIr) -> bool {
+    matches!(
+        operation,
+        BuiltinOperationIr::ArraySet
+            | BuiltinOperationIr::ArrayPush
+            | BuiltinOperationIr::ArrayPop
+            | BuiltinOperationIr::ArrayInsert
+            | BuiltinOperationIr::ArrayRemove
+            | BuiltinOperationIr::ArrayClear
+            | BuiltinOperationIr::MapSet
+            | BuiltinOperationIr::MapInsert
+            | BuiltinOperationIr::MapRemove
+            | BuiltinOperationIr::MapClear
+            | BuiltinOperationIr::SetInsert
+            | BuiltinOperationIr::SetRemove
+            | BuiltinOperationIr::SetClear
+            | BuiltinOperationIr::BufferSet
+    )
+}
+
 fn statement_contains_await(statement: &Statement) -> bool {
     match &statement.kind {
         StatementKind::Bind { value, .. }
@@ -12166,12 +12520,14 @@ fn statement_contains_await(statement: &Statement) -> bool {
         StatementKind::While { condition, body } => {
             expression_contains_await(condition) || block_contains_await(body)
         }
-        StatementKind::For {
-            start, end, body, ..
-        } => {
-            expression_contains_await(start)
-                || expression_contains_await(end)
-                || block_contains_await(body)
+        StatementKind::For { iterable, body, .. } => {
+            let iterable = match iterable {
+                ForIterable::Range { start, end, .. } => {
+                    expression_contains_await(start) || expression_contains_await(end)
+                }
+                ForIterable::Expression(expression) => expression_contains_await(expression),
+            };
+            iterable || block_contains_await(body)
         }
         StatementKind::Break
         | StatementKind::Continue
@@ -12506,6 +12862,9 @@ fn instantiate_inferred_surface_type(
             Box::new(instantiate_inferred_surface_type(key, bindings)?),
             Box::new(instantiate_inferred_surface_type(value, bindings)?),
         )),
+        SurfaceType::Set(inner) => Some(IrType::Set(Box::new(instantiate_inferred_surface_type(
+            inner, bindings,
+        )?))),
         SurfaceType::Tuple(values) => values
             .iter()
             .map(|value| instantiate_inferred_surface_type(value, bindings))
@@ -12551,6 +12910,7 @@ fn unify_surface_type(
         | (SurfaceType::Named { .. }, IrType::Named(_)) => true,
         (SurfaceType::Option(left), IrType::Option(right))
         | (SurfaceType::Array(left), IrType::Array(right))
+        | (SurfaceType::Set(left), IrType::Set(right))
         | (SurfaceType::Snapshot(left), IrType::Snapshot(right))
         | (SurfaceType::Buffer(left), IrType::Buffer(right))
         | (SurfaceType::StateHandle(left), IrType::StateHandle(right))
@@ -12575,6 +12935,7 @@ fn collect_named_types(ty: &IrType, output: &mut Vec<DefinitionId>) {
         IrType::Named(definition) => output.push(*definition),
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => collect_named_types(inner, output),
@@ -12994,6 +13355,7 @@ fn collect_inline_value_targets(
         | IrType::Named(_)
         | IrType::Array(_)
         | IrType::Map(_, _)
+        | IrType::Set(_)
         | IrType::HostRequest(_)
         | IrType::ResourceToken(_)
         | IrType::Snapshot(_)
