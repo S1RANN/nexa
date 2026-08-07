@@ -14,7 +14,6 @@
 (async_keyword) @keyword
 (return_keyword) @keyword
 (let_keyword) @keyword
-(mut_keyword) @keyword
 (if_keyword) @keyword
 (else_keyword) @keyword
 (while_keyword) @keyword
@@ -44,10 +43,7 @@
 (builtin_type) @type.builtin
 (type_path) @type
 
-(struct_literal
-  type: (type_path) @type)
-
-(new_expression
+(aggregate_literal
   type: (type_path) @type)
 
 (struct_declaration
@@ -77,6 +73,10 @@
 
 (for_statement
   variable: (identifier) @variable)
+
+(pair_binding
+  key: (identifier) @variable
+  value: (identifier) @variable)
 
 (field_declaration
   name: (identifier) @property)

@@ -12,8 +12,9 @@ Host Contract files:
 - `language-syntax.json` is the shared lexical vocabulary.
 - `scripts/` generates, validates, and packages the extensions.
 
-The Nexa v2 grammar covers `use` declarations and `::` namespace paths,
-`pub` and `pub(package)`, typed constants, `let mut`, mutable class fields,
+The Nexa v3 grammar covers `use` declarations and `::` namespace paths,
+`pub` and `pub(package)`, module constants, mutable `let` bindings, immutable
+block-local `const` bindings, default-mutable parameters and fields,
 attributes, `async fn`, postfix `.await`/`?`, structural updates, loop control,
 comments, documentation comments, and string interpolation. The Contract (v3)
 grammar covers the flat `contract <Name>;` header (with `@stable(...)`

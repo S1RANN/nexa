@@ -64,11 +64,9 @@ fn single_file_sync_main_receives_arguments_routes_console_and_returns_exit_code
     let fixture = Fixture::new();
     let source = fixture.source(
         "console-main.nexa",
-        r"use host::console;
-
-fn main(args: Array<string>) -> i32 {
-    console::write_line(args[0]);
-    console::write_error_line(args[1]);
+        r"fn main(args: Array<string>) -> i32 {
+    host::write_line(args[0]);
+    host::write_error_line(args[1]);
     return args.len();
 }
 ",
@@ -94,10 +92,8 @@ fn async_main_and_top_level_await_use_the_runtime_task_path() {
 
     let top_level = fixture.source(
         "top-level-await.nexa",
-        r#"use host::console;
-
-async fn announce() {
-    console::write_line("awaited");
+        r#"async fn announce() {
+    host::write_line("awaited");
 }
 
 announce().await;
@@ -114,15 +110,56 @@ fn top_level_scripts_receive_implicit_args() {
     let fixture = Fixture::new();
     let source = fixture.source(
         "top-level-args.nexa",
-        r"use host::console;
-
-console::write_line(args[0]);
+        r"host::write_line(args[0]);
 ",
     );
     let output = fixture.run(&["run", path(&source), "script-argument"]);
     assert_exit(&output, 0);
     assert_eq!(text(&output.stdout), "script-argument\n");
     assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn standalone_accepts_relaxed_main_forms_and_formats_console_values() {
+    let fixture = Fixture::new();
+    for (name, source, arguments, expected_exit, expected_stdout) in [
+        (
+            "sync-unit-no-args.nexa",
+            "fn main() { host::write_line(42); }\n",
+            Vec::<&str>::new(),
+            0,
+            "42\n",
+        ),
+        (
+            "sync-unit-args.nexa",
+            "fn main(args: Array<string>) { host::write_line(args); }\n",
+            vec!["alpha", "beta"],
+            0,
+            "[alpha, beta]\n",
+        ),
+        (
+            "sync-i32-no-args.nexa",
+            "fn main() -> i32 { return 7; }\n",
+            Vec::<&str>::new(),
+            7,
+            "",
+        ),
+        (
+            "async-unit-no-args.nexa",
+            "async fn main() { host::write_line(true); }\n",
+            Vec::<&str>::new(),
+            0,
+            "true\n",
+        ),
+    ] {
+        let source = fixture.source(name, source);
+        let mut command = vec!["run", path(&source)];
+        command.extend(arguments);
+        let output = fixture.run(&command);
+        assert_exit(&output, expected_exit);
+        assert_eq!(text(&output.stdout), expected_stdout);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    }
 }
 
 #[test]
@@ -140,7 +177,6 @@ fn standalone_rejects_main_conflicts_missing_main_and_wrong_signatures() {
     assert_exit(&fixture.run(&["run", path(&conflict)]), 1);
 
     for (name, source) in [
-        ("no-args.nexa", "fn main() -> i32 { return 0; }\n"),
         (
             "wrong-argument.nexa",
             "fn main(args: Array<i32>) -> i32 { return 0; }\n",
@@ -170,6 +206,32 @@ fn standalone_rejects_main_conflicts_missing_main_and_wrong_signatures() {
         "{}",
         text(&output.stderr)
     );
+}
+
+#[test]
+fn standalone_reports_bounds_and_type_context_with_actual_values() {
+    let fixture = Fixture::new();
+    let bounds = fixture.source(
+        "bounds.nexa",
+        "fn main() { let values = [10, 20]; host::write_line(values[5]); }\n",
+    );
+    let output = fixture.run(&["run", path(&bounds)]);
+    assert_exit(&output, 4);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("array index 5"), "{stderr}");
+    assert!(stderr.contains("length 2"), "{stderr}");
+    assert!(stderr.contains("valid indices are 0..1"), "{stderr}");
+
+    let mismatch = fixture.source(
+        "type-context.nexa",
+        "fn consume(value: string) {}\nfn main() { consume(42); }\n",
+    );
+    let output = fixture.run(&["run", path(&mismatch)]);
+    assert_exit(&output, 1);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("argument 1 to `consume`"), "{stderr}");
+    assert!(stderr.contains("expected string"), "{stderr}");
+    assert!(stderr.contains("found i32"), "{stderr}");
 }
 
 #[test]

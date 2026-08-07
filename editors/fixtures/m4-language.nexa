@@ -1,7 +1,6 @@
 /// Public score rules used by the game package.
 use package::demo::food;
 use snake_common::score as score;
-use host::snake;
 
 // Public constants participate in the package API fingerprint.
 pub const MAX_SCORE: i32 = 100;
@@ -16,7 +15,12 @@ pub(package) struct ScorePolicy {
 @state(version = 2)
 pub class PlayState {
     @stable("play-state.total-games")
-    mut total_games: i32,
+    total_games: i32,
+}
+
+fn advance(value: i32) -> i32 {
+    value += 1;
+    return value;
 }
 
 @test
@@ -28,6 +32,24 @@ fn score_is_positive() -> bool {
         break;
     }
 
+    let scores: Array<i32> = Array::new();
+    scores.push(10);
+    for item in scores {
+        let _ = item;
+    }
+
+    let map: Map<string, i32> = Map::new();
+    for (key, count) in map {
+        let _ = key;
+        let _ = count;
+    }
+
+    let seen: Set<i32> = Set::new();
+    seen.insert(1);
+    for element in seen {
+        let _ = element;
+    }
+
     let escaped: string = "literal \${score}";
     let rendered: string = "score ${MAX_SCORE}";
     return true;
@@ -35,5 +57,5 @@ fn score_is_positive() -> bool {
 
 @activation
 pub async fn activate(value: i32) -> i32 {
-    return snake::update(value, MAX_SCORE);
+    return host::update(value, MAX_SCORE);
 }

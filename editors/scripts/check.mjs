@@ -35,6 +35,11 @@ const { INITIAL, Registry, parseRawGrammar } = vscodeTextmate;
 const nexaExamples = [
   "editors/fixtures/m4-language.nexa",
   "examples/add.nexa",
+  "examples/canary/range.nexa",
+  "examples/canary/array.nexa",
+  "examples/canary/buffer.nexa",
+  "examples/canary/map.nexa",
+  "examples/canary/set.nexa",
   "examples/combat-runtime/gameplay.nexa",
   "examples/combat-runtime/reload/activation_fault.nexa",
   "examples/combat-runtime/reload/invalid.nexa",
@@ -449,17 +454,17 @@ function validateSyntaxContract() {
     "M4 loop control keywords are missing",
   );
   assert(
-    ["mut", "use", "async"].every((keyword) =>
+    ["use", "async", "const", "let"].every((keyword) =>
       [
         ...syntax.nexa.declarationKeywords,
         ...syntax.nexa.effectKeywords,
         ...syntax.nexa.statementKeywords,
       ].includes(keyword),
     ),
-    "Nexa v2 surface keywords are missing",
+    "Nexa Language v3 surface keywords are missing",
   );
   assert(
-    ["var", "module", "import", "task", "immediate", "migration", "activation", "cleanup", "stateful", "with"]
+    ["mut", "var", "module", "import", "task", "immediate", "migration", "activation", "cleanup", "stateful", "with"]
       .filter((keyword) => !syntax.nexa.attributeKeywords.includes(keyword))
       .every(
         (keyword) =>

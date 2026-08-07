@@ -31,12 +31,12 @@ pub fn validate_contract_path(path: &Path, command: &str) -> CliResult<()> {
     if file_name.ends_with(".contract.nexa") {
         return Ok(());
     }
-    if file_name.ends_with(".nidl") {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nidl"))
+    {
         let new_name = path.with_extension("contract.nexa");
-        let new_name_str = new_name
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("");
+        let new_name_str = new_name.file_name().and_then(OsStr::to_str).unwrap_or("");
         return Err(CliError::contract_usage(
             format!(
                 "`{command}` accepts only `*.contract.nexa` files; \
@@ -48,9 +48,7 @@ pub fn validate_contract_path(path: &Path, command: &str) -> CliResult<()> {
         ));
     }
     Err(CliError::contract_usage(
-        format!(
-            "`{command}` accepts only `*.contract.nexa` files, got `{file_name}`"
-        ),
+        format!("`{command}` accepts only `*.contract.nexa` files, got `{file_name}`"),
         path,
     ))
 }
@@ -2381,7 +2379,8 @@ capabilities = []\n";
         let directory = TestDirectory::new();
         let package = directory.0.join("packages/app");
         fs::create_dir_all(package.join("src/example")).expect("create package source directory");
-        fs::write(directory.0.join("lockless.contract.nexa"), CONTRACT).expect("write Host contract");
+        fs::write(directory.0.join("lockless.contract.nexa"), CONTRACT)
+            .expect("write Host contract");
         fs::write(package.join("package.toml"), MANIFEST).expect("write Package Manifest");
         fs::write(package.join("src/example/lockless.nexa"), SOURCE).expect("write Package source");
         fs::write(

@@ -9,13 +9,12 @@ use nexa_syntax::parse_nexa;
 fn complete_v2_ast_covers_uses_async_updates_and_scripts() {
     let source = r#"
 use package::food::effects;
-use host::snake;
 use snake_common::score as score;
 
 @state(version = 1)
 class GameState {
     @stable("score")
-    mut score: i32,
+    score: i32,
     name: string,
 }
 
@@ -34,20 +33,20 @@ enum Food {
 
 @fuel(8)
 async fn load_score(id: i32) -> Result<i32, string> {
-    let mut values: Array<i32> = Array::new();
+    let values: Array<i32> = Array::new();
     let moved = Cell {
         x: 10,
         ..cell
     };
-    let copied = new GameState {
+    let copied = GameState {
         score: 50,
         ..state
     };
-    values[0] = host::snake::load(id).await?.value;
+    values[0] = host::load(id).await?.value;
     return moved.x + copied.score + values[0];
 }
 
-let mut script_value = 1;
+let script_value = 1;
 script_value = script_value + 1;
 "#;
     let tree = parse_nexa(source).expect("small source");
@@ -56,7 +55,7 @@ script_value = script_value + 1;
 
     let ast = parse_nexa_ast(&tree);
     assert!(ast.errors.is_empty(), "AST errors: {:?}", ast.errors);
-    assert_eq!(ast.uses.len(), 3);
+    assert_eq!(ast.uses.len(), 2);
     assert_eq!(ast.uses[0].root.kind, UsePathRootKind::Package);
     assert_eq!(ast.uses[0].root.name.text, "package");
     assert_eq!(
@@ -67,10 +66,9 @@ script_value = script_value + 1;
             .collect::<Vec<_>>(),
         ["food", "effects"]
     );
-    assert_eq!(ast.uses[1].root.kind, UsePathRootKind::Host);
-    assert_eq!(ast.uses[2].root.kind, UsePathRootKind::Dependency);
+    assert_eq!(ast.uses[1].root.kind, UsePathRootKind::Dependency);
     assert_eq!(
-        ast.uses[2].alias.as_ref().map(|alias| alias.text.as_str()),
+        ast.uses[1].alias.as_ref().map(|alias| alias.text.as_str()),
         Some("score")
     );
     assert!(
@@ -85,7 +83,7 @@ script_value = script_value + 1;
     };
     assert_eq!(state.kind, TypeDeclarationKind::Class);
     assert!(state.fields[0].mutable);
-    assert!(!state.fields[1].mutable);
+    assert!(state.fields[1].mutable);
     assert_eq!(
         ast.declarations[0].attributes[0].arguments[0].classification,
         AttributeArgumentClassification::Named
@@ -150,7 +148,7 @@ script_value = script_value + 1;
             _ => None,
         })
         .expect("copied binding");
-    let ExpressionKind::New { fields, update, .. } = &copied.kind else {
+    let ExpressionKind::Construct { fields, update, .. } = &copied.kind else {
         panic!("class construction");
     };
     assert_eq!(fields.len(), 1);
@@ -186,7 +184,7 @@ fn named_attribute_arguments_classify_unknown_and_duplicates() {
     let source = r"
 @state(extra = 0, version = 1, version = 2)
 class State {
-    mut score: i32,
+    score: i32,
 }
 ";
     let tree = parse_nexa(source).expect("small source");

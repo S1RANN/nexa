@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use nexa;
 use nexa::prelude as nexa_runtime;
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateTerminalKind, CapabilitySet,
@@ -382,10 +381,8 @@ fn source(id: &str, package: &str, activation: &str, script: &str) -> MemorySour
     )
     .package({
         let module = module_name(package);
-        MemoryPackage::new(package.replace('.', "-"), manifest(package, activation, "")).source(
-            source_path(&module),
-            format!("use host::test_host as test;\n{script}"),
-        )
+        MemoryPackage::new(package.replace('.', "-"), manifest(package, activation, ""))
+            .source(source_path(&module), script.to_owned())
     })
 }
 
@@ -577,8 +574,9 @@ fn engine_records_instruction_count_independently_from_fuel_charge() {
         )
         .source(
             "src/tests/meter.nexa",
-            "use host::meter_host as meter;
-             pub fn run(value: i32) -> i32 { return meter::expensive(value); }",
+            r"pub fn run(value: i32) -> i32 {
+    return host::expensive(value);
+}",
         ),
     );
     let mut engine = NexaEngine::builder(contract)
@@ -679,8 +677,7 @@ fn entitlement_lock_unlock_and_required_policy_are_enforced() {
         )
         .source(
             "src/tests/licensed.nexa",
-            "use host::test_host as test;\n\
-             pub fn run(value: i32) -> i32 { return value; }",
+            "pub fn run(value: i32) -> i32 { return value; }",
         ),
     );
     let mut engine = builder(licensed)
@@ -786,9 +783,7 @@ impl PackageSource for RemovableSource {
 #[test]
 fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 { return value + 1; }"
-            .to_owned(),
+        "pub fn run(value: i32) -> i32 { return value + 1; }".to_owned(),
     ));
     let source = SharedSource {
         id: SourceId::new("reload").expect("source ID"),
@@ -801,9 +796,8 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
     engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.reload").expect("package ID");
     assert_eq!(engine.call::<Run>(&id, &1).expect("call v1").value, 2);
-    *script.write().expect("source lock") = "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 { return value + 2; }"
-        .into();
+    *script.write().expect("source lock") =
+        "pub fn run(value: i32) -> i32 { return value + 2; }".into();
     engine.reload(&id).expect("reload v2");
     assert_eq!(engine.call::<Run>(&id, &1).expect("call v2").value, 3);
     *script.write().expect("source lock") = "pub fn run(".into();
@@ -883,7 +877,7 @@ fn trap_fuel_yield_and_host_wait_are_distinct_package_failures() {
             "",
             true,
             "pub async fn run(value: i32) -> i32 {
-                 let result: Result<i32, test::WaitError> = test::wait(value).await;
+                 let result: Result<i32, host::WaitError> = host::wait(value).await;
                  return match result { Result::Ok(found) => found, Result::Err(error) => 0 };
              }",
         ),
@@ -896,10 +890,8 @@ fn trap_fuel_yield_and_host_wait_are_distinct_package_failures() {
         )
         .package({
             let module = module_name(package_id);
-            MemoryPackage::new(package_id.replace('.', "-"), raw_manifest).source(
-                source_path(&module),
-                format!("use host::test_host as test;\n{script}"),
-            )
+            MemoryPackage::new(package_id.replace('.', "-"), raw_manifest)
+                .source(source_path(&module), script.to_owned())
         });
         let mut engine = if is_task {
             task_builder(source)
@@ -935,7 +927,7 @@ fn runtime_trap_diagnostic_contains_script_stack_and_host_boundary() {
         "tests.host-trap",
         "default-enabled",
         "pub async fn run(value: i32) -> i32 {
-             let result: Result<i32, test::WaitError> = test::wait(value).await;
+             let result: Result<i32, host::WaitError> = host::wait(value).await;
              return match result { Result::Ok(found) => found, Result::Err(error) => 0 };
          }",
     );
@@ -1005,7 +997,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
         )
         .package(MemoryPackage::new("tests-policy", excessive).source(
             "src/tests/policy.nexa",
-            "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value; }",
+            "pub fn run(value: i32) -> i32 { return value; }",
         ),)
         .discover(&CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec())),
         Err(PackageSourceError::Policy(
@@ -1021,7 +1013,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
         .package(
             MemoryPackage::new("tests-policy", illegal_activation).source(
                 "src/tests/policy.nexa",
-                "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value; }",
+                "pub fn run(value: i32) -> i32 { return value; }",
             ),
         )
         .discover(&CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec())),
@@ -1049,8 +1041,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
 #[test]
 fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         @state(version = 1) class Store { mut value: i32, }\n\
+        "@state(version = 1) class Store { value: i32, }\n\
          pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
@@ -1068,8 +1059,7 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         .set_state_i32(&id, "store", "Store", 1, "value", 9)
         .expect("insert state");
 
-    *script.write().expect("source lock") = "use host::test_host as test;\n\
-         @state(version = 1) class Store { mut value: i32, }\n\
+    *script.write().expect("source lock") = "@state(version = 1) class Store { value: i32, }\n\
          pub fn run(value: i32) -> i32 { return value + 2; }"
         .into();
     assert_eq!(engine.reload_changed().expect("change scan reload"), 1);
@@ -1081,16 +1071,15 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         Some(9)
     );
 
-    *script.write().expect("source lock") = "use host::test_host as test;\n\
-         @state(version = 2) class Store { mut value: i32, mut extra: i32, }\n\
+    *script.write().expect("source lock") =
+        "@state(version = 2) class Store { value: i32, extra: i32, }\n\
          pub fn run(value: i32) -> i32 { return value + 3; }"
-        .into();
+            .into();
     assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
     assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
     assert_eq!(engine.call::<Run>(&id, &1).expect("rollback old").value, 3);
 
-    *script.write().expect("source lock") = "use host::test_host as test;\n\
-         @state(version = 1) class Store { mut value: i32, }\n\
+    *script.write().expect("source lock") = "@state(version = 1) class Store { value: i32, }\n\
          pub fn run(value: i32) -> i32 { return value + 4; }\n\
          @activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
         .into();
@@ -1116,8 +1105,7 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
 #[allow(clippy::too_many_lines)]
 fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         @state(version = 1) class Store { mut value: i32, }\n\
+        "@state(version = 1) class Store { value: i32, }\n\
          pub fn run(value: i32) -> i32 { return value; }"
             .to_owned(),
     ));
@@ -1137,8 +1125,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
 
     for generation in 1..=100 {
         *script.write().expect("source lock") = format!(
-            "use host::test_host as test;\n\
-             @state(version = 1) class Store {{ mut value: i32, }}\n\
+            "@state(version = 1) class Store {{ value: i32, }}\n\
              pub fn run(value: i32) -> i32 {{ return value + {generation}; }}"
         );
         engine.reload(&id).expect("successful reload");
@@ -1162,8 +1149,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     }
     for _ in 0..100 {
         *script.write().expect("source lock") =
-            "use host::test_host as test;\npub fn run(value: i32) -> i32 { return missing; }"
-                .into();
+            "pub fn run(value: i32) -> i32 { return missing; }".into();
         assert!(matches!(
             engine.reload(&id),
             Err(EngineError::Diagnostic(_))
@@ -1171,10 +1157,10 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
         assert_eq!(engine.call::<Run>(&id, &1).expect("type LKG").value, 101);
     }
     for _ in 0..100 {
-        *script.write().expect("source lock") = "use host::test_host as test;\n\
-             @state(version = 2) class Store { mut value: i32, mut extra: i32, }\n\
+        *script.write().expect("source lock") =
+            "@state(version = 2) class Store { value: i32, extra: i32, }\n\
              pub fn run(value: i32) -> i32 { return value + 999; }"
-            .into();
+                .into();
         assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
         assert_eq!(
             engine.call::<Run>(&id, &1).expect("migration LKG").value,
@@ -1187,8 +1173,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
             .call::<Run>(&id, &1)
             .expect("call LKG before activation fault")
             .value;
-        *script.write().expect("source lock") = "use host::test_host as test;\n\
-             @state(version = 1) class Store { mut value: i32, }\n\
+        *script.write().expect("source lock") = "@state(version = 1) class Store { value: i32, }\n\
              pub fn run(value: i32) -> i32 { return value; }\n\
              @activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
             .into();
@@ -1212,8 +1197,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
         );
 
         *script.write().expect("source lock") = format!(
-            "use host::test_host as test;\n\
-             @state(version = 1) class Store {{ mut value: i32, }}\n\
+            "@state(version = 1) class Store {{ value: i32, }}\n\
              pub fn run(value: i32) -> i32 {{ return value + {generation}; }}"
         );
         engine.reload(&id).expect("fault recovery reload");
@@ -1243,9 +1227,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
 #[allow(clippy::too_many_lines)]
 fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 { return value + 1; }"
-            .to_owned(),
+        "pub fn run(value: i32) -> i32 { return value + 1; }".to_owned(),
     ));
     let source = SharedSource {
         id: SourceId::new("dev").expect("source ID"),
@@ -1266,7 +1248,7 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     let id = PackageId::new("tests.dev").expect("package ID");
 
     *script.write().expect("source lock") =
-        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value + 2; }".into();
+        "pub fn run(value: i32) -> i32 { return value + 2; }".into();
     let observed = engine.tick().expect("observe save");
     assert!(
         observed
@@ -1329,7 +1311,7 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     assert_eq!(engine.call::<Run>(&id, &1).expect("new active").value, 3);
 
     *script.write().expect("source lock") =
-        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return missing; }".into();
+        "pub fn run(value: i32) -> i32 { return missing; }".into();
     engine.tick().expect("observe invalid");
     engine.tick().expect("queue invalid");
     let mut failed = false;
@@ -1358,9 +1340,7 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
 #[test]
 fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearance() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 { return value + 1; }"
-            .to_owned(),
+        "pub fn run(value: i32) -> i32 { return value + 1; }".to_owned(),
     ));
     let available = Arc::new(RwLock::new(true));
     let source = RemovableSource {
@@ -1385,7 +1365,7 @@ fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearanc
     let package_id = PackageId::new("tests.removable").expect("package ID");
 
     *script.write().expect("source lock") =
-        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value + 2; }".into();
+        "pub fn run(value: i32) -> i32 { return value + 2; }".into();
     engine.tick().expect("queue changed source");
     *available.write().expect("availability lock") = false;
     let missing = engine.tick().expect("observe source removal");
@@ -1449,9 +1429,7 @@ fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearanc
 #[test]
 fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
     let script = Arc::new(RwLock::new(
-        "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 { return value + 1; }"
-            .to_owned(),
+        "pub fn run(value: i32) -> i32 { return value + 1; }".to_owned(),
     ));
     let source = SharedSource {
         id: SourceId::new("disable-race").expect("source ID"),
@@ -1470,7 +1448,7 @@ fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
     engine.discover().expect("discover");
     let package_id = PackageId::new("tests.disable-race").expect("package ID");
     engine.enable(&package_id).expect("enable");
-    let mut slow = String::from("use host::test_host as test;\npub fn run(value: i32) -> i32 {\n");
+    let mut slow = String::from("pub fn run(value: i32) -> i32 {\n");
     for index in 0..1_000 {
         writeln!(&mut slow, "let value_{index}: i32 = {index};").expect("write slow source");
     }
@@ -1532,10 +1510,7 @@ struct GenerationAccountingEvidence {
 }
 
 fn accounting_script(_module: &str, delta: i32) -> String {
-    format!(
-        "use host::test_host as test;\n\
-         pub fn run(value: i32) -> i32 {{ return value + {delta}; }}"
-    )
+    format!("pub fn run(value: i32) -> i32 {{ return value + {delta}; }}")
 }
 
 fn accounting_engine(

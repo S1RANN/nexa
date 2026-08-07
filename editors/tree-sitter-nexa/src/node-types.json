@@ -56,6 +56,10 @@
     "named": true,
     "subtypes": [
       {
+        "type": "aggregate_literal",
+        "named": true
+      },
+      {
         "type": "array_literal",
         "named": true
       },
@@ -72,10 +76,6 @@
         "named": true
       },
       {
-        "type": "new_expression",
-        "named": true
-      },
-      {
         "type": "parenthesized_expression",
         "named": true
       },
@@ -89,10 +89,6 @@
       },
       {
         "type": "string_literal",
-        "named": true
-      },
-      {
-        "type": "struct_literal",
         "named": true
       },
       {
@@ -168,6 +164,32 @@
         "named": true
       }
     ]
+  },
+  {
+    "type": "aggregate_literal",
+    "named": true,
+    "fields": {
+      "fields": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "field_initializer_block",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_path",
+            "named": true
+          }
+        ]
+      }
+    }
   },
   {
     "type": "argument_list",
@@ -394,17 +416,11 @@
         "required": true,
         "types": [
           {
-            "type": "let_keyword",
+            "type": "const_keyword",
             "named": true
-          }
-        ]
-      },
-      "mutable": {
-        "multiple": false,
-        "required": false,
-        "types": [
+          },
           {
-            "type": "mut_keyword",
+            "type": "let_keyword",
             "named": true
           }
         ]
@@ -823,16 +839,6 @@
     "type": "field_declaration",
     "named": true,
     "fields": {
-      "mutable": {
-        "multiple": false,
-        "required": false,
-        "types": [
-          {
-            "type": "mut_keyword",
-            "named": true
-          }
-        ]
-      },
       "name": {
         "multiple": false,
         "required": true,
@@ -973,7 +979,17 @@
       },
       "end": {
         "multiple": false,
-        "required": true,
+        "required": false,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      },
+      "iterable": {
+        "multiple": false,
+        "required": false,
         "types": [
           {
             "type": "expression",
@@ -983,7 +999,7 @@
       },
       "start": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "expression",
@@ -997,6 +1013,10 @@
         "types": [
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "pair_binding",
             "named": true
           }
         ]
@@ -1396,39 +1416,29 @@
     }
   },
   {
-    "type": "new_expression",
+    "type": "pair_binding",
     "named": true,
     "fields": {
-      "fields": {
+      "key": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "field_initializer_block",
+            "type": "identifier",
             "named": true
           }
         ]
       },
-      "type": {
+      "value": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "type_path",
+            "type": "identifier",
             "named": true
           }
         ]
       }
-    },
-    "children": {
-      "multiple": false,
-      "required": true,
-      "types": [
-        {
-          "type": "new_keyword",
-          "named": true
-        }
-      ]
     }
   },
   {
@@ -1675,32 +1685,6 @@
           "named": true
         }
       ]
-    }
-  },
-  {
-    "type": "struct_literal",
-    "named": true,
-    "fields": {
-      "fields": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "field_initializer_block",
-            "named": true
-          }
-        ]
-      },
-      "type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "type_path",
-            "named": true
-          }
-        ]
-      }
     }
   },
   {
@@ -2018,6 +2002,10 @@
     "named": false
   },
   {
+    "type": "Set",
+    "named": false
+  },
+  {
     "type": "Snapshot",
     "named": false
   },
@@ -2179,10 +2167,6 @@
   {
     "type": "migration",
     "named": false
-  },
-  {
-    "type": "mut_keyword",
-    "named": true
   },
   {
     "type": "new_keyword",

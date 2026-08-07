@@ -53,7 +53,7 @@ impl ReplCellInput {
 /// The namespace and callable metadata of a REPL binding.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReplBindingKind {
-    /// A top-level `let` or `let mut`, persisted in a hidden state slot.
+    /// A top-level mutable `let` or immutable `const`, persisted in a hidden state slot.
     Value,
     /// A top-level function. `ty` on the enclosing slot is its result type.
     Function {
@@ -1539,7 +1539,7 @@ mod tests {
         let first = ready(
             session
                 .stage_cell(
-                    input(1, "let mut answer = 41;"),
+                    input(1, "let answer = 41;"),
                     ReplCellAnalysisOutcome::Accepted(delta(
                         1,
                         vec![ReplBindingDeclaration::value(

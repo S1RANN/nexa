@@ -28,12 +28,12 @@ Module      repl.session
 Cell        repl::cell_N
 ```
 
-Expressions, declarations, and statements use Nexa Language v2:
+Expressions, declarations, and statements use Nexa Language v3:
 
 ```nexa
 1 + 2
-let greeting = "hello";
-let mut count = 1;
+const greeting = "hello";
+let count = 1;
 count = count + 1;
 fn double(value: i32) -> i32 { return value * 2; }
 double(count)
@@ -43,11 +43,11 @@ A final expression without a semicolon is displayed as the cell result; Unit
 produces no result line. Incomplete syntax is buffered until the production
 parser identifies a complete cell.
 
-Top-level `let` and `let mut` bindings are lowered into a hidden
+Top-level `let` and block-local `const` bindings are lowered into a hidden
 `@state(version = 1) class __ReplEnvironment`. Each successful declaration
-receives a stable slot derived from its cell and declaration position. `let`
-slots may be written only by their defining cell; `let mut` slots may be
-assigned by later cells. Variables and functions may shadow earlier
+receives a stable slot derived from its cell and declaration position. `const`
+slots may be written only by their defining cell; `let` slots may be assigned
+by later cells. Variables and functions may shadow earlier
 definitions. Type redefinition is rejected because existing state may use the
 old layout; use `:reset` before declaring the replacement type. A previously
 compiled function continues to refer to the definitions it originally

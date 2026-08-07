@@ -7,18 +7,17 @@ use nexa_syntax::{
 };
 
 #[test]
-fn language_v2_positive_surface_matrix() {
+fn language_v3_positive_surface_matrix() {
     let source = r"
 use package::model;
 use self::helpers as helpers;
 use super::shared;
-use host::console;
 use std::math;
 use snake_common::score;
 
 @state(version = 1)
 class State {
-    mut score: i32,
+    score: i32,
 }
 
 struct Cell {
@@ -37,21 +36,22 @@ enum Direction {
 const MAX_SCORE: i32 = 100;
 
 async fn load_score(id: i32) -> Result<i32, string> {
-    let mut values = Array::new();
+    let values = Array::new();
+    const original_id = id;
     let moved = Cell { x: 10, ..cell };
-    let copied = new State { score: 50, ..state };
-    values[0] = host::console::load(id).await?.score;
+    let copied = State { score: 50, ..state };
+    values[0] = host::load(id).await?.score;
     return moved.x + copied.score;
 }
 
-let mut script_score = 0;
+let script_score = 0;
 script_score = script_score + 1;
 ";
     let tree = parse_nexa(source).expect("small source");
     assert!(tree.errors.is_empty(), "tree errors: {:?}", tree.errors);
     let ast = parse_nexa_ast(&tree);
     assert!(ast.errors.is_empty(), "AST errors: {:?}", ast.errors);
-    assert_eq!(ast.uses.len(), 6);
+    assert_eq!(ast.uses.len(), 5);
     assert_eq!(ast.declarations.len(), 5);
     assert_eq!(ast.top_level_statements.len(), 2);
     let DeclarationKind::Function(function) = &ast.declarations[4].kind else {
@@ -61,6 +61,11 @@ script_score = script_score + 1;
     assert!(
         function.body.statements.iter().any(|statement| {
             matches!(statement.kind, StatementKind::Bind { mutable: true, .. })
+        })
+    );
+    assert!(
+        function.body.statements.iter().any(|statement| {
+            matches!(statement.kind, StatementKind::Bind { mutable: false, .. })
         })
     );
     assert!(function.body.statements.iter().any(|statement| {
@@ -81,7 +86,7 @@ script_score = script_score + 1;
 fn compound_assignments_have_lossless_tokens_and_typed_ast_nodes() {
     let source = r"
 fn update() {
-    let mut value = 20;
+    let value = 20;
     value += 2;
     value -= 3;
     value *= 4;
@@ -212,22 +217,42 @@ fn legacy_surface_forms_are_rejected_at_the_removed_word() {
 }
 
 #[test]
-fn mut_is_only_valid_for_let_and_class_fields() {
-    let accepted = parse_nexa("class State { mut score: i32, }\nfn run() { let mut score = 0; }\n")
+fn language_v3_rejects_host_namespace_imports() {
+    let tree = parse_nexa("use host::console;\nfn main() { host::write_line(1); }\n")
         .expect("small source");
+    let ast = parse_nexa_ast(&tree);
+    assert!(ast.errors.iter().any(|error| {
+        error
+            .message
+            .contains("`use host::...` was removed in Nexa v3")
+    }));
+}
+
+#[test]
+fn mut_is_rejected_because_language_v3_defaults_to_mutable() {
+    let accepted = parse_nexa(
+        "class State { score: i32, }\nfn run(value: i32) { let score = value; const fixed = value; }\nconst script_value = 1;\n",
+    )
+    .expect("small source");
     let ast = parse_nexa_ast(&accepted);
     assert!(ast.errors.is_empty(), "{:?}", ast.errors);
+    assert!(matches!(
+        ast.top_level_statements[0].kind,
+        StatementKind::Bind { mutable: false, .. }
+    ));
 
     for source in [
         "struct Cell { mut x: i32, }",
-        "enum Value { mut Some(i32), }",
+        "class State { mut value: i32, }",
+        "fn run(mut value: i32) {}",
+        "fn run() { let mut value = 1; }",
     ] {
         let tree = parse_nexa(source).expect("small source");
         let ast = parse_nexa_ast(&tree);
         let error = ast
             .errors
             .iter()
-            .find(|error| error.message.contains("only allowed on class fields"))
+            .find(|error| error.message.contains("removed in Language v3"))
             .unwrap_or_else(|| panic!("{source}: {:?}", ast.errors));
         assert_eq!(
             &source[usize::try_from(error.range.start.get()).unwrap()
@@ -271,7 +296,7 @@ fn named_attribute_arguments_preserve_names_and_classification() {
     let source = r"
 @state(version = 1, extra = 2, version = 3)
 class State {
-    mut score: i32,
+    score: i32,
 }
 ";
     let tree = parse_nexa(source).expect("small source");

@@ -12,21 +12,22 @@ For each Package:
 2. Keep each file at the path that defines its Module identity. For example,
    `src/snake/classic_rules.nexa` is `package::snake::classic_rules`.
 3. Delete every source-level `module` declaration.
-4. Replace namespace imports with `use`. Host symbols use a Contract
-   namespace such as `use host::snake;`; same-Package paths start with
+4. Replace namespace imports with `use`. On the current Language v3 surface,
+   Host symbols are referenced directly as `host::member`; same-Package paths start with
    `package::`, `self::`, or `super::`; dependencies start with their Manifest
    alias.
-5. Change `var value` to `let mut value`. Keep immutable runtime bindings as
-   `let value`.
+5. Change mutable `var value` bindings to `let value`. Change bindings that
+   must not be reassigned to block-local `const value`.
 6. Change `task fn` to `async fn` and prefix awaits to postfix `.await`.
    Pending async values cannot be stored for a later await.
 7. Replace a state-specific type declaration with
-   `@state(version = N) class`, and put `mut` on each field that may change
-   after construction.
+   `@state(version = N) class`. Fields are mutable by default.
 8. Replace special function kinds with attributes: `@migration`,
    `@activation`, `@cleanup`, and `@immediate`.
-9. Replace update expressions with explicit Struct literals or `new Class`
-   literals using `..base`.
+9. Initialize both Struct and Class values with `Type { ... }`. Remove the old
+   Class constructor keyword from `new Type { ... }`; update expressions use
+   `Type { fields, ..base }`. The migration namespace `new.create<T>(...)`
+   remains a separate persistent-state operation.
 10. Rename functions, parameters, fields, and locals to `snake_case`; rename
     types, Contracts, and Variants to `PascalCase`; rename constants to
     `SCREAMING_SNAKE_CASE`.

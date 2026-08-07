@@ -16,7 +16,7 @@ use nexa_verifier::VerifiedModule;
 /// Declaration order fixes the function indices used by the cases below.
 const CORPUS: &str = r#"
 struct Pair { first: i32, second: i32, }
-class Cell { mut value: i32, next: Option<Cell>, }
+class Cell { value: i32, next: Option<Cell>, }
 enum Signal { Quiet, Loud(i32), }
 
 fn fold_chain(x: i32) -> i32 {
@@ -56,13 +56,13 @@ fn struct_escape(x: i32) -> i32 {
 }
 fn array_sweep(n: i32) -> i32 {
     let values: Array<i32> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         values.push(index * 2);
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < values.len() {
         total = total + values[cursor];
         cursor = cursor + 1;
@@ -70,8 +70,8 @@ fn array_sweep(n: i32) -> i32 {
     return total;
 }
 fn string_walk(n: i32) -> i32 {
-    let mut total: i32 = 0;
-    let mut index: i32 = 0;
+    let total: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         let text: string = "interned-literal";
         total = total + text.byte_len();
@@ -81,13 +81,13 @@ fn string_walk(n: i32) -> i32 {
 }
 fn map_round(n: i32) -> i32 {
     let values: Map<i32, i32> = Map::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         values.set(index, index * 3);
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < n {
         total = total + match values.get(cursor) {
             Option::Some(value) => value,
@@ -130,13 +130,13 @@ fn index_trap(n: i32) -> i32 {
 }
 fn row_projection(n: i32) -> i32 {
     let cells: Array<Pair> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         cells.push(Pair { first: index, second: index * 2 });
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < cells.len() {
         let cell: Pair = cells[cursor];
         total = total + cell.first + cell.second;
@@ -187,12 +187,12 @@ fn class_value(cell: Cell) -> i32 {
     return cell.value;
 }
 fn scalar_class() -> i32 {
-    let cell: Cell = new Cell { value: 7, next: Option::None };
+    let cell: Cell = Cell { value: 7, next: Option::None };
     cell.value = cell.value + 1;
     return cell.value;
 }
 fn scalar_class_escape() -> i32 {
-    let cell: Cell = new Cell { value: 7, next: Option::None };
+    let cell: Cell = Cell { value: 7, next: Option::None };
     return class_value(cell);
 }
 "#;
@@ -360,7 +360,7 @@ fn next_seeded(state: &mut u64) -> u32 {
 fn generated_layout_corpus() -> String {
     let mut source = String::from(
         "struct GeneratedPair { left: i32, right: i32, }\n\
-         class GeneratedNode { mut value: i32, }\n\
+         class GeneratedNode { value: i32, }\n\
          struct GeneratedHolder { node: GeneratedNode, bias: i32, }\n\
          enum GeneratedValue { Empty, Pair(GeneratedPair), Scalar(i32), }\n",
     );
@@ -409,7 +409,7 @@ fn generated_layout_corpus() -> String {
             ),
             4 => writeln!(
                 source,
-                "  let node: GeneratedNode = new GeneratedNode {{ value: x + {left} }};\n\
+                "  let node: GeneratedNode = GeneratedNode {{ value: x + {left} }};\n\
                  let holder: GeneratedHolder = GeneratedHolder {{ node: node, bias: {right} }};\n\
                  return holder.node.value * {factor} + holder.bias;\n\
                  }}"

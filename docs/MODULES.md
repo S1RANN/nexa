@@ -26,7 +26,6 @@ use package::shared::math as math;
 use self::helpers;
 use super::shared;
 use snake_common::score;
-use host::snake;
 use std::string as text;
 ```
 
@@ -36,12 +35,14 @@ roots are:
 - `package::` for the current Package.
 - `self::` for the current Module.
 - `super::` for the parent Module. It cannot escape the Package root.
-- `host::` for the current Host Contract.
 - `std::` for the standard library.
 - A Manifest dependency alias for a statically linked dependency Package.
 
 Wildcard selection, selective use, re-export, dynamic loading, and conditional
 use are not supported.
+
+Host members are not imported. They are referenced directly through the
+reserved `host::member` path.
 
 Module cycles are rejected. Cycle diagnostics report the complete normalized
 cycle chain.

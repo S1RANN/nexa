@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nexa_analysis::{ResolvedBuildInput, source_set_fingerprint};
-use nexa_core::{BuildFingerprint, FileId, FingerprintBuilder, StableId};
 use nexa_contract::ValidatedContract;
+use nexa_core::{BuildFingerprint, FileId, FingerprintBuilder, StableId};
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::CompileError;

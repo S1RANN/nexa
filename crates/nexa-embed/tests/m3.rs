@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use nexa;
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateCancellation,
     CandidateTerminal, CapabilitySet, CompileJob, DevelopmentCompileRequest, DevelopmentCompiler,

@@ -17,19 +17,20 @@ pub use codegen::{
     BindingModel, CodegenError, generate_rust, generate_rust_for_source_file, generate_rust_tokens,
 };
 pub use descriptor::{
-    ABI_DESCRIPTOR_VERSION, AbiDescriptor, DeclarationFingerprint, EffectiveContractDescriptor,
-    EffectiveContractSelection, EffectiveDescriptorError, CONTRACT_SYNTAX_VERSION, abi_descriptor,
-    contract_fingerprint, effective_contract_descriptor, effective_contract_fingerprint,
-    host_function_fingerprints, nexa_entrypoint_fingerprints, type_layout_fingerprints,
+    ABI_DESCRIPTOR_VERSION, AbiDescriptor, CONTRACT_SYNTAX_VERSION, DeclarationFingerprint,
+    EffectiveContractDescriptor, EffectiveContractSelection, EffectiveDescriptorError,
+    abi_descriptor, contract_fingerprint, effective_contract_descriptor,
+    effective_contract_fingerprint, host_function_fingerprints, nexa_entrypoint_fingerprints,
+    type_layout_fingerprints,
 };
 pub use model::{
     AbandonPolicy, AbiFingerprint, Attribute, AttributeArgument, AttributeValue, CancelPolicy,
-    ContractDecl, ContractRustNames, DocComment, EnumDecl, EnumRustNames, FieldDecl, FunctionBlock,
-    FunctionDecl, FunctionRustNames, HandleDecl, HandleRustNames, NamedAbiKind, ContractAst, ContractError,
-    ContractErrorKind, ParameterDecl, ResolvedNamedType, ResolvedTypeKind, ResolvedTypeRef, RustName,
-    SnapshotRustNames, StructDecl, StructRustNames, TypeKind, TypeRef, ValidatedContract,
-    ValidatedEnum, ValidatedField, ValidatedFunction, ValidatedHandle, ValidatedParameter,
-    ValidatedStruct, ValidatedVariant, VariantDecl,
+    ContractAst, ContractDecl, ContractError, ContractErrorKind, ContractRustNames, DocComment,
+    EnumDecl, EnumRustNames, FieldDecl, FunctionBlock, FunctionDecl, FunctionRustNames, HandleDecl,
+    HandleRustNames, NamedAbiKind, ParameterDecl, ResolvedNamedType, ResolvedTypeKind,
+    ResolvedTypeRef, RustName, SnapshotRustNames, StructDecl, StructRustNames, TypeKind, TypeRef,
+    ValidatedContract, ValidatedEnum, ValidatedField, ValidatedFunction, ValidatedHandle,
+    ValidatedParameter, ValidatedStruct, ValidatedVariant, VariantDecl,
 };
 
 /// Lowers one exact Contract source snapshot into an AST with source spans and documentation.

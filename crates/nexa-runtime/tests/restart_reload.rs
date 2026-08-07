@@ -382,8 +382,8 @@ fn delete_removes_state_and_invalidates_handle() {
 fn migration_error_rolls_back_before_commit() {
     let mut scenario = stateful_scenario();
     let failing = compile(
-        "@state(version = 2) class EnemyBrain { mut phase: i32, mut aggression: i32, }
-         @state(version = 1) class StableBrain { mut phase: i32, }
+        "@state(version = 2) class EnemyBrain { phase: i32, aggression: i32, }
+         @state(version = 1) class StableBrain { phase: i32, }
          @migration
          pub fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;

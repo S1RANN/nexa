@@ -596,10 +596,16 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
         })?;
         validate_contract_path(contract, "nexa check --contract")?;
         let contract_source = std::fs::read_to_string(contract).map_err(|error| {
-            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), contract)
+            CliError::contract_internal(
+                format!("could not read {}: {error}", contract.display()),
+                contract,
+            )
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), contract)
+            CliError::contract_diagnostic(
+                format!("invalid {}: {error}", contract.display()),
+                contract,
+            )
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -1032,14 +1038,21 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
     let source = source
         .ok_or_else(|| CliError::usage("usage: nexa build <source-or-package> [-o module.nxb]"))?;
     if source.is_dir() {
-        let contract = contract
-            .ok_or_else(|| CliError::usage("Package build requires `--contract <snake_api.contract.nexa>`"))?;
+        let contract = contract.ok_or_else(|| {
+            CliError::usage("Package build requires `--contract <snake_api.contract.nexa>`")
+        })?;
         validate_contract_path(&contract, "nexa build --contract")?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
-            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), &contract)
+            CliError::contract_internal(
+                format!("could not read {}: {error}", contract.display()),
+                &contract,
+            )
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), &contract)
+            CliError::contract_diagnostic(
+                format!("invalid {}: {error}", contract.display()),
+                &contract,
+            )
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -1239,14 +1252,21 @@ fn test_command(arguments: cli::TestArgs, format: DiagnosticFormat) -> CliResult
         }
     } else {
         let directory = directory.expect("exclusive target was checked");
-        let contract = contract
-            .ok_or_else(|| CliError::usage("Package test requires `--contract <snake_api.contract.nexa>`"))?;
+        let contract = contract.ok_or_else(|| {
+            CliError::usage("Package test requires `--contract <snake_api.contract.nexa>`")
+        })?;
         validate_contract_path(&contract, "nexa test --contract")?;
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
-            CliError::contract_internal(format!("could not read {}: {error}", contract.display()), &contract)
+            CliError::contract_internal(
+                format!("could not read {}: {error}", contract.display()),
+                &contract,
+            )
         })?;
         let contract_model = nexa::parse_contract(&contract_source).map_err(|error| {
-            CliError::contract_diagnostic(format!("invalid {}: {error}", contract.display()), &contract)
+            CliError::contract_diagnostic(
+                format!("invalid {}: {error}", contract.display()),
+                &contract,
+            )
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
             &contract_model,
@@ -3187,7 +3207,7 @@ mod tests {
             full,
             render_module_dump(&bytes, &module, None, false).unwrap()
         );
-        assert!(full.contains("header magic=NXBC version=7 sections=16"));
+        assert!(full.contains("header magic=NXBC version=8 sections=16"));
         assert!(full.contains("000000 LoadI32"));
         assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(full.contains("struct "));
@@ -3290,10 +3310,10 @@ mod tests {
         fs::write(&path, "contract Test;\n").unwrap();
         // JSON output: stdout has structured envelope, stderr is empty.
         let result = super::check_contract(&path, DiagnosticFormat::Json);
-        assert!(result.is_ok(), "JSON check should succeed: {:?}", result);
+        assert!(result.is_ok(), "JSON check should succeed: {result:?}");
         // Ndjson output.
         let result = super::check_contract(&path, DiagnosticFormat::Ndjson);
-        assert!(result.is_ok(), "NDJSON check should succeed: {:?}", result);
+        assert!(result.is_ok(), "NDJSON check should succeed: {result:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3325,9 +3345,16 @@ mod tests {
         );
         // Valid path.
         let valid = dir.join("good.contract.nexa");
-        fs::write(&valid, "contract Test;\nhost { fn log(m: string); }\nnexa { fn run(); }\n").unwrap();
+        fs::write(
+            &valid,
+            "contract Test;\nhost { fn log(m: string); }\nnexa { fn run(); }\n",
+        )
+        .unwrap();
         let result = super::generate_contract(&valid, DiagnosticFormat::Human);
-        assert!(result.is_ok(), "generate should succeed for valid path: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "generate should succeed for valid path: {result:?}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

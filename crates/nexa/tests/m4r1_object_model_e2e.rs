@@ -41,7 +41,7 @@ enum Measurement {
 }
 
 class Counter {
-    mut value: i32,
+    value: i32,
 }
 
 pub fn struct_value_copy() -> i32 {
@@ -60,21 +60,21 @@ pub fn enum_payload() -> i32 {
 }
 
 pub fn class_mutable_field() -> i32 {
-    let original = new Counter { value: 1 };
+    let original = Counter { value: 1 };
     let alias = original;
     alias.value = 7;
     return original.value;
 }
 
 pub fn class_identity() -> bool {
-    let original = new Counter { value: 11 };
+    let original = Counter { value: 11 };
     let alias = original;
-    let distinct = new Counter { value: 11 };
+    let distinct = Counter { value: 11 };
     return original == alias && original != distinct;
 }
 
 pub fn option_class_some() -> i32 {
-    let value: Option<Counter> = Option::Some(new Counter { value: 29 });
+    let value: Option<Counter> = Option::Some(Counter { value: 29 });
     return match value {
         Option::None => 0,
         Option::Some(counter) => counter.value,

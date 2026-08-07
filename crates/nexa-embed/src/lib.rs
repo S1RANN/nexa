@@ -30,7 +30,6 @@ use std::time::Duration;
 // Keep implementation paths descriptive while routing every public runtime/IDL/core type through
 // the stable `nexa` facade.
 use nexa as nexa_diagnostics;
-use nexa;
 use nexa as nexa_verifier;
 use nexa::prelude as nexa_core;
 use nexa::prelude as nexa_runtime;

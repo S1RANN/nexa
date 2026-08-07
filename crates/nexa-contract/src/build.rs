@@ -51,9 +51,7 @@ pub fn generate(path: impl AsRef<Path>) -> Result<PathBuf, BuildError> {
     // Strip a `.contract` suffix from the stem so that `snake_api.contract.nexa`
     // produces `snake_api.rs` (not `snake_api.contract.rs`).
     let stem = stem.to_string_lossy();
-    let stem = stem
-        .strip_suffix(".contract")
-        .unwrap_or(&stem);
+    let stem = stem.strip_suffix(".contract").unwrap_or(&stem);
     let out_dir = std::env::var_os("OUT_DIR").ok_or(BuildError::MissingOutDir)?;
     let output = PathBuf::from(out_dir).join(stem).with_extension("rs");
     let generated = super::generate_rust_for_source_file(&idl, path)?;

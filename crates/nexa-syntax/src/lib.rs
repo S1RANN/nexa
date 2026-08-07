@@ -33,24 +33,24 @@ impl SourceProfile {
 }
 
 pub mod ast;
-mod lexer;
 pub mod contract;
+mod lexer;
 mod text;
 mod tree;
 
-pub use lexer::{Lexed, lex_contract, lex_nexa};
 pub use contract::{
     ContractAst, ContractAstError, ContractAttribute, ContractAttributeArgument,
-    ContractAttributeValue, ContractHeader, ContractItem, ContractDocComment, ContractEnumDecl,
-    ContractField, ContractFunction, ContractFunctionBlock, ContractFunctionBlockKind,
-    ContractHandleDecl, ContractParameter, ContractStructDecl, ContractTypeRef, ContractVariant,
+    ContractAttributeValue, ContractDocComment, ContractEnumDecl, ContractField, ContractFunction,
+    ContractFunctionBlock, ContractFunctionBlockKind, ContractHandleDecl, ContractHeader,
+    ContractItem, ContractParameter, ContractStructDecl, ContractTypeRef, ContractVariant,
     parse_contract_ast,
 };
+pub use lexer::{Lexed, lex_contract, lex_nexa};
 pub use text::{
     LineColumn, LineIndex, SourceText, SourceTooLarge, TextEncoding, TextRange, TextSize,
 };
 pub use tree::{
-    AstRoot, CellCompleteness, Declaration, DeclarationKind, ContractRoot, NodeKind, SyntaxError,
+    AstRoot, CellCompleteness, ContractRoot, Declaration, DeclarationKind, NodeKind, SyntaxError,
     SyntaxErrorKind, SyntaxLanguage, SyntaxNode, SyntaxTree, UseDeclaration, Visibility,
     classify_cell_completeness, parse_contract, parse_nexa,
 };

@@ -628,6 +628,22 @@ impl fmt::Display for InterpreterError {
 
 impl std::error::Error for InterpreterError {}
 
+fn collection_bounds_message(
+    collection: &str,
+    index: usize,
+    length: usize,
+) -> crate::RuntimeMessage {
+    let message = if length == 0 {
+        format!("{collection} index {index} is out of bounds because the {collection} is empty")
+    } else {
+        format!(
+            "{collection} index {index} is out of bounds for length {length}; valid indices are 0..{}",
+            length - 1
+        )
+    };
+    crate::RuntimeMessage::inline(&message)
+}
+
 impl From<FrameError> for InterpreterError {
     fn from(error: FrameError) -> Self {
         match error {
@@ -2808,13 +2824,13 @@ impl CheckedInterpreter {
             ($operation:expr) => {
                 match $operation {
                     Ok(value) => value,
-                    Err(HeapError::IndexOutOfBounds { .. }) => {
+                    Err(HeapError::IndexOutOfBounds { index, length }) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                         let trap = Trap::from_continuation(
                             module,
                             &continuation,
                             TrapKind::ArrayIndexOutOfBounds,
-                            "array index out of bounds",
+                            collection_bounds_message("array", index, length),
                         );
                         reclaim_storage!();
                         return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
@@ -2825,15 +2841,20 @@ impl CheckedInterpreter {
         }
         macro_rules! array_index {
             ($value:expr) => {
-                match usize::try_from($value) {
-                    Ok(index) => index,
-                    Err(_) => {
+                match {
+                    let raw_index = $value;
+                    (usize::try_from(raw_index), raw_index)
+                } {
+                    (Ok(index), _) => index,
+                    (Err(_), raw_index) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                         let trap = Trap::from_continuation(
                             module,
                             &continuation,
                             TrapKind::ArrayIndexOutOfBounds,
-                            "array index out of bounds",
+                            crate::RuntimeMessage::inline(&format!(
+                                "array index {raw_index} is invalid; indices must be non-negative"
+                            )),
                         );
                         reclaim_storage!();
                         return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
@@ -2845,13 +2866,13 @@ impl CheckedInterpreter {
             ($operation:expr) => {
                 match $operation {
                     Ok(value) => value,
-                    Err(HeapError::IndexOutOfBounds { .. }) => {
+                    Err(HeapError::IndexOutOfBounds { index, length }) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                         let trap = Trap::from_continuation(
                             module,
                             &continuation,
                             TrapKind::BufferIndexOutOfBounds,
-                            "buffer index out of bounds",
+                            collection_bounds_message("buffer", index, length),
                         );
                         reclaim_storage!();
                         return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
@@ -2862,15 +2883,20 @@ impl CheckedInterpreter {
         }
         macro_rules! buffer_index {
             ($value:expr) => {
-                match usize::try_from($value) {
-                    Ok(index) => index,
-                    Err(_) => {
+                match {
+                    let raw_index = $value;
+                    (usize::try_from(raw_index), raw_index)
+                } {
+                    (Ok(index), _) => index,
+                    (Err(_), raw_index) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                         let trap = Trap::from_continuation(
                             module,
                             &continuation,
                             TrapKind::BufferIndexOutOfBounds,
-                            "buffer index out of bounds",
+                            crate::RuntimeMessage::inline(&format!(
+                                "buffer index {raw_index} is invalid; indices must be non-negative"
+                            )),
                         );
                         reclaim_storage!();
                         return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
@@ -3521,7 +3547,8 @@ impl CheckedInterpreter {
                     let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let value = if let Ok(index) = usize::try_from(index) {
+                    let resolved_index = usize::try_from(index);
+                    let value = if let Ok(index) = resolved_index {
                         heap.as_deref()
                             .ok_or(InterpreterError::HeapUnavailable)?
                             .string_rune_at(source, index)?
@@ -3530,11 +3557,24 @@ impl CheckedInterpreter {
                     };
                     let Some(value) = value else {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        let message = if let Ok(index) = resolved_index {
+                            let length = heap
+                                .as_deref()
+                                .ok_or(InterpreterError::HeapUnavailable)?
+                                .string(source)?
+                                .chars()
+                                .count();
+                            collection_bounds_message("string rune", index, length)
+                        } else {
+                            crate::RuntimeMessage::inline(&format!(
+                                "string rune index {index} is invalid; indices must be non-negative"
+                            ))
+                        };
                         let trap = Trap::from_continuation(
                             module,
                             &continuation,
                             TrapKind::StringIndexOutOfBounds,
-                            "string rune index out of bounds",
+                            message,
                         );
                         reclaim_storage!();
                         return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
@@ -7182,9 +7222,11 @@ fn run_standard_intrinsic(
                 .array_swap(arguments[0], lhs, rhs)
             {
                 Ok(()) => returned(RuntimeValue::Bool(true)),
-                Err(HeapError::IndexOutOfBounds { .. }) => Ok(StandardIntrinsicOutcome::Trapped(
-                    "array swap index out of bounds".into(),
-                )),
+                Err(HeapError::IndexOutOfBounds { index, length }) => {
+                    Ok(StandardIntrinsicOutcome::Trapped(
+                        collection_bounds_message("array", index, length),
+                    ))
+                }
                 Err(error) => Err(InterpreterError::Heap(error)),
             }
         }
@@ -9100,7 +9142,7 @@ fn work() -> i32 {
     #[test]
     fn static_leaf_constant_kernel_and_physical_enum_path_match_full_execution() {
         let source = r#"
-class Cell { mut value: i32, next: Option<Cell>, }
+class Cell { value: i32, next: Option<Cell>, }
 struct Row { value: i32, wide: i64, label: string, }
 fn string_constant() -> i32 {
     let text: string = "kernel";
@@ -9111,7 +9153,7 @@ fn struct_constant() -> i32 {
     return row.value;
 }
 fn class_constant() -> i32 {
-    let cell: Cell = new Cell { value: 7, next: Option::None };
+    let cell: Cell = Cell { value: 7, next: Option::None };
     cell.value = cell.value + 1;
     return cell.value;
 }
@@ -9268,7 +9310,7 @@ fn work(x: i32) -> i32 {
     let text: string = "row-parity";
     let cell: Pair = Pair { first: x, second: text.byte_len() };
     let values: Array<i32> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < 24 {
         values.push(cell.first + index);
         index = index + 1;
@@ -12107,7 +12149,7 @@ pub fn run() -> i32 {
     s.insert(10);
     s.insert(20);
     s.insert(30);
-    let mut total: i32 = 0;
+    let total: i32 = 0;
     for item in s { total += item; }
     return total;
 }
@@ -12120,7 +12162,7 @@ fn mutate(s: Set<i32>) {
 pub fn run() -> i32 {
     let s: Set<i32> = Set::new();
     s.insert(10);
-    let mut total: i32 = 0;
+    let total: i32 = 0;
     for item in s { total += item; mutate(s); }
     return total;
 }
@@ -12133,7 +12175,7 @@ fn overwrite(m: Map<i32, i32>) {
 pub fn run() -> i32 {
     let m: Map<i32, i32> = Map::new();
     m.set(1, 7);
-    let mut total: i32 = 0;
+    let total: i32 = 0;
     for (k, v) in m { total += k + v; overwrite(m); }
     return total;
 }
@@ -12147,7 +12189,7 @@ fn touch(s: Set<i32>) -> i32 {
 pub fn run() -> i32 {
     let s: Set<i32> = Set::new();
     s.insert(10);
-    let mut total: i32 = 0;
+    let total: i32 = 0;
     for item in s {
         total += item;
         let present: bool = s.contains(item);
@@ -12161,7 +12203,7 @@ pub fn run() -> i32 {
 pub fn run() -> i32 {
     let m: Map<i32, i32> = Map::new();
     m.set(5, 7);
-    let mut total: i32 = 0;
+    let total: i32 = 0;
     for (k, v) in m { total += k + v; }
     return total;
 }
@@ -12169,7 +12211,7 @@ pub fn run() -> i32 {
 
     const V3_DYNAMIC_RANGE: &str = r"
 pub fn run(start: i32, end: i32) -> i32 {
-    let mut count: i32 = 0;
+    let count: i32 = 0;
     for i in start..end { count += 1; }
     return count;
 }

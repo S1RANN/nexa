@@ -538,7 +538,8 @@ fn console_contract_input() -> HostContractInput<'static> {
 fn engine_contract() -> HostContract {
     static CONTRACT: OnceLock<HostContract> = OnceLock::new();
     *CONTRACT.get_or_init(|| {
-        let model = nexa::parse_contract(ENGINE_CONTRACT_SOURCE).expect("WP98 Engine Host contract");
+        let model =
+            nexa::parse_contract(ENGINE_CONTRACT_SOURCE).expect("WP98 Engine Host contract");
         let descriptor = nexa::abi_descriptor(&model);
         let fingerprint = descriptor.fingerprint.into_bytes();
         let descriptor = Box::leak(descriptor.bytes.into_boxed_slice());

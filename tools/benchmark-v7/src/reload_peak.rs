@@ -24,14 +24,14 @@ const BUFFER_ELEMENTS: usize = 256;
 const RELOAD_PEAK_V1: &str = r#"
 fn stable_helper(x: i32) -> i32 { return x + 1; }
 @state(version = 1)
-class BenchState { mut value: i32, mut legacy: i32, }
+class BenchState { value: i32, legacy: i32, }
 async fn update(value: i32) -> i32 { return value; }
 "#;
 
 const RELOAD_PEAK_V2: &str = r#"
 fn stable_helper(x: i32) -> i32 { return x + 1; }
 @state(version = 2)
-class BenchState { mut value: i32, mut total: i32, }
+class BenchState { value: i32, total: i32, }
 @migration
 pub fn migrate() -> bool {
     let old_state: BenchState = old.get<BenchState>(bench);

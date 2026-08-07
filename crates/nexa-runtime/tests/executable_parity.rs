@@ -24,8 +24,8 @@ fn arithmetic(x: i32) -> i32 {
     return a * 100 + b;
 }
 fn strings(n: i32) -> i32 {
-    let mut total: i32 = 0;
-    let mut index: i32 = 0;
+    let total: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         let text: string = "parity" + "-corpus";
         total = total + text.byte_len();
@@ -49,14 +49,14 @@ fn aggregates(x: i32) -> i32 {
 fn collections(n: i32) -> i32 {
     let values: Array<i32> = Array::new();
     let table: Map<i32, i32> = Map::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         values.push(index * 2);
         table.set(index, index + 1);
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < values.len() {
         total = total + values[cursor] + match table.get(cursor) {
             Option::Some(value) => value,
@@ -76,7 +76,7 @@ fn index_trap(n: i32) -> i32 {
 }
 fn enum_collection(n: i32) -> i32 {
     let values: Array<Signal> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < n {
         values.push(Signal::Loud(index + 17));
         index = index + 1;
@@ -335,7 +335,7 @@ fn trap_kinds_survive_the_row_path() {
 const STATIC_LEAF_CORPUS: &str = r#"
 enum Inner { Value(i32), }
 enum Outer { Wrap(Inner), }
-class Counter { mut value: i32, }
+class Counter { value: i32, }
 
 fn leaf_add(x: i32) -> i32 {
     return x + 1;
@@ -347,7 +347,7 @@ fn leaf_nested(x: i32) -> Outer {
     return Outer::Wrap(Inner::Value(x));
 }
 fn leaf_class() -> i32 {
-    let value: Counter = new Counter { value: 7 };
+    let value: Counter = Counter { value: 7 };
     value.value = value.value + 1;
     return value.value;
 }

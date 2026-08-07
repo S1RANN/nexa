@@ -15,7 +15,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::descriptor::{
-    ABI_DESCRIPTOR_VERSION, EffectiveContractSelection, CONTRACT_SYNTAX_VERSION, abi_descriptor,
+    ABI_DESCRIPTOR_VERSION, CONTRACT_SYNTAX_VERSION, EffectiveContractSelection, abi_descriptor,
     effective_contract_fingerprint,
 };
 use crate::model::{
@@ -923,7 +923,10 @@ pub fn generate_rust_tokens(contract: &ValidatedContract) -> Result<TokenStream,
 }
 
 pub fn generate_rust(contract: &ValidatedContract) -> Result<String, CodegenError> {
-    let header = format!("// @generated from Contract `{}`. DO NOT EDIT.\n", contract.name);
+    let header = format!(
+        "// @generated from Contract `{}`. DO NOT EDIT.\n",
+        contract.name
+    );
     generate_rust_with_header(contract, &header)
 }
 

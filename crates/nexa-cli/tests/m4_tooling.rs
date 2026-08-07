@@ -652,9 +652,7 @@ fn package_test_cli_rejects_an_indirect_host_call_before_execution() {
     .expect("Host contract");
     fs::write(
         fixture.app.join("src/example/main.nexa"),
-        r"use host::test_host as host;
-
-pub(package) fn forbidden_clock() -> i32 {
+        r"pub(package) fn forbidden_clock() -> i32 {
     return host::clock();
 }
 ",
@@ -1005,9 +1003,7 @@ fn standalone_compound_assignment_interpolation_and_receiver_methods_execute() {
     let source = fixture.root.join("language-features.nexa");
     fs::write(
         &source,
-        r#"use host::console;
-
-fn next_index(counter: Array<i32>) -> i32 {
+        r#"fn next_index(counter: Array<i32>) -> i32 {
     counter[0] += 1;
     return 1;
 }
@@ -1019,24 +1015,24 @@ fn main(args: Array<string>) -> i32 {
     number *= 4;
     number /= 2;
     number %= 7;
-    console::write_line("${number}");
+    host::write_line("${number}");
 
     let values = [10, 2];
     let counter = [0];
     values[next_index(counter)] += 5;
-    console::write_line("${values}");
-    console::write_line("${counter[0]}");
-    console::write_line("${[[1, 2], [3]]}");
+    host::write_line("${values}");
+    host::write_line("${counter[0]}");
+    host::write_line("${[[1, 2], [3]]}");
 
     let name = args.get(0).unwrap_or("world");
-    console::write_line("hello, ${name}");
+    host::write_line("hello, ${name}");
     let text = "  nexa  ".trim();
-    console::write_line(text);
-    console::write_line("${text.contains("nexa")}");
+    host::write_line(text);
+    host::write_line("${text.contains("nexa")}");
     let parts = "a,b".split(",");
-    console::write_line("${parts}");
+    host::write_line("${parts}");
     let outcome: Result<i32, string> = Result::Ok(9);
-    console::write_line("${outcome.unwrap_or(0)}");
+    host::write_line("${outcome.unwrap_or(0)}");
     return 0;
 }
 "#,

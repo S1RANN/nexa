@@ -202,13 +202,13 @@
     },
     "builtin-types": {
       "name": "support.type.builtin.nexa",
-      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Map|Buffer|Option|Result|Token|Snapshot|StateHandle)\\b"
+      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Map|Set|Buffer|Option|Result|Token|Snapshot|StateHandle)\\b"
     },
     "keywords": {
       "patterns": [
         {
           "name": "keyword.control.nexa",
-          "match": "\\b(?:use|as|fn|struct|enum|class|const|pub|package|async|return|let|mut|if|else|while|match|new|await|yield|defer|for|in|break|continue)\\b"
+          "match": "\\b(?:use|as|fn|struct|enum|class|const|pub|package|async|return|let|if|else|while|match|new|await|yield|defer|for|in|break|continue)\\b"
         },
         {
           "name": "constant.language.boolean.nexa",

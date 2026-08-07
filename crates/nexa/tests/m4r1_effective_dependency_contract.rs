@@ -110,8 +110,7 @@ fn static_library_host_reference_defines_the_effective_contract() {
     );
     let dependency_manifest = Arc::new(dependency_manifest());
     let dependency_source = format!(
-        "use host::dependency_contract as api;\n\
-         pub fn load() -> api::Payload {{ return api::{}(); }}\n",
+        "pub fn load() -> host::Payload {{ return host::{}(); }}\n",
         selected_function.name
     );
     let dependency_sources = source_set(

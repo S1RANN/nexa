@@ -40,8 +40,6 @@ pub fn lex_contract(source: &str) -> Result<Lexed, SourceTooLarge> {
     Ok(Lexer::new(source, LexerLanguage::Contract)?.lex())
 }
 
-
-
 struct Lexer {
     source: SourceText,
     language: LexerLanguage,

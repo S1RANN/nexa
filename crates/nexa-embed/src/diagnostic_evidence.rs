@@ -527,8 +527,7 @@ fn signature_mismatch() -> Result<EngineDiagnosticEvidence, String> {
         package_id.as_str(),
         "user-controlled",
         "",
-        "use host::test;\n\
-         pub fn run(value: i64) -> i32 { return 1; }",
+        "pub fn run(value: i64) -> i32 { return 1; }",
     )?;
     let mut engine = builder(source, None)
         .require_export::<Run>()
@@ -555,7 +554,7 @@ fn handler_wait() -> Result<EngineDiagnosticEvidence, String> {
         "evidence-wait",
         "evidence.handler-wait",
         "pub async fn run(value: i32) -> i32 {
-            let result: Result<i32, test::WaitError> = test::wait(value).await;
+            let result: Result<i32, host::WaitError> = host::wait(value).await;
             return match result {
                 Result::Ok(found) => found,
                 Result::Err(error) => 0,
@@ -584,13 +583,7 @@ fn task_handler_failure(
     code: nexa::ErrorCode,
 ) -> Result<EngineDiagnosticEvidence, String> {
     let package_id = package_id(package_name)?;
-    let source = memory_source(
-        source_name,
-        package_name,
-        "default-enabled",
-        "",
-        &format!("use host::test;\n{body}"),
-    )?;
+    let source = memory_source(source_name, package_name, "default-enabled", "", body)?;
     let mut engine = task_builder(source, None)
         .require_export::<TaskRun>()
         .build()
@@ -610,13 +603,7 @@ fn ordinary_handler_failure(
     code: nexa::ErrorCode,
 ) -> Result<EngineDiagnosticEvidence, String> {
     let package_id = package_id(package_name)?;
-    let source = memory_source(
-        source_name,
-        package_name,
-        "default-enabled",
-        "",
-        &format!("use host::test;\n{body}"),
-    )?;
+    let source = memory_source(source_name, package_name, "default-enabled", "", body)?;
     let mut engine = builder(source, None)
         .require_export::<Run>()
         .build()
@@ -850,7 +837,8 @@ fn builder_with_contract(
 fn host_function_authority() -> HostFunctionAuthority {
     EVIDENCE_HOST_AUTHORITY
         .get_or_init(|| {
-            let contract = nexa::parse_contract(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
+            let contract =
+                nexa::parse_contract(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
             let model = nexa::BindingModel::from_contract(&contract)
                 .expect("diagnostic evidence Contract runtime binding model");
             let function = model
@@ -1002,19 +990,15 @@ fn memory_source(
 }
 
 fn valid_script(increment: i32) -> String {
-    format!(
-        "use host::test;\n\
-         pub fn run(value: i32) -> i32 {{ return value + {increment}; }}"
-    )
+    format!("pub fn run(value: i32) -> i32 {{ return value + {increment}; }}")
 }
 
 fn stateful_script(schema: u32, increment: i32, activation_fault: bool) -> String {
     format!(
-        "use host::test;\n\
-         @state(version = {schema}) class Store {{ mut value: i32,{} }}\n\
+        "@state(version = {schema}) class Store {{ value: i32,{} }}\n\
          pub fn run(value: i32) -> i32 {{ return value + {increment}; }}\n\
          {}",
-        if schema == 1 { "" } else { " mut extra: i32," },
+        if schema == 1 { "" } else { " extra: i32," },
         if activation_fault {
             "@activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
         } else {

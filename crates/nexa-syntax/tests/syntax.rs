@@ -1,11 +1,11 @@
 use nexa_syntax::{
     Keyword, LineColumn, NodeKind, SourceText, SyntaxErrorKind, TextEncoding, TextSize, TokenKind,
-    Visibility, lex_nexa, lex_contract, parse_nexa, parse_contract,
+    Visibility, lex_contract, lex_nexa, parse_contract, parse_nexa,
 };
 
 #[test]
 fn nexa_lexer_is_lossless_and_keeps_comment_trivia() {
-    let source = "/// score\nuse host::snake; // note\n/* block */ pub fn score() -> i32 { 1 }";
+    let source = "/// score\nuse package::snake; // note\n/* block */ pub fn score() -> i32 { host::load(1) }";
     let lexed = lex_nexa(source).expect("small source");
     assert_eq!(lexed.reconstructed(), source);
     assert!(lexed.errors.is_empty(), "{:?}", lexed.errors);
@@ -172,7 +172,7 @@ use package::food::effects;
 use snake_common::score as score;
 pub const DEFAULT_SCORE: i32 = 10;
 fn score() -> i32 { DEFAULT_SCORE }
-let mut value = score();
+let value = score();
 value = value + 1;
 ";
     let tree = parse_nexa(source).expect("small source");

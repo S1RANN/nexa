@@ -84,7 +84,7 @@ fn repl_persists_bindings_mutation_shadowing_functions_and_async_cells() {
         r"1 + 2
 let value = 4;
 value
-let mut count = 1;
+let count = 1;
 count = 2;
 count
 let value = 9;
@@ -110,7 +110,7 @@ async_value().await
 #[test]
 fn repl_preserves_state_across_one_hundred_mutation_cells() {
     let fixture = Fixture::new();
-    let mut input = String::from("let mut total = 0;\n");
+    let mut input = String::from("let total = 0;\n");
     for _ in 0..100 {
         input.push_str("total = total + 1;\n");
     }

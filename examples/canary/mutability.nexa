@@ -1,0 +1,30 @@
+struct MutableCell {
+    value: i32,
+}
+
+class MutableBox {
+    value: i32,
+}
+
+struct ReferenceHolder {
+    object: MutableBox,
+    values: Array<i32>,
+}
+
+fn bump(value: i32) -> i32 {
+    value += 1;
+    return value;
+}
+
+pub fn default_mutability() -> i32 {
+    let cell = MutableCell { value: 1 };
+    cell.value += 1;
+    const object = MutableBox { value: cell.value };
+    object.value += 1;
+    const values = [object.value];
+    values[0] += 1;
+    const references = ReferenceHolder { object: object, values: values };
+    references.object.value += 1;
+    references.values[0] += 1;
+    return bump(references.object.value + references.values[0]);
+}

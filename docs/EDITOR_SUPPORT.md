@@ -1,6 +1,6 @@
 # Nexa editor support
 
-Status: Contract Syntax v3 migration COMPLETE
+Status: Language v3 support IN PROGRESS — Set type, collection iteration, pair binding
 
 Nexa provides local syntax support for executable `.nexa` files and
 `.contract.nexa` files in VS Code and Zed. The Contract file type is displayed
@@ -114,7 +114,8 @@ Nexa support follows the current compiler Lexer and Parser:
   `SCREAMING_SNAKE_CASE` diagnostics
 - path-derived modules and `use` declarations rooted at `package::`, `self::`,
   `super::`, `host::`, `std::`, or a dependency alias
-- `let`, `let mut`, module `const`, and field-level `mut`
+- mutable `let`, immutable block-local `const`, module `const`, and
+  default-mutable parameters and fields
 - Struct and Enum value declarations, Class reference declarations, and
   `@state(version = N)` metadata
 - `async fn`, postfix `.await`, `yield`, `defer`, and attribute-based
@@ -122,6 +123,9 @@ Nexa support follows the current compiler Lexer and Parser:
 - strings, interpolation, Unicode runes, integers, floats, built-in generic
   collections, `Option`, `Result`, and Reload intrinsics
 - namespace and associated-item `::`, member `.`, Range and update `..`
+- `Set<T>` built-in generic type with `Set::new`, `insert`, `contains`, `remove`, `clear`, `len`
+- single-binding collection `for` iteration over `Array`, `Buffer`, and `Set`
+- pair-binding `for (key, value) in map` iteration over `Map<K, V>`
 
 Contract support follows the shared `SourceProfile::Contract`,
 `ContractSyntaxTree`, and validated Contract model:

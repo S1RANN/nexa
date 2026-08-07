@@ -96,8 +96,11 @@ impl<'a> HostContractInput<'a> {
             return Err(HostContractSourceError::InvalidIdentity(identity));
         }
         let text = text.into();
-        let parsed = nexa_contract::parse_contract(&text).map_err(HostContractSourceError::Parse)?;
-        if nexa_contract::abi_descriptor(&parsed).bytes != nexa_contract::abi_descriptor(contract).bytes {
+        let parsed =
+            nexa_contract::parse_contract(&text).map_err(HostContractSourceError::Parse)?;
+        if nexa_contract::abi_descriptor(&parsed).bytes
+            != nexa_contract::abi_descriptor(contract).bytes
+        {
             return Err(HostContractSourceError::ParsedContractMismatch);
         }
         let selection = default_effective_selection(contract, &[]);
@@ -316,7 +319,9 @@ impl<'a> HostContractInput<'a> {
 
     /// All legal Nexa entrypoints declared by this contract.
     #[must_use]
-    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = &nexa_contract::ValidatedFunction> + '_ {
+    pub fn entrypoints(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &nexa_contract::ValidatedFunction> + '_ {
         self.contract.nexa_functions.iter()
     }
 
@@ -1072,9 +1077,9 @@ impl PackageBuildSession {
         let mut outcome = analyze_package(input, &environment, &mut self.queries);
         let Some(ir) = outcome.ir.take() else {
             self.pipeline.finish_check_analysis(false);
-            return Err(PackageBuildError::AnalysisFailed(
+            return Err(PackageBuildError::AnalysisFailed(Box::new(
                 outcome.diagnostics.clone(),
-            ));
+            )));
         };
         self.pipeline.finish_check_analysis(true);
         let compilation_evidence =
@@ -1167,6 +1172,7 @@ impl PackageBuildSession {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn compile_package_with_contract_and_limits_observed(
         &mut self,
         input: &ResolvedBuildInput,
@@ -1198,15 +1204,16 @@ impl PackageBuildSession {
             let environment = crate::package_environment::canonical_analysis_environment(contract)?;
             self.pipeline.start_compile_analysis();
             let mut outcome = analyze_package(input, &environment, &mut self.queries);
-            let ir = outcome
-                .ir
-                .take()
-                .ok_or_else(|| PackageBuildError::AnalysisFailed(outcome.diagnostics.clone()))?;
+            let ir = outcome.ir.take().ok_or_else(|| {
+                PackageBuildError::AnalysisFailed(Box::new(outcome.diagnostics.clone()))
+            })?;
             let compilation_evidence =
                 package_compilation_evidence(&ir, &outcome.resolved_import_edges);
             self.pipeline.start_typed_compiler();
             let compiled = nexa_compiler::compile_typed_package(&ir).map_err(|error| {
-                PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+                PackageBuildError::CompileFailed(Box::new(compile_error_diagnostic_batch(
+                    &ir, &error,
+                )))
             })?;
             validate_product_compiler_output(&compiled, &outcome)?;
             let verify_started = Instant::now();
@@ -1357,15 +1364,14 @@ impl PackageBuildSession {
                 return Err(PackageBuildError::ExecutableProfileRequired);
             }
         };
-        let ir = outcome
-            .ir
-            .take()
-            .ok_or_else(|| PackageBuildError::AnalysisFailed(outcome.diagnostics.clone()))?;
+        let ir = outcome.ir.take().ok_or_else(|| {
+            PackageBuildError::AnalysisFailed(Box::new(outcome.diagnostics.clone()))
+        })?;
         let compilation_evidence =
             package_compilation_evidence(&ir, &outcome.resolved_import_edges);
         self.pipeline.start_typed_compiler();
         let standalone = nexa_compiler::compile_typed_standalone_package(&ir).map_err(|error| {
-            PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+            PackageBuildError::CompileFailed(Box::new(compile_error_diagnostic_batch(&ir, &error)))
         })?;
         let compiled = standalone.package;
         validate_product_compiler_output(&compiled, &outcome)?;
@@ -1493,7 +1499,9 @@ impl PackageBuildSession {
                 analysis, staged, ..
             } => (analysis, staged),
             ReplSessionAnalysisOutcome::Rejected { analysis } => {
-                return Err(PackageBuildError::AnalysisFailed(analysis.diagnostics));
+                return Err(PackageBuildError::AnalysisFailed(Box::new(
+                    analysis.diagnostics,
+                )));
             }
         };
         let ir = staged
@@ -1617,13 +1625,12 @@ impl PackageBuildSession {
         let environment = crate::package_environment::canonical_analysis_environment(contract)?;
         self.pipeline.start_compile_analysis();
         let mut outcome = analyze_package_tests(input, &environment, &mut self.queries);
-        let ir = outcome
-            .ir
-            .take()
-            .ok_or_else(|| PackageBuildError::AnalysisFailed(outcome.diagnostics.clone()))?;
+        let ir = outcome.ir.take().ok_or_else(|| {
+            PackageBuildError::AnalysisFailed(Box::new(outcome.diagnostics.clone()))
+        })?;
         self.pipeline.start_typed_compiler();
         let compiled = nexa_compiler::compile_typed_package(&ir).map_err(|error| {
-            PackageBuildError::CompileFailed(compile_error_diagnostic_batch(&ir, &error))
+            PackageBuildError::CompileFailed(Box::new(compile_error_diagnostic_batch(&ir, &error)))
         })?;
         validate_test_compiler_output(&compiled, &outcome)?;
         let module = compiled
@@ -2942,11 +2949,11 @@ pub enum PackageBuildError {
     InvalidReplStateSurface,
     HostContractSource(HostContractSourceError),
     Environment(crate::package_environment::PackageEnvironmentError),
-    AnalysisFailed(DiagnosticBatch),
+    AnalysisFailed(Box<DiagnosticBatch>),
     /// A typed-lowering failure converted into the shared source-backed batch so
     /// every consumer renders compile-phase diagnostics through the unified
     /// pipeline (stable code, user message, and exact source labels).
-    CompileFailed(DiagnosticBatch),
+    CompileFailed(Box<DiagnosticBatch>),
     MissingTypedPackageIr,
     Compile(nexa_compiler::CompileError),
     Verify(nexa_verifier::VerifyError),
@@ -4481,7 +4488,7 @@ activation = "programmatic"
                 concat!(
                     "@stable(\"root-state\")\n",
                     "@state(version = 1)\n",
-                    "pub class Root { mut value: i32, }\n",
+                    "pub class Root { value: i32, }\n",
                     "pub fn value() -> i32 { return 7; }\n",
                 ),
                 nexa_analysis::SourceRole::Production,
@@ -4501,8 +4508,14 @@ activation = "programmatic"
     fn library_check_rejects_both_directions_of_unit_return_mismatch() {
         let contract = nexa_contract::parse_contract("contract Empty;").unwrap();
         for (source, expected_message) in [
-            ("fn bad() -> i32 { return; }\n", "expected i32, found unit"),
-            ("fn bad() { return 1; }\n", "expected unit, found i32"),
+            (
+                "fn bad() -> i32 { return; }\n",
+                "return value of `bad`: expected i32, found unit",
+            ),
+            (
+                "fn bad() { return 1; }\n",
+                "return value of `bad`: expected unit, found i32",
+            ),
         ] {
             let (manifest, sources) = library_manifest_and_sources(source);
             let input = resolved_input(manifest, sources, &contract);
@@ -5144,7 +5157,7 @@ activation = "programmatic"
         production
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "@state(version = 1)\npub class ProductState { mut value: i32, }\npub fn value() -> i32 { return 7; }\n",
+                "@state(version = 1)\npub class ProductState { value: i32, }\npub fn value() -> i32 { return 7; }\n",
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
@@ -5161,7 +5174,7 @@ activation = "programmatic"
         tests
             .add(
                 NormalizedPackagePath::new("tests/checks.nexa").unwrap(),
-                "@state(version = 99)\npub class TestOnlyState { mut ignored: string, }\n@test fn succeeds() -> bool { return true; }\n",
+                "@state(version = 99)\npub class TestOnlyState { ignored: string, }\n@test fn succeeds() -> bool { return true; }\n",
                 nexa_analysis::SourceRole::Test,
             )
             .unwrap();

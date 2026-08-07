@@ -3,10 +3,10 @@ pub async fn update(value: i32) -> i32 {
 }
 @state(version = 1)
 class EnemyBrain {
-    mut phase: i32,
-    mut legacy_target: i32,
+    phase: i32,
+    legacy_target: i32,
 }
 @state(version = 1)
 class StableBrain {
-    mut phase: i32,
+    phase: i32,
 }

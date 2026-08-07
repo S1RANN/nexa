@@ -1,0 +1,37 @@
+pub fn static_range() -> i32 {
+    let total: i32 = 0;
+    for i in 0..4 {
+        total = total + i;
+    }
+    return total;
+}
+
+pub fn dynamic_range(n: i32) -> i32 {
+    let total: i32 = 0;
+    for i in 0..n {
+        total = total + i;
+    }
+    return total;
+}
+
+pub fn range_with_break() -> i32 {
+    let total: i32 = 0;
+    for i in 0..10 {
+        if i == 3 {
+            break;
+        }
+        total = total + i;
+    }
+    return total;
+}
+
+pub fn range_with_continue() -> i32 {
+    let total: i32 = 0;
+    for i in 0..5 {
+        if i == 2 {
+            continue;
+        }
+        total = total + i;
+    }
+    return total;
+}

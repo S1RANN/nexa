@@ -206,7 +206,8 @@ remains a Package-level Restart operation.
 
 M4R1 is a breaking language and toolchain reset built on that completed
 foundation. It replaces source declarations from M4 with path-derived modules,
-`use`, `let mut`, field-level `mut`, `async fn`, postfix `.await`,
+`use`, mutable `let`, immutable block-local `const`, default-mutable fields and
+parameters, `async fn`, postfix `.await`,
 `@state(version = N) class`, and attribute-based lifecycle roles. It freezes
 Struct and Enum as value types, Class as a sealed GC reference type, and
 removes source-level compatibility aliases.
@@ -253,6 +254,21 @@ per-workload CPU sample proving interpreter execution is at least 40% in two
 products and no LLVM prototype proving compilation-cost amortization within a
 frozen call/frame budget. A future JIT proposal must establish both before it
 can change this decision.
+
+## Language v3
+
+```text
+Language v3 = IN PROGRESS
+```
+
+Language v3 adds `Set<T>` as a built-in compiler-provided hash set type and
+collection iteration for `for` loops. `for item in collection` iterates over
+`Array`, `Buffer`, and `Set`; `for (key, value) in map` iterates over
+`Map<K, V>` with key-value pair bindings. The existing range-based `for i in
+start..end` remains unchanged.
+
+Version identifiers: Language3, Bytecode8, OpcodeCost8, stdlib2.0.0.
+Contract/Host/Descriptor versions unchanged.
 
 M4R1 does not include user generics, traits or interfaces, closures,
 inheritance, dynamic dispatch, operator overloading, macros, reflection,

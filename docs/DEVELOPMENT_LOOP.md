@@ -28,9 +28,12 @@ the sole source of module identity. Dependencies and sibling modules use `use`
 declarations:
 
 ```nexa
-use host::app;
 use package::ui::commands as commands;
 use shared_math::score;
+
+fn emit(value: string) {
+    host::log(value);
+}
 ```
 
 Changing a file path or a `use` target is therefore an identity and dependency

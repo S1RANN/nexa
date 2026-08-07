@@ -357,7 +357,6 @@ pub struct AnalysisOutcome {
 pub enum ResolvedImportTarget {
     Module(ModuleKey),
     Static(ModulePath),
-    Host,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -450,7 +449,6 @@ fn cached_standard_library() -> &'static [CachedCompilerModule] {
 enum ImportTarget {
     Source(SourceModuleKey),
     Static(ModulePath),
-    Host,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -468,6 +466,7 @@ struct DeclRecord {
 #[derive(Clone)]
 struct FunctionSignature {
     parameters: Vec<DefinitionId>,
+    mutable_parameters: Vec<DefinitionId>,
     parameter_types: Vec<IrType>,
     result: IrType,
     effect: IrEffect,
@@ -911,6 +910,7 @@ impl<'a> Analyzer<'a> {
                             declaration.definition,
                             FunctionSignature {
                                 parameters: function.parameters.clone(),
+                                mutable_parameters: function.mutable_parameters.clone(),
                                 parameter_types,
                                 result: function.return_type.clone(),
                                 effect: function.effect,
@@ -2086,6 +2086,7 @@ impl<'a> Analyzer<'a> {
                     is_async,
                     name: identifier("main"),
                     parameters: vec![ast::Parameter {
+                        mutable: false,
                         name: identifier("args"),
                         ty: arguments_type,
                         range: eof,
@@ -2460,6 +2461,14 @@ impl<'a> Analyzer<'a> {
                         self.function_signatures.insert(
                             definition,
                             FunctionSignature {
+                                mutable_parameters: function
+                                    .parameters
+                                    .iter()
+                                    .zip(parameters.iter().copied())
+                                    .filter_map(|(parameter, definition)| {
+                                        parameter.mutable.then_some(definition)
+                                    })
+                                    .collect(),
                                 parameters,
                                 parameter_types: Vec::new(),
                                 result: IrType::Unit,
@@ -2742,7 +2751,7 @@ impl<'a> Analyzer<'a> {
                         &module.source,
                         byte_range(declaration.range),
                         "REPL cells cannot declare additional persistent state classes",
-                        "top-level `let` and `let mut` are persisted by the reserved REPL environment",
+                        "top-level `let` and block-local `const` are persisted by the reserved REPL environment",
                     );
                 }
                 if has_attribute(&declaration.attributes, "state")
@@ -2764,15 +2773,6 @@ impl<'a> Analyzer<'a> {
                         &field.name,
                         "field names must use snake_case",
                     );
-                    if field.mutable && ty.kind != TypeDeclarationKind::Class {
-                        self.push_source_error(
-                            ErrorCode::NX2501,
-                            &module.source,
-                            byte_range(field.range),
-                            "`mut` fields are only valid in a class",
-                            "Struct mutability is determined by its containing place",
-                        );
-                    }
                     for attribute in &field.attributes {
                         if attribute.name.text != "stable" || !state_class {
                             self.push_source_error(
@@ -4756,7 +4756,6 @@ impl<'a> Analyzer<'a> {
                         target.module.clone(),
                     )),
                     ImportTarget::Static(module) => ResolvedImportTarget::Static(module.clone()),
-                    ImportTarget::Host => ResolvedImportTarget::Host,
                 };
                 self.resolved_import_edges.push(ResolvedImportEdge {
                     importer: importer_module.clone(),
@@ -4810,13 +4809,6 @@ impl<'a> Analyzer<'a> {
                             (module.source.clone(), byte_range(path_range)),
                         );
                     }
-                    ImportTarget::Host => {
-                        self.host_namespaces.insert((
-                            module.key.package.clone(),
-                            module.key.module.clone(),
-                            local_alias,
-                        ));
-                    }
                     ImportTarget::Static(_) => {}
                 }
             }
@@ -4834,7 +4826,6 @@ impl<'a> Analyzer<'a> {
                         canonical_imports.push(1);
                         append_string(&mut canonical_imports, module.as_str());
                     }
-                    ImportTarget::Host => canonical_imports.push(2),
                 }
             }
             let mut dependencies = semantic_input_query_keys(self.input);
@@ -4913,12 +4904,6 @@ impl<'a> Analyzer<'a> {
             .collect::<Vec<_>>();
         if segments.is_empty() {
             return None;
-        }
-
-        if usage.root.kind == UsePathRootKind::Host {
-            let host = self.environment.host.as_ref()?;
-            let expected = snake_case_name(&host.contract_name);
-            return (segments.as_slice() == [expected.as_str()]).then_some(ImportTarget::Host);
         }
 
         let source_target = |package: PackageId, path: String| {
@@ -5021,6 +5006,14 @@ impl<'a> Analyzer<'a> {
                     self.function_signatures.insert(
                         record.definition,
                         FunctionSignature {
+                            mutable_parameters: function
+                                .parameters
+                                .iter()
+                                .zip(parameter_ids.iter().copied())
+                                .filter_map(|(parameter, definition)| {
+                                    parameter.mutable.then_some(definition)
+                                })
+                                .collect(),
                             parameters: parameter_ids,
                             parameter_types: parameter_types.clone(),
                             result: result.clone(),
@@ -5550,6 +5543,18 @@ impl<'a> Analyzer<'a> {
         path: &ast::QualifiedName,
         usage: SymbolUse,
     ) -> Option<DefinitionId> {
+        if path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.text == "host")
+            && self.environment.host.is_some()
+        {
+            self.host_namespaces.insert((
+                module.key.package.clone(),
+                module.key.module.clone(),
+                "host".to_owned(),
+            ));
+        }
         let current = self.lookup_symbol_path(module, path);
         let current_is_from_staged_cell = current.is_some_and(|definition| {
             let definition = &self.definitions[definition.0 as usize];
@@ -5731,7 +5736,16 @@ impl<'a> Analyzer<'a> {
             .imports
             .get(&module.key)
             .and_then(|scope| scope.aliases.get(&first.text));
-        let (mut definition, consumed) = if let Some(target) = imported {
+        let direct_host = first.text == "host" && self.environment.host.is_some();
+        let (mut definition, consumed) = if direct_host {
+            let name = segments.get(1)?;
+            let host = ModulePath::new("host").expect("reserved host module");
+            let definition = self
+                .symbols
+                .get(&(self.input.root_manifest.id.clone(), host, name.text.clone()))
+                .copied()?;
+            (definition, 2)
+        } else if let Some(target) = imported {
             let name = segments.get(1)?;
             let definition = match target {
                 ImportTarget::Source(target) => self
@@ -5750,12 +5764,6 @@ impl<'a> Analyzer<'a> {
                         name.text.clone(),
                     ))
                     .copied(),
-                ImportTarget::Host => {
-                    let host = ModulePath::new("host").expect("reserved host module");
-                    self.symbols
-                        .get(&(self.input.root_manifest.id.clone(), host, name.text.clone()))
-                        .copied()
-                }
             }?;
             (definition, 2)
         } else {
@@ -6070,8 +6078,9 @@ impl<'a> Analyzer<'a> {
             .function_signatures
             .get(&definition)
             .is_some_and(|signature| {
-                signature.parameter_types == [IrType::Array(Box::new(IrType::String))]
-                    && signature.result == IrType::I32
+                (signature.parameter_types.is_empty()
+                    || signature.parameter_types == [IrType::Array(Box::new(IrType::String))])
+                    && matches!(signature.result, IrType::Unit | IrType::I32)
                     && matches!(signature.effect, IrEffect::Ordinary | IrEffect::Task)
             });
         if valid {
@@ -6083,7 +6092,7 @@ impl<'a> Analyzer<'a> {
             &span.source,
             range_from_source(&span),
             "standalone `main` has an invalid signature",
-            "only `fn main(args: Array<string>) -> i32` or `async fn main(args: Array<string>) -> i32` is accepted",
+            "`main` may take no arguments or one `Array<string>` argument, may return `Unit` or `i32`, and may be `fn` or `async fn`",
         );
     }
 
@@ -6541,6 +6550,7 @@ impl<'a> Analyzer<'a> {
                         definition: record.definition,
                         body: TypedDeclarationBody::Function(TypedFunctionIr {
                             parameters: signature.parameters,
+                            mutable_parameters: signature.mutable_parameters,
                             locals,
                             return_type: signature.result,
                             effect: signature.effect,
@@ -6551,6 +6561,7 @@ impl<'a> Analyzer<'a> {
                 DeclarationKind::Const(constant) => {
                     let signature = FunctionSignature {
                         parameters: Vec::new(),
+                        mutable_parameters: Vec::new(),
                         parameter_types: Vec::new(),
                         result: self.definitions[record.definition.0 as usize].ty.clone(),
                         effect: IrEffect::Immediate,
@@ -6577,12 +6588,10 @@ impl<'a> Analyzer<'a> {
                             definition: *definition,
                             ty: self.definitions[definition.0 as usize].ty.clone(),
                             order: u32::try_from(order).unwrap_or(u32::MAX),
-                            mutable: ty.kind == TypeDeclarationKind::Class
-                                && metadata
-                                    .field_mutability
-                                    .get(definition)
-                                    .copied()
-                                    .unwrap_or(false),
+                            // Struct updates rebuild the containing place and are governed by
+                            // the root binding. Class fields are directly writable in Language
+                            // v3 and therefore carry runtime setter authority.
+                            mutable: ty.kind == TypeDeclarationKind::Class,
                         })
                         .collect::<Vec<_>>();
                     let variants = metadata
@@ -7148,7 +7157,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             effect: signature.effect,
             scopes: vec![parameters],
             locals: Vec::new(),
-            mutable_bindings: BTreeSet::new(),
+            mutable_bindings: signature.mutable_parameters.iter().copied().collect(),
             readonly_loop_bindings: BTreeSet::new(),
             iterated_collections: BTreeSet::new(),
             loop_depth: 0,
@@ -7541,7 +7550,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 let place = self.check_place(target)?;
                 let target_type = place_type(&place, &self.analyzer.definitions);
                 let value = self.check_expression(value, Some(&target_type));
-                self.expect_type(&value.ty, &target_type, &value.span);
+                self.expect_type_for(&value.ty, &target_type, &value.span, "assignment value");
                 Some(TypedStatementIr::Assign {
                     target: place,
                     value,
@@ -7555,7 +7564,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 let place = self.check_place(target)?;
                 let target_type = place_type(&place, &self.analyzer.definitions);
                 let value = self.check_expression(value, Some(&target_type));
-                self.expect_type(&value.ty, &target_type, &value.span);
+                self.expect_type_for(
+                    &value.ty,
+                    &target_type,
+                    &value.span,
+                    "compound-assignment value",
+                );
                 let result = binary_result(
                     operator.kind,
                     &target_type,
@@ -7593,7 +7607,20 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     || source_range(&self.module.source, statement.range),
                     |value| value.span.clone(),
                 );
-                self.expect_type(&actual, &self.return_type.clone(), &mismatch_span);
+                let function_name = self.current_function.map_or_else(
+                    || "main".to_owned(),
+                    |definition| {
+                        self.analyzer.definitions[definition.0 as usize]
+                            .name
+                            .clone()
+                    },
+                );
+                self.expect_type_for(
+                    &actual,
+                    &self.return_type.clone(),
+                    &mismatch_span,
+                    &format!("return value of `{function_name}`"),
+                );
                 Some(TypedStatementIr::Return(value))
             }
             StatementKind::If {
@@ -7750,6 +7777,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         definition: cleanup,
                         body: TypedDeclarationBody::Function(TypedFunctionIr {
                             parameters,
+                            mutable_parameters: Vec::new(),
                             locals: Vec::new(),
                             return_type: IrType::Unit,
                             effect: IrEffect::Cleanup,
@@ -7970,19 +7998,6 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             ),
             ExpressionKind::Construct { ty, fields, update } => {
                 self.check_construct(expression, ty, fields, update.as_deref())
-            }
-            ExpressionKind::New { ty, fields, update } => {
-                let definition = match &ty.kind {
-                    TypeKind::Named(path) | TypeKind::Generic { base: path, .. } => self
-                        .analyzer
-                        .resolve_symbol_path(&self.module, path, SymbolUse::Type),
-                    _ => None,
-                };
-                if let Some(definition) = definition {
-                    self.check_class_construct(expression, definition, fields, update.as_deref())
-                } else {
-                    self.error_expression(span)
-                }
             }
             ExpressionKind::Member { receiver, member } => {
                 let receiver = self.check_expression(receiver, None);
@@ -8237,9 +8252,24 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             .imports
             .get(&self.module.key)
             .and_then(|scope| scope.aliases.get(&first.text));
-        let consumed: usize = if imported.is_some() { 2 } else { 1 };
+        let direct_host = first.text == "host" && self.analyzer.environment.host.is_some();
+        let consumed: usize = if imported.is_some() || direct_host {
+            2
+        } else {
+            1
+        };
         let value = path.segments.get(consumed.saturating_sub(1))?;
-        let definition = if let Some(target) = imported {
+        let definition = if direct_host {
+            let host = ModulePath::new("host").expect("reserved host module");
+            self.analyzer
+                .symbols
+                .get(&(
+                    self.analyzer.input.root_manifest.id.clone(),
+                    host,
+                    value.text.clone(),
+                ))
+                .copied()
+        } else if let Some(target) = imported {
             match target {
                 ImportTarget::Source(target) => self
                     .analyzer
@@ -8259,17 +8289,6 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         value.text.clone(),
                     ))
                     .copied(),
-                ImportTarget::Host => {
-                    let host = ModulePath::new("host").expect("reserved host module");
-                    self.analyzer
-                        .symbols
-                        .get(&(
-                            self.analyzer.input.root_manifest.id.clone(),
-                            host,
-                            value.text.clone(),
-                        ))
-                        .copied()
-                }
             }
         } else {
             self.analyzer
@@ -8813,6 +8832,34 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             Vec::new(),
                             false,
                         ),
+                        "first" => (
+                            BuiltinOperationIr::ArrayFirst,
+                            IrType::Option(Box::new(element.clone())),
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "last" => (
+                            BuiltinOperationIr::ArrayLast,
+                            IrType::Option(Box::new(element.clone())),
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "swap" => (
+                            BuiltinOperationIr::ArraySwap,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![IrType::I32, IrType::I32],
+                            false,
+                        ),
+                        "reverse" => (
+                            BuiltinOperationIr::ArrayReverse,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
                         _ => return None,
                     }
                 }
@@ -8868,6 +8915,27 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             IrType::Bool,
                             operation_type_arguments,
                             Vec::new(),
+                            false,
+                        ),
+                        "is_empty" => (
+                            BuiltinOperationIr::MapIsEmpty,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "get_or" => (
+                            BuiltinOperationIr::MapGetOr,
+                            value.clone(),
+                            operation_type_arguments,
+                            vec![key.clone(), value.clone()],
+                            false,
+                        ),
+                        "insert_if_absent" => (
+                            BuiltinOperationIr::MapInsertIfAbsent,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![key.clone(), value.clone()],
                             false,
                         ),
                         _ => return None,
@@ -8953,6 +9021,20 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             IrType::Bool,
                             operation_type_arguments,
                             vec![buffer, IrType::I32, IrType::I32, IrType::I32],
+                            false,
+                        ),
+                        "is_empty" => (
+                            BuiltinOperationIr::BufferIsEmpty,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "fill" => (
+                            BuiltinOperationIr::BufferFill,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![element],
                             false,
                         ),
                         _ => return None,
@@ -9487,7 +9569,6 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 .analyzer
                 .lookup_symbol_path(&self.module, ty)
                 .map(IrType::Named),
-            ExpressionKind::New { ty, .. } => self.infer_type_ref(ty),
             ExpressionKind::Await { operand } => {
                 self.infer_expression_type(operand, allow_numeric_literals)
             }
@@ -9719,6 +9800,18 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             self.type_error(span.clone(), "symbol has no callable signature");
             return self.error_expression(span);
         };
+        let formats_console_value = host.as_ref().is_some_and(|(contract, function)| {
+            self.analyzer.definitions[contract.0 as usize].name == "Console"
+                && matches!(
+                    function.name.as_str(),
+                    "write" | "write_line" | "write_error" | "write_error_line"
+                )
+                && function.parameters == [SurfaceType::String]
+                && function.result == SurfaceType::Unit
+        });
+        let callable_name = self.analyzer.definitions[definition.0 as usize]
+            .name
+            .clone();
         let explicit_type_arguments = type_arguments
             .iter()
             .map(|argument| self.analyzer.resolve_type_ref(&self.module, argument))
@@ -9792,7 +9885,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     let expected = parameters.get(index);
                     let value = self.check_expression(argument, expected);
                     if let Some(expected) = expected {
-                        self.expect_type(&value.ty, expected, &value.span);
+                        self.expect_type_for(
+                            &value.ty,
+                            expected,
+                            &value.span,
+                            &format!("argument {} to `{callable_name}`", index + 1),
+                        );
                     }
                     value
                 })
@@ -9820,9 +9918,37 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 .enumerate()
                 .map(|(index, argument)| {
                     let expected = parameters.get(index);
-                    let value = self.check_expression(argument, expected);
+                    let value = self.check_expression(
+                        argument,
+                        if formats_console_value && index == 0 {
+                            None
+                        } else {
+                            expected
+                        },
+                    );
+                    if formats_console_value
+                        && index == 0
+                        && value.ty != IrType::String
+                        && is_interpolatable(&value.ty)
+                    {
+                        return TypedExpressionIr {
+                            ty: IrType::String,
+                            effect: value.effect,
+                            span: value.span.clone(),
+                            kind: TypedExpressionKind::BuiltinCall {
+                                operation: BuiltinOperationIr::ValueToString,
+                                type_arguments: vec![value.ty.clone()],
+                                arguments: vec![value],
+                            },
+                        };
+                    }
                     if let Some(expected) = expected {
-                        self.expect_type(&value.ty, expected, &value.span);
+                        self.expect_type_for(
+                            &value.ty,
+                            expected,
+                            &value.span,
+                            &format!("argument {} to `{callable_name}`", index + 1),
+                        );
                     }
                     value
                 })
@@ -11053,6 +11179,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             return self.error_expression(span);
         };
         let definition_kind = self.analyzer.definitions[definition.0 as usize].kind;
+        if definition_kind == DefinitionKind::Class {
+            return self.check_class_construct(whole, definition, fields, update);
+        }
         let is_host_struct = definition_kind == DefinitionKind::HostContract
             && self.analyzer.host_types.iter().any(|host_type| {
                 host_type.definition == definition && host_type.kind == ExternalTypeKind::Struct
@@ -11060,7 +11189,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         if definition_kind != DefinitionKind::Struct && !is_host_struct {
             self.type_error(
                 span.clone(),
-                "Class construction requires `new`; a Struct constructor cannot name this type",
+                "brace initialization requires a Struct, Class, or named Enum variant",
             );
             return self.error_expression(span);
         }
@@ -11176,10 +11305,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
         if self.analyzer.definitions[definition.0 as usize].kind != DefinitionKind::Class {
-            self.type_error(
-                span.clone(),
-                "`new` requires a Class type; Struct values omit `new`",
-            );
+            self.type_error(span.clone(), "class initialization requires a Class type");
             return self.error_expression(span);
         }
         if self.is_state_definition(definition) {
@@ -11632,7 +11758,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             &self.module.source,
                             byte_range(expression.range),
                             format!("binding `{}` is immutable", path.segments[0].text),
-                            "declare it with `let mut` to allow assignment",
+                            "declare it with `let` to allow assignment",
                         );
                         return None;
                     }
@@ -11671,7 +11797,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         &self.module.source,
                         byte_range(expression.range),
                         format!("binding `{}` is immutable", path.segments[0].text),
-                        "declare it with `let mut` to allow rebinding or Struct field updates",
+                        "declare it with `let` to allow rebinding or Struct field updates",
                     );
                     return None;
                 }
@@ -11812,6 +11938,26 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     }
 
     fn expect_type(&mut self, actual: &IrType, expected: &IrType, span: &SourceRange) {
+        self.expect_type_in_context(actual, expected, span, None);
+    }
+
+    fn expect_type_for(
+        &mut self,
+        actual: &IrType,
+        expected: &IrType,
+        span: &SourceRange,
+        context: &str,
+    ) {
+        self.expect_type_in_context(actual, expected, span, Some(context));
+    }
+
+    fn expect_type_in_context(
+        &mut self,
+        actual: &IrType,
+        expected: &IrType,
+        span: &SourceRange,
+        context: Option<&str>,
+    ) {
         if contains_ir_error(actual) || contains_ir_error(expected) {
             self.record_suppressed();
             return;
@@ -11831,26 +11977,36 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     },
                     Severity::Error,
                     if numeric_conversion {
-                        format!(
+                        let message = format!(
                             "cannot implicitly convert {} to {}",
                             display_ir_type(actual, &self.analyzer.definitions),
                             display_ir_type(expected, &self.analyzer.definitions)
-                        )
+                        );
+                        context.map_or(message.clone(), |context| format!("{context}: {message}"))
                     } else {
-                        format!(
+                        let message = format!(
                             "expected {}, found {}",
                             display_ir_type(expected, &self.analyzer.definitions),
                             display_ir_type(actual, &self.analyzer.definitions)
-                        )
+                        );
+                        context.map_or(message.clone(), |context| format!("{context}: {message}"))
                     },
                 )
                 .with_label(Label::primary(
                     source_identity(&span.source),
                     range_from_source(span),
                     if numeric_conversion {
-                        "numeric conversion is not implicit"
+                        format!(
+                            "{}; found {} here",
+                            context.unwrap_or("numeric conversion is not implicit"),
+                            display_ir_type(actual, &self.analyzer.definitions)
+                        )
                     } else {
-                        "expression has an incompatible type"
+                        format!(
+                            "{}; found {} here",
+                            context.unwrap_or("expression has an incompatible type"),
+                            display_ir_type(actual, &self.analyzer.definitions)
+                        )
                     },
                 ))
                 .with_note(format!(
@@ -12431,30 +12587,6 @@ fn is_pascal_case(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn snake_case_name(value: &str) -> String {
-    let characters = value.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    for (index, character) in characters.iter().copied().enumerate() {
-        if character.is_ascii_uppercase() {
-            let previous_is_lower_or_digit = index > 0
-                && (characters[index - 1].is_ascii_lowercase()
-                    || characters[index - 1].is_ascii_digit());
-            let acronym_boundary = index > 0
-                && characters[index - 1].is_ascii_uppercase()
-                && characters
-                    .get(index + 1)
-                    .is_some_and(char::is_ascii_lowercase);
-            if !output.is_empty() && (previous_is_lower_or_digit || acronym_boundary) {
-                output.push('_');
-            }
-            output.push(character.to_ascii_lowercase());
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
 fn use_path_text(usage: &ast::UseDeclaration) -> String {
     std::iter::once(usage.root.name.text.as_str())
         .chain(usage.segments.iter().map(|segment| segment.text.as_str()))
@@ -12484,14 +12616,18 @@ fn builtin_operation_mutates(operation: BuiltinOperationIr) -> bool {
             | BuiltinOperationIr::ArrayInsert
             | BuiltinOperationIr::ArrayRemove
             | BuiltinOperationIr::ArrayClear
+            | BuiltinOperationIr::ArraySwap
+            | BuiltinOperationIr::ArrayReverse
             | BuiltinOperationIr::MapSet
             | BuiltinOperationIr::MapInsert
+            | BuiltinOperationIr::MapInsertIfAbsent
             | BuiltinOperationIr::MapRemove
             | BuiltinOperationIr::MapClear
             | BuiltinOperationIr::SetInsert
             | BuiltinOperationIr::SetRemove
             | BuiltinOperationIr::SetClear
             | BuiltinOperationIr::BufferSet
+            | BuiltinOperationIr::BufferFill
     )
 }
 
@@ -12563,8 +12699,7 @@ fn expression_contains_await(expression: &Expression) -> bool {
         ExpressionKind::Index { receiver, index } => {
             expression_contains_await(receiver) || expression_contains_await(index)
         }
-        ExpressionKind::Construct { fields, update, .. }
-        | ExpressionKind::New { fields, update, .. } => {
+        ExpressionKind::Construct { fields, update, .. } => {
             fields
                 .iter()
                 .any(|field| expression_contains_await(&field.value))

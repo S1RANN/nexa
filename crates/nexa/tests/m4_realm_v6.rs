@@ -31,25 +31,25 @@ const WAIT_PARAMETERS: &[ValueType] = &[ValueType::I32];
 const B_BASELINE: &str = r"
 @state(version = 1)
 class ModelState {
-    mut value: i32,
-    mut legacy: i32,
+    value: i32,
+    legacy: i32,
 }
 ";
 
 const C_BASELINE: &str = r"
 @state(version = 2)
 class ModelState {
-    mut value: i32,
-    mut replacement: i32,
+    value: i32,
+    replacement: i32,
 }
 ";
 
 const D_BASELINE: &str = r"
 @state(version = 3)
 class ModelState {
-    mut value: i32,
-    mut replacement: i32,
-    mut generation: i32,
+    value: i32,
+    replacement: i32,
+    generation: i32,
 }
 ";
 

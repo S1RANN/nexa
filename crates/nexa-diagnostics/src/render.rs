@@ -893,7 +893,7 @@ mod tests {
     fn replacement_fix_keeps_standalone_nidl_identity_and_utf16_range_in_json_and_ndjson() {
         let usage = SourceIdentity::package("root.app", "src/main.nexa");
         let contract = SourceIdentity::standalone("/tmp/Host 合同.nidl");
-        let usage_text = "use host::host;\r\nfn main() {\r\n    let marker = \"🚀\";\r\n    host::ping();\r\n}\r\n";
+        let usage_text = "fn main() {\r\n    let marker = \"🚀\";\r\n    host::ping();\r\n}\r\n";
         let contract_text = "contract Host {\r\n    host {\r\n        fn ping(message: string) \
                              -> i32;\r\n    }\r\n}\r\n";
         let mut sources = SourceSnapshotRegistry::builder();

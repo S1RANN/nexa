@@ -16,7 +16,8 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
     let root = artifact_root();
     clear_case_artifacts(&root);
     let shared_target = root.join("cargo-target");
-    let base_idl = nexa_contract::parse_contract(e2e_support::BASE_CONTRACT).expect("base NIDL parses");
+    let base_idl =
+        nexa_contract::parse_contract(e2e_support::BASE_CONTRACT).expect("base NIDL parses");
     let base_contract_runtime_id = nexa_contract::contract_runtime_id(&base_idl);
     let base_generated = nexa_contract::generate_rust(&base_idl).expect("base bindings generate");
     let context = CaseContext {

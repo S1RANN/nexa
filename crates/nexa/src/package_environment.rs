@@ -15,12 +15,12 @@ use nexa_analysis::{
     NexaEntrypointSurface, RequiredEntrypointSurface, SurfaceType,
 };
 use nexa_bytecode::result_type;
-use nexa_core::SourceSpan;
-use nexa_diagnostics::{ByteRange, SourceIdentity};
 use nexa_contract::{
     AbandonPolicy, CancelPolicy, ResolvedTypeKind, ResolvedTypeRef, ValidatedContract,
     ValidatedFunction,
 };
+use nexa_core::SourceSpan;
+use nexa_diagnostics::{ByteRange, SourceIdentity};
 
 use crate::package_build::HostContractInput;
 
@@ -82,8 +82,10 @@ pub(crate) fn canonical_host_surface(
 ) -> Result<HostContractSurface, PackageEnvironmentError> {
     let source = Arc::clone(input.source().text());
     let identity = input.source().identity().clone();
-    let contract = nexa_contract::parse_contract(&source).map_err(PackageEnvironmentError::InvalidHostSource)?;
-    if nexa_contract::abi_descriptor(&contract).bytes != nexa_contract::abi_descriptor(input.contract()).bytes
+    let contract = nexa_contract::parse_contract(&source)
+        .map_err(PackageEnvironmentError::InvalidHostSource)?;
+    if nexa_contract::abi_descriptor(&contract).bytes
+        != nexa_contract::abi_descriptor(input.contract()).bytes
     {
         return Err(PackageEnvironmentError::HostSourceContractMismatch);
     }

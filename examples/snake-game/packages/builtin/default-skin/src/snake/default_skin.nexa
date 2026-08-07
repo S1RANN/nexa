@@ -1,22 +1,21 @@
-use host::snake;
 
-fn empty() -> Array<snake::SnakeCommand> {
+fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
-fn register() -> Array<snake::SnakeCommand> {
-    return [snake::SnakeCommand::RegisterSkin("classic")];
+fn register() -> Array<host::SnakeCommand> {
+    return [host::SnakeCommand::RegisterSkin("classic")];
 }
 
-pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
+pub fn on_event(event: host::SnakeEvent) -> Array<host::SnakeCommand> {
     return match event {
-        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
-        snake::SnakeEvent::GameStarted(snapshot) => empty(),
-        snake::SnakeEvent::GameTick(snapshot) => empty(),
-        snake::SnakeEvent::ScoreChanged(snapshot) => empty(),
-        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
-        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
-        snake::SnakeEvent::GameEnded(snapshot) => empty(),
-        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
+        host::SnakeEvent::PackageEnabled(snapshot) => register(),
+        host::SnakeEvent::GameStarted(snapshot) => empty(),
+        host::SnakeEvent::GameTick(snapshot) => empty(),
+        host::SnakeEvent::ScoreChanged(snapshot) => empty(),
+        host::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        host::SnakeEvent::FoodEaten(snapshot) => empty(),
+        host::SnakeEvent::GameEnded(snapshot) => empty(),
+        host::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

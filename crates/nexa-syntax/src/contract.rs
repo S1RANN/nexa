@@ -269,7 +269,9 @@ impl<'a> Parser<'a> {
                     )?)
                 }
                 _ => {
-                    return Err(self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`"));
+                    return Err(
+                        self.error_here("expected `handle`, `struct`, `enum`, `host`, or `nexa`")
+                    );
                 }
             };
             items.push(item);

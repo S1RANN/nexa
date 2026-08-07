@@ -353,7 +353,7 @@ pub fn run() -> i32 {
 fn reassignment_of_iterated_collection_is_rejected() {
     const SOURCE: &str = r"
 pub fn run() -> i32 {
-    let mut set: Set<i32> = Set::new();
+    let set: Set<i32> = Set::new();
     for item in set { set = Set::new(); }
     return 0;
 }

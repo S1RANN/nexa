@@ -1,6 +1,6 @@
 # Nexa v2 Standard Library
 
-Status: M4R1 COMPLETE
+Status: Language v3 IN PROGRESS — Set type added
 
 The standard library is versioned and supplied by the compiler. Operations that
 belong to a value type use receiver methods and require no `use std::...`
@@ -43,7 +43,7 @@ let value = result.unwrap_or(0);
 ### Array and Map
 
 ```nexa
-let mut scores: Array<i32> = Array::new();
+let scores: Array<i32> = Array::new();
 scores.push(10);
 let first = scores.get(0); // Option<i32>
 let value = first.unwrap_or(0);
@@ -53,6 +53,21 @@ let value = first.unwrap_or(0);
   `remove()`, `reserve()`, `capacity()`, `clear()`, `shrink_to_fit()`
 - `Map<K, V>`: `len()`, `contains()`, `get()`, `set()`/`insert()`, `remove()`,
   `clear()`
+
+### Set
+
+```nexa
+let seen: Set<i32> = Set::new();
+seen.insert(10);
+let present = seen.contains(10);
+let removed = seen.remove(10);
+```
+
+- `Set<T>`: `insert()`, `contains()`, `remove()`, `len()`, `clear()`
+
+`Set<T>` is a compiler-provided hash set. Insertion, removal, and membership
+check are O(1) amortized. Iteration does not guarantee order; `for element in set`
+visits each element exactly once in an unspecified sequence.
 
 Array indexing (`values[index]`) remains the trapping/direct form. `get(index)`
 is the bounds-checked form and returns `Option<T>`.

@@ -1,8 +1,8 @@
-# Nexa v2 Language Surface
+# Nexa Language v3 Surface
 
-Status: M4R1 COMPLETE
+Status: Language v3 IN PROGRESS — Set type, collection iteration for loops
 
-Nexa v2 defines one source language for Packages, standalone programs, and
+Nexa Language v3 defines one source language for Packages, standalone programs, and
 REPL cells. It deliberately does not add user-defined generics, traits,
 closures, dynamic dispatch, inheritance, operator overloading, macros,
 reflection, raw pointers, or nullable references.
@@ -36,27 +36,51 @@ do not affect Public API, Build, or ABI Fingerprints.
 
 ## Bindings and constants
 
-`let` creates a runtime local binding that cannot be rebound. `let mut` permits
-rebinding and permits writes through a Struct place:
+`let` creates a mutable runtime binding. `const` creates a block-local binding
+that is initialized exactly once and cannot be rebound. Module-level `const`
+continues to declare a compile-time constant:
 
 ```nexa
-let title = "classic";
-let mut score = 0;
+const title = "classic";
+let score = 0;
 score += 10;
 score *= 2;
 
-let mut cell = Cell { x: 1, y: 2 };
+let cell = Cell { x: 1, y: 2 };
 cell.x -= 1;
+```
+
+Parameters and fields are mutable by default. Language v3 has no `mut` marker:
+
+```nexa
+fn advance(value: i32) -> i32 {
+    value += 1;
+    return value;
+}
 ```
 
 Nexa supports `+=`, `-=`, `*=`, `/=`, and `%=` on writable places. They use
 the same type rules as their binary operators and evaluate a field receiver or
 collection index exactly once. Prefix/postfix `++` and `--` remain unsupported.
 
-Binding mutability is shallow. A Class field can be changed only when that
-field itself is declared `mut`, regardless of whether the binding is mutable.
+Binding immutability is shallow. Starting from a `const` value, Struct field
+selection remains read-only. Once evaluation reaches a Class, Array, Map, or
+Buffer reference, mutations are governed by the referenced type rather than by
+the outer `const` binding:
 
-Consts exist only at Module scope and require an explicit type:
+| Value kind | `const` prohibits | `const` permits |
+| --- | --- | --- |
+| Scalar | replacing the value | — |
+| Struct / Enum | replacing the value or mutating an internal Place | — |
+| Class | replacing the reference | mutating object fields |
+| Array / Map / Buffer | replacing the reference | mutating container contents |
+| String | replacing the reference/value | —; String is immutable |
+
+This is not deep const. For example, a Class or Array reached through a field
+of a `const` Struct may still be mutated, while replacing that Struct field is
+rejected.
+
+Module constants require an explicit type:
 
 ```nexa
 pub const BASE_SCORE: i32 = 10;
@@ -71,8 +95,9 @@ the Public API Fingerprint.
 
 ## Structs, Enums, and Classes
 
-Structs and Enums are value types. Struct creation does not use `new`, and
-Enum construction uses an associated path:
+Structs and Enums are value types. Struct and Class initialization use the same
+`Type { ... }` form; the old constructor `new` keyword is not part of Language
+v3. Enum construction uses an associated path:
 
 ```nexa
 struct Cell {
@@ -93,16 +118,16 @@ let moved = Cell { x: 10, ..origin };
 let effect = FoodEffect::Teleport { cell: moved };
 ```
 
-Classes are sealed, non-null GC reference types with object identity. They
-must be created with `new`; their field mutability is declared independently:
+Classes are sealed, non-null GC reference types with object identity. Struct
+values and Class objects use the same brace initializer syntax:
 
 ```nexa
 class Enemy {
     name: string,
-    mut health: i32,
+    health: i32,
 }
 
-let enemy = new Enemy {
+let enemy = Enemy {
     name: "asp",
     health: 100,
 };
@@ -119,7 +144,7 @@ Persistent state is Class metadata:
 @state(version = 1)
 class GameState {
     @stable("score")
-    mut score: i32,
+    score: i32,
 }
 ```
 
@@ -133,10 +158,8 @@ Asynchronous work is declared with `async fn`. Awaiting is a postfix operation
 and is valid only inside an async function:
 
 ```nexa
-use host::snake;
-
 async fn load_profile(id: i64) -> Result<Profile, LoadError> {
-    let profile = snake::load_profile(id).await?;
+    let profile = host::load_profile(id).await?;
     return Result::Ok(profile);
 }
 ```

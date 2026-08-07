@@ -1,9 +1,9 @@
 # Standalone Nexa programs
 
-Status: M4R1 Standalone Profile v1 COMPLETE
+Status: Language v3 Standalone Profile IN PROGRESS
 
 The Standalone profile runs a Nexa program as a command-line application. It
-uses the same syntax, analysis, Typed IR, Bytecode v7, verifier, and runtime as
+uses the same syntax, analysis, Typed IR, Bytecode v8, verifier, and runtime as
 an embedded package. `nexa run` selects a source program and calls its typed
 `main`; it never asks users for a bytecode function index.
 
@@ -28,12 +28,11 @@ executable, command, or source path.
 
 ## Package entrypoint
 
-An Application package must provide exactly one of these signatures:
+An Application package may omit arguments it does not consume and may omit an
+explicit exit code:
 
 ```nexa
-fn main(args: Array<string>) -> i32 {
-    return 0;
-}
+fn main() {}
 ```
 
 ```nexa
@@ -42,10 +41,12 @@ async fn main(args: Array<string>) -> i32 {
 }
 ```
 
-No other parameter list, return type, overload, or public Future type is a
-Standalone entrypoint. The name `main`, parameter name `args`, parameter type,
-arity, and return type are all part of the ABI. A missing, duplicate, or
-misplaced `main` is a compilation error.
+The accepted surface is `fn` or `async fn`, zero arguments or one
+`Array<string>` argument, and a `Unit` or `i32` result. A `Unit` result becomes
+exit code 0. The compiler adapts every accepted form to the internal
+`(Array<string>) -> i32` task ABI. Other parameter or return types, overloads,
+and public Future types are rejected. A missing, duplicate, or misplaced
+`main` is a compilation error.
 
 The synchronous form runs as one verified function. The asynchronous form runs
 as one bounded task to completion under the normal wait, yield, cancellation,
@@ -75,21 +76,19 @@ host {
 ```
 
 ```nexa
-use host::console;
-
-fn main(args: Array<string>) -> i32 {
-    console::write("hello");
-    console::write_line(", world");
-    console::write_error("warning");
-    console::write_error_line(": example");
-    return 0;
+fn main() {
+    host::write("hello");
+    host::write_line(", world");
+    host::write_error("warning");
+    host::write_error_line(": example");
 }
 ```
 
 `write` and `write_line` write to standard output.
 `write_error` and `write_error_line` write to standard error. The `_line`
 forms append one line feed; the other forms append nothing. All four return
-Unit.
+Unit. Their source-level argument may be any formattable value; the compiler
+converts it to `string` before calling the fixed Host ABI.
 
 The Standalone Host does not provide file, network, process, environment,
 wall-clock, or system-random APIs. A package cannot obtain those facilities by
@@ -101,16 +100,14 @@ A single `.nexa` file may use a normal explicit `main`, or it may contain
 top-level executable statements:
 
 ```nexa
-use host::console;
-
 let name = args
     .get(0)
     .unwrap_or("world");
 
-console::write_line("hello, ${name}");
+host::write_line("hello, ${name}");
 
 let values = [3, 1, 4];
-console::write_line("values = ${values}"); // values = [3, 1, 4]
+host::write_line("values = ${values}"); // values = [3, 1, 4]
 ```
 
 `Array<T>.get(index)` is bounds checked and returns `Option<T>`; direct
@@ -128,13 +125,11 @@ If any top-level statement consumes an asynchronous result with `.await`, the
 compiler synthesizes an `async fn main`:
 
 ```nexa
-use host::console;
-
 async fn greeting() -> string {
     return "hello";
 }
 
-console::write_line(greeting().await);
+host::write_line(greeting().await);
 ```
 
 A single file cannot contain both an explicit `main` and top-level executable

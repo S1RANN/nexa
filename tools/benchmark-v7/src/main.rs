@@ -2600,7 +2600,7 @@ fn thermal_policy() -> String {
 const LANGUAGE_SOURCE_BASE: &str = r#"
 enum BenchError { Failed, }
 struct BenchStruct { value: i32, wide: i64, label: string, }
-class BenchClass { mut value: i32, next: Option<BenchClass>, }
+class BenchClass { value: i32, next: Option<BenchClass>, }
 enum BenchEvent { Idle, Value(i32), }
 
 @immediate
@@ -2622,7 +2622,7 @@ fn struct_construction() -> i32 {
     return value.value;
 }
 fn class_allocation() -> i32 {
-    let value: BenchClass = new BenchClass { value: 7, next: Option::None };
+    let value: BenchClass = BenchClass { value: 7, next: Option::None };
     value.value = value.value + 1;
     return value.value;
 }
@@ -2654,14 +2654,14 @@ fn buffer_copy(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
 }
 fn product_data_sweep() -> i32 {
     let values: Array<i32> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < 256 {
         let cell: BenchStruct = BenchStruct { value: index, wide: 9, label: "sweep" };
         values.push(cell.value);
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < 256 {
         total = total + values.get(cursor);
         cursor = cursor + 1;
@@ -2677,20 +2677,20 @@ fn product_combat_tick() -> i32 {
     let attack: Array<i32> = Array::new();
     let defense: Array<i32> = Array::new();
     let health: Array<i32> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < 128 {
         attack.push(10 + index);
         defense.push(3 + index / 2);
         health.push(100);
         index = index + 1;
     }
-    let mut round: i32 = 0;
-    let mut defeated: i32 = 0;
+    let round: i32 = 0;
+    let defeated: i32 = 0;
     while round < 8 {
-        let mut cursor: i32 = 0;
+        let cursor: i32 = 0;
         while cursor < 128 {
             let raw: i32 = attack.get(cursor) - defense.get(127 - cursor);
-            let mut damage: i32 = raw;
+            let damage: i32 = raw;
             if raw < 1 {
                 damage = 1;
             }
@@ -2706,14 +2706,14 @@ fn product_combat_tick() -> i32 {
     return defeated + health.get(0);
 }
 fn product_grid_score() -> i32 {
-    let mut score: i32 = 0;
-    let mut y: i32 = 0;
+    let score: i32 = 0;
+    let y: i32 = 0;
     while y < 64 {
-        let mut x: i32 = 0;
+        let x: i32 = 0;
         while x < 64 {
             let dx: i32 = x - 32;
             let dy: i32 = y - 32;
-            let mut cell: i32 = dx * dx + dy * dy;
+            let cell: i32 = dx * dx + dy * dy;
             if cell > 1024 {
                 cell = 1024;
             }
@@ -2726,13 +2726,13 @@ fn product_grid_score() -> i32 {
 }
 fn product_struct_rows() -> i32 {
     let cells: Array<BenchStruct> = Array::new();
-    let mut index: i32 = 0;
+    let index: i32 = 0;
     while index < 128 {
         cells.push(BenchStruct { value: index, wide: 9, label: "row" });
         index = index + 1;
     }
-    let mut total: i32 = 0;
-    let mut cursor: i32 = 0;
+    let total: i32 = 0;
+    let cursor: i32 = 0;
     while cursor < 128 {
         let cell: BenchStruct = cells.get(cursor);
         total = total + cell.value;
@@ -3590,13 +3590,13 @@ fn migration_inputs() -> Result<MigrationInputs, Box<dyn std::error::Error>> {
 
 const MIGRATION_V1: &str = r#"
 @state(version = 1)
-class BenchState { mut value: i32, mut legacy: i32, }
+class BenchState { value: i32, legacy: i32, }
 async fn update(value: i32) -> i32 { return value; }
 "#;
 
 const MIGRATION_V2: &str = r#"
 @state(version = 2)
-class BenchState { mut value: i32, mut total: i32, }
+class BenchState { value: i32, total: i32, }
 @migration
 pub fn migrate() -> bool {
     let old_state: BenchState = old.get<BenchState>(bench);

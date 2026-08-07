@@ -46,7 +46,7 @@ nexa {
 ```
 
 The Rust Host implements functions in `host {}` and Nexa code calls them
-through `use host::app;`. Nexa packages implement functions in `nexa {}` and
+through the reserved `host::member` namespace. Nexa packages implement functions in `nexa {}` and
 the Rust Host calls them through generated typed entrypoint markers. A
 contract declaration only defines a legal entrypoint signature; the Host
 decides separately whether that entrypoint is required.

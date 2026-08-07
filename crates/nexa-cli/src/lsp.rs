@@ -4179,14 +4179,14 @@ mod tests {
 
     #[test]
     fn lsp_contract_outline_exposes_all_six_symbol_kinds() {
-        let source = r#"
+        let source = r"
             contract SnakeApi;
             struct Cell { x: i32, y: i32, }
             enum SnakeEvent { Started, Ended, }
             handle Entity;
             host { fn log(message: string); }
             nexa { fn on_event(event: SnakeEvent) -> Array<i32>; }
-        "#;
+        ";
         let symbols = super::contract_document_symbols(source);
         let names = symbols
             .iter()
@@ -4754,6 +4754,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn lsp_related_information_fallback_uses_open_documents_and_drops_unmapped_packages() {
         let identity = |package: Option<&str>, path: &str| {
             package.map_or_else(

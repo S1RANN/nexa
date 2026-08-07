@@ -1,5 +1,4 @@
-use host::console;
 
 pub fn main() -> i32 {
-    return console::log("hello, world");
+    return host::log("hello, world");
 }

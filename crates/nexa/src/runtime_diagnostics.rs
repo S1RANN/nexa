@@ -435,10 +435,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         "use package::diagnostic_stack::leaf as leaf;\n",
         "pub(package) fn forward() -> i32 { return leaf::crash(); }\n",
     );
-    const LEAF_SOURCE: &str = concat!(
-        "use host::diagnostic_stack_host as test_host;\n",
-        "pub(package) fn crash() -> i32 { return test_host::fail(); }\n",
-    );
+    const LEAF_SOURCE: &str = "pub(package) fn crash() -> i32 { return host::fail(); }\n";
 
     let idl = nexa_contract::parse_contract(IDL_SOURCE).map_err(|error| error.to_string())?;
     let contract = crate::HostContractInput::with_source(
@@ -728,7 +725,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
     let stack_source_set = stack_sources.iter().collect::<BTreeSet<_>>();
     let file_id_set = file_ids.iter().collect::<BTreeSet<_>>();
     let expected_stack = ["crash", "forward", "entry"];
-    let expected_text = ["test_host::fail()", "leaf::crash()", "middle::forward()"];
+    let expected_text = ["host::fail()", "leaf::crash()", "middle::forward()"];
     let nidl_identity = nidl_source.identity.to_string();
     let human_has_all_sources = stack_sources
         .iter()
@@ -759,7 +756,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         && true_call_site_pcs
         && true_host_call_boundary
         && boundary_source.identity.to_string() == stack_sources[0]
-        && host_boundary_text.contains("test_host::fail()")
+        && host_boundary_text.contains("host::fail()")
         && nidl_range.start < nidl_range.end
         && contract_binding_verified
         && contract_exact_source_preserved

@@ -28,6 +28,7 @@ Milestone finalization runs once on the clean candidate commit:
 
 ```sh
 cargo xtask finalize-m5
+cargo xtask finalize-language-v3
 ```
 
 The finalizer performs the workspace build/test/doc suite once, writes a

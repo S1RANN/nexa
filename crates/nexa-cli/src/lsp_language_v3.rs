@@ -175,10 +175,8 @@ fn completion_receiver(source: &str, offset: usize) -> Option<(&str, bool)> {
     let before_partial = prefix[..cursor].trim_end();
     let (before_receiver, is_static) = if let Some(value) = before_partial.strip_suffix("::") {
         (value, true)
-    } else if let Some(value) = before_partial.strip_suffix('.') {
-        (value, false)
     } else {
-        return None;
+        (before_partial.strip_suffix('.')?, false)
     };
     final_word(before_receiver).map(|receiver| (receiver, is_static))
 }

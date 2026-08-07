@@ -26,7 +26,7 @@ use nexa_runtime::{
 use crate::{CompiledReplCellArtifact, HostContractInput, PackageBuildError, PackageBuildSession};
 
 /// Built-in Host contract used by standalone scripts and REPL sessions.
-pub const CONSOLE_HOST_CONTRACT: &str = r#"
+pub const CONSOLE_HOST_CONTRACT: &str = r"
 contract Console;
 host {
     fn write(value: string);
@@ -34,7 +34,7 @@ host {
     fn write_error(value: string);
     fn write_error_line(value: string);
 }
-"#;
+";
 
 /// Reader-facing identity of the built-in Console contract.
 pub const CONSOLE_HOST_SOURCE_IDENTITY: &str = "contract://builtin/console.contract.nexa";
@@ -230,7 +230,7 @@ pub enum ReplSessionError {
     Console(ReplConsoleHostError),
     Analysis {
         source: SourceIdentity,
-        diagnostics: DiagnosticBatch,
+        diagnostics: Box<DiagnosticBatch>,
     },
     AnalysisSession(Box<nexa_analysis::ReplSessionError>),
     Build(PackageBuildError),
@@ -1083,7 +1083,7 @@ impl ReplSession {
                 self.diagnostics.push_back(diagnostics.clone());
                 ReplSessionError::Analysis {
                     source,
-                    diagnostics,
+                    diagnostics: Box::new(diagnostics),
                 }
             }
             error => ReplSessionError::Build(error),

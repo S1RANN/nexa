@@ -152,8 +152,7 @@ impl ProjectState {
     fn root_source(&self) -> String {
         self.root_override.clone().unwrap_or_else(|| {
             format!(
-                "use support::library as support;\nuse host::test_host as stress;\n\
-                 @state(version = {}) class Store {{ mut value: i32, }}\n\
+                "use support::library as support;\n@state(version = {}) class Store {{ value: i32, }}\n\
                  pub fn run(value: i32) -> i32 {{ return support::revision() + value + {}; }}\n",
                 self.state_version, self.delta,
             )
@@ -453,8 +452,7 @@ impl StressTrace {
 
 fn nidl_reload_script(host_function: &str, delta: i32) -> String {
     format!(
-        "use host::test_host as host;\n\
-         pub fn run(value: i32) -> i32 {{\n\
+        "pub fn run(value: i32) -> i32 {{\n\
              return host::{host_function}() + value + {delta};\n\
          }}\n"
     )
@@ -897,11 +895,10 @@ fn m4_reload_stress() {
         .write()
         .expect("stress project write lock")
         .root_override = Some(
-        "use support::library as support;\nuse host::test_host as stress;\n\
-         @state(version = 1) class Store { mut value: i32, }\n\
+        "use support::library as support;\n@state(version = 1) class Store { value: i32, }\n\
          pub fn run(value: i32) -> i32 { return support::revision() + value; }\n\
          pub async fn resource_probe(value: i32) -> i32 {\n\
-             let result: Result<i32, stress::WaitError> = stress::wait(value).await;\n\
+             let result: Result<i32, host::WaitError> = host::wait(value).await;\n\
              return match result { Result::Ok(found) => found, Result::Err(error) => 0 };\n\
          }\n"
         .into(),
@@ -1090,8 +1087,7 @@ path = \"library\"
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "use support::library as support;\nuse host::test_host as stress;\n\
-                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+            "use support::library as support;\n@state(version = 1) class Store {{ value: i32, }}\n\
                  pub fn run(value: i32) -> i32 {{ return support::revision() + missing_{iteration}; }}\n"
         ));
         let identity = queue_late_result(&mut engine, &mut trace, &package_id, "type failure");
@@ -1131,8 +1127,7 @@ path = \"library\"
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "use support::library as support;\nuse host::test_host as stress;\n\
-                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+            "use support::library as support;\n@state(version = 1) class Store {{ value: i32, }}\n\
                  @immediate\n\
                  pub fn run(value: i32) -> i32 {{\n\
                      for step in 0..{bound} {{\n\
@@ -1351,8 +1346,7 @@ path = \"library\"
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "use support::library as support;\nuse host::test_host as stress;\n\
-                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+            "use support::library as support;\n@state(version = 1) class Store {{ value: i32, }}\n\
                  pub fn run(value: i32) -> i32 {{ return support::revision() + value; }}\n\
                  @activation pub fn activate() -> i32 {{\n\
                      let marker: i32 = {};\n\

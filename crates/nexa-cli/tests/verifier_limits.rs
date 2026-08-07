@@ -46,7 +46,8 @@ impl Fixture {
         )
         .expect("Application Manifest");
         fs::write(app.join("src/example/main.nexa"), &oversized_frame).expect("Application source");
-        fs::write(root.join("app_api.contract.nexa"), "contract EmptyHost;\n").expect("Host Contract");
+        fs::write(root.join("app_api.contract.nexa"), "contract EmptyHost;\n")
+            .expect("Host Contract");
 
         let project = root.join("nexa.dev.toml");
         fs::write(

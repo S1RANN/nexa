@@ -390,6 +390,7 @@ impl CheckSummary {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), DynError> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".into());
@@ -467,6 +468,11 @@ fn main() -> Result<(), DynError> {
         "test-contract-lsp" => contract::test_contract_lsp(),
         "contract-migration-check" => contract::contract_migration_check(),
         "finalize-contract-v3" => contract::finalize_contract_v3_gates(true),
+        "test-language-v3" => test_language_v3(),
+        "language-v3-canary" => language_v3_canary(),
+        "finalize-language-v3" => finalize_language_v3(FinalizeLanguageV3Options::parse(
+            arguments.collect::<Vec<_>>(),
+        )?),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -489,7 +495,8 @@ fn main() -> Result<(), DynError> {
                  m5-final-report|m5-v8-comparison|\
                  m5-performance-regression|finalize-m5|test-contract-syntax|\
                  test-contract-semantics|test-contract-descriptor|test-contract-codegen|\
-                 test-contract-cli|test-contract-lsp|contract-migration-check|finalize-contract-v3"
+                 test-contract-cli|test-contract-lsp|contract-migration-check|finalize-contract-v3|\
+                 test-language-v3|language-v3-canary|finalize-language-v3"
             );
             Err("unknown xtask command".into())
         }
@@ -849,6 +856,374 @@ fn editor_check() -> Result<(), DynError> {
     } else {
         Err(format!("pnpm editor check failed with {status}").into())
     }
+}
+
+fn test_language_v3() -> Result<(), DynError> {
+    eprintln!("[language-v3] running scoped language v3 gates");
+    language_v3_non_workspace_gates()?;
+    cargo(&["test", "-p", "nexa-analysis", "--test", "language_v3"])?;
+    cargo(&["test", "-p", "nexa-runtime", "--lib", "v3_"])?;
+    cargo(&["test", "-p", "nexa-cli", "lsp_language_v3"])?;
+    eprintln!("[language-v3] all scoped gates PASS");
+    Ok(())
+}
+
+fn language_v3_non_workspace_gates() -> Result<(), DynError> {
+    editor_check()?;
+    language_v3_canary()
+}
+
+fn language_v3_canary() -> Result<(), DynError> {
+    let root = workspace_root();
+    eprintln!("[language-v3-canary] compiling canonical source canaries");
+    let canary_dir = root.join("examples/canary");
+    let expected = [
+        "array.nexa",
+        "buffer.nexa",
+        "map.nexa",
+        "mutability.nexa",
+        "range.nexa",
+        "set.nexa",
+    ];
+    let mut actual = std::fs::read_dir(&canary_dir)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            (entry.path().extension().and_then(|value| value.to_str()) == Some("nexa"))
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    if actual != expected {
+        return Err(format!(
+            "Language v3 canary inventory differs: expected {expected:?}, found {actual:?}"
+        )
+        .into());
+    }
+    for name in expected {
+        let path = canary_dir.join(name);
+        let status = Command::new("cargo")
+            .args(["run", "-p", "nexa-cli", "--quiet", "--", "check"])
+            .arg(&path)
+            .current_dir(&root)
+            .status()?;
+        if !status.success() {
+            return Err(
+                format!("canonical Language v3 build failed for {}", path.display()).into(),
+            );
+        }
+    }
+    eprintln!("[language-v3-canary] all five canonical source builds PASS");
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FinalizeLanguageV3Options {
+    dry_run: bool,
+}
+
+impl FinalizeLanguageV3Options {
+    fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self, DynError> {
+        let mut options = Self::default();
+        for argument in arguments {
+            match argument.as_str() {
+                "--dry-run" if !options.dry_run => options.dry_run = true,
+                "--dry-run" => {
+                    return Err("duplicate finalize-language-v3 option `--dry-run`".into());
+                }
+                _ => return Err(format!("unknown finalize-language-v3 option `{argument}`").into()),
+            }
+        }
+        Ok(options)
+    }
+
+    fn print_plan() {
+        println!(
+            "finalize-language-v3 --dry-run\n\
+             validates frozen historical tags and Language3/Bytecode8/OpcodeCost8/stdlib2.0.0\n\
+             runs editor+canonical canary gates, then workspace fmt/check/clippy/test/doc once\n\
+             writes target/nexa-artifacts/language-v3-finalize/final-report.json only on PASS"
+        );
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LanguageV3FinalReport {
+    schema: u32,
+    milestone: &'static str,
+    implementation_commit: String,
+    branch: String,
+    remote: String,
+    completion_tag_object: String,
+    tag_target: String,
+    historical_tags: Vec<PreviousTagStatus>,
+    non_workspace_gates: &'static str,
+    workspace_fmt: &'static str,
+    workspace_check: &'static str,
+    workspace_clippy: &'static str,
+    workspace_test: &'static str,
+    workspace_doc: &'static str,
+    language_version: u64,
+    bytecode_version: u64,
+    opcode_cost_version: u64,
+    stdlib_version: &'static str,
+    contract_syntax_version: u64,
+    host_schema_version: u64,
+    descriptor_version: u64,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviousTagStatus {
+    name: String,
+    object: String,
+    target: String,
+    status: &'static str,
+}
+
+#[allow(clippy::too_many_lines)]
+fn finalize_language_v3(options: FinalizeLanguageV3Options) -> Result<(), DynError> {
+    const HISTORICAL_TAGS: [(&str, &str, &str); 12] = [
+        (
+            "gate1-v2.9-stop",
+            "1217d4dfdb323a6442717b18385dfcb6fb74d499",
+            "8552064ec01b3191467633717de7b77c97cb24f1",
+        ),
+        (
+            "internal-pivot-m1-complete",
+            "772fe1a6faa66b9377e4339fd6f3f02452671fe5",
+            "a44ec778f2733e1e1cc9e122823190ff131c9c70",
+        ),
+        (
+            "internal-pivot-m1-complete-r1",
+            "ff67117903df6996a1a94f19fed61fde57b17386",
+            "049b7b52891d4731af1793ab0a755f79130a03dd",
+        ),
+        (
+            "embed-snake-m2-complete",
+            "d3ae62fab3c3d40a5741853c8a7332ecffcfa676",
+            "aef12a0f92a1efe8c0f0497c3cb6147cb86f0c7e",
+        ),
+        (
+            "developer-loop-m3-complete",
+            "058e3c5638997735cc1faa55f6d9cf8496141dea",
+            "621612f49c4180989711df3ca80021fd21ad9277",
+        ),
+        (
+            "developer-loop-m3-complete-r1",
+            "a7e809ad42036d9286cf8d78f7ba126e3964e05c",
+            "b53ce21f98db7387b37cca0572fbbf920ab53d61",
+        ),
+        (
+            "developer-loop-m3-complete-r2",
+            "8077ff2b5c99f2c3a145d95d04d42b0b81a76e8a",
+            "71c3a3ead70533f013928b6d1c434e1870f49b24",
+        ),
+        (
+            "developer-loop-m3-complete-r3",
+            "cc05c461c0db2b7ba2310536071d136807563cfd",
+            "9d31064536b5c201ffdb064fb6af8837e87edbb5",
+        ),
+        (
+            "language-scale-m4-complete",
+            "ccb2284ad4a949d0d32978c4258599263dfd74b9",
+            "dffdede878e88845e21d6f1733f75d57839e81da",
+        ),
+        (
+            "language-scale-m4-complete-r1",
+            "e23f95204aac67ea2c4669cbe893831077a6d8a0",
+            "5de5027b5ebe4b2adbe1cec9e8dd5b9b25b9b8ba",
+        ),
+        (
+            "performance-m5-baseline",
+            "ca6eecec77bdecf6f717d3c3e85aae5a2298541c",
+            "24e87e0a7df07281d2205b1ed88162c7e6617231",
+        ),
+        (
+            "performance-m5-complete",
+            "293a57f34caf96eb44b649973536853c67d4a2f0",
+            "47c7a440ae62d039d09ef57845840114bd082378",
+        ),
+    ];
+    if options.dry_run {
+        FinalizeLanguageV3Options::print_plan();
+        return Ok(());
+    }
+    let root = workspace_root();
+    eprintln!("[language-v3-finalize] Language v3 finalization");
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let branch = git_output(&["branch", "--show-current"])?;
+    let worktree_status = git_output(&["status", "--porcelain"])?;
+    if branch != "main" || !worktree_status.is_empty() {
+        return Err(format!(
+            "finalize-language-v3 requires clean attached main; branch={branch:?}, status={worktree_status:?}"
+        )
+        .into());
+    }
+    let completion_tag = "language-v3-complete";
+    if git_output(&["cat-file", "-t", completion_tag])? != "tag" {
+        return Err("language-v3-complete must be an annotated tag".into());
+    }
+    let completion_tag_object = git_output(&["rev-parse", completion_tag])?;
+    let tag_target = git_output(&["rev-parse", "language-v3-complete^{}"])?;
+    if tag_target != head {
+        return Err("language-v3-complete must target final main HEAD".into());
+    }
+
+    let mut remote_references = vec![
+        "refs/heads/main".to_owned(),
+        "refs/heads/codex/language-v3".to_owned(),
+        "refs/tags/language-v3-complete".to_owned(),
+        "refs/tags/language-v3-complete^{}".to_owned(),
+    ];
+    for (name, _, _) in HISTORICAL_TAGS {
+        remote_references.push(format!("refs/tags/{name}"));
+        remote_references.push(format!("refs/tags/{name}^{{}}"));
+    }
+    let mut remote_command = Command::new("git");
+    remote_command.args(["ls-remote", "origin"]);
+    remote_command.args(&remote_references);
+    remote_command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&root);
+    let remote_output = captured_stdout(&mut remote_command, "git ls-remote origin")?;
+    let remote = remote_output
+        .lines()
+        .filter_map(|line| {
+            let (object, reference) = line.split_once('\t')?;
+            Some((reference.to_owned(), object.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for reference in ["refs/heads/main", "refs/heads/codex/language-v3"] {
+        if remote.get(reference).map(String::as_str) != Some(head.as_str()) {
+            return Err(format!("remote {reference} does not target final HEAD {head}").into());
+        }
+    }
+    if remote
+        .get("refs/tags/language-v3-complete")
+        .map(String::as_str)
+        != Some(completion_tag_object.as_str())
+        || remote
+            .get("refs/tags/language-v3-complete^{}")
+            .map(String::as_str)
+            != Some(head.as_str())
+    {
+        return Err("remote language-v3-complete differs from the local annotated tag".into());
+    }
+    let mut historical_tags = Vec::with_capacity(HISTORICAL_TAGS.len());
+    for (name, expected_object, expected_target) in HISTORICAL_TAGS {
+        let object = git_output(&["rev-parse", name])?;
+        let target = git_output(&["rev-parse", &format!("{name}^{{}}")])?;
+        if git_output(&["cat-file", "-t", name])? != "tag"
+            || object != expected_object
+            || target != expected_target
+            || remote.get(&format!("refs/tags/{name}")).map(String::as_str) != Some(expected_object)
+            || remote
+                .get(&format!("refs/tags/{name}^{{}}"))
+                .map(String::as_str)
+                != Some(expected_target)
+        {
+            return Err(
+                format!("historical annotated tag {name} changed locally or remotely").into(),
+            );
+        }
+        historical_tags.push(PreviousTagStatus {
+            name: name.to_owned(),
+            object,
+            target,
+            status: "PASS",
+        });
+    }
+
+    let analysis_source = fs::read_to_string(root.join("crates/nexa-analysis/src/options.rs"))?;
+    let core_source = fs::read_to_string(root.join("crates/nexa-core/src/lib.rs"))?;
+    let contract_source = fs::read_to_string(root.join("crates/nexa-contract/src/descriptor.rs"))?;
+    let host_source = fs::read_to_string(root.join("crates/nexa-runtime/src/host.rs"))?;
+    let stdlib_source = fs::read_to_string(root.join("crates/nexa-stdlib/src/lib.rs"))?;
+    let language_version = public_rust_integer_constant(&analysis_source, "NEXA_LANGUAGE_VERSION")?;
+    let bytecode_version = public_rust_integer_constant(&core_source, "BYTECODE_VERSION")?;
+    let opcode_cost_version =
+        public_rust_integer_constant(&core_source, "OPCODE_COST_TABLE_VERSION")?;
+    let contract_syntax_version =
+        public_rust_integer_constant(&contract_source, "CONTRACT_SYNTAX_VERSION")?;
+    let descriptor_version =
+        public_rust_integer_constant(&contract_source, "ABI_DESCRIPTOR_VERSION")?;
+    let host_schema_version =
+        public_rust_integer_constant(&host_source, "HOST_CONTRACT_SCHEMA_VERSION")?;
+    if (
+        language_version,
+        bytecode_version,
+        opcode_cost_version,
+        contract_syntax_version,
+        host_schema_version,
+        descriptor_version,
+    ) != (3, 8, 8, 3, 2, 2)
+        || !stdlib_source.contains(
+            "pub const VERSION: StandardLibraryVersion = StandardLibraryVersion::new(2, 0, 0);",
+        )
+    {
+        return Err("Language v3 release version authority is inconsistent".into());
+    }
+
+    language_v3_non_workspace_gates()?;
+    cargo(&["fmt", "--all", "--", "--check"])?;
+    cargo(&["check", "--workspace", "--all-targets"])?;
+    cargo(&[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    cargo(&["test", "--workspace", "--all-targets"])?;
+    cargo_with_environment(
+        &["doc", "--workspace", "--no-deps"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
+    )?;
+
+    let report = LanguageV3FinalReport {
+        schema: 1,
+        milestone: "language-v3-finalize",
+        implementation_commit: head.clone(),
+        branch,
+        remote: "origin".into(),
+        completion_tag_object,
+        tag_target,
+        historical_tags,
+        non_workspace_gates: "PASS",
+        workspace_fmt: "PASS",
+        workspace_check: "PASS",
+        workspace_clippy: "PASS",
+        workspace_test: "PASS",
+        workspace_doc: "PASS",
+        language_version,
+        bytecode_version,
+        opcode_cost_version,
+        stdlib_version: "2.0.0",
+        contract_syntax_version,
+        host_schema_version,
+        descriptor_version,
+        status: "PASS",
+    };
+
+    let report_dir = root.join("target/nexa-artifacts/language-v3-finalize");
+    let report_path = report_dir.join("final-report.json");
+    fs::create_dir_all(&report_dir)?;
+    let temporary = report_path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    fs::rename(temporary, &report_path)?;
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    eprintln!(
+        "[language-v3-finalize] report written to {}",
+        report_path.display()
+    );
+    eprintln!("[language-v3-finalize] finalize-language-v3 complete");
+    Ok(())
 }
 
 fn dev_loop_stress() -> Result<(), DynError> {

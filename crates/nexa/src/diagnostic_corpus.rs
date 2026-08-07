@@ -333,8 +333,10 @@ fn load_cases(root: &Path) -> Result<Vec<(PathBuf, DiagnosticCase)>, String> {
 }
 
 fn fixture_case_id(path: &Path) -> String {
-    path.file_stem()
-        .map_or_else(|| "<unknown>".to_owned(), |stem| stem.to_string_lossy().into_owned())
+    path.file_stem().map_or_else(
+        || "<unknown>".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
 }
 
 pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticReport, String> {
@@ -450,8 +452,10 @@ pub fn run_diagnostic_corpus(
     let fixture_set = loaded
         .iter()
         .map(|(path, _)| {
-            path.file_stem()
-                .map_or_else(|| "<unknown>".to_owned(), |stem| stem.to_string_lossy().into_owned())
+            path.file_stem().map_or_else(
+                || "<unknown>".to_owned(),
+                |stem| stem.to_string_lossy().into_owned(),
+            )
         })
         .collect::<BTreeSet<_>>();
     if fixture_set.len() != loaded.len() {

@@ -246,10 +246,10 @@ fn manifest_and_standard_library_are_build_inputs() {
 #[test]
 fn docs_change_source_and_build_but_not_analyzed_api_or_state_schema() {
     let (baseline, baseline_build) = analyze_documented_package(
-        "/// Persistent counter docs.\n@state(version = 1) class Counter {\n    mut value: i32,\n}\n\n/// Returns the score.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
+        "/// Persistent counter docs.\n@state(version = 1) class Counter {\n    value: i32,\n}\n\n/// Returns the score.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
     );
     let (changed, changed_build) = analyze_documented_package(
-        "/// Reload-safe counter documentation.\n@state(version = 1) class Counter {\n    mut value: i32,\n}\n\n/// Returns the unchanged score value.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
+        "/// Reload-safe counter documentation.\n@state(version = 1) class Counter {\n    value: i32,\n}\n\n/// Returns the unchanged score value.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
     );
 
     assert!(

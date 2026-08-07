@@ -1,0 +1,37 @@
+pub fn set_new_and_insert() -> i32 {
+    let seen: Set<i32> = Set::new();
+    seen.insert(10);
+    seen.insert(20);
+    seen.insert(30);
+    return seen.len();
+}
+
+pub fn set_contains() -> bool {
+    let seen: Set<i32> = Set::new();
+    seen.insert(42);
+    return seen.contains(42);
+}
+
+pub fn set_remove() -> bool {
+    let seen: Set<i32> = Set::new();
+    seen.insert(1);
+    return seen.remove(1);
+}
+
+pub fn set_clear() {
+    let seen: Set<i32> = Set::new();
+    seen.insert(1);
+    seen.clear();
+}
+
+pub fn set_for_iteration() -> i32 {
+    let seen: Set<i32> = Set::new();
+    seen.insert(10);
+    seen.insert(20);
+    seen.insert(30);
+    let total: i32 = 0;
+    for element in seen {
+        total = total + element;
+    }
+    return total;
+}

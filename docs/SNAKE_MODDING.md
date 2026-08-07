@@ -35,15 +35,13 @@ nexa {
 ```
 
 The corresponding entry Source Module keeps every Host symbol behind the
-Contract namespace and publishes only the entrypoints it implements:
+reserved Host namespace and publishes only the entrypoints it implements:
 
 ```nexa
-use host::snake;
-
 pub fn on_event(
-    event: snake::SnakeEvent,
-) -> Array<snake::SnakeCommand> {
-    let output: Array<snake::SnakeCommand> = Array::new();
+    event: host::SnakeEvent,
+) -> Array<host::SnakeCommand> {
+    let output: Array<host::SnakeCommand> = Array::new();
     return output;
 }
 ```
@@ -105,8 +103,8 @@ handler_fuel = 20000
 capabilities = ["ui.register", "ui.update"]
 ```
 
-The entry above maps to `src/community/example.nexa`. Host access is explicit:
-`use host::snake;`.
+The entry above maps to `src/community/example.nexa`. Host access is explicit
+through the reserved `host::member` path.
 
 Local Mods cannot request entitlements and cannot exceed the public Mod
 capability ceiling.
@@ -124,7 +122,7 @@ ordinary Class carrying state metadata:
 @state(version = 1)
 class OverlayState {
     @stable("foods")
-    mut foods: i32,
+    foods: i32,
 }
 ```
 

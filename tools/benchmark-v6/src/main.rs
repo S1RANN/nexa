@@ -469,7 +469,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 const LANGUAGE_SOURCE: &str = r#"
 enum BenchError { Failed, }
 struct BenchStruct { value: i32, wide: i64, label: string, }
-class BenchClass { mut value: i32, next: Option<BenchClass>, }
+class BenchClass { value: i32, next: Option<BenchClass>, }
 enum BenchEvent { Idle, Value(i32), }
 
 @immediate
@@ -491,7 +491,7 @@ fn struct_construction() -> i32 {
     return value.value;
 }
 fn class_allocation() -> i32 {
-    let value: BenchClass = new BenchClass { value: 7, next: Option::None };
+    let value: BenchClass = BenchClass { value: 7, next: Option::None };
     value.value = value.value + 1;
     return value.value;
 }
@@ -882,13 +882,13 @@ fn migration_inputs() -> Result<MigrationInputs, Box<dyn std::error::Error>> {
 
 const MIGRATION_V1: &str = r#"
 @state(version = 1)
-class BenchState { mut value: i32, mut legacy: i32, }
+class BenchState { value: i32, legacy: i32, }
 async fn update(value: i32) -> i32 { return value; }
 "#;
 
 const MIGRATION_V2: &str = r#"
 @state(version = 2)
-class BenchState { mut value: i32, mut total: i32, }
+class BenchState { value: i32, total: i32, }
 @migration
 pub fn migrate() -> bool {
     let old_state: BenchState = old.get<BenchState>(bench);

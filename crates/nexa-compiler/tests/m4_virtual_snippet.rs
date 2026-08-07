@@ -79,9 +79,9 @@ activation = "default-enabled"
         host_contract: Vec::new(),
         contract_syntax_version: nexa_contract::CONTRACT_SYNTAX_VERSION,
         host_contract_source: Vec::new(),
-        host_required_entrypoints: nexa_contract::required_entrypoints_descriptor(std::iter::empty::<
-            &str,
-        >()),
+        host_required_entrypoints: nexa_contract::required_entrypoints_descriptor(
+            std::iter::empty::<&str>(),
+        ),
         repl_session_context: Vec::new(),
         language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
@@ -183,8 +183,6 @@ fn run() -> i32 {
             NormalizedPackagePath::new("src/api.nexa").expect("normalized dependency path"),
             Arc::<str>::from(
                 r"
-use host::dispatch_host as host;
-
 pub fn read() -> i32 {
     return host::third();
 }
@@ -598,14 +596,12 @@ fn synchronous_unit_host_results_materialize_only_after_the_host_call() {
     };
     let compiled = compile_typed_evidence_package_with_environment(
         r"
-use host::unit_host as api;
-
 fn consume(value: unit) -> i32 {
     return 23;
 }
 
 fn host_unit() -> i32 {
-    return consume(api::touch());
+    return consume(host::touch());
 }
 ",
         &environment,
@@ -1279,10 +1275,8 @@ contract GameHost;
     )
     .unwrap();
     let source = r"
-use host::game_host as engine;
-
 pub async fn update(entity: i32) -> i32 {
-    let result: Result<i32, engine::AnimationError> = engine::animation(entity).await;
+    let result: Result<i32, host::AnimationError> = host::animation(entity).await;
     return match result {
         Result::Ok(value) => value,
         Result::Err(error) => 0,
@@ -1341,8 +1335,6 @@ contract DispatchHost;
         .expect("the third Host function is present");
     let verified = nexa_compiler::compile_with_contract(
         r"
-use host::dispatch_host as host;
-
 fn invoke_third() -> i32 {
     return host::third();
 }
@@ -1408,8 +1400,6 @@ contract TokenHost;
     .expect("valid nominal Handle contract");
     let verified = nexa_compiler::compile_with_contract(
         r"
-use host::token_host as host;
-
 fn first(value: Token<host::First>) -> Token<host::First> {
     return host::echo_first(value);
 }
@@ -1496,7 +1486,7 @@ fn contract_id_snippet_lowers_real_typed_migration_ir() {
         r"
 @state(version = 1)
 class State {
-    mut value: i32,
+    value: i32,
 }
 
 @migration

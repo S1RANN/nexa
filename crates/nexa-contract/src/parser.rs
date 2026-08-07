@@ -1,18 +1,20 @@
 use nexa_core::{FileId, SourceSpan};
 use nexa_syntax::{
     ContractAst as SyntaxAst, ContractAttribute as SyntaxAttribute,
-    ContractAttributeArgument as SyntaxAttributeArgument, ContractAttributeValue as SyntaxAttributeValue,
-    ContractItem, ContractDocComment as SyntaxDocComment, ContractEnumDecl as SyntaxEnum,
-    ContractField as SyntaxField, ContractFunction as SyntaxFunction,
-    ContractFunctionBlock as SyntaxFunctionBlock, ContractFunctionBlockKind, ContractHandleDecl as SyntaxHandle,
-    ContractParameter as SyntaxParameter, ContractStructDecl as SyntaxStruct, ContractTypeRef as SyntaxTypeRef,
-    ContractVariant as SyntaxVariant, TextRange, parse_contract, parse_contract_ast,
+    ContractAttributeArgument as SyntaxAttributeArgument,
+    ContractAttributeValue as SyntaxAttributeValue, ContractDocComment as SyntaxDocComment,
+    ContractEnumDecl as SyntaxEnum, ContractField as SyntaxField,
+    ContractFunction as SyntaxFunction, ContractFunctionBlock as SyntaxFunctionBlock,
+    ContractFunctionBlockKind, ContractHandleDecl as SyntaxHandle, ContractItem,
+    ContractParameter as SyntaxParameter, ContractStructDecl as SyntaxStruct,
+    ContractTypeRef as SyntaxTypeRef, ContractVariant as SyntaxVariant, TextRange, parse_contract,
+    parse_contract_ast,
 };
 
 use crate::model::{
-    Attribute, AttributeArgument, AttributeValue, ContractDecl, DocComment, EnumDecl, FieldDecl,
-    FunctionBlock, FunctionDecl, HandleDecl, ContractAst, ContractError, ContractErrorKind, ParameterDecl,
-    StructDecl, TypeKind, TypeRef, VariantDecl,
+    Attribute, AttributeArgument, AttributeValue, ContractAst, ContractDecl, ContractError,
+    ContractErrorKind, DocComment, EnumDecl, FieldDecl, FunctionBlock, FunctionDecl, HandleDecl,
+    ParameterDecl, StructDecl, TypeKind, TypeRef, VariantDecl,
 };
 
 pub fn parse(source: &str) -> Result<ContractAst, Vec<ContractError>> {
@@ -198,7 +200,10 @@ fn lower_function(function: &SyntaxFunction, file: FileId) -> Result<FunctionDec
     })
 }
 
-fn lower_parameter(parameter: &SyntaxParameter, file: FileId) -> Result<ParameterDecl, ContractError> {
+fn lower_parameter(
+    parameter: &SyntaxParameter,
+    file: FileId,
+) -> Result<ParameterDecl, ContractError> {
     Ok(ParameterDecl {
         name: parameter.name.text.clone(),
         name_span: span(file, parameter.name.range),

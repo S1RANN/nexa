@@ -138,13 +138,13 @@ const DEFAULT_CHOICE: Choice = Choice::Value(3);
 const FLAGS: (i32, bool) = (1, true);
 
 class Counter {
-    mut value: i32,
+    value: i32,
     label: string,
 }
 
 @state(version = 1)
 class SavedState {
-    mut score: i32,
+    score: i32,
 }
 
 async fn load_score() -> i32 {
@@ -158,10 +158,10 @@ async fn load_twice() -> i32 {
 }
 
 pub fn run() -> i32 {
-    let mut cell = Cell { x: 1, y: support::base_value() };
+    let cell = Cell { x: 1, y: support::base_value() };
     cell.x = 2;
     let moved = Cell { y: 3, ..cell };
-    let counter = new Counter { value: moved.x, label: "v2" };
+    let counter = Counter { value: moved.x, label: "v2" };
     counter.value = counter.value + 1;
     let choice = Choice::Value(counter.value);
     return match choice {

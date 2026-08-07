@@ -1,9 +1,8 @@
-use host::realm_v6_host as fixture_host;
 
 @state(version = 2)
 class ModelState {
-    mut value: i32,
-    mut replacement: i32,
+    value: i32,
+    replacement: i32,
 }
 
 @cleanup
@@ -30,13 +29,13 @@ pub async fn explicit(value: i32) -> i32 {
     return value;
 }
 
-pub async fn request(value: i32) -> Result<i32, fixture_host::WaitError> {
+pub async fn request(value: i32) -> Result<i32, host::WaitError> {
     defer finalize(value);
     for index in 0..8 {
         value + index;
     }
     yield;
-    let completed: i32 = fixture_host::wait(value).await?;
+    let completed: i32 = host::wait(value).await?;
     return Result::Ok(completed);
 }
 

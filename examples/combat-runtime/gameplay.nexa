@@ -1,14 +1,13 @@
-use host::game as engine;
 
 @state(version = 1)
 class EnemyBrain {
-    mut phase: i32,
-    mut legacy_target: i32,
+    phase: i32,
+    legacy_target: i32,
 }
 
 @state(version = 1)
 class StableBrain {
-    mut phase: i32,
+    phase: i32,
 }
 
 struct CombatStats {
@@ -22,7 +21,7 @@ enum CombatEvent {
 }
 
 class CombatFrame {
-    mut hits: i32,
+    hits: i32,
     next: Option<CombatFrame>,
 }
 
@@ -42,20 +41,20 @@ fn no_target() -> Option<i32> {
     return Option::None;
 }
 
-pub async fn animation_checked(value: i32) -> Result<i32, engine::AnimationError> {
-    let completed: i32 = engine::animation(value).await?;
+pub async fn animation_checked(value: i32) -> Result<i32, host::AnimationError> {
+    let completed: i32 = host::animation(value).await?;
     return Result::Ok(completed);
 }
 
 pub async fn update(value: i32) -> i32 {
-    let lock = engine::action_lock(value);
-    let snapshot = engine::world_snapshot();
-    let animation: Result<i32, engine::AnimationError> = engine::animation(value).await;
+    let lock = host::action_lock(value);
+    let snapshot = host::world_snapshot();
+    let animation: Result<i32, host::AnimationError> = host::animation(value).await;
     let completed: i32 = match animation {
         Result::Ok(result) => result,
         Result::Err(error) => 0,
     };
-    return engine::update(value, 1);
+    return host::update(value, 1);
 }
 
 pub fn feature_probe(input: Buffer<i32>) -> i32 {
@@ -70,7 +69,7 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
         CombatEvent::Damage(payload) => payload.damage,
     };
 
-    let frame: CombatFrame = new CombatFrame { hits: 1, next: Option::None };
+    let frame: CombatFrame = CombatFrame { hits: 1, next: Option::None };
     frame.hits = frame.hits + 1;
 
     let values: Array<i32> = Array::new();
@@ -90,9 +89,9 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
     input.copy(copied, 0, 1, 1);
 
     let optional: Option<i32> = Option::Some(input.get(1));
-    let result: Result<i32, engine::AnimationError> = match optional {
+    let result: Result<i32, host::AnimationError> = match optional {
         Option::Some(value) => Result::Ok(value),
-        Option::None => Result::Err(engine::AnimationError::MissingClip),
+        Option::None => Result::Err(host::AnimationError::MissingClip),
     };
     let amount: i32 = match result {
         Result::Ok(value) => value,

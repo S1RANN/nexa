@@ -1,28 +1,27 @@
-use host::snake;
 
-fn empty() -> Array<snake::SnakeCommand> {
+fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
-fn register() -> Array<snake::SnakeCommand> {
-    return [snake::SnakeCommand::RegisterWidget("score")];
+fn register() -> Array<host::SnakeCommand> {
+    return [host::SnakeCommand::RegisterWidget("score")];
 }
 
-fn update(snapshot: snake::GameSnapshot) -> Array<snake::SnakeCommand> {
-    let stats: snake::GameStats = snapshot.stats;
-    let text: string = snake::format_score(stats.score);
-    return [snake::SnakeCommand::SetWidgetText(snake::WidgetText { local_id: "score", text: text })];
+fn update(snapshot: host::GameSnapshot) -> Array<host::SnakeCommand> {
+    let stats: host::GameStats = snapshot.stats;
+    let text: string = host::format_score(stats.score);
+    return [host::SnakeCommand::SetWidgetText(host::WidgetText { local_id: "score", text: text })];
 }
 
-pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
+pub fn on_event(event: host::SnakeEvent) -> Array<host::SnakeCommand> {
     return match event {
-        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
-        snake::SnakeEvent::GameStarted(snapshot) => empty(),
-        snake::SnakeEvent::GameTick(snapshot) => update(snapshot),
-        snake::SnakeEvent::ScoreChanged(snapshot) => update(snapshot),
-        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
-        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
-        snake::SnakeEvent::GameEnded(snapshot) => empty(),
-        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
+        host::SnakeEvent::PackageEnabled(snapshot) => register(),
+        host::SnakeEvent::GameStarted(snapshot) => empty(),
+        host::SnakeEvent::GameTick(snapshot) => update(snapshot),
+        host::SnakeEvent::ScoreChanged(snapshot) => update(snapshot),
+        host::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        host::SnakeEvent::FoodEaten(snapshot) => empty(),
+        host::SnakeEvent::GameEnded(snapshot) => empty(),
+        host::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

@@ -421,9 +421,7 @@ host {
     let product = resolved_product_with_source(
         application_manifest(),
         &contract,
-        r"use host::test_host as host;
-
-pub(package) fn host_value() -> i32 {
+        r"pub(package) fn host_value() -> i32 {
     return host::clock();
 }
 ",

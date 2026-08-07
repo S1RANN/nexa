@@ -18,12 +18,12 @@ use nexa_analysis::{
     external_source_key, infer_snippet_module, source_set_fingerprint,
 };
 use nexa_bytecode::{Module, result_type};
-use nexa_core::{FileId, SourceSpan, StableId};
-use nexa_diagnostics::{ByteRange, Diagnostic, LabelStyle, SourceIdentity};
 use nexa_contract::{
     AbandonPolicy, CancelPolicy, ResolvedTypeKind, ResolvedTypeRef, ValidatedContract,
     ValidatedFunction,
 };
+use nexa_core::{FileId, SourceSpan, StableId};
+use nexa_diagnostics::{ByteRange, Diagnostic, LabelStyle, SourceIdentity};
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
@@ -939,7 +939,8 @@ mod tests {
         assert!(fingerprint.canonical_lock_graph.is_empty());
 
         let contract =
-            nexa_contract::parse_contract("contract Host; nexa { fn update(value: i32) -> i32; }").unwrap();
+            nexa_contract::parse_contract("contract Host; nexa { fn update(value: i32) -> i32; }")
+                .unwrap();
         let hosted = resolved_snippet(
             "pub fn update(value: i32) -> i32 { return value; }\n",
             FileId(9),

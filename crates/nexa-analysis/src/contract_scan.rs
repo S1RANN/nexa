@@ -6,8 +6,8 @@ use std::sync::Arc;
 use nexa_core::StableId;
 use nexa_syntax::ast::{
     self, DeclarationKind, ElseBranch, Expression, ExpressionKind, ForIterable, InterpolationPart,
-    Pattern, PatternKind, Statement, StatementKind, TypeKind, TypeRef, UsePathRootKind,
-    VariantPayload, parse_nexa_ast,
+    Pattern, PatternKind, Statement, StatementKind, TypeKind, TypeRef, VariantPayload,
+    parse_nexa_ast,
 };
 use nexa_syntax::parse_nexa;
 
@@ -109,8 +109,6 @@ pub fn effective_contract_references(
         .iter()
         .map(|surface| (surface.name.as_str(), surface))
         .collect::<BTreeMap<_, _>>();
-    let contract_import_name = snake_case_name(&host.contract_name);
-
     let mut referenced_type_names = BTreeSet::<String>::new();
     let mut referenced_function_names = BTreeSet::<String>::new();
     for unit in std::iter::once(root_sources)
@@ -120,24 +118,7 @@ pub fn effective_contract_references(
         let syntax = parse_nexa(&unit.text)
             .map_err(|_| EffectiveContractScanError::SourceTooLarge(unit.key.clone()))?;
         let ast = parse_nexa_ast(&syntax);
-        let aliases = ast
-            .uses
-            .iter()
-            .filter(|usage| {
-                usage.root.kind == UsePathRootKind::Host
-                    && usage.segments.len() == 1
-                    && usage.segments[0].text == contract_import_name
-            })
-            .map(|usage| {
-                usage.alias.as_ref().map_or_else(
-                    || usage.segments[0].text.clone(),
-                    |alias| alias.text.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
         let mut scanner = AstReferenceScanner {
-            aliases: &aliases,
-            contract_import_name: &contract_import_name,
             host_type_by_name: &host_type_by_name,
             host_function_by_name: &host_function_by_name,
             referenced_type_names: &mut referenced_type_names,
@@ -184,8 +165,6 @@ pub fn effective_contract_references(
 }
 
 struct AstReferenceScanner<'a> {
-    aliases: &'a BTreeSet<String>,
-    contract_import_name: &'a str,
     host_type_by_name: &'a BTreeMap<&'a str, &'a ExternalTypeSurface>,
     host_function_by_name: &'a BTreeMap<&'a str, &'a crate::HostFunctionSurface>,
     referenced_type_names: &'a mut BTreeSet<String>,
@@ -384,15 +363,6 @@ impl AstReferenceScanner<'_> {
                     self.scan_expression(update);
                 }
             }
-            ExpressionKind::New { ty, fields, update } => {
-                self.scan_type(ty);
-                for field in fields {
-                    self.scan_expression(&field.value);
-                }
-                if let Some(update) = update {
-                    self.scan_expression(update);
-                }
-            }
             ExpressionKind::Match { value, arms } => {
                 self.scan_expression(value);
                 for arm in arms {
@@ -433,12 +403,7 @@ impl AstReferenceScanner<'_> {
 
     fn scan_host_function_path(&mut self, path: &ast::QualifiedName) {
         let function = match path.segments.as_slice() {
-            [alias, function] if self.aliases.contains(&alias.text) => function,
-            [root, contract, function]
-                if root.text == "host" && contract.text == self.contract_import_name =>
-            {
-                function
-            }
+            [root, function] if root.text == "host" => function,
             _ => return,
         };
         if self
@@ -451,12 +416,7 @@ impl AstReferenceScanner<'_> {
 
     fn scan_type_path(&mut self, path: &ast::QualifiedName) {
         let ty = match path.segments.as_slice() {
-            [alias, ty, ..] if self.aliases.contains(&alias.text) => ty,
-            [root, contract, ty, ..]
-                if root.text == "host" && contract.text == self.contract_import_name =>
-            {
-                ty
-            }
+            [root, ty, ..] if root.text == "host" => ty,
             _ => return,
         };
         if self.host_type_by_name.contains_key(ty.text.as_str()) {
@@ -531,30 +491,6 @@ fn close_referenced_types(
         queue.extend(nested);
     }
     Ok(stable_ids.into_iter().collect())
-}
-
-fn snake_case_name(value: &str) -> String {
-    let characters = value.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    for (index, character) in characters.iter().copied().enumerate() {
-        if character.is_ascii_uppercase() {
-            let previous_is_lower_or_digit = index > 0
-                && (characters[index - 1].is_ascii_lowercase()
-                    || characters[index - 1].is_ascii_digit());
-            let acronym_boundary = index > 0
-                && characters[index - 1].is_ascii_uppercase()
-                && characters
-                    .get(index + 1)
-                    .is_some_and(char::is_ascii_lowercase);
-            if !output.is_empty() && (previous_is_lower_or_digit || acronym_boundary) {
-                output.push('_');
-            }
-            output.push(character.to_ascii_lowercase());
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -714,13 +650,11 @@ mod tests {
         let references = effective_contract_references(
             &sources(
                 r#"
-use host::game_http_host as api;
-
 pub fn optional_tick(value: Missing) -> unit {
-    let direct: api::Direct = api::Direct {};
-    api::load();
-    let text = "api::ignored()";
-    // api::ignored();
+    let direct: host::Direct = host::Direct {};
+    host::load();
+    let text = "host::ignored()";
+    // host::ignored();
 }
 "#,
             ),
@@ -744,6 +678,30 @@ pub fn optional_tick(value: Missing) -> unit {
         assert_eq!(
             references.entrypoints.effective,
             ["optional_tick", "required_tick"]
+        );
+    }
+
+    #[test]
+    fn flat_host_root_selects_functions_and_types_without_a_contract_alias() {
+        let references = effective_contract_references(
+            &sources(
+                r"
+pub fn run(value: host::Envelope) -> host::Payload {
+    return host::load(value);
+}
+",
+            ),
+            &BTreeMap::new(),
+            &ModulePath::new("main").unwrap(),
+            &host(),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(references.host_functions, [StableId(100)]);
+        assert_eq!(
+            references.referenced_types,
+            [StableId(20), StableId(30), StableId(40)]
         );
     }
 
@@ -787,8 +745,8 @@ pub fn optional_tick(value: unit) -> unit {
                 NormalizedPackagePath::new("src/lib.nexa").unwrap(),
                 Arc::<str>::from(
                     r"
-pub fn dependency_value(value: host::game_http_host::Direct) -> unit {
-    host::game_http_host::load();
+pub fn dependency_value(value: host::Direct) -> unit {
+    host::load();
 }
 ",
                 ),

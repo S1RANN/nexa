@@ -1,0 +1,15 @@
+pub fn buffer_is_empty(buffer: Buffer<i32>) -> bool {
+    return buffer.is_empty();
+}
+
+pub fn buffer_fill(buffer: Buffer<i32>) -> bool {
+    return buffer.fill(42);
+}
+
+pub fn buffer_for_iteration(buffer: Buffer<i64>) -> i64 {
+    let total: i64 = 0;
+    for item in buffer {
+        total = total + item;
+    }
+    return total;
+}

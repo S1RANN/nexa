@@ -11,9 +11,9 @@ mod typed;
 use std::fmt;
 
 use nexa_bytecode::{Module, ValueType};
+use nexa_contract::ValidatedContract;
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_diagnostics::{ErrorCode, SourceIdentity};
-use nexa_contract::ValidatedContract;
 use nexa_verifier::VerifiedModule;
 
 pub use package::{

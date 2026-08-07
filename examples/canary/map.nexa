@@ -1,0 +1,53 @@
+pub fn map_new_and_insert() -> i32 {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("alpha", 1);
+    lookup.insert("beta", 2);
+    lookup.insert("gamma", 3);
+    return lookup.len();
+}
+
+pub fn map_get() -> i32 {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("key", 42);
+    return lookup.get("key").unwrap_or(0);
+}
+
+pub fn map_contains() -> bool {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("present", 1);
+    return lookup.contains("present");
+}
+
+pub fn map_remove() -> i32 {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("key", 99);
+    return lookup.remove("key").unwrap_or(0);
+}
+
+pub fn map_is_empty() -> bool {
+    let lookup: Map<string, i32> = Map::new();
+    return lookup.is_empty();
+}
+
+pub fn map_get_or() -> i32 {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("a", 1);
+    return lookup.get_or("a", 0) + lookup.get_or("z", 99);
+}
+
+pub fn map_insert_if_absent() -> bool {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("a", 1);
+    return lookup.insert_if_absent("b", 2);
+}
+
+pub fn map_for_iteration() -> i32 {
+    let lookup: Map<string, i32> = Map::new();
+    lookup.insert("a", 1);
+    lookup.insert("b", 2);
+    let total: i32 = 0;
+    for (key, value) in lookup {
+        total = total + key.len() + value;
+    }
+    return total;
+}

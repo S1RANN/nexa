@@ -29,18 +29,16 @@ host {
 }
 ";
 const SOURCE: &str = r"
-use host::nominal_host as api;
-
-fn echo_ticket(value: api::Ticket) -> api::Ticket {
+fn echo_ticket(value: host::Ticket) -> host::Ticket {
     return value;
 }
 
-fn inspect_payload(value: api::Ticket) -> api::Payload {
-    return api::inspect(value);
+fn inspect_payload(value: host::Ticket) -> host::Payload {
+    return host::inspect(value);
 }
 
-async fn fetch_payload(value: api::Ticket) -> Result<api::Payload, api::Failure> {
-    return api::fetch(value).await;
+async fn fetch_payload(value: host::Ticket) -> Result<host::Payload, host::Failure> {
+    return host::fetch(value).await;
 }
 ";
 

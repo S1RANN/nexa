@@ -1,58 +1,57 @@
-use host::snake;
 
-fn empty() -> Array<snake::SnakeCommand> {
+fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
-fn register() -> Array<snake::SnakeCommand> {
+fn register() -> Array<host::SnakeCommand> {
     return [
-        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "golden", length_delta: 2, score_delta: 20, speed_delta: 0 }),
-        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "poison", length_delta: 0 - 1, score_delta: 0, speed_delta: 0 }),
-        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "speed", length_delta: 0, score_delta: 0, speed_delta: 0 - 20 }),
+        host::SnakeCommand::RegisterFood(host::FoodDefinition { local_id: "golden", length_delta: 2, score_delta: 20, speed_delta: 0 }),
+        host::SnakeCommand::RegisterFood(host::FoodDefinition { local_id: "poison", length_delta: 0 - 1, score_delta: 0, speed_delta: 0 }),
+        host::SnakeCommand::RegisterFood(host::FoodDefinition { local_id: "speed", length_delta: 0, score_delta: 0, speed_delta: 0 - 20 }),
     ];
 }
 
 pub fn calculate_food_effect(
-    context: snake::FoodEatenContext,
-) -> snake::FoodEffect {
+    context: host::FoodEatenContext,
+) -> host::FoodEffect {
     let kind: string = context.food.kind;
     if kind == "official.food-chaos:golden" {
-        return snake::FoodEffect {
+        return host::FoodEffect {
             length_delta: 2,
             score_delta: 20,
             speed_delta: 0,
         };
     }
     if kind == "official.food-chaos:poison" {
-        return snake::FoodEffect {
+        return host::FoodEffect {
             length_delta: 0 - 1,
             score_delta: 0,
             speed_delta: 0,
         };
     }
     if kind == "official.food-chaos:speed" {
-        return snake::FoodEffect {
+        return host::FoodEffect {
             length_delta: 0,
             score_delta: 0,
             speed_delta: 0 - 20,
         };
     }
-    return snake::FoodEffect {
+    return host::FoodEffect {
         length_delta: 0,
         score_delta: 0,
         speed_delta: 0,
     };
 }
 
-pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
+pub fn on_event(event: host::SnakeEvent) -> Array<host::SnakeCommand> {
     return match event {
-        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
-        snake::SnakeEvent::GameStarted(snapshot) => empty(),
-        snake::SnakeEvent::GameTick(snapshot) => empty(),
-        snake::SnakeEvent::ScoreChanged(snapshot) => empty(),
-        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
-        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
-        snake::SnakeEvent::GameEnded(snapshot) => empty(),
-        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
+        host::SnakeEvent::PackageEnabled(snapshot) => register(),
+        host::SnakeEvent::GameStarted(snapshot) => empty(),
+        host::SnakeEvent::GameTick(snapshot) => empty(),
+        host::SnakeEvent::ScoreChanged(snapshot) => empty(),
+        host::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        host::SnakeEvent::FoodEaten(snapshot) => empty(),
+        host::SnakeEvent::GameEnded(snapshot) => empty(),
+        host::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

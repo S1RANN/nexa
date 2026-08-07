@@ -1707,7 +1707,7 @@ mod tests {
 
     const CORPUS: &str = r#"
 struct Pair { first: i32, second: i32, }
-class Counter { mut value: i32, }
+class Counter { value: i32, }
 enum Signal { Quiet, Loud(i32), }
 
 fn mixed(x: i32) -> i32 {
@@ -1728,7 +1728,7 @@ fn helper(x: i32) -> i32 {
     return x + 1;
 }
 fn update_counter() -> i32 {
-    let counter: Counter = new Counter { value: 1 };
+    let counter: Counter = Counter { value: 1 };
     counter.value = counter.value + 1;
     return counter.value;
 }

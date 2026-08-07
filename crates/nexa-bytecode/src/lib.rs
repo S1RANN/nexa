@@ -457,12 +457,16 @@ impl StandardIntrinsic {
             | Self::SetInsert { .. }
             | Self::SetRemove { .. }
             | Self::BufferFill { .. } => 2,
-            Self::StringSubstring | Self::MapInsert { .. } | Self::ArraySwap { .. } => 3,
-            Self::MapGetOr { .. } | Self::MapInsertIfAbsent { .. } => 3,
+            Self::StringSubstring
+            | Self::MapInsert { .. }
+            | Self::ArraySwap { .. }
+            | Self::MapGetOr { .. }
+            | Self::MapInsertIfAbsent { .. } => 3,
         }
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn argument_type(self, index: u16) -> Option<ValueType> {
         let option = |value| ValueType::Named(option_type(value).type_id);
         let result = |success, error| ValueType::Named(result_type(success, error).type_id);
@@ -501,18 +505,6 @@ impl StandardIntrinsic {
                 | Self::MapInsertIfAbsent { value: ty, .. },
                 2,
             ) => Some(ty),
-            (
-                Self::ArrayFirst { element }
-                | Self::ArrayLast { element }
-                | Self::ArrayReverse { element },
-                0,
-            ) => Some(array(element)),
-            (Self::ArraySwap { element }, 0) => Some(array(element)),
-            (Self::ArraySwap { .. }, 1 | 2) => Some(ValueType::I32),
-            (Self::MapIsEmpty { key, value }, 0) => Some(map(key, value)),
-            (Self::MapGetOr { key, value } | Self::MapInsertIfAbsent { key, value }, 0) => {
-                Some(map(key, value))
-            }
             (Self::MapGetOr { key: ty, .. } | Self::MapInsertIfAbsent { key: ty, .. }, 1) => {
                 Some(ty)
             }
@@ -552,7 +544,7 @@ impl StandardIntrinsic {
                 | Self::DebugTrap,
                 0,
             ) => Some(ValueType::String),
-            (Self::StringSubstring, 1 | 2)
+            (Self::ArraySwap { .. } | Self::StringSubstring, 1 | 2)
             | (Self::ArrayGet { .. } | Self::ArrayReserve { .. }, 1) => Some(ValueType::I32),
             (
                 Self::ArrayLen { element }
@@ -563,7 +555,11 @@ impl StandardIntrinsic {
                 | Self::ArrayReserve { element }
                 | Self::ArrayCapacity { element }
                 | Self::ArrayClear { element }
-                | Self::ArrayShrinkToFit { element },
+                | Self::ArrayShrinkToFit { element }
+                | Self::ArrayFirst { element }
+                | Self::ArrayLast { element }
+                | Self::ArraySwap { element }
+                | Self::ArrayReverse { element },
                 0,
             ) => Some(array(element)),
             (
@@ -571,7 +567,10 @@ impl StandardIntrinsic {
                 | Self::MapContains { key, value }
                 | Self::MapGet { key, value }
                 | Self::MapRemove { key, value }
-                | Self::MapInsert { key, value },
+                | Self::MapInsert { key, value }
+                | Self::MapIsEmpty { key, value }
+                | Self::MapGetOr { key, value }
+                | Self::MapInsertIfAbsent { key, value },
                 0,
             ) => Some(map(key, value)),
             (
@@ -615,7 +614,7 @@ impl StandardIntrinsic {
             | Self::BufferFill { .. }
             | Self::DebugAssert
             | Self::DebugTrap => ValueType::Bool,
-            Self::OptionUnwrapOr { value } => value,
+            Self::OptionUnwrapOr { value } | Self::MapGetOr { value, .. } => value,
             Self::ResultUnwrapOr { success, .. } => success,
             Self::F32Floor
             | Self::F32Ceil
@@ -647,7 +646,6 @@ impl StandardIntrinsic {
             Self::MapGet { value, .. } | Self::MapRemove { value, .. } => {
                 ValueType::Named(option_type(value).type_id)
             }
-            Self::MapGetOr { value, .. } => value,
         }
     }
 
@@ -743,25 +741,24 @@ impl StandardIntrinsic {
                 passes: 3,
             },
             Self::StringSplit => StandardIntrinsicFuelModel::StringSplit,
-            Self::ArrayPush { .. } | Self::ArrayPop { .. } => StandardIntrinsicFuelModel::ArrayCopy,
+            Self::ArrayPush { .. }
+            | Self::ArrayPop { .. }
+            | Self::ArraySwap { .. }
+            | Self::ArrayReverse { .. }
+            | Self::BufferFill { .. } => StandardIntrinsicFuelModel::ArrayCopy,
             Self::ArrayReserve { .. } | Self::ArrayShrinkToFit { .. } => {
                 StandardIntrinsicFuelModel::ArrayResize
             }
             Self::ArrayClear { .. } => StandardIntrinsicFuelModel::ArrayClear,
-            Self::MapContains { .. } | Self::MapGet { .. } | Self::MapRemove { .. } => {
-                StandardIntrinsicFuelModel::MapLookup
+            Self::MapContains { .. }
+            | Self::MapGet { .. }
+            | Self::MapRemove { .. }
+            | Self::SetContains { .. }
+            | Self::SetRemove { .. }
+            | Self::MapGetOr { .. } => StandardIntrinsicFuelModel::MapLookup,
+            Self::MapInsert { .. } | Self::SetInsert { .. } | Self::MapInsertIfAbsent { .. } => {
+                StandardIntrinsicFuelModel::MapInsertAttempt
             }
-            Self::MapInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
-            Self::SetContains { .. } | Self::SetRemove { .. } => {
-                StandardIntrinsicFuelModel::MapLookup
-            }
-            Self::SetInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
-            Self::MapGetOr { .. } => StandardIntrinsicFuelModel::MapLookup,
-            Self::MapInsertIfAbsent { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
-            Self::ArraySwap { .. } | Self::ArrayReverse { .. } => {
-                StandardIntrinsicFuelModel::ArrayCopy
-            }
-            Self::BufferFill { .. } => StandardIntrinsicFuelModel::ArrayCopy,
             Self::ValueToString { .. } => StandardIntrinsicFuelModel::ValueToString,
             _ => StandardIntrinsicFuelModel::Fixed,
         }
@@ -3533,6 +3530,7 @@ fn encode_standard_intrinsic(output: &mut Vec<u8>, intrinsic: StandardIntrinsic)
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_standard_intrinsic(reader: &mut Reader<'_>) -> Result<StandardIntrinsic, DecodeError> {
     let unary = |reader: &mut Reader<'_>| decode_type(reader);
     let binary = |reader: &mut Reader<'_>| Ok((decode_type(reader)?, decode_type(reader)?));

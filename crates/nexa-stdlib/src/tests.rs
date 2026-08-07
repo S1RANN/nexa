@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::{
     CANONICAL_PACKAGE_ID, DESCRIPTOR_SCHEMA_VERSION, Effect, Intrinsic, Lowering, PACKAGE_ID,
-    Termination, VERSION, canonical_descriptor_identity, buffer, collections, core as std_core,
+    Termination, VERSION, buffer, canonical_descriptor_identity, collections, core as std_core,
     debug, math, set, standard_library, string,
 };
 
@@ -158,14 +158,7 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
                 "set_clear",
             ],
         ),
-        (
-            "buffer",
-            &["Buffer"],
-            &[
-                "buffer_is_empty",
-                "buffer_fill",
-            ],
-        ),
+        ("buffer", &["Buffer"], &["buffer_is_empty", "buffer_fill"]),
         ("debug", &[], &["assert", "trap"]),
     ];
 

@@ -9985,18 +9985,15 @@ mod tests {
         loop {
             let mut removed_any = false;
             let mut cursor = (1_u8, 8_usize);
-            loop {
-                let Some((phase, slot, value)) =
-                    heap.set_iter_advance(set, cursor.0, cursor.1).unwrap()
-                else {
-                    break;
-                };
-                if phase == 1 {
-                    if let RuntimeValue::I32(key) = value {
-                        assert!(heap.set_remove(set, RuntimeValue::I32(key)).unwrap());
-                        removed_keys.insert(key);
-                        removed_any = true;
-                    }
+            while let Some((phase, slot, value)) =
+                heap.set_iter_advance(set, cursor.0, cursor.1).unwrap()
+            {
+                if phase == 1
+                    && let RuntimeValue::I32(key) = value
+                {
+                    assert!(heap.set_remove(set, RuntimeValue::I32(key)).unwrap());
+                    removed_keys.insert(key);
+                    removed_any = true;
                 }
                 cursor = (phase, slot);
                 if phase > 1 {
@@ -10114,9 +10111,8 @@ mod tests {
             heap.set_insert(set, RuntimeValue::I32(1)),
             Err(HeapError::MutationEpochExhausted)
         );
-        assert_eq!(
-            heap.set_contains(set, RuntimeValue::I32(1)).unwrap(),
-            false,
+        assert!(
+            !heap.set_contains(set, RuntimeValue::I32(1)).unwrap(),
             "the failed insert left the set unchanged"
         );
 
@@ -10297,12 +10293,17 @@ mod tests {
                 .iter()
                 .all(|reference| heap.string(*reference).is_ok())
         );
-        for index in 0..12 {
-            let reference = references[index];
-            let hash = heap.string_hash(reference).unwrap();
+        for reference in references.iter().take(12) {
+            let hash = heap.string_hash(*reference).unwrap();
             assert!(
-                heap.set_contains(set, RuntimeValue::String { reference, hash },)
-                    .unwrap()
+                heap.set_contains(
+                    set,
+                    RuntimeValue::String {
+                        reference: *reference,
+                        hash
+                    },
+                )
+                .unwrap()
             );
         }
     }

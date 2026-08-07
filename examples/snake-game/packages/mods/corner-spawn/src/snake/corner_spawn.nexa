@@ -1,28 +1,27 @@
-use host::snake;
 
-fn empty() -> Array<snake::SnakeCommand> {
+fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
-fn register() -> Array<snake::SnakeCommand> {
-    return [snake::SnakeCommand::RegisterSpawnPolicy("corner")];
+fn register() -> Array<host::SnakeCommand> {
+    return [host::SnakeCommand::RegisterSpawnPolicy("corner")];
 }
 
-pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
+pub fn on_event(event: host::SnakeEvent) -> Array<host::SnakeCommand> {
     return match event {
-        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
-        snake::SnakeEvent::GameStarted(snapshot) => empty(),
-        snake::SnakeEvent::GameTick(snapshot) => empty(),
-        snake::SnakeEvent::ScoreChanged(snapshot) => empty(),
-        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
-        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
-        snake::SnakeEvent::GameEnded(snapshot) => empty(),
-        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
+        host::SnakeEvent::PackageEnabled(snapshot) => register(),
+        host::SnakeEvent::GameStarted(snapshot) => empty(),
+        host::SnakeEvent::GameTick(snapshot) => empty(),
+        host::SnakeEvent::ScoreChanged(snapshot) => empty(),
+        host::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        host::SnakeEvent::FoodEaten(snapshot) => empty(),
+        host::SnakeEvent::GameEnded(snapshot) => empty(),
+        host::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }
 
 pub fn choose_food_spawn(
-    context: snake::FoodSpawnContext,
-) -> Option<snake::Cell> {
-    return Option::Some(snake::Cell { x: 0, y: 0 });
+    context: host::FoodSpawnContext,
+) -> Option<host::Cell> {
+    return Option::Some(host::Cell { x: 0, y: 0 });
 }

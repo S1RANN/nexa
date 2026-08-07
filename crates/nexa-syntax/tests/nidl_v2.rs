@@ -1,5 +1,5 @@
 use nexa_syntax::{
-    ContractAttributeValue, ContractItem, ContractFunctionBlockKind, NodeKind, SourceProfile,
+    ContractAttributeValue, ContractFunctionBlockKind, ContractItem, NodeKind, SourceProfile,
     SyntaxErrorKind, lex_contract, parse_contract, parse_contract_ast,
 };
 
@@ -49,7 +49,8 @@ nexa {
     assert_eq!(ast.contract.name.text, "Snake");
     assert_eq!(ast.contract.docs[0].text, "/// Snake ABI.");
     assert_eq!(ast.contract.attributes[0].name.text, "stable");
-    let ContractAttributeValue::String { cooked, .. } = &ast.contract.attributes[0].arguments[0].value
+    let ContractAttributeValue::String { cooked, .. } =
+        &ast.contract.attributes[0].arguments[0].value
     else {
         panic!("stable string");
     };
@@ -203,8 +204,8 @@ fn v3_missing_semicolon_after_header_is_diagnosed() {
 
 #[test]
 fn v3_duplicate_contract_header_is_diagnosed() {
-    let tree =
-        parse_contract("contract Api;\ncontract Other;\nstruct A { x: i32, }").expect("small source");
+    let tree = parse_contract("contract Api;\ncontract Other;\nstruct A { x: i32, }")
+        .expect("small source");
     assert!(
         tree.errors
             .iter()
@@ -256,10 +257,10 @@ fn v3_lex_contract_is_available() {
     let lexed = lex_contract("contract Api;").expect("small source");
     assert!(lexed.errors.is_empty(), "{:?}", lexed.errors);
     assert!(
-        lexed
-            .tokens
-            .iter()
-            .any(|token| matches!(token.kind, nexa_syntax::TokenKind::Keyword(nexa_syntax::Keyword::Contract))),
+        lexed.tokens.iter().any(|token| matches!(
+            token.kind,
+            nexa_syntax::TokenKind::Keyword(nexa_syntax::Keyword::Contract)
+        )),
         "lexer emits `contract` keyword"
     );
 }
@@ -303,15 +304,19 @@ fn v3_recovery_missing_header_semicolon_preserves_later_items() {
         NodeKind::ContractHostDeclaration,
         NodeKind::ContractNexaDeclaration,
     ] {
-        assert!(kinds.contains(&expected), "missing {expected:?} in {kinds:?}");
+        assert!(
+            kinds.contains(&expected),
+            "missing {expected:?} in {kinds:?}"
+        );
     }
 }
 
 #[test]
 fn v3_recovery_duplicate_header_preserves_later_items() {
     // A second `contract` header must be diagnosed without dropping later valid items.
-    let tree = parse_contract("contract Api;\nstruct A { x: i32, }\ncontract Other;\nenum B { X, }")
-        .expect("small source");
+    let tree =
+        parse_contract("contract Api;\nstruct A { x: i32, }\ncontract Other;\nenum B { X, }")
+            .expect("small source");
     assert!(
         tree.errors
             .iter()
@@ -328,8 +333,10 @@ fn v3_recovery_duplicate_header_preserves_later_items() {
 fn v3_recovery_unsupported_item_preserves_later_items() {
     // An illegal top-level declaration must be diagnosed and recovery must keep the
     // subsequent valid Struct/Enum items in the tree.
-    let tree = parse_contract("contract Api;\npub fn run() -> i32 { return 0; }\nstruct A { x: i32, }\nenum B { X, }")
-        .expect("small source");
+    let tree = parse_contract(
+        "contract Api;\npub fn run() -> i32 { return 0; }\nstruct A { x: i32, }\nenum B { X, }",
+    )
+    .expect("small source");
     assert!(
         tree.errors
             .iter()

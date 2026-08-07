@@ -1,11 +1,11 @@
 @state(version = 2)
 class EnemyBrain {
-    mut phase: i32,
-    mut aggression: i32,
+    phase: i32,
+    aggression: i32,
 }
 @state(version = 1)
 class StableBrain {
-    mut phase: i32,
+    phase: i32,
 }
 @migration
 pub fn migrate(value: i32) -> i32 {

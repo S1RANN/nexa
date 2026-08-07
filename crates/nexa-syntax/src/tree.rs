@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use crate::{
-    Keyword, Lexed, SourceText, SourceTooLarge, TextRange, TextSize, Token, TokenKind, lex_nexa,
-    lex_contract,
+    Keyword, Lexed, SourceText, SourceTooLarge, TextRange, TextSize, Token, TokenKind,
+    lex_contract, lex_nexa,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -268,7 +268,12 @@ impl Parser<'_> {
                 TokenKind::Keyword(Keyword::Struct) => NodeKind::StructDeclaration,
                 TokenKind::Keyword(Keyword::Enum) => NodeKind::EnumDeclaration,
                 TokenKind::Keyword(Keyword::Class) => NodeKind::ClassDeclaration,
-                TokenKind::Keyword(Keyword::Const) => NodeKind::ConstDeclaration,
+                TokenKind::Keyword(Keyword::Const)
+                    if self.kind_at(cursor + 1) == Some(TokenKind::Identifier)
+                        && self.kind_at(cursor + 2) == Some(TokenKind::Colon) =>
+                {
+                    NodeKind::ConstDeclaration
+                }
                 TokenKind::Keyword(Keyword::Contract) => NodeKind::ContractDeclaration,
                 _ if declaration_keyword.is_some() => declaration_keyword.expect("checked"),
                 _ => NodeKind::TopLevelStatement,
@@ -361,27 +366,30 @@ impl Parser<'_> {
             prefix_end = self.skip_attribute(prefix_end);
         }
 
-        let header_cursor = if self.kind_at(prefix_end) == Some(TokenKind::Keyword(Keyword::Contract))
-        {
-            Some(prefix_end)
-        } else if let Some(position) = self.significant.iter().position(|&index| {
-            self.tokens[index].kind == TokenKind::Keyword(Keyword::Contract)
-        }) {
-            // A `contract` keyword exists but is not the first declaration in the file.
-            self.errors.push(SyntaxError {
-                kind: SyntaxErrorKind::ContractHeaderNotFirst,
-                range: self.tokens[self.significant[position]].range,
-                message: "`contract` header must be the first declaration in a Contract file".into(),
-            });
-            Some(position)
-        } else {
-            self.errors.push(SyntaxError {
-                kind: SyntaxErrorKind::MissingContract,
-                range: TextRange::new(TextSize::ZERO, TextSize::ZERO),
-                message: "expected a `contract` header declaration".into(),
-            });
-            None
-        };
+        let header_cursor =
+            if self.kind_at(prefix_end) == Some(TokenKind::Keyword(Keyword::Contract)) {
+                Some(prefix_end)
+            } else if let Some(position) = self
+                .significant
+                .iter()
+                .position(|&index| self.tokens[index].kind == TokenKind::Keyword(Keyword::Contract))
+            {
+                // A `contract` keyword exists but is not the first declaration in the file.
+                self.errors.push(SyntaxError {
+                    kind: SyntaxErrorKind::ContractHeaderNotFirst,
+                    range: self.tokens[self.significant[position]].range,
+                    message: "`contract` header must be the first declaration in a Contract file"
+                        .into(),
+                });
+                Some(position)
+            } else {
+                self.errors.push(SyntaxError {
+                    kind: SyntaxErrorKind::MissingContract,
+                    range: TextRange::new(TextSize::ZERO, TextSize::ZERO),
+                    message: "expected a `contract` header declaration".into(),
+                });
+                None
+            };
 
         let Some(mut cursor) = header_cursor else {
             return self.root(Vec::new());
@@ -399,8 +407,9 @@ impl Parser<'_> {
             if self.kind_at(after_name).is_some() {
                 self.errors.push(SyntaxError {
                     kind: SyntaxErrorKind::ContractHeaderSemicolon,
-                    range: self.tokens[self.significant[name_cursor.min(self.significant.len() - 1)]]
-                        .range,
+                    range: self.tokens
+                        [self.significant[name_cursor.min(self.significant.len() - 1)]]
+                    .range,
                     message: "expected `;` after contract header".into(),
                 });
             }

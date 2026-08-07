@@ -1023,7 +1023,12 @@ impl MatchScopes {
     fn new(function: &TypedFunctionIr) -> Self {
         Self {
             scopes: Vec::new(),
-            immutable: function.parameters.iter().copied().collect(),
+            immutable: function
+                .parameters
+                .iter()
+                .filter(|parameter| !function.mutable_parameters.contains(parameter))
+                .copied()
+                .collect(),
         }
     }
 
@@ -1616,7 +1621,12 @@ impl PropagationScopes {
     fn new(function: &TypedFunctionIr) -> Self {
         Self {
             scopes: vec![BTreeMap::new()],
-            immutable: function.parameters.iter().copied().collect(),
+            immutable: function
+                .parameters
+                .iter()
+                .filter(|parameter| !function.mutable_parameters.contains(parameter))
+                .copied()
+                .collect(),
         }
     }
 
@@ -2655,6 +2665,7 @@ mod tests {
     fn function_returning(expression: TypedExpressionIr) -> TypedFunctionIr {
         TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: Vec::new(),
             return_type: expression.ty.clone(),
             effect: IrEffect::Ordinary,
@@ -2750,6 +2761,7 @@ mod tests {
         // let a = 2; let b = a; let dead = 9; if true { return b + 3; }
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: vec![DefinitionId(1), DefinitionId(2), DefinitionId(3)],
             return_type: IrType::I32,
             effect: IrEffect::Ordinary,
@@ -2817,6 +2829,7 @@ mod tests {
         // return 0; let after = 1; -> unreachable tail removed
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: vec![DefinitionId(7), DefinitionId(8)],
             return_type: IrType::I32,
             effect: IrEffect::Ordinary,
@@ -2867,6 +2880,7 @@ mod tests {
         // let mut m = 1; m = 2; return m;
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: vec![DefinitionId(4)],
             return_type: IrType::I32,
             effect: IrEffect::Ordinary,
@@ -2942,6 +2956,7 @@ mod tests {
         // let s = "x"; return s + "y"; -> return "xy";
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: vec![DefinitionId(6)],
             return_type: IrType::String,
             effect: IrEffect::Ordinary,
@@ -3008,6 +3023,7 @@ mod tests {
         );
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: vec![DefinitionId(1)],
             return_type: IrType::Unit,
             effect: IrEffect::Ordinary,
@@ -3063,6 +3079,7 @@ mod tests {
     fn pass_invariant_rejects_invalid_input_before_rewrite() {
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
+            mutable_parameters: Vec::new(),
             locals: Vec::new(),
             return_type: IrType::Unit,
             effect: IrEffect::Ordinary,
@@ -3200,6 +3217,7 @@ mod tests {
         );
         let helper_function = TypedFunctionIr {
             parameters: vec![lhs, rhs],
+            mutable_parameters: Vec::new(),
             locals: Vec::new(),
             return_type: IrType::I32,
             effect: IrEffect::Ordinary,
@@ -3260,6 +3278,7 @@ mod tests {
         };
         let function = TypedFunctionIr {
             parameters: vec![array, state],
+            mutable_parameters: Vec::new(),
             locals: Vec::new(),
             return_type: IrType::Unit,
             effect: IrEffect::Task,
@@ -3336,6 +3355,7 @@ mod tests {
         let result = DefinitionId(62);
         let mut function = TypedFunctionIr {
             parameters: vec![left, right],
+            mutable_parameters: Vec::new(),
             locals: vec![result],
             return_type: IrType::Unit,
             effect: IrEffect::Ordinary,

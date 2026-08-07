@@ -9,8 +9,7 @@ use serde_json::Value;
 
 pub const BASE_CONTRACT: &str = include_str!("fixtures/business_host/game.contract.nexa");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
-const BASE_NEXA_MODULE: &str = "use host::game as engine;\n\
-pub fn update(entity: i32) -> i32 { return engine::heartbeat(entity); }\n\
+const BASE_NEXA_MODULE: &str = "pub fn update(entity: i32) -> i32 { return host::heartbeat(entity); }\n\
 fn reset() -> i32 { return 0; }\n";
 const GENERATED_REGISTRY_RUNTIME_TEST: &str = r#"
 use super::*;
@@ -961,7 +960,11 @@ fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
     let mutations = mutations();
     assert_eq!(mutations.len(), 20);
     for mutation in mutations {
-        assert_ne!(mutation.mutated_contract, BASE_CONTRACT, "{}", mutation.name);
+        assert_ne!(
+            mutation.mutated_contract, BASE_CONTRACT,
+            "{}",
+            mutation.name
+        );
         nexa_contract::parse_contract(&mutation.mutated_contract)
             .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
     }
@@ -992,7 +995,10 @@ fn changed(
     expected_diagnostic_symbols: &'static [&'static str],
     patch_business_host: fn(&str) -> String,
 ) -> MutationCase {
-    assert!(BASE_CONTRACT.contains(from), "missing mutation token {from}");
+    assert!(
+        BASE_CONTRACT.contains(from),
+        "missing mutation token {from}"
+    );
     MutationCase {
         id,
         name,
@@ -1189,8 +1195,11 @@ pub fn prepare_case(
     }
     fs::write(case.join("base/contract.contract.nexa"), BASE_CONTRACT).expect("write base NIDL");
     fs::write(case.join("base/bindings.rs"), base_generated).expect("write base binding");
-    fs::write(case.join("mutated/contract.contract.nexa"), &mutation.mutated_contract)
-        .expect("write changed NIDL");
+    fs::write(
+        case.join("mutated/contract.contract.nexa"),
+        &mutation.mutated_contract,
+    )
+    .expect("write changed NIDL");
     for (index, generated) in [changed_generated, changed_generated, changed_generated]
         .iter()
         .enumerate()
@@ -1203,10 +1212,16 @@ pub fn prepare_case(
     }
     let changed_module = positive_module_source(mutation);
     fs::write(case.join("script/module.nexa"), &changed_module).expect("write positive script");
-    fs::write(case.join("host/src/base_contract.contract.nexa"), BASE_CONTRACT)
-        .expect("write base contract fixture");
-    fs::write(case.join("host/src/contract.contract.nexa"), &mutation.mutated_contract)
-        .expect("write changed contract fixture");
+    fs::write(
+        case.join("host/src/base_contract.contract.nexa"),
+        BASE_CONTRACT,
+    )
+    .expect("write base contract fixture");
+    fs::write(
+        case.join("host/src/contract.contract.nexa"),
+        &mutation.mutated_contract,
+    )
+    .expect("write changed contract fixture");
     fs::write(case.join("host/src/base_module.nexa"), BASE_NEXA_MODULE)
         .expect("write base script fixture");
     fs::write(case.join("host/src/module.nexa"), changed_module)
@@ -1272,7 +1287,6 @@ pub fn prepare_case(
 
 fn positive_module_source(mutation: &MutationCase) -> String {
     match mutation.id {
-        "12" => BASE_NEXA_MODULE.replacen("use host::game", "use host::combat", 1),
         "20" => BASE_NEXA_MODULE.replacen(
             "fn reset() -> i32 { return 0; }",
             "pub fn reset() -> i32 { return 0; }",

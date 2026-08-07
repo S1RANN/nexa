@@ -545,7 +545,7 @@ fn called_value_package(outcome: &AnalysisOutcome) -> String {
 fn mixed_import_fixture(
     compilation_options: CompilationOptions,
 ) -> (ResolvedBuildInput, AnalysisEnvironment, &'static str) {
-    const MAIN: &str = "use package::app::util as local;\nuse shared_api::math as dependency;\nuse std::core as standard;\nuse fixture::static as static_api;\nuse host::fixture_host as host_api;\npub fn run() -> i32 { return 0; }\n";
+    const MAIN: &str = "use package::app::util as local;\nuse shared_api::math as dependency;\nuse std::core as standard;\nuse fixture::static as static_api;\npub fn run() -> i32 { return host::clock(); }\n";
     const UTIL: &str = "pub(package) fn value() -> i32 { return 1; }\n";
     const LIBRARY: &str = "pub fn twice(value: i32) -> i32 { return value + value; }\n";
     let dependency = dependency_fixture(&[("src/math.nexa", LIBRARY, SourceRole::Production)]);
@@ -585,7 +585,7 @@ fn main_import_edges(outcome: &AnalysisOutcome) -> Vec<(&str, &ResolvedImportTar
 #[test]
 fn imports_per_module_counts_every_resolved_namespace_kind() {
     let mut compilation_options = CompilationOptions::default();
-    compilation_options.limits.imports_per_module = 4;
+    compilation_options.limits.imports_per_module = 3;
     compilation_options.limits.module_edges = usize::MAX;
     let (input, environment, main) = mixed_import_fixture(compilation_options);
     let outcome = analyze_deterministically(&input, &environment);
@@ -593,18 +593,18 @@ fn imports_per_module_counts_every_resolved_namespace_kind() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(main, "use host::fixture_host as host_api;"),
+        range(main, "use fixture::static as static_api;"),
     );
 
     let edges = main_import_edges(&outcome);
     assert_eq!(
         edges.len(),
-        5,
+        4,
         "limit diagnostics must not erase exact edges"
     );
     assert_eq!(
         edges.iter().map(|(alias, _)| *alias).collect::<Vec<_>>(),
-        ["dependency", "host_api", "local", "standard", "static_api"]
+        ["dependency", "local", "standard", "static_api"]
     );
     assert!(edges.iter().any(|(alias, target)| {
         *alias == "dependency"
@@ -640,25 +640,22 @@ fn imports_per_module_counts_every_resolved_namespace_kind() {
                 ResolvedImportTarget::Static(module) if module.as_str() == "fixture.static"
             )
     }));
-    assert!(edges.iter().any(
-        |(alias, target)| *alias == "host_api" && matches!(target, ResolvedImportTarget::Host)
-    ));
 }
 
 #[test]
 fn module_edge_limit_counts_non_source_imports_across_the_closure() {
     let mut compilation_options = CompilationOptions::default();
     compilation_options.limits.imports_per_module = usize::MAX;
-    compilation_options.limits.module_edges = 4;
+    compilation_options.limits.module_edges = 3;
     let (input, environment, main) = mixed_import_fixture(compilation_options);
     let outcome = analyze_deterministically(&input, &environment);
     let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2702);
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(main, "use host::fixture_host as host_api;"),
+        range(main, "use fixture::static as static_api;"),
     );
-    assert_eq!(main_import_edges(&outcome).len(), 5);
+    assert_eq!(main_import_edges(&outcome).len(), 4);
 }
 
 #[test]
@@ -713,7 +710,7 @@ fn dynamic_while_limit_changes_both_build_identity_and_typed_ir() {
 
 #[test]
 fn assignable_places_and_index_key_types_match_typed_codegen() {
-    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { mut value: i32, }\npub fn run(buffer: Buffer<i32>) -> i32 {\n    let object: Boxed = new Boxed { value: 0 };\n    object.value = 1;\n    let record: Record = Record { value: 1 };\n    let changed: Record = Record { value: 2, ..record };\n    let array: Array<i32> = [0];\n    array[0] = changed.value;\n    let table: Map<bool, i32> = Map::new();\n    table[true] = object.value;\n    buffer[0] = table[true];\n    return buffer[0];\n}\n";
+    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { value: i32, }\npub fn run(buffer: Buffer<i32>) -> i32 {\n    let object: Boxed = Boxed { value: 0 };\n    object.value = 1;\n    let record: Record = Record { value: 1 };\n    let changed: Record = Record { value: 2, ..record };\n    let array: Array<i32> = [0];\n    array[0] = changed.value;\n    let table: Map<bool, i32> = Map::new();\n    table[true] = object.value;\n    buffer[0] = table[true];\n    return buffer[0];\n}\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -732,7 +729,7 @@ fn assignable_places_and_index_key_types_match_typed_codegen() {
 
 #[test]
 fn analyzer_rejects_immutable_places_and_noncomparable_values() {
-    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { value: i32, }\npub fn run() -> bool {\n    let record: Record = Record { value: 1 };\n    record.value = 2;\n    let object: Boxed = new Boxed { value: 1 };\n    object.value = 2;\n    let text: string = \"abc\";\n    text[0] = 'x';\n    let values: Array<i32> = [1];\n    return values == values;\n}\n";
+    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { value: i32, }\npub fn run() -> bool {\n    const record: Record = Record { value: 1 };\n    record.value = 2;\n    let object: Boxed = Boxed { value: 1 };\n    object.value = 2;\n    let text: string = \"abc\";\n    text[0] = 'x';\n    let values: Array<i32> = [1];\n    return values == values;\n}\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -742,7 +739,7 @@ fn analyzer_rejects_immutable_places_and_noncomparable_values() {
     );
     let outcome = analyze_deterministically(&input, &AnalysisEnvironment::default());
     let diagnostics = outcome.diagnostics.diagnostics();
-    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
     assert_eq!(
         diagnostics
             .iter()
@@ -750,7 +747,6 @@ fn analyzer_rejects_immutable_places_and_noncomparable_values() {
             .collect::<Vec<_>>(),
         [
             (ErrorCode::NX2501, "binding `record` is immutable",),
-            (ErrorCode::NX2501, "class field `value` is immutable",),
             (
                 ErrorCode::NX2101,
                 "assignment index requires Array, Map, or Buffer",
@@ -821,9 +817,11 @@ fn rust_macro_shapes_suppress_downstream_unknown_function() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(diagnostics[0].code, ErrorCode::NX1002);
     assert!(diagnostics[0].message.contains("Rust macro"));
-    assert!(!diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == ErrorCode::NX2001));
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == ErrorCode::NX2001)
+    );
 }
 
 #[test]
@@ -839,7 +837,10 @@ fn return_statements_strictly_distinguish_unit_from_recovery_types() {
 
     let missing_value = analyze_main_source(MISSING_VALUE);
     let diagnostic = one_diagnostic(&missing_value, ErrorCode::NX2101);
-    assert_eq!(diagnostic.message.as_ref(), "expected i32, found unit");
+    assert_eq!(
+        diagnostic.message.as_ref(),
+        "return value of `bad`: expected i32, found unit"
+    );
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
@@ -849,7 +850,10 @@ fn return_statements_strictly_distinguish_unit_from_recovery_types() {
 
     let unexpected_value = analyze_main_source(UNEXPECTED_VALUE);
     let diagnostic = one_diagnostic(&unexpected_value, ErrorCode::NX2101);
-    assert_eq!(diagnostic.message.as_ref(), "expected unit, found i32");
+    assert_eq!(
+        diagnostic.message.as_ref(),
+        "return value of `bad`: expected unit, found i32"
+    );
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
@@ -872,7 +876,10 @@ fn return_statements_strictly_distinguish_unit_from_recovery_types() {
     messages.sort_unstable();
     assert_eq!(
         messages,
-        ["expected i32, found bool", "expected i32, found unit"]
+        [
+            "argument 1 to `sink`: expected i32, found bool",
+            "return value of `bad`: expected i32, found unit",
+        ]
     );
 }
 
@@ -980,7 +987,10 @@ fn constructor_and_try_diagnostics_are_structured_and_source_exact() {
             .iter()
             .map(AsRef::as_ref)
             .collect::<Vec<_>>(),
-        ["function error type: `bool`", "expression error type: `i32`"]
+        [
+            "function error type: `bool`",
+            "expression error type: `i32`"
+        ]
     );
 }
 
@@ -1229,8 +1239,8 @@ fn static_range_binding_is_read_only() {
 
 #[test]
 fn migration_intrinsics_require_exact_state_class_owners_and_targets() {
-    const WRONG_OLD_OWNER: &str = "@state(version = 1) class Left { mut value: i32, }\n@state(version = 1) class Right { mut value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = old.get<Left>(legacy);\n    old.field<i32>(object, Right::value);\n    preserve(legacy);\n    finish_migration();\n    return true;\n}\n";
-    const WRONG_NEW_OWNER: &str = "@state(version = 1) class Left { mut value: i32, }\n@state(version = 1) class Right { mut value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = new.create<Left>(replacement);\n    new.set(object, Right::value, 1);\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
+    const WRONG_OLD_OWNER: &str = "@state(version = 1) class Left { value: i32, }\n@state(version = 1) class Right { value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = old.get<Left>(legacy);\n    old.field<i32>(object, Right::value);\n    preserve(legacy);\n    finish_migration();\n    return true;\n}\n";
+    const WRONG_NEW_OWNER: &str = "@state(version = 1) class Left { value: i32, }\n@state(version = 1) class Right { value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = new.create<Left>(replacement);\n    new.set(object, Right::value, 1);\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
     const WRONG_REPLACE_TARGET: &str = "struct Plain { value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Plain = Plain { value: 1 };\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
 
     for source in [WRONG_OLD_OWNER, WRONG_NEW_OWNER, WRONG_REPLACE_TARGET] {
@@ -1245,30 +1255,26 @@ fn migration_intrinsics_require_exact_state_class_owners_and_targets() {
 }
 
 #[test]
-fn direct_state_class_construction_is_rejected_for_literal_and_new_syntax() {
-    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
+fn direct_state_class_construction_is_rejected() {
+    const SOURCE: &str = r"@state(version = 1) class State { value: i32, }
 fn construct_literal() -> State { return State { value: 1 }; }
-fn construct_new() -> State { return new State { value: 2 }; }
 ";
     let outcome = analyze_main_source(SOURCE);
     let diagnostics = diagnostics_with_code(&outcome, ErrorCode::NX2101);
-    assert_eq!(diagnostics.len(), 2, "{:#?}", outcome.diagnostics);
+    assert_eq!(diagnostics.len(), 1, "{:#?}", outcome.diagnostics);
     assert_eq!(
         diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_ref())
             .collect::<Vec<_>>(),
-        [
-            "Class construction requires `new`; a Struct constructor cannot name this type",
-            "@state Class values cannot be constructed directly",
-        ]
+        ["@state Class values cannot be constructed directly"]
     );
     assert!(outcome.ir.is_none());
 }
 
 #[test]
 fn direct_state_class_field_read_is_rejected() {
-    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
+    const SOURCE: &str = r"@state(version = 1) class State { value: i32, }
 fn read(state: State) -> i32 { return state.value; }
 ";
     let outcome = analyze_main_source(SOURCE);
@@ -1287,7 +1293,7 @@ fn read(state: State) -> i32 { return state.value; }
 
 #[test]
 fn direct_state_class_field_assignment_is_rejected() {
-    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
+    const SOURCE: &str = r"@state(version = 1) class State { value: i32, }
 fn write(state: State) -> i32 {
     state.value = 1;
     return 0;
@@ -1309,7 +1315,7 @@ fn write(state: State) -> i32 {
 
 #[test]
 fn migration_intrinsics_and_state_handle_resolution_remain_the_state_value_paths() {
-    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
+    const SOURCE: &str = r"@state(version = 1) class State { value: i32, }
 fn resolve(handle: StateHandle<State>) -> Result<State, StateHandleError> {
     return handle.resolve();
 }
@@ -1912,7 +1918,7 @@ fn const_expression_cannot_call_a_function() {
 
 #[test]
 fn tests_reject_bad_signatures_and_indirect_host_calls() {
-    const MAIN: &str = "use host::fixture_host as host;\npub(package) fn host_value() -> i32 { return host::clock(); }\n";
+    const MAIN: &str = "pub(package) fn host_value() -> i32 { return host::clock(); }\n";
     const TESTS: &str = "use package::app::main as app;\n@test fn bad_signature(value: i32) -> i32 { return value; }\n@test fn indirect_host() -> bool { return app::host_value() == 0; }\n";
     let product = Arc::new(resolved_input(
         root_fixture(
@@ -1950,8 +1956,8 @@ fn tests_reject_bad_signatures_and_indirect_host_calls() {
 
 #[test]
 fn test_analysis_preserves_production_abi_state_and_product_query_authority() {
-    const MAIN: &str = "@state(version = 1) pub class ProductState { mut value: i32, }\npub fn value() -> i32 { return 7; }\n";
-    const TESTS: &str = "@state(version = 99) pub class TestOnlyState { mut ignored: string, }\npub fn test_only_api() -> i32 { return 99; }\n@test fn succeeds() -> bool { return true; }\n";
+    const MAIN: &str = "@state(version = 1) pub class ProductState { value: i32, }\npub fn value() -> i32 { return 7; }\n";
+    const TESTS: &str = "@state(version = 99) pub class TestOnlyState { ignored: string, }\npub fn test_only_api() -> i32 { return 99; }\n@test fn succeeds() -> bool { return true; }\n";
     let product = Arc::new(resolved_input(
         root_fixture(
             &[("src/app/main.nexa", MAIN, SourceRole::Production)],
@@ -2130,8 +2136,7 @@ fn external_nominal_type_can_resolve_to_the_dependency_definition() {
 
 #[test]
 fn host_call_requires_every_declared_function_capability() {
-    const SOURCE: &str =
-        "use host::fixture_host as host;\npub fn run() -> i32 { return host::clock(); }\n";
+    const SOURCE: &str = "pub fn run() -> i32 { return host::clock(); }\n";
     let environment = {
         let mut environment = host_environment();
         environment.host.as_mut().unwrap().functions[0].required_capabilities =
@@ -2246,7 +2251,7 @@ fn async_host_result_preserves_both_nominal_arms() {
 
 #[test]
 fn persistent_database_invalidates_typed_module_when_host_signature_changes() {
-    const SOURCE: &str = "use host::fixture_host as api;\nfn run() -> i32 { let ignored = api::clock(); return 0; }\n";
+    const SOURCE: &str = "fn run() -> i32 { let ignored = host::clock(); return 0; }\n";
     let first_input = resolved_input_with_contract(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -2301,7 +2306,7 @@ fn persistent_database_invalidates_typed_module_when_host_signature_changes() {
 
 #[test]
 fn failed_host_mode_revision_cannot_pollute_next_successful_revision() {
-    const SOURCE: &str = "use host::fixture_host as api;\nasync fn run() -> Result<i32, bool> { return api::clock().await; }\n";
+    const SOURCE: &str = "async fn run() -> Result<i32, bool> { return host::clock().await; }\n";
     let sync_input = resolved_input_with_contract(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],

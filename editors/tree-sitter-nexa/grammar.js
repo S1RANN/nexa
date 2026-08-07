@@ -149,7 +149,9 @@ module.exports = grammar({
       ),
 
     const_declaration: ($) =>
-      seq(
+      prec(
+        1,
+        seq(
         repeat($.attribute),
         optional(field("visibility", $.visibility)),
         field("keyword", $.const_keyword),
@@ -159,6 +161,7 @@ module.exports = grammar({
         "=",
         field("value", $.expression),
         ";",
+        ),
       ),
 
     field_declaration_block: ($) =>
@@ -167,7 +170,6 @@ module.exports = grammar({
     field_declaration: ($) =>
       seq(
         repeat($.attribute),
-        optional(field("mutable", $.mut_keyword)),
         field("name", $.identifier),
         ":",
         field("type", $.type),
@@ -208,7 +210,11 @@ module.exports = grammar({
       seq("(", optional(commaSep1($.parameter)), optional(","), ")"),
 
     parameter: ($) =>
-      seq(field("name", $.identifier), ":", field("type", $.type)),
+      seq(
+        field("name", $.identifier),
+        ":",
+        field("type", $.type),
+      ),
 
     block: ($) => seq("{", repeat($.statement), "}"),
 
@@ -232,8 +238,7 @@ module.exports = grammar({
 
     binding_statement: ($) =>
       seq(
-        field("keyword", $.let_keyword),
-        optional(field("mutable", $.mut_keyword)),
+        field("keyword", choice($.let_keyword, $.const_keyword)),
         field("name", $.identifier),
         optional(seq(":", field("type", $.type))),
         "=",
@@ -257,14 +262,32 @@ module.exports = grammar({
       ),
 
     for_statement: ($) =>
+      choice(
+        seq(
+          $.for_keyword,
+          field("variable", $.identifier),
+          $.in_keyword,
+          field("start", $.expression),
+          "..",
+          field("end", $.expression),
+          field("body", $.block),
+        ),
+        seq(
+          $.for_keyword,
+          field("variable", choice($.identifier, $.pair_binding)),
+          $.in_keyword,
+          field("iterable", $.expression),
+          field("body", $.block),
+        ),
+      ),
+
+    pair_binding: ($) =>
       seq(
-        $.for_keyword,
-        field("variable", $.identifier),
-        $.in_keyword,
-        field("start", $.expression),
-        "..",
-        field("end", $.expression),
-        field("body", $.block),
+        "(",
+        field("key", $.identifier),
+        ",",
+        field("value", $.identifier),
+        ")"
       ),
 
     while_statement: ($) =>
@@ -399,8 +422,7 @@ module.exports = grammar({
 
     primary_expression: ($) =>
       choice(
-        $.new_expression,
-        $.struct_literal,
+        $.aggregate_literal,
         $.array_literal,
         $.tuple_expression,
         $.parenthesized_expression,
@@ -415,17 +437,7 @@ module.exports = grammar({
     array_literal: ($) =>
       seq("[", optional(commaSep1($.expression)), optional(","), "]"),
 
-    new_expression: ($) =>
-      prec(
-        PREC.POSTFIX,
-        seq(
-          $.new_keyword,
-          field("type", $.type_path),
-          field("fields", $.field_initializer_block),
-        ),
-      ),
-
-    struct_literal: ($) =>
+    aggregate_literal: ($) =>
       prec(
         PREC.POSTFIX,
         seq(
@@ -537,7 +549,6 @@ module.exports = grammar({
     async_keyword: (_) => keywords.async,
     return_keyword: (_) => keywords.return,
     let_keyword: (_) => keywords.let,
-    mut_keyword: (_) => keywords.mut,
     if_keyword: (_) => keywords.if,
     else_keyword: (_) => keywords.else,
     while_keyword: (_) => keywords.while,

@@ -78,7 +78,7 @@ M4 keeps Runtime isolation simple while scaling the language frontend. A
 schema 2 Application and its lockfile-pinned local Library closure compile to
 one deterministic Package Artifact, one Realm, and one Epoch. M4R1 freezes the
 breaking Language v2 surface: modules are derived from source paths, `use`
-binds namespaces, Host access is explicit (`use host::app;`), and
+binds package namespaces, Host access is explicit (`host::member`), and
 module-private, `pub(package)`, and `pub` visibility remain distinct. There is
 no source-level compatibility mode for the M4 syntax.
 

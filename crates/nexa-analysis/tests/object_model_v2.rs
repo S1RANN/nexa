@@ -119,14 +119,19 @@ fn assert_analysis_rejected(outcome: &AnalysisOutcome) {
 }
 
 #[test]
-fn struct_place_mutability_is_enforced() {
-    const VALID: &str = r"
+fn const_struct_place_immutability_and_default_mutable_fields_are_enforced() {
+    const VALID: &str = r#"
 struct Cell {
     value: i32,
 }
 
 class Counter {
-    mut value: i32,
+    value: i32,
+}
+
+struct References {
+    counter: Counter,
+    values: Array<i32>,
 }
 
 enum Choice {
@@ -134,18 +139,27 @@ enum Choice {
     Stored(Cell),
 }
 
-pub fn run() -> i32 {
-    let mut cell = Cell { value: 1 };
+pub fn run(buffer: Buffer<i32>) -> i32 {
+    let cell = Cell { value: 1 };
     cell.value = 2;
-    let counter = new Counter { value: cell.value };
+    const counter = Counter { value: cell.value };
     counter.value = 3;
+    const values: Array<i32> = Array::new();
+    values[0] = counter.value;
+    const table: Map<string, i32> = Map::new();
+    table["counter"] = values[0];
+    const frozen_buffer = buffer;
+    frozen_buffer[0] = table["counter"];
+    const references = References { counter: counter, values: values };
+    references.counter.value = frozen_buffer[0];
+    references.values[0] = references.counter.value;
     let choice = Choice::Stored(cell);
     return match choice {
         Choice::Empty => 0,
-        Choice::Stored(value) => value.value + counter.value,
+        Choice::Stored(value) => value.value + references.counter.value,
     };
 }
-";
+"#;
     const INVALID: &str = r"
 struct Cell {
     value: i32,
@@ -156,9 +170,9 @@ class Counter {
 }
 
 pub fn run() -> i32 {
-    let cell = Cell { value: 1 };
+    const cell = Cell { value: 1 };
     cell.value = 2;
-    let counter = new Counter { value: 1 };
+    let counter = Counter { value: 1 };
     counter.value = 2;
     return 0;
 }
@@ -178,12 +192,6 @@ pub fn run() -> i32 {
         messages
             .iter()
             .any(|message| message.contains("binding `cell` is immutable")),
-        "{messages:#?}"
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.contains("class field `value` is immutable")),
         "{messages:#?}"
     );
 }
@@ -229,7 +237,7 @@ pub fn run() -> i32 {
 
     let reference_breaks = r"
 class Node {
-    mut next: Option<Node>,
+    next: Option<Node>,
 }
 
 struct Batch {

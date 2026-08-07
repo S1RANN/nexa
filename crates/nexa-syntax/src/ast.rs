@@ -165,6 +165,7 @@ pub struct FunctionDeclaration {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parameter {
+    pub mutable: bool,
     pub name: Identifier,
     pub ty: TypeRef,
     pub range: TextRange,
@@ -379,11 +380,6 @@ pub enum ExpressionKind {
     },
     Construct {
         ty: QualifiedName,
-        fields: Vec<FieldInitializer>,
-        update: Option<Box<Expression>>,
-    },
-    New {
-        ty: TypeRef,
         fields: Vec<FieldInitializer>,
         update: Option<Box<Expression>>,
     },
@@ -677,6 +673,12 @@ impl<'a> Parser<'a> {
             },
             name: root_name,
         };
+        if root.kind == UsePathRootKind::Host {
+            self.error(
+                root.name.range,
+                "`use host::...` was removed in Nexa v3; reference Host members directly as `host::member`",
+            );
+        }
         let mut segments = Vec::new();
         while self.take(TokenKind::ColonColon).is_some() {
             segments.push(self.member_identifier());
@@ -713,10 +715,11 @@ impl<'a> Parser<'a> {
                             | Keyword::Struct
                             | Keyword::Enum
                             | Keyword::Class
-                            | Keyword::Const
                     )
             )
-        )
+        ) || (self.at_keyword(Keyword::Const)
+            && self.kind_at(self.cursor + 1) == Some(TokenKind::Identifier)
+            && self.kind_at(self.cursor + 2) == Some(TokenKind::Colon))
     }
 
     fn parse_declaration(&mut self) -> Declaration {
@@ -914,6 +917,12 @@ impl<'a> Parser<'a> {
             }
             while !self.at_end() && !self.at(TokenKind::RParen) && !self.at(TokenKind::LBrace) {
                 let parameter_start = self.current_range();
+                if let Some(range) = self.take_keyword(Keyword::Mut) {
+                    self.error(
+                        range,
+                        "`mut` was removed in Language v3; parameters are mutable by default",
+                    );
+                }
                 let parameter_name = self.identifier();
                 self.require_snake_case(&parameter_name, "parameter");
                 if self.take(TokenKind::Colon).is_none() {
@@ -938,6 +947,7 @@ impl<'a> Parser<'a> {
                 }
                 let ty = self.ty();
                 parameters.push(Parameter {
+                    mutable: true,
                     name: parameter_name,
                     range: cover(parameter_start, ty.range),
                     ty,
@@ -993,14 +1003,13 @@ impl<'a> Parser<'a> {
                 .first()
                 .map_or_else(|| self.current_range(), |doc| doc.range);
             let attributes = self.attributes();
-            let mutable_range = self.take_keyword(Keyword::Mut);
-            let mutable = mutable_range.is_some();
-            if mutable && kind != TypeDeclarationKind::Class {
+            if let Some(range) = self.take_keyword(Keyword::Mut) {
                 self.error(
-                    mutable_range.expect("mutable range exists"),
-                    "`mut` is only allowed on class fields",
+                    range,
+                    "`mut` was removed in Language v3; fields are mutable by default",
                 );
             }
+            let mutable = true;
             let member_name = self.identifier();
             if kind == TypeDeclarationKind::Enum {
                 self.require_pascal_case(&member_name, "enum variant");
@@ -1074,7 +1083,10 @@ impl<'a> Parser<'a> {
                 .map_or_else(|| self.current_range(), |doc| doc.range);
             let attributes = self.attributes();
             if let Some(range) = self.take_keyword(Keyword::Mut) {
-                self.error(range, "`mut` is not allowed on enum payload fields");
+                self.error(
+                    range,
+                    "`mut` was removed in Language v3; fields are mutable by default",
+                );
             }
             let name = self.identifier();
             self.require_snake_case(&name, "enum payload field");
@@ -1215,7 +1227,7 @@ impl<'a> Parser<'a> {
             && self.kind_at(self.cursor + 1) == Some(TokenKind::Identifier)
         {
             let range = self.bump_range();
-            self.error(range, "legacy `var` binding was removed; write `let mut`");
+            self.error(range, "legacy `var` binding was removed; write `let`");
             self.synchronize_statement();
             return ParsedStatement::Statement(Statement {
                 kind: StatementKind::Error,
@@ -1234,8 +1246,20 @@ impl<'a> Parser<'a> {
                 range: cover(start, end),
             });
         }
-        if self.take_keyword(Keyword::Let).is_some() {
-            let mutable = self.take_keyword(Keyword::Mut).is_some();
+        let binding_mutability = if self.take_keyword(Keyword::Let).is_some() {
+            Some(true)
+        } else if self.take_keyword(Keyword::Const).is_some() {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(mutable) = binding_mutability {
+            if let Some(range) = self.take_keyword(Keyword::Mut) {
+                self.error(
+                    range,
+                    "`mut` was removed in Language v3; use `let` for a mutable binding or `const` for an immutable binding",
+                );
+            }
             let name = self.identifier();
             self.require_snake_case(&name, "local variable");
             let ty = self.take(TokenKind::Colon).map(|_| self.ty());
@@ -1556,7 +1580,7 @@ impl<'a> Parser<'a> {
             {
                 self.keyword_qualified_expression()
             }
-            Some(TokenKind::Keyword(Keyword::New)) => self.new_expression(),
+            Some(TokenKind::Keyword(Keyword::New)) => self.removed_new_expression(),
             Some(TokenKind::Keyword(Keyword::Package)) => self.keyword_qualified_expression(),
             Some(TokenKind::Integer) => self.literal_expression(LiteralKind::Integer),
             Some(TokenKind::Float) => self.literal_expression(LiteralKind::Float),
@@ -1802,17 +1826,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn new_expression(&mut self) -> Expression {
+    fn removed_new_expression(&mut self) -> Expression {
         let start = self.bump_range();
-        let ty = self.ty();
-        let (fields, update) = if self.at(TokenKind::LBrace) {
+        self.error(
+            start,
+            "`new` constructor syntax was removed in Language v3; write `Type { ... }`",
+        );
+        self.ty();
+        if self.at(TokenKind::LBrace) {
             self.field_initializers()
         } else {
             (Vec::new(), None)
         };
         Expression {
             range: cover(start, self.previous_range()),
-            kind: ExpressionKind::New { ty, fields, update },
+            kind: ExpressionKind::Error,
         }
     }
 
@@ -2101,7 +2129,7 @@ impl<'a> Parser<'a> {
         };
         if !matches!(
             token.kind,
-            TokenKind::Identifier | TokenKind::Keyword(Keyword::Package)
+            TokenKind::Identifier | TokenKind::Keyword(Keyword::Package | Keyword::Host)
         ) {
             self.error(token.range, "expected ASCII path segment");
             return Identifier {

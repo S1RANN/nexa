@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
-use nexa_core::FileId;
 use nexa_contract::{
-    ABI_DESCRIPTOR_VERSION, CONTRACT_SYNTAX_VERSION, ContractErrorKind, ResolvedTypeKind, abi_descriptor,
-    contract_fingerprint, parse_contract, parse_contract_ast_with_file_id,
+    ABI_DESCRIPTOR_VERSION, CONTRACT_SYNTAX_VERSION, ContractErrorKind, ResolvedTypeKind,
+    abi_descriptor, contract_fingerprint, parse_contract, parse_contract_ast_with_file_id,
 };
+use nexa_core::FileId;
 
 const COMPLETE_CONTRACT: &str = r#"
 /// Profile contract documentation.
@@ -335,7 +335,8 @@ fn descriptor_obeys_frozen_order_and_comment_rules() {
 
 #[test]
 fn async_entrypoint_effect_changes_the_descriptor() {
-    let synchronous = parse_contract("contract Effect; nexa { fn run(value: i32) -> i32; }").unwrap();
+    let synchronous =
+        parse_contract("contract Effect; nexa { fn run(value: i32) -> i32; }").unwrap();
     let asynchronous =
         parse_contract("contract Effect; nexa { async fn run(value: i32) -> i32; }").unwrap();
     assert_ne!(

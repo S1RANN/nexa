@@ -204,10 +204,8 @@ fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
     )
     .expect("parse Host handle contract");
     let source = r"
-        use host::root_map_host as api;
-
-        pub async fn hold_ticket() -> api::Ticket {
-            let ticket: api::Ticket = api::issue();
+        pub async fn hold_ticket() -> host::Ticket {
+            let ticket: host::Ticket = host::issue();
             yield;
             return ticket;
         }
@@ -291,7 +289,7 @@ fn compiler_state_handle_remains_live_across_yield_and_realm_gc() {
     let source = r"
         @state(version = 1)
         pub class Model {
-            mut value: i32,
+            value: i32,
         }
 
         pub async fn hold_handle(handle: StateHandle<Model>) -> StateHandle<Model> {

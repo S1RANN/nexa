@@ -1806,12 +1806,8 @@ fn repl_statement_reads_pending_field(
         } => reads(condition) || repl_block_reads_pending_field(body, expected, initialized),
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
-        } => {
-            reads(start)
-                || reads(end)
-                || repl_block_reads_pending_field(body, expected, initialized)
         }
-        TypedStatementIr::DynamicRangeFor {
+        | TypedStatementIr::DynamicRangeFor {
             start, end, body, ..
         } => {
             reads(start)
@@ -2084,6 +2080,7 @@ fn append_repl_task_wrapper(
     Ok(wrapper)
 }
 
+#[allow(clippy::too_many_lines)]
 fn standalone_main_info(
     package: &TypedPackageIr,
     compiled: &PackageCompileOutput,
@@ -2150,11 +2147,20 @@ fn standalone_main_info(
                 debug.definition_span,
             )
         })?;
+    let source_is_canonical_task = source_effect == FunctionEffect::Task
+        && plan.1.parameters.len() == 1
+        && plan.1.return_type == IrType::I32;
     if export.signature != expected_signature
         || export.effect != FunctionEffect::Task
-        || (source_effect == FunctionEffect::Task && export.function != debug.function_index)
-        || (source_effect == FunctionEffect::Ordinary
-            && !is_standalone_sync_wrapper(&compiled.module, export.function, debug.function_index))
+        || (source_is_canonical_task && export.function != debug.function_index)
+        || (!source_is_canonical_task
+            && !is_standalone_main_adapter(
+                &compiled.module,
+                export.function,
+                debug.function_index,
+                plan.1.parameters.len(),
+                plan.1.return_type == IrType::Unit,
+            ))
     {
         return Err(CompileError::invalid_main_signature(
             "standalone main export marker disagrees with the validated ABI",
@@ -2184,23 +2190,30 @@ fn standalone_main_info(
     })
 }
 
-fn is_standalone_sync_wrapper(module: &nexa_bytecode::Module, wrapper: u32, main: u32) -> bool {
+fn is_standalone_main_adapter(
+    module: &nexa_bytecode::Module,
+    wrapper: u32,
+    main: u32,
+    parameter_count: usize,
+    returns_unit: bool,
+) -> bool {
     module
         .functions
         .get(usize::try_from(wrapper).unwrap_or(usize::MAX))
         .is_some_and(|function| {
+            let mut expected = vec![Instruction::Call {
+                function: main,
+                args_base: 0,
+                args_count: u16::try_from(parameter_count).unwrap_or(u16::MAX),
+                dst: 1,
+            }];
+            if returns_unit {
+                expected.push(Instruction::LoadI32 { dst: 1, value: 0 });
+            }
+            expected.push(Instruction::Return { source: 1 });
             function.signature == standalone_main_signature()
                 && function.effect == FunctionEffect::Task
-                && function.code
-                    == [
-                        Instruction::Call {
-                            function: main,
-                            args_base: 0,
-                            args_count: 1,
-                            dst: 1,
-                        },
-                        Instruction::Return { source: 1 },
-                    ]
+                && function.code == expected
         })
 }
 
@@ -2208,17 +2221,19 @@ fn invalid_standalone_main_signature(
     package: &TypedPackageIr,
     function: &TypedFunctionIr,
 ) -> Option<&'static str> {
-    if function.parameters.len() != 1 {
-        return Some("standalone main must accept exactly one Array<string> argument");
+    if function.parameters.len() > 1 {
+        return Some("standalone main accepts either no arguments or one Array<string> argument");
     }
-    let Some(parameter) = package.definition(function.parameters[0]) else {
-        return Some("standalone main parameter is missing from typed IR");
-    };
-    if parameter.ty != IrType::Array(Box::new(IrType::String)) {
-        return Some("standalone main argument must have type Array<string>");
+    if let Some(parameter) = function.parameters.first() {
+        let Some(parameter) = package.definition(*parameter) else {
+            return Some("standalone main parameter is missing from typed IR");
+        };
+        if parameter.ty != IrType::Array(Box::new(IrType::String)) {
+            return Some("standalone main argument must have type Array<string>");
+        }
     }
-    if function.return_type != IrType::I32 {
-        return Some("standalone main must return i32");
+    if !matches!(function.return_type, IrType::Unit | IrType::I32) {
+        return Some("standalone main must return Unit or i32");
     }
     if !matches!(function.effect, IrEffect::Ordinary | IrEffect::Task) {
         return Some("standalone main must be `fn` or `async fn` without lifecycle attributes");
@@ -2260,20 +2275,24 @@ fn emit_standalone_main_export(
     };
     let definition_span = source_span(&main.definition.span, files)?;
     let source_function = function_indices[&main.definition.id];
+    let canonical_source_signature =
+        main.function.parameters.len() == 1 && main.function.return_type == IrType::I32;
     let function_index = match main.function.effect {
-        IrEffect::Task => source_function,
-        IrEffect::Ordinary => {
+        IrEffect::Task if canonical_source_signature => source_function,
+        IrEffect::Task | IrEffect::Ordinary => {
             let wrapper_index = u32::try_from(function_plans.len())
                 .map_err(|_| CompileError::too_many_registers(definition_span))?;
-            let code = vec![
-                Instruction::Call {
-                    function: source_function,
-                    args_base: 0,
-                    args_count: 1,
-                    dst: 1,
-                },
-                Instruction::Return { source: 1 },
-            ];
+            let mut code = vec![Instruction::Call {
+                function: source_function,
+                args_base: 0,
+                args_count: u16::try_from(main.function.parameters.len())
+                    .expect("validated standalone main has at most one parameter"),
+                dst: 1,
+            }];
+            if main.function.return_type == IrType::Unit {
+                code.push(Instruction::LoadI32 { dst: 1, value: 0 });
+            }
+            code.push(Instruction::Return { source: 1 });
             let register_types = vec![
                 Some(ValueType::Named(array_type(ValueType::String))),
                 Some(ValueType::I32),
@@ -2785,12 +2804,8 @@ fn statement_references_definition(statement: &TypedStatementIr, definition: Def
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
-        } => {
-            expression_references_definition(start, definition)
-                || expression_references_definition(end, definition)
-                || block_references_definition(body, definition)
         }
-        TypedStatementIr::DynamicRangeFor {
+        | TypedStatementIr::DynamicRangeFor {
             start, end, body, ..
         } => {
             expression_references_definition(start, definition)
@@ -2915,12 +2930,8 @@ fn inline_class_statement_is_scalar(
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
-        } => {
-            inline_class_expression_is_scalar(start, definition)
-                && inline_class_expression_is_scalar(end, definition)
-                && inline_class_block_is_scalar(body, definition)
         }
-        TypedStatementIr::DynamicRangeFor {
+        | TypedStatementIr::DynamicRangeFor {
             start, end, body, ..
         } => {
             inline_class_expression_is_scalar(start, definition)
@@ -3436,6 +3447,50 @@ impl<'a> FunctionEmitter<'a> {
                 operator,
                 value,
             } => match target {
+                TypedPlaceIr::ClassField { object, field }
+                    if matches!(&object.kind, TypedExpressionKind::Reference(definition)
+                        if self.inline_classes.contains_key(definition)) =>
+                {
+                    let TypedExpressionKind::Reference(definition) = &object.kind else {
+                        unreachable!("guard matched a reference object");
+                    };
+                    let (owner, fields_base) = self.inline_classes[definition];
+                    let (field_owner, field_layout) =
+                        self.layouts.fields.get(field).cloned().ok_or_else(|| {
+                            CompileError::unknown_name(
+                                self.definition_name(*field),
+                                self.function_span,
+                            )
+                        })?;
+                    if field_owner != owner
+                        || self.layouts.aggregates[&owner].kind != TypedAggregateKind::Class
+                        || !field_layout.mutable
+                    {
+                        return Err(CompileError::type_mismatch(
+                            None,
+                            None,
+                            self.span(&value.span)?,
+                        ));
+                    }
+                    let destination =
+                        self.inline_field_register(owner, fields_base, *field, self.function_span)?;
+                    let source = self.allocate_expression(value)?;
+                    self.emit_expression(value, source)?;
+                    let span = self.span(&value.span)?;
+                    let result = self.allocate(field_layout.ty)?;
+                    self.emit_compound_binary(
+                        *operator,
+                        &value.ty,
+                        destination,
+                        source,
+                        result,
+                        span,
+                    )?;
+                    self.push(
+                        self.copy_value_instruction(field_layout.ty, destination, result, span)?,
+                        span,
+                    );
+                }
                 TypedPlaceIr::Definition(definition) => {
                     let destination = self.local(*definition)?;
                     let source = self.allocate_expression(value)?;
@@ -5515,7 +5570,11 @@ impl<'a> FunctionEmitter<'a> {
             }
             BuiltinOperationIr::ArrayReserve
             | BuiltinOperationIr::ArrayCapacity
-            | BuiltinOperationIr::ArrayShrinkToFit => {
+            | BuiltinOperationIr::ArrayShrinkToFit
+            | BuiltinOperationIr::ArrayFirst
+            | BuiltinOperationIr::ArrayLast
+            | BuiltinOperationIr::ArraySwap
+            | BuiltinOperationIr::ArrayReverse => {
                 let [element] = type_arguments else {
                     return Err(CompileError::type_mismatch(None, None, span));
                 };
@@ -5528,6 +5587,10 @@ impl<'a> FunctionEmitter<'a> {
                     BuiltinOperationIr::ArrayShrinkToFit => {
                         StandardIntrinsic::ArrayShrinkToFit { element }
                     }
+                    BuiltinOperationIr::ArrayFirst => StandardIntrinsic::ArrayFirst { element },
+                    BuiltinOperationIr::ArrayLast => StandardIntrinsic::ArrayLast { element },
+                    BuiltinOperationIr::ArraySwap => StandardIntrinsic::ArraySwap { element },
+                    BuiltinOperationIr::ArrayReverse => StandardIntrinsic::ArrayReverse { element },
                     _ => unreachable!("array capacity operations are matched above"),
                 };
                 self.push(
@@ -5595,6 +5658,32 @@ impl<'a> FunctionEmitter<'a> {
                     span,
                 );
                 load_true(self)
+            }
+            BuiltinOperationIr::MapIsEmpty
+            | BuiltinOperationIr::MapGetOr
+            | BuiltinOperationIr::MapInsertIfAbsent => {
+                let [key, value] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let key = lower_type(self.package, key, span)?;
+                let value = lower_type(self.package, value, span)?;
+                let intrinsic = match operation {
+                    BuiltinOperationIr::MapIsEmpty => StandardIntrinsic::MapIsEmpty { key, value },
+                    BuiltinOperationIr::MapGetOr => StandardIntrinsic::MapGetOr { key, value },
+                    BuiltinOperationIr::MapInsertIfAbsent => {
+                        StandardIntrinsic::MapInsertIfAbsent { key, value }
+                    }
+                    _ => unreachable!("map extension operations are matched above"),
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic,
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
             }
             BuiltinOperationIr::SetNew => {
                 let ValueType::Named(type_id) = lower_type(self.package, result, span)? else {
@@ -5692,6 +5781,26 @@ impl<'a> FunctionEmitter<'a> {
                     span,
                 );
                 load_true(self)
+            }
+            BuiltinOperationIr::BufferIsEmpty | BuiltinOperationIr::BufferFill => {
+                let [element] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let element = lower_type(self.package, element, span)?;
+                let intrinsic = if operation == BuiltinOperationIr::BufferIsEmpty {
+                    StandardIntrinsic::BufferIsEmpty { element }
+                } else {
+                    StandardIntrinsic::BufferFill { element }
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic,
+                        args_base,
+                        args_count: argument_slots,
+                        dst: destination,
+                    },
+                    span,
+                )
             }
             BuiltinOperationIr::StateHandleResolve => {
                 let target = lower_type(self.package, &type_arguments[0], span)?;
@@ -6296,7 +6405,7 @@ impl<'a> FunctionEmitter<'a> {
                 }
             }
             TypedAggregateKind::Class => {
-                // A class update is an explicit `new Class { ..base }`: it creates a fresh object
+                // A class update is an explicit `Class { ..base }`: it creates a fresh object
                 // rather than mutating or aliasing `base`.
                 let source = self.allocate_expression(base)?;
                 self.emit_expression(base, source)?;
@@ -7380,7 +7489,11 @@ fn validate_builtin_call_signature(
         | BuiltinOperationIr::ArrayClear
         | BuiltinOperationIr::ArrayReserve
         | BuiltinOperationIr::ArrayCapacity
-        | BuiltinOperationIr::ArrayShrinkToFit => {
+        | BuiltinOperationIr::ArrayShrinkToFit
+        | BuiltinOperationIr::ArrayFirst
+        | BuiltinOperationIr::ArrayLast
+        | BuiltinOperationIr::ArraySwap
+        | BuiltinOperationIr::ArrayReverse => {
             let [element] = type_arguments else {
                 return Err(CompileError::type_mismatch(None, None, span));
             };
@@ -7418,12 +7531,30 @@ fn validate_builtin_call_signature(
                     validate_builtin_arguments(arguments, &[array], span)?;
                     validate_builtin_result(result, element, span)
                 }
-                BuiltinOperationIr::ArrayClear | BuiltinOperationIr::ArrayShrinkToFit => {
+                BuiltinOperationIr::ArrayClear
+                | BuiltinOperationIr::ArrayShrinkToFit
+                | BuiltinOperationIr::ArrayReverse => {
                     validate_builtin_arguments(arguments, &[array], span)?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
                 BuiltinOperationIr::ArrayReserve => {
                     validate_builtin_arguments(arguments, &[array, IrType::I32], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
+                BuiltinOperationIr::ArrayFirst | BuiltinOperationIr::ArrayLast => {
+                    validate_builtin_arguments(arguments, &[array], span)?;
+                    validate_builtin_result(
+                        result,
+                        &IrType::Option(Box::new(element.clone())),
+                        span,
+                    )
+                }
+                BuiltinOperationIr::ArraySwap => {
+                    validate_builtin_arguments(
+                        arguments,
+                        &[array, IrType::I32, IrType::I32],
+                        span,
+                    )?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
                 _ => unreachable!("array operations are matched above"),
@@ -7432,6 +7563,9 @@ fn validate_builtin_call_signature(
         BuiltinOperationIr::MapLen
         | BuiltinOperationIr::MapGet
         | BuiltinOperationIr::MapSet
+        | BuiltinOperationIr::MapIsEmpty
+        | BuiltinOperationIr::MapGetOr
+        | BuiltinOperationIr::MapInsertIfAbsent
         | BuiltinOperationIr::MapRemove
         | BuiltinOperationIr::MapContains
         | BuiltinOperationIr::MapClear => {
@@ -7444,11 +7578,15 @@ fn validate_builtin_call_signature(
                     validate_builtin_arguments(arguments, &[map], span)?;
                     validate_builtin_result(result, &IrType::I32, span)
                 }
+                BuiltinOperationIr::MapIsEmpty | BuiltinOperationIr::MapClear => {
+                    validate_builtin_arguments(arguments, &[map], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
                 BuiltinOperationIr::MapGet | BuiltinOperationIr::MapRemove => {
                     validate_builtin_arguments(arguments, &[map, key.clone()], span)?;
                     validate_builtin_result(result, &IrType::Option(Box::new(value.clone())), span)
                 }
-                BuiltinOperationIr::MapSet => {
+                BuiltinOperationIr::MapSet | BuiltinOperationIr::MapInsertIfAbsent => {
                     validate_builtin_arguments(
                         arguments,
                         &[map, key.clone(), value.clone()],
@@ -7456,12 +7594,16 @@ fn validate_builtin_call_signature(
                     )?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
+                BuiltinOperationIr::MapGetOr => {
+                    validate_builtin_arguments(
+                        arguments,
+                        &[map, key.clone(), value.clone()],
+                        span,
+                    )?;
+                    validate_builtin_result(result, value, span)
+                }
                 BuiltinOperationIr::MapContains => {
                     validate_builtin_arguments(arguments, &[map, key.clone()], span)?;
-                    validate_builtin_result(result, &IrType::Bool, span)
-                }
-                BuiltinOperationIr::MapClear => {
-                    validate_builtin_arguments(arguments, &[map], span)?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
                 _ => unreachable!("map operations are matched above"),
@@ -7486,11 +7628,9 @@ fn validate_builtin_call_signature(
                     validate_builtin_arguments(arguments, &[set], span)?;
                     validate_builtin_result(result, &IrType::I32, span)
                 }
-                BuiltinOperationIr::SetContains => {
-                    validate_builtin_arguments(arguments, &[set, element.clone()], span)?;
-                    validate_builtin_result(result, &IrType::Bool, span)
-                }
-                BuiltinOperationIr::SetInsert | BuiltinOperationIr::SetRemove => {
+                BuiltinOperationIr::SetContains
+                | BuiltinOperationIr::SetInsert
+                | BuiltinOperationIr::SetRemove => {
                     validate_builtin_arguments(arguments, &[set, element.clone()], span)?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
@@ -7502,10 +7642,12 @@ fn validate_builtin_call_signature(
             }
         }
         BuiltinOperationIr::BufferLen
+        | BuiltinOperationIr::BufferIsEmpty
         | BuiltinOperationIr::BufferGet
         | BuiltinOperationIr::BufferSet
         | BuiltinOperationIr::BufferSlice
-        | BuiltinOperationIr::BufferCopy => {
+        | BuiltinOperationIr::BufferCopy
+        | BuiltinOperationIr::BufferFill => {
             let [element] = type_arguments else {
                 return Err(CompileError::type_mismatch(None, None, span));
             };
@@ -7514,6 +7656,10 @@ fn validate_builtin_call_signature(
                 BuiltinOperationIr::BufferLen => {
                     validate_builtin_arguments(arguments, &[buffer], span)?;
                     validate_builtin_result(result, &IrType::I32, span)
+                }
+                BuiltinOperationIr::BufferIsEmpty => {
+                    validate_builtin_arguments(arguments, &[buffer], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
                 }
                 BuiltinOperationIr::BufferGet => {
                     validate_builtin_arguments(arguments, &[buffer, IrType::I32], span)?;
@@ -7547,6 +7693,10 @@ fn validate_builtin_call_signature(
                         ],
                         span,
                     )?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
+                BuiltinOperationIr::BufferFill => {
+                    validate_builtin_arguments(arguments, &[buffer, element.clone()], span)?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
                 _ => unreachable!("buffer operations are matched above"),
@@ -8518,7 +8668,10 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         } => range(fields_base, fields_count),
         Instruction::StructWith { source, value, .. }
         | Instruction::ClassSet { source, value, .. }
-        | Instruction::ArrayPush { source, value } => vec![source, value],
+        | Instruction::ArrayPush { source, value }
+        | Instruction::SetContains { source, value, .. }
+        | Instruction::SetInsert { source, value, .. }
+        | Instruction::SetRemove { source, value, .. } => vec![source, value],
         Instruction::ArrayPushRow {
             source,
             fields_base,
@@ -8547,21 +8700,6 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::MapRemove { source, key, .. }
         | Instruction::MapContains { source, key, .. } => vec![source, key],
         Instruction::MapSet { source, key, value } => vec![source, key, value],
-        Instruction::SetContains {
-            source,
-            value,
-            dst: _,
-        }
-        | Instruction::SetInsert {
-            source,
-            value,
-            dst: _,
-        }
-        | Instruction::SetRemove {
-            source,
-            value,
-            dst: _,
-        } => vec![source, value],
         Instruction::IterNew { kind, state } => match kind {
             CollectionIteratorKind::Range => vec![state.collection, state.phase],
             CollectionIteratorKind::Array { .. }
@@ -8702,8 +8840,8 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::SetLen { dst, .. }
         | Instruction::SetContains { dst, .. }
         | Instruction::SetInsert { dst, .. }
-        | Instruction::SetRemove { dst, .. } => Some(dst),
-        Instruction::StateOldFieldGet { dst, .. }
+        | Instruction::SetRemove { dst, .. }
+        | Instruction::StateOldFieldGet { dst, .. }
         | Instruction::StateCurrentGet { dst, .. }
         | Instruction::StateHandleResolve { dst, .. }
         | Instruction::StateHandleIsAlive { dst, .. }
@@ -9474,12 +9612,8 @@ fn collect_block_type_metadata(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
-            } => {
-                collect_expression_type_metadata(package, start, span, metadata)?;
-                collect_expression_type_metadata(package, end, span, metadata)?;
-                collect_block_type_metadata(package, body, span, metadata)?;
             }
-            TypedStatementIr::DynamicRangeFor {
+            | TypedStatementIr::DynamicRangeFor {
                 start, end, body, ..
             } => {
                 collect_expression_type_metadata(package, start, span, metadata)?;
@@ -9918,6 +10052,7 @@ fn ir_type_contains_type_parameter(ty: &IrType) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn standard_call_lowering(
     package: &TypedPackageIr,
     intrinsic: nexa_stdlib::Intrinsic,
@@ -10696,12 +10831,8 @@ fn collect_block_codegen_inputs(block: &TypedBlockIr, inputs: &mut CodegenInputs
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
-            } => {
-                collect_expression_codegen_inputs(start, inputs);
-                collect_expression_codegen_inputs(end, inputs);
-                collect_block_codegen_inputs(body, inputs);
             }
-            TypedStatementIr::DynamicRangeFor {
+            | TypedStatementIr::DynamicRangeFor {
                 start, end, body, ..
             } => {
                 collect_expression_codegen_inputs(start, inputs);
@@ -11339,27 +11470,8 @@ fn collect_block_call_graph(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
-            } => {
-                for value in [start, end] {
-                    collect_expression_call_graph(
-                        package,
-                        value,
-                        function_indices,
-                        state_fields,
-                        calls,
-                        effects,
-                    );
-                }
-                collect_block_call_graph(
-                    package,
-                    body,
-                    function_indices,
-                    state_fields,
-                    calls,
-                    effects,
-                );
             }
-            TypedStatementIr::DynamicRangeFor {
+            | TypedStatementIr::DynamicRangeFor {
                 start, end, body, ..
             } => {
                 for value in [start, end] {
@@ -12410,7 +12522,7 @@ mod tests {
         assert!(
             validate_concrete_standard_lowering(
                 &package,
-                &[set_argument.clone()],
+                std::slice::from_ref(&set_argument),
                 &IrType::Unit,
                 TypedStandardLowering::SetClear {
                     element: ValueType::I32,

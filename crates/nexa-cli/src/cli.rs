@@ -67,7 +67,9 @@ pub(crate) enum Command {
     Build(BuildArgs),
 
     /// Discover and execute canonical @test functions.
-    #[command(after_help = "Examples:\n  nexa test packages/app --contract snake_api.contract.nexa")]
+    #[command(
+        after_help = "Examples:\n  nexa test packages/app --contract snake_api.contract.nexa"
+    )]
     Test(TestArgs),
 
     /// Resolve and write a schema-2 project/package lockfile.
@@ -114,7 +116,9 @@ pub(crate) enum Command {
     },
 
     /// Validate or generate Contract bindings.
-    #[command(after_help = "Examples:\n  nexa contract check snake_api.contract.nexa\n  nexa contract generate snake_api.contract.nexa")]
+    #[command(
+        after_help = "Examples:\n  nexa contract check snake_api.contract.nexa\n  nexa contract generate snake_api.contract.nexa"
+    )]
     Contract {
         #[command(subcommand)]
         command: ContractCommand,

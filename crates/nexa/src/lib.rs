@@ -37,6 +37,15 @@ pub use nexa_compiler::{
     PackageMainInfo, PackageReplCellInfo, PackageReplStateFieldInfo, STANDALONE_MAIN_STABLE_ID,
     standalone_main_stable_id,
 };
+pub use nexa_contract::{
+    ABI_DESCRIPTOR_VERSION, AbiDescriptor, AbiFingerprint, BindingModel, CONTRACT_SYNTAX_VERSION,
+    CodegenError, ContractAst, ContractError, ContractErrorKind, EffectiveContractDescriptor,
+    EffectiveContractSelection, EffectiveDescriptorError, ValidatedContract, ValidatedFunction,
+    abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
+    effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
+    generate_rust as generate_rust_bindings, generate_rust_for_source_file,
+    host_function_signature, parse_contract, parse_contract_ast, validate_contract,
+};
 pub use nexa_core::{FileId, StableId};
 pub use nexa_diagnostics::{
     ByteRange, Diagnostic as LeafDiagnostic, DiagnosticBatch, DiagnosticBatchLimits,
@@ -45,15 +54,6 @@ pub use nexa_diagnostics::{
     RelatedLocation as LeafRelatedLocation, RenderError as DiagnosticRenderError, SourceIdentity,
     SourceSnapshot, SourceSnapshotRegistry, SourceSnapshotRegistryBuilder,
     SourceSnapshotRegistryError, TextEditSuggestion,
-};
-pub use nexa_contract::{
-    ABI_DESCRIPTOR_VERSION, AbiDescriptor, AbiFingerprint, BindingModel, CodegenError,
-    EffectiveContractDescriptor, EffectiveContractSelection, EffectiveDescriptorError,
-    CONTRACT_SYNTAX_VERSION, ContractAst, ContractError, ContractErrorKind, ValidatedContract, ValidatedFunction,
-    abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
-    effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
-    generate_rust as generate_rust_bindings, generate_rust_for_source_file, host_function_signature, parse_contract,
-    parse_contract_ast, validate_contract,
 };
 pub use nexa_runtime::profiler;
 pub use nexa_runtime::{
@@ -121,8 +121,8 @@ pub mod prelude {
         StateHandleType, StateSchema, StateType, StructField, StructType, ValueType, option_type,
         result_type,
     };
-    pub use nexa_core::{FileId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_contract::generate_rust as generate_rust_bindings;
+    pub use nexa_core::{FileId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_runtime::{
         CancelReason, CompletionAccounting, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostFunctionAuthority, HostFunctionAuthorityField,

@@ -7,12 +7,12 @@
 
 mod model;
 
+pub mod buffer;
 pub mod collections;
 pub mod core;
 pub mod debug;
 pub mod math;
 pub mod set;
-pub mod buffer;
 pub mod string;
 
 pub use model::{

@@ -1,11 +1,9 @@
 use package::language_scale::flow as flow;
 use package::language_scale::rules as rules;
 use package::language_scale::text as text;
-use host::language_scale as console;
-
 pub fn on_event(value: i32) -> string {
     let score: i32 = flow::pass_through(rules::score(value));
     let message: string = text::message(score);
-    console::log(message);
+    host::log(message);
     return message;
 }
