@@ -1,5 +1,5 @@
 [package]
-name = "nexa-idl-fuzz"
+name = "nexa-contract-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
