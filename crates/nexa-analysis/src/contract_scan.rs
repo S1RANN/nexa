@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use nexa_core::StableId;
 use nexa_syntax::ast::{
-    self, DeclarationKind, ElseBranch, Expression, ExpressionKind, InterpolationPart, Pattern,
-    PatternKind, Statement, StatementKind, TypeKind, TypeRef, UsePathRootKind, VariantPayload,
-    parse_nexa_ast,
+    self, DeclarationKind, ElseBranch, Expression, ExpressionKind, ForIterable, InterpolationPart,
+    Pattern, PatternKind, Statement, StatementKind, TypeKind, TypeRef, UsePathRootKind,
+    VariantPayload, parse_nexa_ast,
 };
 use nexa_syntax::parse_nexa;
 
@@ -254,7 +254,9 @@ impl AstReferenceScanner<'_> {
                     self.scan_type(ty);
                 }
             }
-            TypeKind::Array(inner) | TypeKind::Option(inner) => self.scan_type(inner),
+            TypeKind::Array(inner) | TypeKind::Option(inner) | TypeKind::Set(inner) => {
+                self.scan_type(inner);
+            }
             TypeKind::Map { key, value }
             | TypeKind::Result {
                 ok: key,
@@ -312,11 +314,8 @@ impl AstReferenceScanner<'_> {
                 self.scan_expression(condition);
                 self.scan_block(body);
             }
-            StatementKind::For {
-                start, end, body, ..
-            } => {
-                self.scan_expression(start);
-                self.scan_expression(end);
+            StatementKind::For { iterable, body, .. } => {
+                self.scan_for_iterable(iterable);
                 self.scan_block(body);
             }
             StatementKind::Defer(expression) | StatementKind::Expression(expression) => {
@@ -326,6 +325,16 @@ impl AstReferenceScanner<'_> {
             | StatementKind::Continue
             | StatementKind::Yield
             | StatementKind::Error => {}
+        }
+    }
+
+    fn scan_for_iterable(&mut self, iterable: &ForIterable) {
+        match iterable {
+            ForIterable::Range { start, end, .. } => {
+                self.scan_expression(start);
+                self.scan_expression(end);
+            }
+            ForIterable::Expression(expression) => self.scan_expression(expression),
         }
     }
 
@@ -463,6 +472,7 @@ fn collect_named_host_types(ty: &SurfaceType, output: &mut BTreeSet<String>) {
         }
         SurfaceType::Option(inner)
         | SurfaceType::Array(inner)
+        | SurfaceType::Set(inner)
         | SurfaceType::Token(inner)
         | SurfaceType::Snapshot(inner)
         | SurfaceType::Buffer(inner)

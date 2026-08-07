@@ -140,6 +140,7 @@ impl PassInvariant {
             | IrType::Rune
             | IrType::Array(_)
             | IrType::Map(_, _)
+            | IrType::Set(_)
             | IrType::HostRequest(_)
             | IrType::ResourceToken(_)
             | IrType::Snapshot(_)
@@ -516,9 +517,16 @@ fn count_calls_in_block(block: &TypedBlockIr, counts: &mut BTreeMap<DefinitionId
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
             } => {
                 count_calls_in_expression(start, counts);
                 count_calls_in_expression(end, counts);
+                count_calls_in_block(body, counts);
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                count_calls_in_expression(iterable, counts);
                 count_calls_in_block(body, counts);
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -606,9 +614,16 @@ fn inline_calls_in_block(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
             } => {
                 inline_calls_in_expression(start, caller, candidates, growth, rewrites);
                 inline_calls_in_expression(end, caller, candidates, growth, rewrites);
+                inline_calls_in_block(body, caller, candidates, growth, rewrites);
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                inline_calls_in_expression(iterable, caller, candidates, growth, rewrites);
                 inline_calls_in_block(body, caller, candidates, growth, rewrites);
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -771,9 +786,16 @@ fn analyze_materialization_block(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
             } => {
                 analyze_materialization_expression(start, invariant, report);
                 analyze_materialization_expression(end, invariant, report);
+                analyze_materialization_block(body, invariant, report);
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                analyze_materialization_expression(iterable, invariant, report);
                 analyze_materialization_block(body, invariant, report);
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -1114,9 +1136,16 @@ fn specialize_match_block(
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
+            }
+            | TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
             } => {
                 specialize_match_expression(start, scopes, context);
                 specialize_match_expression(end, scopes, context);
+                specialize_match_block(body, scopes, context);
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                specialize_match_expression(iterable, scopes, context);
                 specialize_match_block(body, scopes, context);
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -1707,9 +1736,16 @@ fn propagate_statement(
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
+        }
+        | TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
         } => {
             substitute_expression(start, scopes, mode, context);
             substitute_expression(end, scopes, mode, context);
+            propagate_block(body, scopes, mode, context);
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            substitute_expression(iterable, scopes, mode, context);
             propagate_block(body, scopes, mode, context);
         }
         TypedStatementIr::Defer { captures, .. } => {
@@ -1904,9 +1940,16 @@ fn fold_statement(statement: &mut TypedStatementIr, context: &mut PassContext) {
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
+        }
+        | TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
         } => {
             fold_expression(start, context);
             fold_expression(end, context);
+            fold_block(body, context);
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            fold_expression(iterable, context);
             fold_block(body, context);
         }
         TypedStatementIr::Defer { captures, .. } => {
@@ -2180,9 +2223,16 @@ fn count_statement_references(
         }
         TypedStatementIr::StaticRangeFor {
             start, end, body, ..
+        }
+        | TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
         } => {
             count_expression_references(start, uses);
             count_expression_references(end, uses);
+            count_block_references(body, uses);
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            count_expression_references(iterable, uses);
             count_block_references(body, uses);
         }
         TypedStatementIr::Defer { captures, .. } => {
@@ -2397,7 +2447,9 @@ fn eliminate_in_block(
                 }
                 eliminate_in_block(body, uses, context);
             }
-            TypedStatementIr::StaticRangeFor { body, .. } => {
+            TypedStatementIr::StaticRangeFor { body, .. }
+            | TypedStatementIr::DynamicRangeFor { body, .. }
+            | TypedStatementIr::CollectionFor { body, .. } => {
                 eliminate_in_block(body, uses, context);
             }
             TypedStatementIr::Return(_) | TypedStatementIr::Break | TypedStatementIr::Continue => {

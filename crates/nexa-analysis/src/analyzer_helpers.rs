@@ -203,6 +203,7 @@ fn equality_supported(
             }
             IrType::Array(_)
             | IrType::Map(_, _)
+            | IrType::Set(_)
             | IrType::HostRequest(_)
             | IrType::ResourceToken(_)
             | IrType::Snapshot(_)
@@ -318,6 +319,7 @@ fn const_safe_type(
         }
         IrType::Array(_)
         | IrType::Map(_, _)
+        | IrType::Set(_)
         | IrType::HostRequest(_)
         | IrType::ResourceToken(_)
         | IrType::Snapshot(_)
@@ -905,6 +907,10 @@ fn encode_type(ty: &IrType, definitions: &[Definition], output: &mut Vec<u8>) {
             output.push(18);
             encode_type(inner, definitions, output);
         }
+        IrType::Set(inner) => {
+            output.push(21);
+            encode_type(inner, definitions, output);
+        }
         IrType::TypeParameter(index) => {
             output.push(19);
             output.extend_from_slice(&index.to_le_bytes());
@@ -1048,6 +1054,7 @@ pub fn contains_ir_error(ty: &IrType) -> bool {
         IrType::Error => true,
         IrType::Option(inner)
         | IrType::Array(inner)
+        | IrType::Set(inner)
         | IrType::Snapshot(inner)
         | IrType::Buffer(inner)
         | IrType::StateHandle(inner) => contains_ir_error(inner),
@@ -1100,6 +1107,7 @@ pub fn display_ir_type(ty: &IrType, definitions: &[Definition]) -> String {
             display_ir_type(key, definitions),
             display_ir_type(value, definitions)
         ),
+        IrType::Set(inner) => format!("Set<{}>", display_ir_type(inner, definitions)),
         IrType::Tuple(values) => format!(
             "({})",
             values
@@ -1162,6 +1170,11 @@ fn surface_type_from_ir(
             Box::new(surface_type_from_ir(key, definitions, type_parameters)?),
             Box::new(surface_type_from_ir(value, definitions, type_parameters)?),
         )),
+        IrType::Set(inner) => Some(SurfaceType::Set(Box::new(surface_type_from_ir(
+            inner,
+            definitions,
+            type_parameters,
+        )?))),
         IrType::Tuple(values) => values
             .iter()
             .map(|value| surface_type_from_ir(value, definitions, type_parameters))
