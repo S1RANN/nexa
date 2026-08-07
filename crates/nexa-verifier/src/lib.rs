@@ -310,6 +310,7 @@ struct NominalIndexes {
     class_fields: Vec<((u64, u64), (usize, usize))>,
     array_types: Vec<(u64, usize)>,
     map_types: Vec<(u64, usize)>,
+    set_types: Vec<(u64, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,6 +320,7 @@ pub struct NominalIndexShape {
     pub class_fields: usize,
     pub array_types: usize,
     pub map_types: usize,
+    pub set_types: usize,
 }
 
 impl NominalIndexes {
@@ -396,12 +398,21 @@ impl NominalIndexes {
             .collect::<Vec<_>>();
         map_types.sort_unstable_by_key(|(type_id, _)| *type_id);
 
+        let mut set_types = module
+            .set_types
+            .iter()
+            .enumerate()
+            .map(|(index, set_type)| (set_type.type_id.0, index))
+            .collect::<Vec<_>>();
+        set_types.sort_unstable_by_key(|(type_id, _)| *type_id);
+
         Self {
             enum_variants,
             struct_fields,
             class_fields,
             array_types,
             map_types,
+            set_types,
         }
     }
 }
@@ -534,6 +545,7 @@ impl VerifiedModule {
             class_fields: self.nominal_indexes.class_fields.len(),
             array_types: self.nominal_indexes.array_types.len(),
             map_types: self.nominal_indexes.map_types.len(),
+            set_types: self.nominal_indexes.set_types.len(),
         }
     }
 
@@ -630,6 +642,17 @@ impl VerifiedModule {
             .ok()
             .and_then(|index| self.nominal_indexes.map_types.get(index))?;
         self.module.map_types.get(*type_index)
+    }
+
+    #[must_use]
+    pub fn set_type(&self, type_id: u64) -> Option<&SetType> {
+        let (_, type_index) = self
+            .nominal_indexes
+            .set_types
+            .binary_search_by_key(&type_id, |(candidate, _)| *candidate)
+            .ok()
+            .and_then(|index| self.nominal_indexes.set_types.get(index))?;
+        self.module.set_types.get(*type_index)
     }
 }
 
@@ -8310,6 +8333,52 @@ mod tests {
         builder.set_type(SetType::new(ValueType::I32));
         builder.function(function);
         builder.finish()
+    }
+
+    #[test]
+    fn verified_module_set_type_accessor_resolves_via_sorted_index() {
+        let set_i32 = SetType::new(ValueType::I32);
+        let set_string = SetType::new(ValueType::String);
+        let mut function = language_v3_function(
+            vec![
+                Instruction::SetNew {
+                    type_id: set_string.type_id,
+                    dst: 1,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1],
+            |_| Vec::new(),
+        );
+        function.root_bitmap[1] = true;
+        let mut builder = ModuleBuilder::new();
+        builder.string("x");
+        builder.set_type(set_string);
+        builder.set_type(set_i32);
+        builder.function(function);
+        let verified = verify(builder.finish(), VerifierLimits::default())
+            .expect("Set metadata module must verify");
+        assert_eq!(
+            verified.set_type(set_i32.type_id.0),
+            Some(&set_i32),
+            "sorted index must resolve the declared Set<I32> metadata"
+        );
+        assert_eq!(
+            verified.set_type(set_string.type_id.0),
+            Some(&set_string),
+            "sorted index must resolve the declared Set<String> metadata"
+        );
+        assert_eq!(
+            verified.set_type(0xdead_beef),
+            None,
+            "unknown Set type IDs must miss the index"
+        );
+        assert_eq!(
+            verified.nominal_index_shape().set_types,
+            2,
+            "the nominal shape must count every declared Set type"
+        );
     }
 
     #[test]
