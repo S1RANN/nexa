@@ -12715,7 +12715,7 @@ fn descriptor_surface_type(
         return Ok(SurfaceType::TypeParameter(text.to_owned()));
     }
     let primitive = match text {
-        "unit" => Some(SurfaceType::Unit),
+        "unit" | "()" => Some(SurfaceType::Unit),
         "bool" => Some(SurfaceType::Bool),
         "i32" => Some(SurfaceType::I32),
         "i64" => Some(SurfaceType::I64),
