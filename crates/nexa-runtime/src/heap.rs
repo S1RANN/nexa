@@ -33,6 +33,35 @@ pub struct VmMap {
     values: CollectionRange,
     length: usize,
     rehash: Option<MapRehash>,
+    /// `LANGUAGE_V3` 4.3: bumped on every observable structural mutation
+    /// (insert of a new key, value overwrite, successful removal, and
+    /// non-empty clear); `IterNew` snapshots it and every `IterNext`
+    /// revalidates it so mutation during iteration traps deterministically.
+    mutation_epoch: u64,
+}
+
+/// Key-only rehash state for a set: no companion value table exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SetRehash {
+    old_slots: CollectionRange,
+    new_slots: CollectionRange,
+    cursor: usize,
+}
+
+/// `LANGUAGE_V3` `Set<T>`: dedicated key-only hash storage reusing the
+/// proven `VmMap` linear-probe slot machinery. Never modeled as
+/// `Map<T, Unit>`; entries are exactly `MapEntry` keys without any value
+/// table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmSet {
+    type_id: StableId,
+    element_type: nexa_bytecode::ValueType,
+    slots: CollectionRange,
+    length: usize,
+    rehash: Option<SetRehash>,
+    /// `LANGUAGE_V3` 4.3 mutation epoch, snapshot by `IterNew` and
+    /// revalidated by every `IterNext`.
+    mutation_epoch: u64,
 }
 
 impl VmMap {
@@ -101,6 +130,39 @@ impl VmMap {
                     .saturating_add(rehash_values)
                     .saturating_mul(self.value_storage.cell_size()),
             )
+    }
+}
+
+impl VmSet {
+    fn trace_references(&self, arena: &MapSlotArena, visit: &mut impl FnMut(GcRef)) {
+        let mut trace_table = |slots: CollectionRange| {
+            for entry in arena.slots(slots).iter().copied().flatten() {
+                if let Some(reference) = value_reference(entry.key) {
+                    visit(reference);
+                }
+            }
+        };
+        trace_table(self.slots);
+        if let Some(rehash) = &self.rehash {
+            trace_table(rehash.old_slots);
+            trace_table(rehash.new_slots);
+        }
+    }
+
+    /// G4 byte accounting: system bytes held by the set's key slot vectors,
+    /// including both sides of an in-flight incremental rehash.
+    fn storage_bytes(&self) -> usize {
+        let slot_bytes = size_of::<Option<MapEntry>>();
+        let rehash_slots = self.rehash.as_ref().map_or(0, |rehash| {
+            rehash
+                .old_slots
+                .length
+                .saturating_add(rehash.new_slots.length)
+        });
+        self.slots
+            .length
+            .saturating_add(rehash_slots)
+            .saturating_mul(slot_bytes)
     }
 }
 
@@ -178,9 +240,64 @@ impl ExactSizeIterator for MapEntries<'_> {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SetEntries<'a> {
+    current: &'a [Option<MapEntry>],
+    old: &'a [Option<MapEntry>],
+    new: &'a [Option<MapEntry>],
+    phase: u8,
+    index: usize,
+    remaining: usize,
+}
+
+#[cfg(test)]
+impl Iterator for SetEntries<'_> {
+    type Item = RuntimeValue;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let slots = match self.phase {
+                0 => self.current,
+                1 => self.old,
+                2 => self.new,
+                _ => return None,
+            };
+            let Some(slot) = slots.get(self.index) else {
+                self.phase += 1;
+                self.index = 0;
+                continue;
+            };
+            self.index += 1;
+            if let Some(entry) = slot {
+                self.remaining = self
+                    .remaining
+                    .checked_sub(1)
+                    .expect("set length matches occupied slots");
+                return Some(entry.key);
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+#[cfg(test)]
+impl ExactSizeIterator for SetEntries<'_> {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapSetOutcome {
     Complete,
+    RehashPending,
+}
+
+/// `LANGUAGE_V3` `SetInsert` outcome: `Complete(bool)` reports whether the
+/// element was newly inserted; `RehashPending` retries without re-hashing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetInsertOutcome {
+    Complete(bool),
     RehashPending,
 }
 
@@ -208,6 +325,15 @@ pub(crate) struct MapFuelShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SetFuelShape {
+    pub current_slots: usize,
+    pub old_slots: usize,
+    pub new_slots: usize,
+    pub rehash_remaining: usize,
+    pub next_rehash_slots: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MapKeyFuelShape {
     pub string_bytes: usize,
     pub string_objects: usize,
@@ -221,6 +347,53 @@ enum MapLocation {
     Current(usize),
     RehashOld(usize),
     RehashNew(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetLocation {
+    Current(usize),
+    RehashOld(usize),
+    RehashNew(usize),
+}
+
+/// Slot-table surface shared by `VmMap` and `VmSet` so the deterministic
+/// phase/slot iteration cursor walks either collection identically.
+trait SlotTable {
+    fn slots_for<'a>(&self, heap: &'a Heap, phase: u8) -> Option<&'a [Option<MapEntry>]>;
+}
+
+impl SlotTable for VmMap {
+    fn slots_for<'a>(&self, heap: &'a Heap, phase: u8) -> Option<&'a [Option<MapEntry>]> {
+        match phase {
+            0 => Some(heap.map_slots.slots(self.slots)),
+            1 => self
+                .rehash
+                .as_ref()
+                .map(|rehash| heap.map_slots.slots(rehash.old_slots)),
+            2 => self
+                .rehash
+                .as_ref()
+                .map(|rehash| heap.map_slots.slots(rehash.new_slots)),
+            _ => None,
+        }
+    }
+}
+
+impl SlotTable for VmSet {
+    fn slots_for<'a>(&self, heap: &'a Heap, phase: u8) -> Option<&'a [Option<MapEntry>]> {
+        match phase {
+            0 => Some(heap.map_slots.slots(self.slots)),
+            1 => self
+                .rehash
+                .as_ref()
+                .map(|rehash| heap.map_slots.slots(rehash.old_slots)),
+            2 => self
+                .rehash
+                .as_ref()
+                .map(|rehash| heap.map_slots.slots(rehash.new_slots)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -612,6 +785,12 @@ pub enum Object {
     Map {
         storage: u32,
     },
+    /// `LANGUAGE_V3`: set headers live in the heap's typed set arena, the
+    /// same slot-arena indirection as maps; the slot carries the arena
+    /// index instead of the full `VmSet` header.
+    Set {
+        storage: u32,
+    },
     Enum {
         type_id: StableId,
         variant: StableId,
@@ -651,12 +830,19 @@ pub enum Object {
         /// arena cells per element instead of one heap object each;
         /// `None` keeps the plain one-cell-per-element layout.
         row_stride: Option<std::num::NonZeroU16>,
+        /// `LANGUAGE_V3` 4.3 mutation epoch; every observable element or
+        /// structural write bumps it so dynamic iteration traps on mixed
+        /// snapshots.
+        mutation_epoch: u64,
     },
     Buffer {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
         storage: CollectionStorage,
         range: CollectionRange,
+        /// `LANGUAGE_V3` 4.3 mutation epoch; every observable element write
+        /// (set/fill/copy destination) bumps it.
+        mutation_epoch: u64,
     },
 }
 
@@ -677,6 +863,7 @@ impl Object {
             | Self::Struct { .. }
             | Self::Class { .. }
             | Self::Map { .. }
+            | Self::Set { .. }
             | Self::String(_)
             | Self::SharedString(_) => {}
         }
@@ -697,9 +884,10 @@ impl Object {
             | Self::Class { storage, range, .. } => {
                 range.length.saturating_mul(storage.cell_size())
             }
-            // Shared literal bytes belong to ExecutableModule; Map payload
-            // lives in its typed arena; Enum payload remains inline.
-            Self::SharedString(_) | Self::Map { .. } | Self::Enum { .. } => 0,
+            // Shared literal bytes belong to ExecutableModule; Map/Set
+            // payload lives in their typed arenas; Enum payload remains
+            // inline.
+            Self::SharedString(_) | Self::Map { .. } | Self::Set { .. } | Self::Enum { .. } => 0,
         };
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
@@ -1133,6 +1321,7 @@ impl ArrayParts {
 #[derive(Clone, Copy)]
 struct BufferParts {
     type_id: StableId,
+    reference: GcRef,
     element_type: nexa_bytecode::ValueType,
     storage: CollectionStorage,
     range: CollectionRange,
@@ -1161,11 +1350,24 @@ pub(crate) struct PreparedBufferGet {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
-    StringTooLarge { bytes: usize, max_bytes: usize },
-    CollectionTooLarge { length: usize, max_length: usize },
-    IndexOutOfBounds { index: usize, length: usize },
+    StringTooLarge {
+        bytes: usize,
+        max_bytes: usize,
+    },
+    CollectionTooLarge {
+        length: usize,
+        max_length: usize,
+    },
+    IndexOutOfBounds {
+        index: usize,
+        length: usize,
+    },
     InjectedFailure(RuntimeFailurePoint),
     InvalidReference(GcRef),
+    /// `LANGUAGE_V3` 4.3: the collection mutation epoch reached `u64::MAX`.
+    /// Advancing it further would wrap and could defeat the iteration trap
+    /// via ABA, so the write traps deterministically before it happens.
+    MutationEpochExhausted,
 }
 
 impl fmt::Display for HeapError {
@@ -1520,6 +1722,10 @@ pub struct Heap {
     /// creation/recycling never grows this index vector on the hot path.
     maps: Vec<Option<VmMap>>,
     free_maps: Vec<u32>,
+    /// `LANGUAGE_V3`: dedicated key-only set header arena, mirroring the map
+    /// arena indirection (the object slot carries only the arena index).
+    sets: Vec<Option<VmSet>>,
+    free_sets: Vec<u32>,
     map_slots: MapSlotArena,
     max_objects: u32,
     max_string_bytes: usize,
@@ -1604,6 +1810,8 @@ pub(crate) struct HeapCheckpoint {
     free: Vec<u32>,
     maps: Vec<Option<VmMap>>,
     free_maps: Vec<u32>,
+    sets: Vec<Option<VmSet>>,
+    free_sets: Vec<u32>,
     map_slots: MapSlotArena,
     collections: CollectionArena,
     scalar_collections: ScalarArenaSet,
@@ -1655,6 +1863,8 @@ impl Heap {
             free: self.free.clone(),
             maps: self.maps.clone(),
             free_maps: self.free_maps.clone(),
+            sets: self.sets.clone(),
+            free_sets: self.free_sets.clone(),
             map_slots: self.map_slots.clone(),
             collections: self.collections.checkpoint_clone(),
             scalar_collections: self.scalar_collections.checkpoint_clone(),
@@ -1677,6 +1887,8 @@ impl Heap {
         restore_reserved_vec(&mut self.free, checkpoint.free);
         restore_reserved_vec(&mut self.maps, checkpoint.maps);
         restore_reserved_vec(&mut self.free_maps, checkpoint.free_maps);
+        restore_reserved_vec(&mut self.sets, checkpoint.sets);
+        restore_reserved_vec(&mut self.free_sets, checkpoint.free_sets);
         self.map_slots.restore_checkpoint(checkpoint.map_slots);
         self.collections.restore_checkpoint(checkpoint.collections);
         self.scalar_collections
@@ -1709,6 +1921,8 @@ impl Heap {
             free: Vec::with_capacity(max_objects as usize),
             maps: Vec::with_capacity(max_objects as usize),
             free_maps: Vec::with_capacity(max_objects as usize),
+            sets: Vec::with_capacity(max_objects as usize),
+            free_sets: Vec::with_capacity(max_objects as usize),
             map_slots: MapSlotArena::new(
                 max_collection_elements,
                 max_collection_ranges
@@ -2087,7 +2301,7 @@ impl Heap {
         // Typed payload handles are created only by their dedicated
         // allocation funnels; accepting a caller-forged map index would
         // break the slot/arena ownership invariant.
-        if matches!(object, Object::Map { .. }) {
+        if matches!(object, Object::Map { .. } | Object::Set { .. }) {
             return Err(invalid_value_reference());
         }
         let payload_bytes = self.object_payload_bytes(&object);
@@ -2106,6 +2320,13 @@ impl Heap {
                 .map_or(0, |map| {
                     u64::try_from(map.storage_bytes()).unwrap_or(u64::MAX)
                 }),
+            Object::Set { storage } => self
+                .sets
+                .get(*storage as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |set| {
+                    u64::try_from(set.storage_bytes()).unwrap_or(u64::MAX)
+                }),
             _ => object.payload_bytes(),
         }
     }
@@ -2115,6 +2336,7 @@ impl Heap {
             Object::Array { .. }
             | Object::Buffer { .. }
             | Object::Map { .. }
+            | Object::Set { .. }
             | Object::Struct { .. }
             | Object::Class { .. } => self.object_payload_bytes(object),
             Object::String(_) | Object::SharedString(_) | Object::Enum { .. } => 0,
@@ -2143,6 +2365,18 @@ impl Heap {
                     }
                     self.free_maps
                         .push(u32::try_from(storage).expect("map arena index originates as u32"));
+                }
+            }
+            Object::Set { storage } => {
+                let storage = *storage as usize;
+                if let Some(set) = self.sets.get_mut(storage).and_then(Option::take) {
+                    self.map_slots.release(set.slots);
+                    if let Some(rehash) = set.rehash {
+                        self.map_slots.release(rehash.old_slots);
+                        self.map_slots.release(rehash.new_slots);
+                    }
+                    self.free_sets
+                        .push(u32::try_from(storage).expect("set arena index originates as u32"));
                 }
             }
             Object::String(_) | Object::SharedString(_) | Object::Enum { .. } => {}
@@ -2203,6 +2437,7 @@ impl Heap {
         Ok(HeapReservation { remaining: count })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn commit(&mut self, reservation: &mut HeapReservation, object: Object) -> GcRef {
         reservation.remaining = reservation
             .remaining
@@ -2214,10 +2449,10 @@ impl Heap {
             .expect("live objects cannot exceed the u32 heap limit");
         self.counters.object_allocations = self.counters.object_allocations.saturating_add(1);
         let header_bytes = size_of::<ObjectSlot>() as u64
-            + if matches!(&object, Object::Map { .. }) {
-                size_of::<Option<VmMap>>() as u64
-            } else {
-                0
+            + match &object {
+                Object::Map { .. } => size_of::<Option<VmMap>>() as u64,
+                Object::Set { .. } => size_of::<Option<VmSet>>() as u64,
+                _ => 0,
             };
         self.counters.allocated_bytes = self.counters.allocated_bytes.saturating_add(header_bytes);
         // WP71: the commit funnel charges both the total live payload and
@@ -2248,7 +2483,7 @@ impl Heap {
                     .collection_storage_allocations
                     .saturating_add(1);
             }
-            Object::Map { .. } => {
+            Object::Map { .. } | Object::Set { .. } => {
                 self.counters.collection_storage_allocations = self
                     .counters
                     .collection_storage_allocations
@@ -2847,6 +3082,16 @@ impl Heap {
                             self.free_maps.push(storage);
                         }
                     }
+                    Object::Set { storage } => {
+                        if let Some(set) = self.sets[storage as usize].take() {
+                            self.map_slots.release(set.slots);
+                            if let Some(rehash) = set.rehash {
+                                self.map_slots.release(rehash.old_slots);
+                                self.map_slots.release(rehash.new_slots);
+                            }
+                            self.free_sets.push(storage);
+                        }
+                    }
                     _ => {}
                 }
                 self.free.push(reference.index);
@@ -2891,6 +3136,7 @@ impl Heap {
                 range,
                 length,
                 row_stride: None,
+                mutation_epoch: 0,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -2918,6 +3164,7 @@ impl Heap {
                 element_type,
                 storage,
                 range,
+                mutation_epoch: 0,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -3476,6 +3723,7 @@ impl Heap {
             range: CollectionRange::default(),
             length: 0,
             row_stride: None,
+            mutation_epoch: 0,
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
@@ -3501,6 +3749,7 @@ impl Heap {
             range: CollectionRange::default(),
             length: 0,
             row_stride: Some(row_slots),
+            mutation_epoch: 0,
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
@@ -3653,9 +3902,12 @@ impl Heap {
         for value in replacement {
             self.shade_on_write(*value);
         }
+        // `LANGUAGE_V3` 4.3 epoch discipline: reserve the next epoch (traps
+        // before any write when exhausted), then commit after success.
+        let epoch = self.next_array_epoch(parts.reference)?;
         self.collections.values_mut(parts.range)?[index * stride..(index + 1) * stride]
             .copy_from_slice(replacement);
-        Ok(())
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     pub fn array_set(
@@ -3671,6 +3923,20 @@ impl Heap {
                 length: parts.length,
             });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
+        self.write_array_element_no_epoch(parts, index, replacement)?;
+        self.commit_array_epoch(parts.reference, epoch)
+    }
+
+    /// Element write without epoch accounting, shared by `array_set` and
+    /// the multi-write `ArraySwap`/`ArrayReverse` primitives (which reserve
+    /// and commit exactly one epoch per public operation).
+    fn write_array_element_no_epoch(
+        &mut self,
+        parts: ArrayParts,
+        index: usize,
+        replacement: RuntimeValue,
+    ) -> Result<(), HeapError> {
         let Some(stride) = parts.rows() else {
             return self.typed_collection_set(
                 parts.storage,
@@ -3687,6 +3953,88 @@ impl Heap {
         self.collections.values_mut(parts.range)?[index * stride..(index + 1) * stride]
             .copy_from_slice(&row[..stride]);
         Ok(())
+    }
+
+    /// Infallible after the caller validated both indices: swaps the
+    /// flattened cells of two elements without materializing or touching
+    /// the epoch.
+    fn swap_array_elements_no_epoch(
+        &mut self,
+        parts: ArrayParts,
+        lhs: usize,
+        rhs: usize,
+    ) -> Result<(), HeapError> {
+        let Some(stride) = parts.rows() else {
+            let left =
+                self.typed_collection_get(parts.storage, parts.element_type, parts.range, lhs)?;
+            let right =
+                self.typed_collection_get(parts.storage, parts.element_type, parts.range, rhs)?;
+            self.typed_collection_set(parts.storage, parts.element_type, parts.range, lhs, right)?;
+            return self.typed_collection_set(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                rhs,
+                left,
+            );
+        };
+        let values = self.collections.values_mut(parts.range)?;
+        let left_row = lhs * stride..(lhs + 1) * stride;
+        let right_row = rhs * stride..(rhs + 1) * stride;
+        let mut scratch = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+        scratch[..stride].copy_from_slice(&values[left_row.clone()]);
+        values.copy_within(right_row.clone(), left_row.start);
+        values[right_row].copy_from_slice(&scratch[..stride]);
+        Ok(())
+    }
+
+    /// `LANGUAGE_V3` `ArraySwap`: swaps the elements at `lhs` and `rhs` in
+    /// place. Bounds are validated before any write; the mutation advances
+    /// the epoch exactly once (never per element), so an exhausted epoch
+    /// traps before the first write.
+    pub fn array_swap(
+        &mut self,
+        value: RuntimeValue,
+        lhs: usize,
+        rhs: usize,
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        if lhs >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index: lhs,
+                length: parts.length,
+            });
+        }
+        if rhs >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index: rhs,
+                length: parts.length,
+            });
+        }
+        if lhs == rhs {
+            return Ok(());
+        }
+        let epoch = self.next_array_epoch(parts.reference)?;
+        self.swap_array_elements_no_epoch(parts, lhs, rhs)?;
+        self.commit_array_epoch(parts.reference, epoch)
+    }
+
+    /// `LANGUAGE_V3` `ArrayReverse`: reverses the live prefix in place with
+    /// one epoch increment per public operation.
+    pub fn array_reverse(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        if parts.length < 2 {
+            return Ok(());
+        }
+        let epoch = self.next_array_epoch(parts.reference)?;
+        let mut left = 0;
+        let mut right = parts.length - 1;
+        while left < right {
+            self.swap_array_elements_no_epoch(parts, left, right)?;
+            left += 1;
+            right -= 1;
+        }
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3721,8 +4069,10 @@ impl Heap {
                 } else {
                     parts.range
                 };
+                let epoch = self.next_array_epoch(parts.reference)?;
                 self.scalar_collections.$arena().values_mut(range)?[current] = stored;
-                self.set_array_length(parts.reference, length)
+                self.set_array_length(parts.reference, length)?;
+                self.commit_array_epoch(parts.reference, epoch)
             }};
         }
         match parts.storage {
@@ -3783,8 +4133,10 @@ impl Heap {
             } else {
                 parts.range
             };
+            let epoch = self.next_array_epoch(parts.reference)?;
             self.collections.values_mut(range)?[current] = element;
-            return self.set_array_length(parts.reference, length);
+            self.set_array_length(parts.reference, length)?;
+            return self.commit_array_epoch(parts.reference, epoch);
         };
         let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
         self.push_row_cells(parts, length, &row[..stride])
@@ -3875,6 +4227,7 @@ impl Heap {
         for value in row {
             self.shade_on_write(*value);
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let needed_cells = length
             .checked_mul(stride)
             .ok_or(HeapError::CapacityExhausted)?;
@@ -3887,7 +4240,7 @@ impl Heap {
                     ((current - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
                 );
             self.set_array_length(parts.reference, length)?;
-            return Ok(());
+            return self.commit_array_epoch(parts.reference, epoch);
         }
         let capacity_cells = grown_array_capacity(
             parts.range.length / stride,
@@ -3905,7 +4258,8 @@ impl Heap {
                 values[index * stride..(index + 1) * stride].copy_from_slice(row);
             },
         )?;
-        self.set_array_length(parts.reference, length)
+        self.set_array_length(parts.reference, length)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     pub fn array_pop_row_discard(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
@@ -3917,10 +4271,12 @@ impl Heap {
                 length: 0,
             });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         self.collections.values_mut(parts.range)?
             [(parts.length - 1) * stride..parts.length * stride]
             .fill(RuntimeValue::Unit);
-        self.set_array_length(parts.reference, parts.length - 1)
+        self.set_array_length(parts.reference, parts.length - 1)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     pub fn array_remove_row_discard(
@@ -3936,6 +4292,7 @@ impl Heap {
                 length: parts.length,
             });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let values = self.collections.values_mut(parts.range)?;
         values.copy_within((index + 1) * stride..parts.length * stride, index * stride);
         values[(parts.length - 1) * stride..parts.length * stride].fill(RuntimeValue::Unit);
@@ -3943,7 +4300,8 @@ impl Heap {
             self.counters.collection_relocation_bytes.saturating_add(
                 ((parts.length - 1 - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
             );
-        self.set_array_length(parts.reference, parts.length - 1)
+        self.set_array_length(parts.reference, parts.length - 1)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     /// Shared row-append tail for [`Self::array_push`] and
@@ -3977,8 +4335,10 @@ impl Heap {
         } else {
             parts.range
         };
+        let epoch = self.next_array_epoch(parts.reference)?;
         self.collections.values_mut(range)?[current * stride..needed_cells].copy_from_slice(row);
-        self.set_array_length(parts.reference, length)
+        self.set_array_length(parts.reference, length)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     pub fn array_pop(&mut self, value: RuntimeValue) -> Result<RuntimeValue, HeapError> {
@@ -3987,6 +4347,7 @@ impl Heap {
         if length == 0 {
             return Err(HeapError::IndexOutOfBounds { index: 0, length });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let Some(stride) = parts.rows() else {
             let result = self.typed_collection_get(
                 parts.storage,
@@ -3996,6 +4357,7 @@ impl Heap {
             )?;
             self.typed_collection_clear(parts.storage, parts.range, length - 1..length)?;
             self.set_array_length(parts.reference, length - 1)?;
+            self.commit_array_epoch(parts.reference, epoch)?;
             return Ok(result);
         };
         // Materialize the row before mutating anything: a failed struct
@@ -4004,6 +4366,7 @@ impl Heap {
         let values = self.collections.values_mut(parts.range)?;
         values[(length - 1) * stride..length * stride].fill(RuntimeValue::Unit);
         self.set_array_length(parts.reference, length - 1)?;
+        self.commit_array_epoch(parts.reference, epoch)?;
         Ok(result)
     }
 
@@ -4017,6 +4380,7 @@ impl Heap {
                 length: 0,
             });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let index = parts.length - 1;
         if let Some(stride) = parts.rows() {
             self.collections.values_mut(parts.range)?[index * stride..parts.length * stride]
@@ -4024,7 +4388,8 @@ impl Heap {
         } else {
             self.typed_collection_clear(parts.storage, parts.range, index..parts.length)?;
         }
-        self.set_array_length(parts.reference, index)
+        self.set_array_length(parts.reference, index)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4173,16 +4538,19 @@ impl Heap {
             self.shade_on_write(element);
             let capacity =
                 grown_array_capacity(parts.range.length, length, self.max_collection_length);
+            let epoch = self.next_array_epoch(parts.reference)?;
             self.regrow_array(parts.reference, parts.range, current, capacity, |values| {
                 values.copy_within(index..current, index + 1);
                 values[index] = element;
             })?;
-            return self.set_array_length(parts.reference, length);
+            self.set_array_length(parts.reference, length)?;
+            return self.commit_array_epoch(parts.reference, epoch);
         };
         let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
         for field in &row[..stride] {
             self.shade_on_write(*field);
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let needed_cells = length
             .checked_mul(stride)
             .ok_or(HeapError::CapacityExhausted)?;
@@ -4195,7 +4563,7 @@ impl Heap {
                     ((current - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
                 );
             self.set_array_length(parts.reference, length)?;
-            return Ok(());
+            return self.commit_array_epoch(parts.reference, epoch);
         }
         let capacity_cells = grown_array_capacity(
             parts.range.length / stride,
@@ -4213,7 +4581,8 @@ impl Heap {
                 values[index * stride..(index + 1) * stride].copy_from_slice(&row[..stride]);
             },
         )?;
-        self.set_array_length(parts.reference, length)
+        self.set_array_length(parts.reference, length)?;
+        self.commit_array_epoch(parts.reference, epoch)
     }
 
     pub fn array_remove(
@@ -4226,6 +4595,7 @@ impl Heap {
         if index >= length {
             return Err(HeapError::IndexOutOfBounds { index, length });
         }
+        let epoch = self.next_array_epoch(parts.reference)?;
         let Some(stride) = parts.rows() else {
             let removed =
                 self.typed_collection_get(parts.storage, parts.element_type, parts.range, index)?;
@@ -4242,11 +4612,13 @@ impl Heap {
                 .collection_relocation_bytes
                 .saturating_add(((length - 1 - index) * element_bytes) as u64);
             self.set_array_length(parts.reference, length - 1)?;
+            self.commit_array_epoch(parts.reference, epoch)?;
             return Ok(removed);
         };
         // Materialize the row before mutating anything: a failed struct
         // allocation must leave the array untouched (failure atomicity).
         let removed = self.array_get(value, index)?;
+        self.commit_array_epoch(parts.reference, epoch)?;
         let values = self.collections.values_mut(parts.range)?;
         values.copy_within((index + 1) * stride..length * stride, index * stride);
         values[(length - 1) * stride..length * stride].fill(RuntimeValue::Unit);
@@ -4262,9 +4634,18 @@ impl Heap {
         // WP50: clear retains capacity; live cells reset so no stale
         // references survive in the extent.
         let parts = self.array_parts(value)?;
+        let epoch = if parts.length != 0 {
+            Some(self.next_array_epoch(parts.reference)?)
+        } else {
+            None
+        };
         let live_cells = parts.length * parts.stride();
         self.typed_collection_clear(parts.storage, parts.range, 0..live_cells)?;
-        self.set_array_length(parts.reference, 0)
+        self.set_array_length(parts.reference, 0)?;
+        if let Some(epoch) = epoch {
+            self.commit_array_epoch(parts.reference, epoch)?;
+        }
+        Ok(())
     }
 
     /// Changes only the retained capacity of an array. `target` is expressed
@@ -4430,6 +4811,49 @@ impl Heap {
         match self.resolve_mut(reference)? {
             Object::Array { length, .. } => {
                 *length = new_length;
+                Ok(())
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    /// `LANGUAGE_V3` 4.3 epoch discipline: mutations first *reserve* the next
+    /// epoch (non-mutating `checked_add`, so an exhausted epoch traps before
+    /// any data write) and *commit* it only after the mutation fully
+    /// succeeded. A failed mutation therefore leaves both data and epoch
+    /// unchanged.
+    fn next_array_epoch(&self, reference: GcRef) -> Result<u64, HeapError> {
+        match self.resolve(reference)? {
+            Object::Array { mutation_epoch, .. } => mutation_epoch
+                .checked_add(1)
+                .ok_or(HeapError::MutationEpochExhausted),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn commit_array_epoch(&mut self, reference: GcRef, epoch: u64) -> Result<(), HeapError> {
+        match self.resolve_mut(reference)? {
+            Object::Array { mutation_epoch, .. } => {
+                *mutation_epoch = epoch;
+                Ok(())
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn next_buffer_epoch(&self, reference: GcRef) -> Result<u64, HeapError> {
+        match self.resolve(reference)? {
+            Object::Buffer { mutation_epoch, .. } => mutation_epoch
+                .checked_add(1)
+                .ok_or(HeapError::MutationEpochExhausted),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn commit_buffer_epoch(&mut self, reference: GcRef, epoch: u64) -> Result<(), HeapError> {
+        match self.resolve_mut(reference)? {
+            Object::Buffer { mutation_epoch, .. } => {
+                *mutation_epoch = epoch;
                 Ok(())
             }
             _ => Err(HeapError::InvalidReference(reference)),
@@ -4646,6 +5070,7 @@ impl Heap {
                 length,
                 row_stride,
                 storage,
+                ..
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
                 Ok(ArrayParts {
                     reference,
@@ -4751,13 +5176,43 @@ impl Heap {
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
         let parts = self.buffer_parts(value)?;
+        let epoch = self.next_buffer_epoch(parts.reference)?;
         self.typed_collection_set(
             parts.storage,
             parts.element_type,
             parts.range,
             index,
             replacement,
-        )
+        )?;
+        self.commit_buffer_epoch(parts.reference, epoch)
+    }
+
+    /// `LANGUAGE_V3` `BufferFill`: overwrites `length` elements starting at
+    /// `index` with `replacement`; bounds are validated before any write.
+    pub fn buffer_fill(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        length: usize,
+        replacement: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let parts = self.buffer_parts(value)?;
+        let end = checked_collection_end(index, length, parts.range.length)?;
+        if length == 0 {
+            // A zero-length fill writes nothing and is not a mutation.
+            return Ok(());
+        }
+        let epoch = self.next_buffer_epoch(parts.reference)?;
+        for destination in index..end {
+            self.typed_collection_set(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                destination,
+                replacement,
+            )?;
+        }
+        self.commit_buffer_epoch(parts.reference, epoch)
     }
 
     pub fn buffer_slice(
@@ -4866,6 +5321,7 @@ impl Heap {
             .counters
             .collection_relocation_bytes
             .saturating_add((prepared.length * element_bytes) as u64);
+        let epoch = self.next_buffer_epoch(prepared.destination.reference)?;
         macro_rules! copy_typed {
             ($arena:ident) => {
                 self.scalar_collections
@@ -4919,7 +5375,7 @@ impl Heap {
                 }
             }
         }
-        Ok(())
+        self.commit_buffer_epoch(prepared.destination.reference, epoch)
     }
 
     fn buffer_parts(&self, value: RuntimeValue) -> Result<BufferParts, HeapError> {
@@ -4932,9 +5388,11 @@ impl Heap {
                 element_type,
                 storage,
                 range,
+                ..
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
                 Ok(BufferParts {
                     type_id,
+                    reference,
                     element_type: *element_type,
                     storage: *storage,
                     range: *range,
@@ -5036,6 +5494,7 @@ impl Heap {
             values,
             length: 0,
             rehash: None,
+            mutation_epoch: 0,
         });
         let reference = self.commit(&mut reservation, Object::Map { storage });
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -5270,6 +5729,11 @@ impl Heap {
     }
 
     fn begin_map_rehash(&mut self, storage: usize, new_capacity: usize) -> Result<(), HeapError> {
+        // `LANGUAGE_V3` 4.3 epoch discipline: reserve the next epoch first
+        // (read-only), so an exhausted epoch traps before any claim,
+        // charge, or header mutation; the reserved value is committed only
+        // after the fallible claims succeeded and the switch completed.
+        let epoch = self.next_map_epoch(storage)?;
         let map = self.maps[storage]
             .as_ref()
             .expect("validated map storage exists");
@@ -5312,21 +5776,53 @@ impl Heap {
             new_values,
             cursor: 0,
         });
+        // Switching to an in-flight rehash is itself an observable
+        // structural mutation (an old iterator must trap even while the
+        // incremental rehash is paused between chunks).
+        self.commit_map_epoch(storage, epoch);
         Ok(())
     }
 
+    fn begin_set_rehash(&mut self, storage: usize, new_capacity: usize) -> Result<(), HeapError> {
+        // `LANGUAGE_V3` 4.3 epoch discipline: reserve the next epoch first
+        // (read-only) so an exhausted epoch traps before any claim,
+        // charge, or header mutation; commit only after the switch.
+        let epoch = self.next_set_epoch(storage)?;
+        let entry_bytes = size_of::<Option<MapEntry>>() as u64;
+        let new_bytes = (new_capacity as u64).saturating_mul(entry_bytes);
+        self.ensure_payload_headroom(new_bytes)?;
+        self.ensure_collection_headroom(new_bytes)?;
+
+        let new_slots = self.map_slots.claim(new_capacity)?;
+        self.charge_collection_payload(new_bytes);
+        self.counters.map_slot_allocations = self
+            .counters
+            .map_slot_allocations
+            .saturating_add(new_capacity as u64);
+
+        let set = self.sets[storage]
+            .as_mut()
+            .expect("validated set storage exists");
+        let old_slots = set.slots;
+        set.slots = CollectionRange::default();
+        set.rehash = Some(SetRehash {
+            old_slots,
+            new_slots,
+            cursor: 0,
+        });
+        // Entering an in-flight rehash is an observable structural
+        // mutation; a paused rehash still traps old iterators.
+        self.commit_set_epoch(storage, epoch);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn map_set_value_range(
         &mut self,
         value: RuntimeValue,
         key: RuntimeValue,
         replacement: &[RuntimeValue],
     ) -> Result<MapSetOutcome, HeapError> {
-        // G1 barrier: shading before the outcome branches is conservative
-        // (a pending rehash publishes nothing yet) but always safe.
-        self.shade_on_write(key);
-        for replacement in replacement {
-            self.shade_on_write(*replacement);
-        }
         // Resolve and validate the public map handle once. The previous
         // implementation repeatedly walked heap slot -> map arena for every
         // branch below, even though neither identity can change during one
@@ -5355,7 +5851,14 @@ impl Heap {
                 .as_ref()
                 .expect("validated map storage exists")
                 .value_storage;
-            let released = progress_map_rehash(
+            // `LANGUAGE_V3` 4.3: every rehash step changes the phase
+            // topology a mid-rehash iterator walks - the cursor advances
+            // and the final step switches back to a single current table -
+            // so the epoch advances unconditionally after each progress
+            // step, even when the chunk contained no entries. Reserve
+            // before the step, commit after it succeeded.
+            let epoch = self.next_map_epoch(storage)?;
+            let (_migrated, released) = progress_map_rehash(
                 self.maps[storage]
                     .as_mut()
                     .expect("validated map storage exists"),
@@ -5363,6 +5866,7 @@ impl Heap {
                 &mut self.collections,
                 &mut self.scalar_collections,
             )?;
+            self.commit_map_epoch(storage, epoch);
             if let Some((old_values, released_bytes)) = released {
                 self.release_typed_collection(value_storage, old_values);
                 // G6: rehash completion released the old slot/value table.
@@ -5379,6 +5883,16 @@ impl Heap {
             self.find_map_entry(map, key, hash)?
         };
         if let Some(location) = location {
+            // `LANGUAGE_V3` 4.3: an existing-key MapInsert overwrites the
+            // value and is an observable write, so the epoch advances
+            // exactly like a new-key insert - reserved before the write,
+            // committed after success, so an exhausted epoch traps without
+            // mutating the map.
+            let epoch = self.next_map_epoch(storage)?;
+            self.shade_on_write(key);
+            for replacement in replacement {
+                self.shade_on_write(*replacement);
+            }
             let map = self.maps[storage]
                 .as_ref()
                 .expect("validated map storage exists");
@@ -5386,6 +5900,7 @@ impl Heap {
             let value_storage = map.value_storage;
             let value_type = map.value_type;
             self.write_map_value_range(value_storage, value_type, value_range, replacement)?;
+            self.commit_map_epoch(storage, epoch);
             return Ok(MapSetOutcome::Complete);
         }
 
@@ -5413,6 +5928,13 @@ impl Heap {
 
         let entry = MapEntry { key, hash };
         self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
+        let epoch = self.next_map_epoch(storage)?;
+        // The insertion barrier runs only on the actual publication path,
+        // after every fallible check and the epoch preflight.
+        self.shade_on_write(key);
+        for replacement in replacement {
+            self.shade_on_write(*replacement);
+        }
         let map = self.maps[storage]
             .as_ref()
             .expect("validated map storage exists");
@@ -5429,6 +5951,7 @@ impl Heap {
             .as_mut()
             .expect("validated map storage exists")
             .length += 1;
+        self.commit_map_epoch(storage, epoch);
         Ok(MapSetOutcome::Complete)
     }
 
@@ -5461,6 +5984,9 @@ impl Heap {
             return Ok(false);
         };
         let storage = self.map_storage_index(value)?;
+        // `LANGUAGE_V3` 4.3: successful removal is observable; the epoch is
+        // reserved before the entry disappears and committed after success.
+        let epoch = self.next_map_epoch(storage)?;
         let map = self.maps[storage]
             .as_ref()
             .expect("validated map storage exists");
@@ -5497,6 +6023,7 @@ impl Heap {
             .as_mut()
             .expect("validated map storage exists")
             .length -= 1;
+        self.commit_map_epoch(storage, epoch);
         Ok(true)
     }
 
@@ -5506,6 +6033,12 @@ impl Heap {
             .as_ref()
             .expect("validated map storage exists")
             .clone();
+        let nonempty = snapshot.length != 0 || snapshot.rehash.is_some();
+        let epoch = if nonempty {
+            Some(self.next_map_epoch(storage)?)
+        } else {
+            None
+        };
         if let Some(rehash) = snapshot.rehash {
             // G6: an in-flight map has no primary table. Clear releases both
             // sides and lets the next insertion choose a fresh capacity.
@@ -5545,7 +6078,490 @@ impl Heap {
                 .expect("validated map storage exists")
                 .length = 0;
         }
+        if let Some(epoch) = epoch {
+            self.commit_map_epoch(storage, epoch);
+        }
         Ok(())
+    }
+
+    fn next_map_epoch(&self, storage: usize) -> Result<u64, HeapError> {
+        self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists")
+            .mutation_epoch
+            .checked_add(1)
+            .ok_or(HeapError::MutationEpochExhausted)
+    }
+
+    fn commit_map_epoch(&mut self, storage: usize, epoch: u64) {
+        self.maps[storage]
+            .as_mut()
+            .expect("validated map storage exists")
+            .mutation_epoch = epoch;
+    }
+
+    fn next_set_epoch(&self, storage: usize) -> Result<u64, HeapError> {
+        self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists")
+            .mutation_epoch
+            .checked_add(1)
+            .ok_or(HeapError::MutationEpochExhausted)
+    }
+
+    fn commit_set_epoch(&mut self, storage: usize, epoch: u64) {
+        self.sets[storage]
+            .as_mut()
+            .expect("validated set storage exists")
+            .mutation_epoch = epoch;
+    }
+
+    /// `LANGUAGE_V3` 4.3: live mutation epoch of a map, snapshot by
+    /// `IterNew` and revalidated by every `IterNext`.
+    pub fn map_mutation_epoch(&self, value: RuntimeValue) -> Result<u64, HeapError> {
+        Ok(self.map(value)?.mutation_epoch)
+    }
+
+    /// `LANGUAGE_V3` 4.3: live mutation epoch of a set.
+    pub fn set_mutation_epoch(&self, value: RuntimeValue) -> Result<u64, HeapError> {
+        Ok(self.set(value)?.mutation_epoch)
+    }
+
+    /// `LANGUAGE_V3` 4.3: live mutation epoch of an array.
+    pub fn array_mutation_epoch(&self, value: RuntimeValue) -> Result<u64, HeapError> {
+        let RuntimeValue::NamedRef { reference, .. } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Array { mutation_epoch, .. } => Ok(*mutation_epoch),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    /// `LANGUAGE_V3` 4.3: live mutation epoch of a buffer.
+    pub fn buffer_mutation_epoch(&self, value: RuntimeValue) -> Result<u64, HeapError> {
+        let RuntimeValue::NamedRef { reference, .. } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Buffer { mutation_epoch, .. } => Ok(*mutation_epoch),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    /// Allocates an empty `Set<T>` with the canonical set type identity.
+    pub fn allocate_set(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::set_type(element_type) {
+            return Err(invalid_value_reference());
+        }
+        let initial_capacity = self.empty_map_capacity();
+        let payload_bytes =
+            (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
+        self.ensure_new_set_headroom(payload_bytes)?;
+        self.ensure_collection_headroom(payload_bytes)?;
+        let mut reservation = self.preflight(1)?;
+        let slots = self.map_slots.claim(initial_capacity)?;
+        let storage = self.claim_set_storage(VmSet {
+            type_id,
+            element_type,
+            slots,
+            length: 0,
+            rehash: None,
+            mutation_epoch: 0,
+        });
+        let reference = self.commit(&mut reservation, Object::Set { storage });
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    fn claim_set_storage(&mut self, set: VmSet) -> u32 {
+        if let Some(index) = self.free_sets.pop() {
+            self.sets[index as usize] = Some(set);
+            return index;
+        }
+        let index = u32::try_from(self.sets.len()).expect("set arena is bounded by heap slots");
+        debug_assert!(index < self.max_objects);
+        debug_assert!(
+            self.sets.len() < self.sets.capacity(),
+            "set arena capacity is reserved with the heap"
+        );
+        self.sets.push(Some(set));
+        index
+    }
+
+    pub fn set_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        Ok(self.set(value)?.length)
+    }
+
+    pub fn set_contains(
+        &self,
+        value: RuntimeValue,
+        element: RuntimeValue,
+    ) -> Result<bool, HeapError> {
+        let hash = self.runtime_value_hash(element)?;
+        let set = self.set(value)?;
+        Ok(self.find_set_entry(set, element, hash)?.is_some())
+    }
+
+    /// Attempts one insertion; `RehashPending` retries without re-hashing
+    /// (the same deterministic attempt contract as `MapSet`).
+    pub fn set_insert(
+        &mut self,
+        value: RuntimeValue,
+        element: RuntimeValue,
+    ) -> Result<SetInsertOutcome, HeapError> {
+        let storage = self.set_storage_index(value)?;
+        if self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists")
+            .rehash
+            .is_some()
+        {
+            // `LANGUAGE_V3` 4.3: every rehash step changes the phase
+            // topology a mid-rehash iterator walks, so the epoch advances
+            // unconditionally after each progress step. Reserve before
+            // the step, commit after it succeeded.
+            let epoch = self.next_set_epoch(storage)?;
+            let (_migrated, released) = progress_set_rehash(
+                self.sets[storage]
+                    .as_mut()
+                    .expect("validated set storage exists"),
+                &mut self.map_slots,
+            )?;
+            self.commit_set_epoch(storage, epoch);
+            if let Some(released_bytes) = released {
+                self.release_collection_payload(released_bytes);
+            }
+            return Ok(SetInsertOutcome::RehashPending);
+        }
+
+        let hash = self.runtime_value_hash(element)?;
+        let location = {
+            let set = self.sets[storage]
+                .as_ref()
+                .expect("validated set storage exists");
+            self.find_set_entry(set, element, hash)?
+        };
+        if location.is_some() {
+            // A duplicate insert leaves the set unchanged: no epoch bump.
+            return Ok(SetInsertOutcome::Complete(false));
+        }
+
+        let set = self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists");
+        if set.length >= self.max_collection_length {
+            return Err(HeapError::CollectionTooLarge {
+                length: set.length.saturating_add(1),
+                max_length: self.max_collection_length,
+            });
+        }
+        if table_needs_rehash(set.slots.length, set.length) {
+            let old_capacity = set.slots.length;
+            let new_capacity =
+                next_table_capacity(set.slots.length, set.length, self.max_collection_length)
+                    .expect("set needs rehash");
+            if new_capacity > old_capacity {
+                self.begin_set_rehash(storage, new_capacity)?;
+                return Ok(SetInsertOutcome::RehashPending);
+            }
+        }
+
+        let entry = MapEntry { key: element, hash };
+        self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
+        let epoch = self.next_set_epoch(storage)?;
+        // The insertion barrier runs only on the actual publication path,
+        // after every fallible check and the epoch preflight.
+        self.shade_on_write(element);
+        let set = self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists");
+        let range = set.slots;
+        insert_map_entry(self.map_slots.slots_mut(range), entry)?;
+        self.sets[storage]
+            .as_mut()
+            .expect("validated set storage exists")
+            .length += 1;
+        self.commit_set_epoch(storage, epoch);
+        Ok(SetInsertOutcome::Complete(true))
+    }
+
+    /// Removes one element; returns whether it was present. A successful
+    /// removal is an observable structural mutation and advances the epoch.
+    pub fn set_remove(
+        &mut self,
+        value: RuntimeValue,
+        element: RuntimeValue,
+    ) -> Result<bool, HeapError> {
+        let hash = self.runtime_value_hash(element)?;
+        let location = {
+            let set = self.set(value)?;
+            self.find_set_entry(set, element, hash)?
+        };
+        let Some(location) = location else {
+            return Ok(false);
+        };
+        let storage = self.set_storage_index(value)?;
+        // `LANGUAGE_V3` 4.3: successful removal is observable; the epoch is
+        // reserved before the entry disappears and committed after success.
+        let epoch = self.next_set_epoch(storage)?;
+        let set = self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists");
+        let range = set_location_range(set, location);
+        match location {
+            SetLocation::RehashOld(_) => {
+                self.map_slots.slots_mut(range)[set_location_index(location)]
+                    .take()
+                    .expect("located set entry exists");
+            }
+            SetLocation::Current(_) | SetLocation::RehashNew(_) => {
+                remove_probed_entry_with_moves(
+                    self.map_slots.slots_mut(range),
+                    set_location_index(location),
+                    |_, _| {},
+                );
+            }
+        }
+        self.sets[storage]
+            .as_mut()
+            .expect("validated set storage exists")
+            .length -= 1;
+        self.commit_set_epoch(storage, epoch);
+        Ok(true)
+    }
+
+    pub fn set_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let storage = self.set_storage_index(value)?;
+        let snapshot = self.sets[storage]
+            .as_ref()
+            .expect("validated set storage exists")
+            .clone();
+        let nonempty = snapshot.length != 0 || snapshot.rehash.is_some();
+        let epoch = if nonempty {
+            Some(self.next_set_epoch(storage)?)
+        } else {
+            None
+        };
+        if let Some(rehash) = snapshot.rehash {
+            self.map_slots.release(rehash.old_slots);
+            self.map_slots.release(rehash.new_slots);
+            let bytes = (rehash
+                .old_slots
+                .length
+                .saturating_add(rehash.new_slots.length) as u64)
+                .saturating_mul(size_of::<Option<MapEntry>>() as u64);
+            let set = self.sets[storage]
+                .as_mut()
+                .expect("validated set storage exists");
+            set.slots = CollectionRange::default();
+            set.rehash = None;
+            set.length = 0;
+            self.release_collection_payload(bytes);
+        } else {
+            self.map_slots.slots_mut(snapshot.slots).fill(None);
+            self.sets[storage]
+                .as_mut()
+                .expect("validated set storage exists")
+                .length = 0;
+        }
+        if let Some(epoch) = epoch {
+            self.commit_set_epoch(storage, epoch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_fuel_shape(&self, value: RuntimeValue) -> Result<SetFuelShape, HeapError> {
+        const REHASH_CHUNK: usize = 8;
+        let set = self.set(value)?;
+        let (old_slots, new_slots, rehash_remaining) =
+            set.rehash.as_ref().map_or((0, 0, 0), |rehash| {
+                (
+                    rehash.old_slots.length,
+                    rehash.new_slots.length,
+                    rehash
+                        .old_slots
+                        .length
+                        .saturating_sub(rehash.cursor)
+                        .min(REHASH_CHUNK),
+                )
+            });
+        let next_rehash_slots = if set.rehash.is_none() {
+            next_table_capacity(set.slots.length, set.length, self.max_collection_length)
+                .filter(|capacity| *capacity > set.slots.length)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(SetFuelShape {
+            current_slots: set.slots.length,
+            old_slots,
+            new_slots,
+            rehash_remaining,
+            next_rehash_slots,
+        })
+    }
+
+    /// Iterates set elements in deterministic backing-slot order without
+    /// allocating or recomputing hashes (current, then old, then new sides
+    /// of an in-flight rehash, lowest slot first).
+    #[cfg(test)]
+    pub(crate) fn set_entries(&self, value: RuntimeValue) -> Result<SetEntries<'_>, HeapError> {
+        let set = self.set(value)?;
+        let empty: &[Option<MapEntry>] = &[];
+        let (old, new) = set.rehash.as_ref().map_or((empty, empty), |rehash| {
+            (
+                self.map_slots.slots(rehash.old_slots),
+                self.map_slots.slots(rehash.new_slots),
+            )
+        });
+        Ok(SetEntries {
+            current: self.map_slots.slots(set.slots),
+            old,
+            new,
+            phase: 0,
+            index: 0,
+            remaining: set.length,
+        })
+    }
+
+    /// Advances a Map iteration cursor; returns the next key and the
+    /// cursor position *after* the yielded entry. The value row is copied
+    /// into `destination` (exactly `value_slots` cells). `phase`/`slot`
+    /// follow the `IteratorStateRegisters` wire contract (0=current,
+    /// 1=rehash-old, 2=rehash-new).
+    pub(crate) fn map_iter_advance_into(
+        &self,
+        value: RuntimeValue,
+        phase: u8,
+        slot: usize,
+        destination: &mut [RuntimeValue],
+    ) -> Result<Option<(u8, usize, RuntimeValue)>, HeapError> {
+        let map = self.map(value)?;
+        if destination.len() != usize::from(map.value_slots) {
+            return Err(invalid_value_reference());
+        }
+        let Some((phase, slot, entry)) = self.advance_slot_cursor(map, phase, slot)? else {
+            return Ok(None);
+        };
+        let location = map_slot_location(phase, slot - 1);
+        let value_range = map_entry_value_range(map, location)?;
+        let view = self.typed_collection_view(map.value_storage, map.value_type, value_range)?;
+        for (destination, value) in destination.iter_mut().zip(view.iter()) {
+            *destination = value;
+        }
+        Ok(Some((phase, slot, entry.key)))
+    }
+
+    /// Advances a Set iteration cursor; returns the next element and the
+    /// cursor position after the yielded entry.
+    pub(crate) fn set_iter_advance(
+        &self,
+        value: RuntimeValue,
+        phase: u8,
+        slot: usize,
+    ) -> Result<Option<(u8, usize, RuntimeValue)>, HeapError> {
+        let set = self.set(value)?;
+        let Some((phase, slot, entry)) = self.advance_slot_cursor(set, phase, slot)? else {
+            return Ok(None);
+        };
+        Ok(Some((phase, slot, entry.key)))
+    }
+
+    fn advance_slot_cursor(
+        &self,
+        table: &impl SlotTable,
+        phase: u8,
+        slot: usize,
+    ) -> Result<Option<(u8, usize, MapEntry)>, HeapError> {
+        let mut phase = phase;
+        let mut slot = slot;
+        loop {
+            let Some(entries) = table.slots_for(self, phase) else {
+                return Ok(None);
+            };
+            if slot >= entries.len() {
+                phase += 1;
+                slot = 0;
+                continue;
+            }
+            let entry = entries[slot];
+            slot += 1;
+            if let Some(entry) = entry {
+                return Ok(Some((phase, slot, entry)));
+            }
+        }
+    }
+
+    fn set_storage_index(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        let Object::Set { storage } = self.resolve(reference)? else {
+            return Err(HeapError::InvalidReference(reference));
+        };
+        let storage = *storage as usize;
+        let set = self
+            .sets
+            .get(storage)
+            .and_then(Option::as_ref)
+            .ok_or(HeapError::InvalidReference(reference))?;
+        if set.type_id == type_id && type_id == nexa_bytecode::set_type(set.element_type) {
+            Ok(storage)
+        } else {
+            Err(HeapError::InvalidReference(reference))
+        }
+    }
+
+    fn set(&self, value: RuntimeValue) -> Result<&VmSet, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        let Object::Set { storage } = self.resolve(reference)? else {
+            return Err(HeapError::InvalidReference(reference));
+        };
+        let set = self
+            .sets
+            .get(*storage as usize)
+            .and_then(Option::as_ref)
+            .ok_or(HeapError::InvalidReference(reference))?;
+        if set.type_id == type_id && type_id == nexa_bytecode::set_type(set.element_type) {
+            Ok(set)
+        } else {
+            Err(HeapError::InvalidReference(reference))
+        }
+    }
+
+    fn find_set_entry(
+        &self,
+        set: &VmSet,
+        element: RuntimeValue,
+        hash: u64,
+    ) -> Result<Option<SetLocation>, HeapError> {
+        if let Some(index) = self.probe_map_slots(self.map_slots.slots(set.slots), element, hash)? {
+            return Ok(Some(SetLocation::Current(index)));
+        }
+        if let Some(rehash) = &set.rehash {
+            if let Some(index) =
+                self.probe_map_slots(self.map_slots.slots(rehash.new_slots), element, hash)?
+            {
+                return Ok(Some(SetLocation::RehashNew(index)));
+            }
+            for (offset, entry) in self.map_slots.slots(rehash.old_slots)[rehash.cursor..]
+                .iter()
+                .enumerate()
+            {
+                if entry.is_some_and(|entry| entry.hash == hash)
+                    && self.runtime_value_equal(entry.expect("checked entry").key, element)?
+                {
+                    return Ok(Some(SetLocation::RehashOld(rehash.cursor + offset)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn map_storage_index(&self, value: RuntimeValue) -> Result<usize, HeapError> {
@@ -5989,7 +7005,7 @@ impl Heap {
         self.live_collection_bytes
     }
 
-    /// O(1) exact bytes owned by live VM objects: occupied object/map
+    /// O(1) exact bytes owned by live VM objects: occupied object/map/set
     /// headers plus their out-of-slot payloads. Reserved allocator slack and
     /// profiler storage remain separate `GC_V1` inspection categories.
     #[must_use]
@@ -5998,8 +7014,11 @@ impl Heap {
             (self.live_objects as u64).saturating_mul(size_of::<ObjectSlot>() as u64);
         let live_maps = self.maps.len().saturating_sub(self.free_maps.len()) as u64;
         let map_headers = live_maps.saturating_mul(size_of::<Option<VmMap>>() as u64);
+        let live_sets = self.sets.len().saturating_sub(self.free_sets.len()) as u64;
+        let set_headers = live_sets.saturating_mul(size_of::<Option<VmSet>>() as u64);
         object_headers
             .saturating_add(map_headers)
+            .saturating_add(set_headers)
             .saturating_add(self.live_payload_bytes)
     }
 
@@ -6019,6 +7038,13 @@ impl Heap {
         } else {
             0
         })
+    }
+
+    fn ensure_new_set_headroom(&self, payload: u64) -> Result<(), HeapError> {
+        self.ensure_payload_headroom(
+            (size_of::<ObjectSlot>() as u64 + size_of::<Option<VmSet>>() as u64)
+                .saturating_add(payload),
+        )
     }
 
     fn ensure_new_object_headroom(&self, payload: u64, map: bool) -> Result<(), HeapError> {
@@ -6518,6 +7544,19 @@ impl Heap {
                         },
                     );
                 }
+                Object::Set { storage } => {
+                    let set = self
+                        .sets
+                        .get(*storage as usize)
+                        .and_then(Option::as_ref)
+                        .ok_or(HeapError::InvalidReference(reference))?;
+                    let slots = &mut self.slots;
+                    set.trace_references(&self.map_slots, &mut |child| {
+                        if Self::enqueue_gray(slots, queue, child) {
+                            grayed += 1;
+                        }
+                    });
+                }
                 _ => {
                     // The object is briefly taken out of its slot so the
                     // visitor can enqueue children against `self.slots`
@@ -6589,6 +7628,7 @@ impl Heap {
     /// slot pool plus O(1) arena metadata - inspection-grade, never called
     /// from the hot path or from inside a bounded GC step.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn byte_inspection(&self) -> HeapByteInspection {
         let slot_bytes = size_of::<ObjectSlot>() as u64;
         let map_header_bytes = size_of::<Option<VmMap>>() as u64;
@@ -6632,7 +7672,7 @@ impl Heap {
                             generic_arena_live.saturating_add(object.payload_bytes());
                     }
                 }
-                Object::Map { .. } => {
+                Object::Map { .. } | Object::Set { .. } => {
                     inspection.map_bytes = inspection
                         .map_bytes
                         .saturating_add(self.object_payload_bytes(object));
@@ -6653,9 +7693,12 @@ impl Heap {
             }
         }
         let occupied_map_headers = self.maps.iter().filter(|map| map.is_some()).count() as u64;
+        let occupied_set_headers = self.sets.iter().filter(|set| set.is_some()).count() as u64;
+        let set_header_bytes = size_of::<Option<VmSet>>() as u64;
         inspection.object_header_bytes = occupied
             .saturating_mul(slot_bytes)
-            .saturating_add(occupied_map_headers.saturating_mul(map_header_bytes));
+            .saturating_add(occupied_map_headers.saturating_mul(map_header_bytes))
+            .saturating_add(occupied_set_headers.saturating_mul(set_header_bytes));
         let pool_slots = self.slots.capacity().max(self.slots.len()) as u64;
         let vacant_pool_bytes = pool_slots
             .saturating_sub(occupied)
@@ -6664,6 +7707,10 @@ impl Heap {
         let vacant_map_pool_bytes = map_pool_slots
             .saturating_sub(occupied_map_headers)
             .saturating_mul(map_header_bytes);
+        let set_pool_slots = self.sets.capacity().max(self.sets.len()) as u64;
+        let vacant_set_pool_bytes = set_pool_slots
+            .saturating_sub(occupied_set_headers)
+            .saturating_mul(set_header_bytes);
         let generic_arena_reserved =
             (self.collections.values.capacity() as u64).saturating_mul(value_bytes);
         let scalar_arena_reserved = self.scalar_arena_reserved_bytes();
@@ -6679,6 +7726,7 @@ impl Heap {
             .saturating_mul(size_of::<Option<MapEntry>>() as u64);
         inspection.allocator_slack_bytes = vacant_pool_bytes
             .saturating_add(vacant_map_pool_bytes)
+            .saturating_add(vacant_set_pool_bytes)
             .saturating_add(arena_free_bytes)
             .saturating_add(map_arena_free_bytes);
         inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
@@ -6766,26 +7814,27 @@ fn checked_collection_end(
     }
 }
 
-fn map_needs_rehash(map: &VmMap) -> bool {
-    map.slots.length == 0
-        || map.length.saturating_add(1).saturating_mul(4) > map.slots.length.saturating_mul(3)
+fn table_needs_rehash(slots: usize, length: usize) -> bool {
+    slots == 0 || length.saturating_add(1).saturating_mul(4) > slots.saturating_mul(3)
 }
 
-fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize> {
-    if !map_needs_rehash(map) {
+fn next_table_capacity(slots: usize, length: usize, max_collection_length: usize) -> Option<usize> {
+    if !table_needs_rehash(slots, length) {
         return None;
     }
     let maximum_capacity = max_collection_length
         .saturating_mul(2)
         .checked_next_power_of_two()
         .unwrap_or(usize::MAX);
-    Some(
-        map.slots
-            .length
-            .saturating_mul(2)
-            .max(1)
-            .min(maximum_capacity),
-    )
+    Some(slots.saturating_mul(2).max(1).min(maximum_capacity))
+}
+
+fn map_needs_rehash(map: &VmMap) -> bool {
+    table_needs_rehash(map.slots.length, map.length)
+}
+
+fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize> {
+    next_table_capacity(map.slots.length, map.length, max_collection_length)
 }
 
 fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<usize, HeapError> {
@@ -6968,31 +8017,63 @@ fn map_entry_value_range(map: &VmMap, location: MapLocation) -> Result<Collectio
     .ok_or_else(invalid_value_reference)
 }
 
-/// Advances one bounded rehash chunk. Completion returns the old companion
-/// value extent and the exact slot+value bytes leaving the live footprint.
+/// Migrates one bounded chunk of old slots into new slots (shared by map
+/// and set incremental rehash). Returns the next cursor; `moved` observes
+/// each migration (the map side copies companion value rows there).
+fn migrate_rehash_chunk(
+    arena: &mut MapSlotArena,
+    old_slots: CollectionRange,
+    new_slots: CollectionRange,
+    cursor: usize,
+    mut moved: impl FnMut(usize, usize) -> Result<(), HeapError>,
+) -> Result<(usize, usize), HeapError> {
+    const REHASH_CHUNK: usize = 8;
+    let end = cursor.saturating_add(REHASH_CHUNK).min(old_slots.length);
+    let mut migrated = 0;
+    for index in cursor..end {
+        if let Some(entry) = arena.slots_mut(old_slots)[index].take() {
+            let destination = insert_map_entry(arena.slots_mut(new_slots), entry)?;
+            migrated += 1;
+            moved(index, destination)?;
+        }
+    }
+    Ok((end, migrated))
+}
+
+/// Advances one bounded rehash chunk for a map. Completion returns the old
+/// companion value extent and the exact slot+value bytes leaving the live
+/// footprint.
+/// Advances one bounded rehash chunk for a map. Returns the number of
+/// entries actually migrated plus, on completion, the old companion value
+/// extent and the exact slot+value bytes leaving the live footprint.
+/// Callers advance the mutation epoch on every progress step.
 fn progress_map_rehash(
     map: &mut VmMap,
     arena: &mut MapSlotArena,
     values: &mut CollectionArena,
     scalar_values: &mut ScalarArenaSet,
-) -> Result<Option<(CollectionRange, u64)>, HeapError> {
-    const REHASH_CHUNK: usize = 8;
+) -> Result<(usize, Option<(CollectionRange, u64)>), HeapError> {
     let rehash = map.rehash.as_mut().expect("rehash state checked by caller");
-    let end = rehash
-        .cursor
-        .saturating_add(REHASH_CHUNK)
-        .min(rehash.old_slots.length);
-    for index in rehash.cursor..end {
-        if let Some(entry) = arena.slots_mut(rehash.old_slots)[index].take() {
-            let destination = insert_map_entry(arena.slots_mut(rehash.new_slots), entry)?;
-            let source = map_value_row(rehash.old_values, map.value_slots, index)
+    let old_slots = rehash.old_slots;
+    let new_slots = rehash.new_slots;
+    let value_slots = map.value_slots;
+    let value_storage = map.value_storage;
+    let old_values = rehash.old_values;
+    let new_values = rehash.new_values;
+    let (cursor, migrated) = migrate_rehash_chunk(
+        arena,
+        old_slots,
+        new_slots,
+        rehash.cursor,
+        |source, destination| {
+            let source = map_value_row(old_values, value_slots, source)
                 .ok_or_else(invalid_value_reference)?;
-            let destination = map_value_row(rehash.new_values, map.value_slots, destination)
+            let destination = map_value_row(new_values, value_slots, destination)
                 .ok_or_else(invalid_value_reference)?;
             typed_collection_copy_absolute(
                 values,
                 scalar_values,
-                map.value_storage,
+                value_storage,
                 source.start..source.end(),
                 destination.start,
             )?;
@@ -7000,18 +8081,14 @@ fn progress_map_rehash(
             typed_collection_clear_in_arenas(
                 values,
                 scalar_values,
-                map.value_storage,
+                value_storage,
                 source,
                 0..source_length,
-            )?;
-        }
-    }
-    rehash.cursor = end;
-    if end == rehash.old_slots.length {
-        let old_slots = rehash.old_slots;
-        let new_slots = rehash.new_slots;
-        let old_values = rehash.old_values;
-        let new_values = rehash.new_values;
+            )
+        },
+    )?;
+    rehash.cursor = cursor;
+    if cursor == old_slots.length {
         let released = (old_slots.length as u64)
             .saturating_mul(size_of::<Option<MapEntry>>() as u64)
             .saturating_add(
@@ -7021,9 +8098,71 @@ fn progress_map_rehash(
         map.slots = new_slots;
         map.values = new_values;
         map.rehash = None;
-        return Ok(Some((old_values, released)));
+        return Ok((migrated, Some((old_values, released))));
     }
-    Ok(None)
+    Ok((migrated, None))
+}
+
+/// Advances one bounded rehash chunk for a set; completion returns the
+/// exact slot bytes leaving the live footprint.
+/// Advances one bounded rehash chunk for a set; returns the number of
+/// entries actually migrated plus, on completion, the exact slot bytes
+/// leaving the live footprint. Callers advance the mutation epoch on
+/// every progress step.
+fn progress_set_rehash(
+    set: &mut VmSet,
+    arena: &mut MapSlotArena,
+) -> Result<(usize, Option<u64>), HeapError> {
+    let rehash = set.rehash.as_mut().expect("rehash state checked by caller");
+    let old_slots = rehash.old_slots;
+    let new_slots = rehash.new_slots;
+    let (cursor, migrated) =
+        migrate_rehash_chunk(arena, old_slots, new_slots, rehash.cursor, |_, _| Ok(()))?;
+    rehash.cursor = cursor;
+    if cursor == old_slots.length {
+        let released =
+            (old_slots.length as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
+        arena.release(old_slots);
+        set.slots = new_slots;
+        set.rehash = None;
+        return Ok((migrated, Some(released)));
+    }
+    Ok((migrated, None))
+}
+
+fn set_location_range(set: &VmSet, location: SetLocation) -> CollectionRange {
+    match location {
+        SetLocation::Current(_) => set.slots,
+        SetLocation::RehashOld(_) => {
+            set.rehash
+                .as_ref()
+                .expect("located rehash entry has state")
+                .old_slots
+        }
+        SetLocation::RehashNew(_) => {
+            set.rehash
+                .as_ref()
+                .expect("located rehash entry has state")
+                .new_slots
+        }
+    }
+}
+
+const fn set_location_index(location: SetLocation) -> usize {
+    match location {
+        SetLocation::Current(index)
+        | SetLocation::RehashOld(index)
+        | SetLocation::RehashNew(index) => index,
+    }
+}
+
+fn map_slot_location(phase: u8, index: usize) -> MapLocation {
+    match phase {
+        0 => MapLocation::Current(index),
+        1 => MapLocation::RehashOld(index),
+        2 => MapLocation::RehashNew(index),
+        _ => unreachable!("iterator phases are bounded to current/old/new"),
+    }
 }
 
 fn map_location_range(map: &VmMap, location: MapLocation) -> CollectionRange {
@@ -7146,7 +8285,8 @@ mod tests {
 
     use super::{
         CollectionStorage, CollectionView, GcBudget, GcRoots, Heap, HeapError, MapEntry,
-        MapSetOutcome, Object, fnv_content_hash, insert_map_entry, remove_probed_entry,
+        MapSetOutcome, Object, SetInsertOutcome, fnv_content_hash, insert_map_entry,
+        remove_probed_entry,
     };
     use crate::{RuntimeFailurePoint, RuntimeValue};
 
@@ -8637,5 +9777,540 @@ mod tests {
                 .all(|reference| heap.string(*reference).is_ok())
         );
         assert!(heap.string(strings[12]).is_err());
+    }
+
+    fn i32_set(heap: &mut Heap) -> RuntimeValue {
+        heap.allocate_set(
+            nexa_bytecode::set_type(nexa_bytecode::ValueType::I32),
+            nexa_bytecode::ValueType::I32,
+        )
+        .unwrap()
+    }
+
+    fn insert_all(heap: &mut Heap, set: RuntimeValue, keys: std::ops::Range<i32>) {
+        for key in keys {
+            while heap.set_insert(set, RuntimeValue::I32(key)).unwrap()
+                == SetInsertOutcome::RehashPending
+            {}
+        }
+    }
+
+    #[test]
+    fn set_insert_remove_reinsert_keeps_probe_chains_correct() {
+        // `LANGUAGE_V3` Set: delete/reinsert churn must keep every surviving
+        // element reachable through the shared backshift probe invariant.
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 512);
+        let set = i32_set(&mut heap);
+        insert_all(&mut heap, set, 0..64);
+        for key in (0..64).step_by(2) {
+            assert!(heap.set_remove(set, RuntimeValue::I32(key)).unwrap());
+        }
+        for key in 0..64 {
+            assert_eq!(
+                heap.set_contains(set, RuntimeValue::I32(key)).unwrap(),
+                key % 2 == 1
+            );
+        }
+        for key in (0..64).step_by(2) {
+            assert_eq!(
+                heap.set_insert(set, RuntimeValue::I32(key)).unwrap(),
+                SetInsertOutcome::Complete(true)
+            );
+        }
+        for key in 0..64 {
+            assert!(heap.set_contains(set, RuntimeValue::I32(key)).unwrap());
+        }
+        assert_eq!(heap.set_len(set).unwrap(), 64);
+    }
+
+    #[test]
+    fn set_duplicate_insert_leaves_set_and_epoch_unchanged() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(7)).unwrap(),
+            SetInsertOutcome::Complete(true)
+        );
+        let epoch = heap.set_mutation_epoch(set).unwrap();
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(7)).unwrap(),
+            SetInsertOutcome::Complete(false)
+        );
+        assert_eq!(heap.set_mutation_epoch(set).unwrap(), epoch);
+        assert_eq!(heap.set_len(set).unwrap(), 1);
+    }
+
+    #[test]
+    fn set_rehash_phases_preserve_elements_and_advance_epoch() {
+        // Rehash begins once the load factor crosses 3/4; each attempt
+        // migrates one bounded chunk, and the epoch advances when the
+        // rehash starts (paused rehash still traps old iterators) and
+        // again when the final insert lands.
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        let mut epochs = Vec::new();
+        for key in 0..10_i32 {
+            loop {
+                match heap.set_insert(set, RuntimeValue::I32(key)).unwrap() {
+                    SetInsertOutcome::Complete(_) => break,
+                    SetInsertOutcome::RehashPending => {
+                        epochs.push(heap.set_mutation_epoch(set).unwrap());
+                    }
+                }
+            }
+        }
+        assert_eq!(heap.set_len(set).unwrap(), 10);
+        assert!(!epochs.is_empty(), "rehash was exercised");
+        for key in 0..10_i32 {
+            assert!(heap.set_contains(set, RuntimeValue::I32(key)).unwrap());
+        }
+        let final_epoch = heap.set_mutation_epoch(set).unwrap();
+        assert!(
+            epochs.iter().all(|epoch| *epoch < final_epoch),
+            "rehash initiation advances the epoch before the final insert"
+        );
+        assert!(
+            epochs.windows(2).all(|pair| pair[0] < pair[1]),
+            "every rehash step advances the epoch"
+        );
+    }
+
+    #[test]
+    fn set_rehash_chunk_progress_advances_epoch_for_mid_rehash_iterators() {
+        // An iterator snapshotted after the rehash began must trap once a
+        // later attempt migrates entries between tables: the chunk itself
+        // advances the epoch.
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        insert_all(&mut heap, set, 0..6);
+        // Attempt 1 begins the rehash (epoch bump before any claim).
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(6)).unwrap(),
+            SetInsertOutcome::RehashPending
+        );
+        let after_begin = heap.set_mutation_epoch(set).unwrap();
+        // Attempt 2 progresses the chunk; every progress step advances
+        // the epoch because the phase topology changes.
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(6)).unwrap(),
+            SetInsertOutcome::RehashPending
+        );
+        let after_chunk = heap.set_mutation_epoch(set).unwrap();
+        assert!(
+            after_chunk > after_begin,
+            "chunk progress advances the epoch"
+        );
+        // Attempt 3 completes the insert.
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(6)).unwrap(),
+            SetInsertOutcome::Complete(true)
+        );
+        assert!(heap.set_mutation_epoch(set).unwrap() > after_chunk);
+        assert_eq!(heap.set_len(set).unwrap(), 7);
+    }
+
+    #[test]
+    fn map_rehash_chunk_progress_advances_epoch_for_mid_rehash_iterators() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        let set = |heap: &mut Heap, key: i32| {
+            while heap
+                .map_set(map, RuntimeValue::I32(key), RuntimeValue::I32(key))
+                .unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        };
+        for key in 0..6 {
+            set(&mut heap, key);
+        }
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(6), RuntimeValue::I32(6))
+                .unwrap(),
+            MapSetOutcome::RehashPending
+        );
+        let after_begin = heap.map_mutation_epoch(map).unwrap();
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(6), RuntimeValue::I32(6))
+                .unwrap(),
+            MapSetOutcome::RehashPending
+        );
+        assert!(
+            heap.map_mutation_epoch(map).unwrap() > after_begin,
+            "map chunk migration advances the epoch"
+        );
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(6), RuntimeValue::I32(6))
+                .unwrap(),
+            MapSetOutcome::Complete
+        );
+        assert_eq!(heap.map_len(map).unwrap(), 7);
+    }
+
+    #[test]
+    fn set_rehash_empty_trailing_chunk_completion_still_advances_epoch() {
+        // Drive the set into a 16->32 rehash, delete every entry still
+        // sitting in the high half of the old table, then let the final
+        // chunk run over only empty slots: the completion that switches
+        // the header back to a single current table must still advance
+        // the epoch (a phase-1 iterator would otherwise end and miss the
+        // new table).
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        insert_all(&mut heap, set, 0..12);
+        let mut began_16_to_32 = false;
+        while !began_16_to_32 {
+            match heap.set_insert(set, RuntimeValue::I32(12)).unwrap() {
+                SetInsertOutcome::RehashPending => began_16_to_32 = true,
+                SetInsertOutcome::Complete(_) => break,
+            }
+        }
+        assert!(began_16_to_32, "the 13th insert enters the 16->32 rehash");
+        // Progress the first chunk (old slots 0..8).
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(12)).unwrap(),
+            SetInsertOutcome::RehashPending
+        );
+        // Delete everything still in old slots 8..16 so the trailing
+        // chunk migrates zero entries. The removed keys leave the set
+        // for good; the surviving keys must all remain reachable.
+        let mut removed_keys = std::collections::BTreeSet::new();
+        loop {
+            let mut removed_any = false;
+            let mut cursor = (1_u8, 8_usize);
+            loop {
+                let Some((phase, slot, value)) =
+                    heap.set_iter_advance(set, cursor.0, cursor.1).unwrap()
+                else {
+                    break;
+                };
+                if phase == 1 {
+                    if let RuntimeValue::I32(key) = value {
+                        assert!(heap.set_remove(set, RuntimeValue::I32(key)).unwrap());
+                        removed_keys.insert(key);
+                        removed_any = true;
+                    }
+                }
+                cursor = (phase, slot);
+                if phase > 1 {
+                    break;
+                }
+            }
+            if !removed_any {
+                break;
+            }
+        }
+        assert!(!removed_keys.is_empty(), "high-half entries were removed");
+        let before_final_chunk = heap.set_mutation_epoch(set).unwrap();
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(12)).unwrap(),
+            SetInsertOutcome::RehashPending,
+            "the trailing empty chunk still returns RehashPending"
+        );
+        assert!(
+            heap.set_mutation_epoch(set).unwrap() > before_final_chunk,
+            "completing the rehash over an empty chunk advances the epoch"
+        );
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(12)).unwrap(),
+            SetInsertOutcome::Complete(true)
+        );
+        for key in 0..12_i32 {
+            assert_eq!(
+                heap.set_contains(set, RuntimeValue::I32(key)).unwrap(),
+                !removed_keys.contains(&key),
+                "surviving keys remain reachable after the rehash completed"
+            );
+        }
+        // The completing insert adds key 12 on top of the survivors.
+        assert_eq!(heap.set_len(set).unwrap(), 12 - removed_keys.len() + 1);
+    }
+
+    #[test]
+    fn set_clear_with_pending_rehash_bumps_epoch() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        insert_all(&mut heap, set, 0..6);
+        // The seventh insert crosses the 3/4 load factor and must enter
+        // the incremental rehash (RehashPending) before completing.
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(6)).unwrap(),
+            SetInsertOutcome::RehashPending
+        );
+        let epoch = heap.set_mutation_epoch(set).unwrap();
+        heap.set_clear(set).unwrap();
+        assert_eq!(heap.set_len(set).unwrap(), 0);
+        assert!(
+            heap.set_mutation_epoch(set).unwrap() > epoch,
+            "clearing a set with a pending rehash advances the epoch"
+        );
+    }
+
+    #[test]
+    fn map_epoch_advances_on_insert_overwrite_remove_and_clear() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        let epoch = |heap: &Heap| heap.map_mutation_epoch(map).unwrap();
+        assert_eq!(epoch(&heap), 0);
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(1), RuntimeValue::I32(10))
+                .unwrap(),
+            MapSetOutcome::Complete
+        );
+        assert_eq!(epoch(&heap), 1);
+        // `LANGUAGE_V3`: an existing-key insert overwrites and advances.
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(1), RuntimeValue::I32(11))
+                .unwrap(),
+            MapSetOutcome::Complete
+        );
+        assert_eq!(epoch(&heap), 2);
+        assert_eq!(
+            heap.map_remove(map, RuntimeValue::I32(1)).unwrap(),
+            Some(RuntimeValue::I32(11))
+        );
+        assert_eq!(epoch(&heap), 3);
+        // Removing a missing key is not a mutation.
+        assert_eq!(heap.map_remove(map, RuntimeValue::I32(9)).unwrap(), None);
+        assert_eq!(epoch(&heap), 3);
+        // Clearing an empty map is not a mutation; clearing a populated
+        // map advances the epoch.
+        heap.map_clear(map).unwrap();
+        assert_eq!(epoch(&heap), 3);
+        heap.map_set(map, RuntimeValue::I32(2), RuntimeValue::I32(20))
+            .unwrap();
+        heap.map_clear(map).unwrap();
+        assert_eq!(epoch(&heap), 5);
+    }
+
+    #[test]
+    fn epoch_exhaustion_traps_before_any_data_write() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        let set_storage = match heap.resolve_mut(named_ref(&set)) {
+            Ok(Object::Set { storage }) => *storage as usize,
+            _ => panic!("set reference resolves to set storage"),
+        };
+        heap.sets[set_storage]
+            .as_mut()
+            .expect("set storage exists")
+            .mutation_epoch = u64::MAX;
+        assert_eq!(
+            heap.set_insert(set, RuntimeValue::I32(1)),
+            Err(HeapError::MutationEpochExhausted)
+        );
+        assert_eq!(
+            heap.set_contains(set, RuntimeValue::I32(1)).unwrap(),
+            false,
+            "the failed insert left the set unchanged"
+        );
+
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        let map_storage = match heap.resolve_mut(named_ref(&map)) {
+            Ok(Object::Map { storage }) => *storage as usize,
+            _ => panic!("map reference resolves to map storage"),
+        };
+        heap.maps[map_storage]
+            .as_mut()
+            .expect("map storage exists")
+            .mutation_epoch = u64::MAX;
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(1), RuntimeValue::I32(10)),
+            Err(HeapError::MutationEpochExhausted)
+        );
+        assert_eq!(heap.map_len(map).unwrap(), 0);
+    }
+
+    #[test]
+    fn array_and_buffer_epochs_advance_on_writes_and_structural_ops() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+        let epoch = |heap: &Heap| heap.array_mutation_epoch(array).unwrap();
+        heap.array_push(array, RuntimeValue::I32(1)).unwrap();
+        assert_eq!(epoch(&heap), 1);
+        heap.array_push(array, RuntimeValue::I32(2)).unwrap();
+        heap.array_set(array, 0, RuntimeValue::I32(9)).unwrap();
+        assert_eq!(epoch(&heap), 3);
+        // Swap and reverse advance the epoch exactly once per operation.
+        heap.array_swap(array, 0, 1).unwrap();
+        assert_eq!(epoch(&heap), 4);
+        heap.array_reverse(array).unwrap();
+        assert_eq!(epoch(&heap), 5);
+        // A no-op swap (lhs == rhs) is not a mutation.
+        heap.array_swap(array, 1, 1).unwrap();
+        assert_eq!(epoch(&heap), 5);
+        heap.array_pop(array).unwrap();
+        assert_eq!(epoch(&heap), 6);
+        heap.array_clear(array).unwrap();
+        assert_eq!(epoch(&heap), 7);
+        // Clearing an already-empty array is not a mutation.
+        heap.array_clear(array).unwrap();
+        assert_eq!(epoch(&heap), 7);
+
+        let buffer_type = nexa_bytecode::buffer_type(nexa_bytecode::ValueType::I32);
+        let buffer = heap
+            .allocate_buffer(
+                buffer_type,
+                nexa_bytecode::ValueType::I32,
+                &[RuntimeValue::I32(0); 4],
+            )
+            .unwrap();
+        let epoch = |heap: &Heap| heap.buffer_mutation_epoch(buffer).unwrap();
+        heap.buffer_set(buffer, 0, RuntimeValue::I32(5)).unwrap();
+        assert_eq!(epoch(&heap), 1);
+        heap.buffer_fill(buffer, 0, 4, RuntimeValue::I32(7))
+            .unwrap();
+        assert_eq!(epoch(&heap), 2);
+    }
+
+    #[test]
+    fn swap_and_reverse_at_max_epoch_trap_before_any_write() {
+        // At epoch u64::MAX the swap must fail atomically: the epoch
+        // reserve traps before the first element write, so neither side
+        // of the swap lands.
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+        heap.array_push(array, RuntimeValue::I32(1)).unwrap();
+        heap.array_push(array, RuntimeValue::I32(2)).unwrap();
+        heap.array_push(array, RuntimeValue::I32(3)).unwrap();
+        {
+            let reference = named_ref(&array);
+            match heap.resolve_mut(reference).unwrap() {
+                Object::Array { mutation_epoch, .. } => *mutation_epoch = u64::MAX,
+                _ => panic!("array reference resolves to array storage"),
+            }
+        }
+        assert_eq!(
+            heap.array_swap(array, 0, 2),
+            Err(HeapError::MutationEpochExhausted)
+        );
+        assert_eq!(
+            heap.array_get(array, 0).unwrap(),
+            RuntimeValue::I32(1),
+            "the failed swap left the array untouched"
+        );
+        assert_eq!(
+            heap.array_get(array, 2).unwrap(),
+            RuntimeValue::I32(3),
+            "neither swap write landed"
+        );
+        assert_eq!(
+            heap.array_reverse(array),
+            Err(HeapError::MutationEpochExhausted)
+        );
+        assert_eq!(
+            heap.array_get(array, 0).unwrap(),
+            RuntimeValue::I32(1),
+            "the failed reverse left the array untouched"
+        );
+        assert_eq!(
+            heap.array_push(array, RuntimeValue::I32(4)),
+            Err(HeapError::MutationEpochExhausted),
+            "every mutation traps once the epoch is exhausted"
+        );
+        assert_eq!(heap.array_len(array).unwrap(), 3);
+    }
+
+    #[test]
+    fn set_iteration_visits_backing_slots_deterministically() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 64);
+        let set = i32_set(&mut heap);
+        insert_all(&mut heap, set, 0..6);
+        let mut entries: Vec<i32> = heap
+            .set_entries(set)
+            .unwrap()
+            .map(|value| match value {
+                RuntimeValue::I32(value) => value,
+                _ => panic!("i32 set elements are i32"),
+            })
+            .collect();
+        entries.sort_unstable();
+        assert_eq!(entries, vec![0, 1, 2, 3, 4, 5]);
+        // Exhausted advance keeps returning None without error.
+        assert!(heap.set_iter_advance(set, 0, 0).unwrap().is_some());
+        assert_eq!(heap.set_iter_advance(set, 0, 1024).unwrap(), None);
+        assert_eq!(heap.set_iter_advance(set, 3, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn set_keys_are_precisely_traced_across_rehash() {
+        // `LANGUAGE_V3` GC: set element references are exact roots; a
+        // rehash-migrated string key must survive collection.
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let string_type = nexa_bytecode::ValueType::String;
+        let set = heap
+            .allocate_set(nexa_bytecode::set_type(string_type), string_type)
+            .unwrap();
+        let mut references = Vec::new();
+        for index in 0..12 {
+            let reference = heap.allocate_string(&format!("set-key-{index}")).unwrap();
+            references.push(reference);
+            let hash = heap.string_hash(reference).unwrap();
+            let value = RuntimeValue::String { reference, hash };
+            while heap.set_insert(set, value).unwrap() == SetInsertOutcome::RehashPending {}
+        }
+        let RuntimeValue::NamedRef {
+            reference: set_reference,
+            ..
+        } = set
+        else {
+            panic!("set allocations are named references")
+        };
+        let roots = GcRoots {
+            running_frames: vec![set_reference],
+            ..GcRoots::default()
+        };
+        // The set plus its 12 string keys survive collection: set element
+        // references are exact GC roots across the rehash.
+        assert_eq!(heap.collect(&roots).unwrap().live, 13);
+        assert!(
+            references
+                .iter()
+                .all(|reference| heap.string(*reference).is_ok())
+        );
+        for index in 0..12 {
+            let reference = references[index];
+            let hash = heap.string_hash(reference).unwrap();
+            assert!(
+                heap.set_contains(set, RuntimeValue::String { reference, hash },)
+                    .unwrap()
+            );
+        }
+    }
+
+    fn named_ref(value: &RuntimeValue) -> crate::GcRef {
+        match value {
+            RuntimeValue::NamedRef { reference, .. } => *reference,
+            _ => panic!("named reference expected"),
+        }
     }
 }

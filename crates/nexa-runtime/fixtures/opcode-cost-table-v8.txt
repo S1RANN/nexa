@@ -1,6 +1,6 @@
-bytecode_version=7
-opcode_cost_table_version=7
-entries=111
+bytecode_version=8
+opcode_cost_table_version=8
+entries=119
 index	name	table_base	effective_base	dynamic_work
 000	LoadI32	1	fixed	fixed
 001	LoadBool	1	fixed	fixed
@@ -113,5 +113,13 @@ index	name	table_base	effective_base	dynamic_work
 108	ArrayPushRow	1	fixed	ceil(moved_elements*element_slots/8)+collection_claim_release_metadata
 109	StringBuild	1	fixed	parts_scan+scalar_format+ceil(output_bytes/32)*2
 110	CopyValue	1	fixed	ceil(physical_slots/8)
+111	SetNew	1	fixed	set_type_index_scan
+112	SetLen	1	fixed	fixed
+113	SetContains	1	fixed	set_lookup_slots+key_hash_and_comparison_shape
+114	SetInsert	1	fixed	set_insert_attempt_slots+key_hash_and_comparison_shape
+115	SetRemove	1	fixed	set_lookup_slots+key_hash_and_comparison_shape
+116	SetClear	1	fixed	ceil((current_slots+old_slots+new_slots)/8)
+117	IterNew	1	fixed	fixed
+118	IterNext	1	fixed	collection_scan_bound
 runtime_transitions=1
 run_cleanup_initial_defer	sum_until_call(call:ceil((cleanup_registers+args_count)/8),other:1)
