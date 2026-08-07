@@ -11850,6 +11850,14 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::BufferSet { .. }
                     | Instruction::BufferSlice { .. }
                     | Instruction::BufferCopy { .. }
+                    | Instruction::SetNew { .. }
+                    | Instruction::SetLen { .. }
+                    | Instruction::SetContains { .. }
+                    | Instruction::SetInsert { .. }
+                    | Instruction::SetRemove { .. }
+                    | Instruction::SetClear { .. }
+                    | Instruction::IterNew { .. }
+                    | Instruction::IterNext { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -11906,9 +11914,9 @@ mod tests {
         StateTypeIr, TypedExpressionIr, TypedExpressionKind,
     };
     use nexa_bytecode::{
-        AbandonPolicy, AsyncResultType, CancelPolicy, Function, FunctionEffect, HostCallMode,
-        HostImport, Instruction, LoopBound, ModuleBuilder, Signature, StandardIntrinsic,
-        StateSchema, ValueType, result_type,
+        AbandonPolicy, AsyncResultType, CancelPolicy, CollectionIteratorKind, Function,
+        FunctionEffect, HostCallMode, HostImport, Instruction, IteratorStateRegisters, LoopBound,
+        ModuleBuilder, Signature, StandardIntrinsic, StateSchema, ValueType, result_type,
     };
     use nexa_core::{SourceSpan, StableId, StableSymbolId};
 
@@ -12436,7 +12444,6 @@ mod tests {
     #[test]
     fn iteration_instruction_shapes_match_the_v8_wire() {
         use super::{typed_instruction_destinations, typed_instruction_sources};
-        use nexa_bytecode::CollectionIteratorKind;
 
         let state = IteratorStateRegisters {
             collection: 1,
@@ -12501,6 +12508,19 @@ mod tests {
             }),
             vec![2, 3, 4],
             "collection kinds initialize phase, slot, and epoch"
+        );
+        assert_eq!(
+            super::collect_safepoints(&[
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::String,
+                    },
+                    state,
+                },
+                iter_next,
+            ]),
+            vec![0, 1],
+            "both iterator operations are exact runtime safepoints"
         );
     }
 

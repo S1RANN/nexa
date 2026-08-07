@@ -8630,8 +8630,8 @@ mod tests {
         AsyncResultType, CollectionIteratorKind, FunctionBuilder, FunctionEffect, HostCallMode,
         HostImport, Instruction, IteratorStateRegisters, ModuleBuilder, RootMap,
         SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
-        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, SetType,
-        Signature, SourceMapEntry, StandardIntrinsic, StructField, StructType, ValueType,
+        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, Signature,
+        SourceMapEntry, StandardIntrinsic, StructField, StructType, ValueType,
     };
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -12107,8 +12107,8 @@ pub fn run() -> i32 {
     s.insert(10);
     s.insert(20);
     s.insert(30);
-    let total: i32 = 0;
-    for item in s { let total: i32 = total + item; }
+    let mut total: i32 = 0;
+    for item in s { total += item; }
     return total;
 }
 ";
@@ -12120,8 +12120,8 @@ fn mutate(s: Set<i32>) {
 pub fn run() -> i32 {
     let s: Set<i32> = Set::new();
     s.insert(10);
-    let total: i32 = 0;
-    for item in s { let total: i32 = total + item; mutate(s); }
+    let mut total: i32 = 0;
+    for item in s { total += item; mutate(s); }
     return total;
 }
 ";
@@ -12133,8 +12133,8 @@ fn overwrite(m: Map<i32, i32>) {
 pub fn run() -> i32 {
     let m: Map<i32, i32> = Map::new();
     m.set(1, 7);
-    let total: i32 = 0;
-    for (k, v) in m { let total: i32 = total + k + v; overwrite(m); }
+    let mut total: i32 = 0;
+    for (k, v) in m { total += k + v; overwrite(m); }
     return total;
 }
 ";
@@ -12147,9 +12147,9 @@ fn touch(s: Set<i32>) -> i32 {
 pub fn run() -> i32 {
     let s: Set<i32> = Set::new();
     s.insert(10);
-    let total: i32 = 0;
+    let mut total: i32 = 0;
     for item in s {
-        let total: i32 = total + item;
+        total += item;
         let present: bool = s.contains(item);
         let length: i32 = touch(s);
     }
@@ -12161,25 +12161,27 @@ pub fn run() -> i32 {
 pub fn run() -> i32 {
     let m: Map<i32, i32> = Map::new();
     m.set(5, 7);
-    let total: i32 = 0;
-    for (k, v) in m { let total: i32 = total + k + v; }
+    let mut total: i32 = 0;
+    for (k, v) in m { total += k + v; }
     return total;
 }
 ";
 
     const V3_DYNAMIC_RANGE: &str = r"
 pub fn run(start: i32, end: i32) -> i32 {
-    let total: i32 = 0;
-    for i in start..end { let total: i32 = total + i; }
-    return total;
+    let mut count: i32 = 0;
+    for i in start..end { count += 1; }
+    return count;
 }
 ";
 
-    fn v3_source(source: &str) -> (nexa_verifier::VerifiedModule, ExecutableModule) {
+    fn v3_source(source: &str) -> (nexa_verifier::VerifiedModule, ExecutableModule, u32) {
         let module = nexa_compiler::compile(source).expect("language v3 source compiles");
         let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
             .expect("language v3 executable");
-        (module, executable)
+        let run = u32::try_from(module.module().functions.len().saturating_sub(1))
+            .expect("language v3 fixture function index fits u32");
+        (module, executable, run)
     }
 
     fn v3_module_contains(
@@ -12203,7 +12205,7 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_set_source_iteration_exhausts_without_iterator_allocation() {
-        let (module, executable) = v3_source(V3_SET_SUM);
+        let (module, executable, run) = v3_source(V3_SET_SUM);
         // The source fixture must lower to the v8 wire, not a fabricated
         // tuple path.
         assert!(v3_module_contains(&module, |i| matches!(
@@ -12219,12 +12221,13 @@ pub fn run(start: i32, end: i32) -> i32 {
             Instruction::IterNext { .. }
         )));
         let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
-        let portable = CheckedInterpreter::run_with_heap(&module, 0, &[], 4_096, &mut heap)
+        let portable = CheckedInterpreter::run_with_heap(&module, run, &[], 4_096, &mut heap)
             .expect("portable language v3 execution");
         assert_eq!(v3_returned_value(portable), RuntimeValue::I32(60));
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
         let dense = CheckedInterpreter::run_with_heap_and_executable(
             &module,
-            0,
+            run,
             &[],
             4_096,
             &mut heap,
@@ -12242,11 +12245,11 @@ pub fn run(start: i32, end: i32) -> i32 {
     #[test]
     fn v3_iteration_traps_on_indirect_insert_and_value_overwrite() {
         for source in [V3_INDIRECT_INSERT_TRAP, V3_INDIRECT_OVERWRITE_TRAP] {
-            let (module, executable) = v3_source(source);
+            let (module, executable, run) = v3_source(source);
             let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
             let outcome = CheckedInterpreter::run_with_heap_and_executable(
                 &module,
-                0,
+                run,
                 &[],
                 4_096,
                 &mut heap,
@@ -12266,11 +12269,11 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_reads_and_duplicate_insert_do_not_trap_during_iteration() {
-        let (module, executable) = v3_source(V3_READS_AND_DUPLICATE_INSERT);
+        let (module, executable, run) = v3_source(V3_READS_AND_DUPLICATE_INSERT);
         let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
         let outcome = CheckedInterpreter::run_with_heap_and_executable(
             &module,
-            0,
+            run,
             &[],
             4_096,
             &mut heap,
@@ -12282,7 +12285,7 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_map_iteration_writes_key_and_value_payloads() {
-        let (module, executable) = v3_source(V3_MAP_SUM);
+        let (module, executable, run) = v3_source(V3_MAP_SUM);
         assert!(v3_module_contains(&module, |i| matches!(
             i,
             Instruction::IterNext { .. }
@@ -12290,7 +12293,7 @@ pub fn run(start: i32, end: i32) -> i32 {
         let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
         let outcome = CheckedInterpreter::run_with_heap_and_executable(
             &module,
-            0,
+            run,
             &[],
             4_096,
             &mut heap,
@@ -12302,13 +12305,13 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_range_iteration_handles_i32_boundaries() {
-        let (module, executable) = v3_source(V3_DYNAMIC_RANGE);
+        let (module, executable, run_function) = v3_source(V3_DYNAMIC_RANGE);
         let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
         let run = |arguments: &[RuntimeValue], heap: &mut Heap| {
             v3_returned_value(
                 CheckedInterpreter::run_with_heap_and_executable(
                     &module,
-                    0,
+                    run_function,
                     arguments,
                     4_096,
                     heap,
@@ -12317,21 +12320,21 @@ pub fn run(start: i32, end: i32) -> i32 {
                 .expect("language v3 execution"),
             )
         };
-        // MAX-2..MAX yields exactly three values summing to 2147483642.
+        // MAX-2..MAX yields the two representable values before the exclusive bound.
         assert_eq!(
             run(
                 &[RuntimeValue::I32(i32::MAX - 2), RuntimeValue::I32(i32::MAX)],
                 &mut heap
             ),
-            RuntimeValue::I32(2_147_483_642)
+            RuntimeValue::I32(2)
         );
-        // The full i32 span counts in i64: MIN..MIN+2 wraps to 1.
+        // MIN..MIN+2 likewise advances exactly twice without overflowing the cursor.
         assert_eq!(
             run(
                 &[RuntimeValue::I32(i32::MIN), RuntimeValue::I32(i32::MIN + 2)],
                 &mut heap
             ),
-            RuntimeValue::I32(1)
+            RuntimeValue::I32(2)
         );
         // A descending range yields nothing.
         assert_eq!(
@@ -12342,7 +12345,7 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_range_iternext_attempt_fuel_never_touches_the_heap() {
-        let (module, _) = v3_source(V3_DYNAMIC_RANGE);
+        let (module, _, _) = v3_source(V3_DYNAMIC_RANGE);
         let instruction = Instruction::IterNext {
             kind: CollectionIteratorKind::Range,
             state: IteratorStateRegisters {
@@ -12374,13 +12377,13 @@ pub fn run(start: i32, end: i32) -> i32 {
 
     #[test]
     fn v3_fuel_shortage_does_not_advance_iterator_state() {
-        let (module, executable) = v3_source(V3_SET_SUM);
+        let (module, executable, run) = v3_source(V3_SET_SUM);
         let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
         // A budget that settles the set construction but cannot settle the
         // first IterNext attempt suspends before any iterator state moves.
         let outcome = CheckedInterpreter::run_with_heap_and_executable(
             &module,
-            0,
+            run,
             &[],
             8,
             &mut heap,
