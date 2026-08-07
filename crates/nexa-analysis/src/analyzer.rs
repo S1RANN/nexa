@@ -12749,10 +12749,12 @@ fn descriptor_surface_type(
             Box::new(error.clone()),
         )),
         ("Array", [inner]) => Ok(SurfaceType::Array(Box::new(inner.clone()))),
+        ("Buffer", [inner]) => Ok(SurfaceType::Buffer(Box::new(inner.clone()))),
         ("Map", [key, value]) => Ok(SurfaceType::Map(
             Box::new(key.clone()),
             Box::new(value.clone()),
         )),
+        ("Set", [inner]) => Ok(SurfaceType::Set(Box::new(inner.clone()))),
         _ => Err(format!("unsupported descriptor type `{text}`")),
     }
 }
