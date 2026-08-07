@@ -297,7 +297,7 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(library.version.to_string(), "1.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0xdf66_59e1_02e8_ed06);
+    assert_eq!(library.descriptor_hash().0, 0xcee4_2ccb_e8f4_20eb);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
     assert_eq!(library.symbols().count(), 96);
 
@@ -324,7 +324,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0xdf66_59e1_02e8_ed06);
+    assert_eq!(library.descriptor_hash().0, 0xcee4_2ccb_e8f4_20eb);
 
     let symbols = library
         .symbols()
@@ -666,13 +666,13 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
     assert!(map.is_empty());
 
     let mut values = vec![1, 2, 3];
-    assert_eq!(collections::array_first(&values), Ok(&1));
-    assert_eq!(collections::array_last(&values), Ok(&3));
+    assert_eq!(collections::array_first(&values), Some(&1));
+    assert_eq!(collections::array_last(&values), Some(&3));
     assert!(collections::array_swap(&mut values, 0, 2).is_ok());
     assert_eq!(values, [3, 2, 1]);
     assert!(collections::array_reverse(&mut values));
     assert_eq!(values, [1, 2, 3]);
-    assert!(collections::array_first::<i32>(&[]).is_err());
+    assert_eq!(collections::array_first::<i32>(&[]), None);
     assert!(collections::array_swap(&mut [1], 0, 1).is_err());
 
     let mut map = BTreeMap::from([("a", 1), ("b", 2)]);
@@ -690,7 +690,7 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
     assert!(!set::set_contains(&set, &3));
     assert!(set::set_remove(&mut set, &1));
     assert!(!set::set_remove(&mut set, &1));
-    assert!(set::set_clear(&mut set));
+    set::set_clear(&mut set);
     assert_eq!(set::set_len(&set), 0);
 
     let mut buf = vec![0i32; 5];

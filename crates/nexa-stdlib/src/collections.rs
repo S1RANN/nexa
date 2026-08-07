@@ -163,19 +163,19 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         name: "array_first",
         type_parameters: &["T"],
         parameters: &[ParameterDescriptor::new("values", "Array<T>")],
-        result: "T",
+        result: "Option<T>",
         lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayFirst),
-        behavior: FunctionBehavior::MAY_TRAP,
-        contract: "first element, or traps when the array is empty",
+        behavior: FunctionBehavior::TOTAL,
+        contract: "first element, or None when the array is empty",
     },
     FunctionDescriptor {
         name: "array_last",
         type_parameters: &["T"],
         parameters: &[ParameterDescriptor::new("values", "Array<T>")],
-        result: "T",
+        result: "Option<T>",
         lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayLast),
-        behavior: FunctionBehavior::MAY_TRAP,
-        contract: "last element, or traps when the array is empty",
+        behavior: FunctionBehavior::TOTAL,
+        contract: "last element, or None when the array is empty",
     },
     FunctionDescriptor {
         name: "array_swap",
@@ -331,12 +331,12 @@ pub fn map_remove<K: Ord, V>(values: &mut BTreeMap<K, V>, key: &K) -> Option<V> 
     values.remove(key)
 }
 
-pub fn array_first<T>(values: &[T]) -> Result<&T, CollectionError> {
-    values.first().ok_or(CollectionError::EmptyArray)
+pub fn array_first<T>(values: &[T]) -> Option<&T> {
+    values.first()
 }
 
-pub fn array_last<T>(values: &[T]) -> Result<&T, CollectionError> {
-    values.last().ok_or(CollectionError::EmptyArray)
+pub fn array_last<T>(values: &[T]) -> Option<&T> {
+    values.last()
 }
 
 pub fn array_swap<T>(values: &mut [T], a: usize, b: usize) -> Result<bool, CollectionError> {

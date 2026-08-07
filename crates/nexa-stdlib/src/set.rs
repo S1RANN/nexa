@@ -76,10 +76,10 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         name: "set_clear",
         type_parameters: &["T"],
         parameters: &[ParameterDescriptor::new("set", "Set<T>")],
-        result: "bool",
+        result: "()",
         lowering: Lowering::CompilerIntrinsic(Intrinsic::SetClear),
         behavior: FunctionBehavior::MUTATES,
-        contract: "removes all elements and returns true",
+        contract: "removes all elements",
     },
 ];
 
@@ -115,7 +115,6 @@ pub fn set_remove<T: Eq + Hash, S: BuildHasher>(values: &mut HashSet<T, S>, valu
     values.remove(value)
 }
 
-pub fn set_clear<T, S: BuildHasher>(values: &mut HashSet<T, S>) -> bool {
+pub fn set_clear<T, S: BuildHasher>(values: &mut HashSet<T, S>) {
     values.clear();
-    true
 }
