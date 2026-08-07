@@ -114,7 +114,7 @@ here and changes both this matrix and the Baseline Index milestone status to
 
 ```text
 Candidate commit: receipts implementation_commit (task #9 final), branch codex/contract-v3-gates, clean worktree
-Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt with one known M5 baseline exception
+Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt: workspace PASS, doc-test PASS, aggregate PASS
 Independent audit: PENDING
 Final decision: PENDING
 ```

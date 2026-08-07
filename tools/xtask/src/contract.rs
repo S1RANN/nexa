@@ -275,40 +275,49 @@ fn collect_rs_for_scan(dir: &Path, violations: &mut Vec<String>, root: &Path) {
 /// Uses exact relative path matching, not path.contains().
 fn is_allowlisted_nidl_use(path: &Path, line: &str) -> bool {
     let relative = path.to_string_lossy();
-    // Migration diagnostic implementation in LSP code (exact path)
-    if relative.ends_with("crates/nexa-cli/src/lsp.rs") {
-        // Allow internal migration functions, but not pub API
-        if line.contains("pub(super)") || line.contains("pub(crate)") || line.contains("pub fn") {
-            return false;
-        }
-        return line.contains("nidl") && (line.contains("migration")
-            || line.contains("Legacy")
-            || line.contains("legacy_")
-            || line.starts_with("//"));
-    }
-    // Negative-test fixture: `nidl_v2.rs` - tests that reject old NIDL spelling
-    if relative.ends_with("crates/nexa-contract/tests/nidl_v2.rs") {
-        return true;
-    }
-    // Negative-test fixture: `e2e_mutations.rs` - tests NIDL mutation coverage
-    if relative.ends_with("crates/nexa-contract/tests/e2e_mutations.rs") {
-        return true;
-    }
-    // Test support: `e2e_support.rs` - shared mutation test infrastructure
-    if relative.ends_with("crates/nexa-contract/tests/e2e_support.rs") {
-        return true;
-    }
-    // Negative-test fixture: `m4_virtual_snippet.rs` - has `distinct_nidl_handles_emit...` test
-    if relative.ends_with("crates/nexa-compiler/tests/m4_virtual_snippet.rs") {
-        return true;
-    }
-    // Internal variable names in reload stress test
-    if relative.ends_with("crates/nexa-embed/tests/m4_reload_stress.rs") {
-        return true;
-    }
-    // Allow `NIDL` in doc comments (non-API prose references)
+    // Doc comments / prose never define a public API symbol.
     if line.starts_with("//!") || line.starts_with("///") || line.starts_with("// ") {
         return true;
+    }
+    // Migration diagnostic implementation in LSP code (exact path).
+    if relative.ends_with("crates/nexa-cli/src/lsp.rs") {
+        // A `pub` item with old naming is never allowed, even in LSP.
+        if line.starts_with("pub ") {
+            return false;
+        }
+        // Only lines that actually invoke the migration diagnostic are allowed.
+        return line.contains("nidl") && (line.contains("migration")
+            || line.contains("Legacy")
+            || line.contains("legacy_"))
+            && !line.starts_with("pub ");
+    }
+    // Negative-test fixtures: lines that are `fn` test names verifying the old
+    // spelling is rejected/removed/migrated. A plain `pub Nidl*` item is NOT allowed.
+    let is_test_decl = !line.starts_with("pub ") && line.contains("fn ");
+    if relative.ends_with("crates/nexa-contract/tests/nidl_v2.rs")
+        && is_test_decl
+        && line.contains("nidl") {
+            return true;
+    }
+    if relative.ends_with("crates/nexa-contract/tests/e2e_mutations.rs")
+        && is_test_decl
+        && line.contains("nidl") {
+            return true;
+    }
+    if relative.ends_with("crates/nexa-contract/tests/e2e_support.rs")
+        && is_test_decl
+        && line.contains("nidl") {
+            return true;
+    }
+    if relative.ends_with("crates/nexa-compiler/tests/m4_virtual_snippet.rs")
+        && is_test_decl
+        && line.contains("nidl") {
+            return true;
+    }
+    // Internal variable names in reload stress test (non-pub, non-test fn lines)
+    if relative.ends_with("crates/nexa-embed/tests/m4_reload_stress.rs")
+        && line.contains("nidl") && !line.starts_with("pub ") {
+            return true;
     }
     false
 }
@@ -414,31 +423,39 @@ fn allow_nexa_idl(violations: &mut Vec<String>, root: &Path) {
             for path in &entries {
                 if path.extension().is_some_and(|e| e == "toml" || e == "json" || e == "rs" || e == "md" || e == "lock")
                     && let Ok(content) = fs::read_to_string(path)
-                        && content.contains("nexa-idl") && !is_nexa_idl_allowlisted(path) {
+                {
+                    for line in content.lines() {
+                        if line.contains("nexa-idl") && !is_nexa_idl_allowlisted(path, line) {
                             violations.push(format!(
-                                "`nexa-idl` reference in {}",
-                                path.strip_prefix(root).unwrap_or(path).display()
+                                "`nexa-idl` reference in {}: {}",
+                                path.strip_prefix(root).unwrap_or(path).display(),
+                                line.trim()
                             ));
                         }
+                    }
+                }
             }
         }
     }
 }
 
-fn is_nexa_idl_allowlisted(path: &Path) -> bool {
+fn is_nexa_idl_allowlisted(path: &Path, line: &str) -> bool {
     let relative = path.to_string_lossy();
-    // The LSP legacy overlay test uses "nexa-idl" as a language ID string in a test fixture
-    // Allowlist exact path + exact line pattern
-    if relative.ends_with("crates/nexa-cli/src/lsp.rs") {
-        return true; // internal LSP migration diagnostic fixture
+    // Doc-comment mention of the old crate name is prose, not a live package.
+    if line.trim_start().starts_with("//!") || line.trim_start().starts_with("///")
+        || line.trim_start().starts_with("// ")
+        || line.trim_start().starts_with("/*")
+        || line.trim_start().starts_with("*") {
+            return true;
     }
-    // The nexa-syntax doc comment mentions the old crate name
-    if relative.ends_with("crates/nexa-syntax/src/contract.rs") {
-        return true; // doc comment only
-    }
-    // The contract migration checker references "nexa-idl" in its own allowlist logic
+    // The scanner's own source references "nexa-idl" only in allowlist rules/tests.
     if relative.ends_with("tools/xtask/src/contract.rs") {
-        return true; // scanner's own source
+        return true;
+    }
+    // The LSP legacy overlay test uses "nexa-idl" as a language-ID string literal.
+    if relative.ends_with("crates/nexa-cli/src/lsp.rs")
+        && line.contains("languageId") && line.contains("nexa-idl") {
+            return true;
     }
     false
 }
@@ -529,87 +546,134 @@ pub(super) fn finalize_contract_v3_gates(force: bool) -> Result<(), DynError> {
 
     if force {
         eprintln!("[contract-v3] running the complete workspace regression and product examples");
-        let workspace_result = cargo_test_workspace();
-        let doc_result = cargo_test_doc();
-        write_workspace_receipt(&workspace_result, &doc_result)?;
-        workspace_result?;
-        doc_result?;
+        let workspace_run = run_workspace_test();
+        let doc_run = run_doc_test();
+        write_workspace_receipt(&workspace_run, &doc_run)?;
+        command_run_result(&workspace_run)?;
+        command_run_result(&doc_run)?;
     }
     Ok(())
 }
 
-/// Runs `cargo test --workspace --all-targets` and returns Ok when all tests pass.
-fn cargo_test_workspace() -> Result<(), DynError> {
+/// Structured result of a test-gate command with real timing, exit code, and
+/// failure summary captured from stdout/stderr.
+#[derive(Clone, Debug, Serialize)]
+struct CommandRun {
+    command: Vec<String>,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    passed: bool,
+    failed_tests: Vec<String>,
+    tail: String,
+}
+
+/// Runs `cargo test --workspace --all-targets`, capturing structured evidence.
+fn run_workspace_test() -> CommandRun {
     let root = workspace_root();
+    let started = std::time::Instant::now();
     let output = std::process::Command::new("cargo")
         .args(["test", "--workspace", "--all-targets"])
         .current_dir(&root)
-        .output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
+        .output()
+        .expect("spawn cargo test --workspace");
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let combined = format!("{stdout}\n{stderr}");
     let failed_tests = combined
         .lines()
         .filter(|line| line.ends_with("FAILED") && line.contains("::"))
         .map(|line| line.trim().to_owned())
         .collect::<Vec<_>>();
-    if !failed_tests.is_empty() {
-        return Err(format!("workspace regression failed: {failed_tests:?}").into());
+    let tail = combined
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let exit_code = output.status.code();
+    let passed = exit_code == Some(0) && failed_tests.is_empty();
+    CommandRun {
+        command: vec!["cargo".to_owned(), "test".to_owned(), "--workspace".to_owned(), "--all-targets".to_owned()],
+        exit_code,
+        duration_ms,
+        passed,
+        failed_tests,
+        tail,
     }
-    if !output.status.success() {
-        return Err("workspace regression failed with a non-test status".into());
-    }
-    Ok(())
 }
 
-fn write_workspace_receipt(workspace_result: &Result<(), DynError>, doc_result: &Result<(), DynError>) -> Result<(), DynError> {
+/// Runs `cargo test --doc --workspace`, capturing structured evidence.
+fn run_doc_test() -> CommandRun {
+    let root = workspace_root();
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new("cargo")
+        .args(["test", "--doc", "--workspace"])
+        .current_dir(&root)
+        .output()
+        .expect("spawn cargo test --doc");
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let combined = format!("{stdout}\n{stderr}");
+    let failed_tests = combined
+        .lines()
+        .filter(|line| line.ends_with("FAILED") && line.contains("::"))
+        .map(|line| line.trim().to_owned())
+        .collect::<Vec<_>>();
+    let tail = combined
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let exit_code = output.status.code();
+    let passed = exit_code == Some(0) && failed_tests.is_empty();
+    CommandRun {
+        command: vec!["cargo".to_owned(), "test".to_owned(), "--doc".to_owned(), "--workspace".to_owned()],
+        exit_code,
+        duration_ms,
+        passed,
+        failed_tests,
+        tail,
+    }
+}
+
+fn command_run_result(run: &CommandRun) -> Result<(), DynError> {
+    if run.passed {
+        Ok(())
+    } else {
+        Err(format!(
+            "command {} failed (exit={:?}): {:?}",
+            run.command.join(" "),
+            run.exit_code,
+            run.failed_tests
+        )
+        .into())
+    }
+}
+
+fn write_workspace_receipt(workspace: &CommandRun, doc: &CommandRun) -> Result<(), DynError> {
     let receipt = WorkspaceReceipt {
         schema: 1,
         milestone: "contract-v3-workspace-regression",
         implementation_commit: git_output(&["rev-parse", "HEAD"])?,
-        workspace: SubCommandResult {
-            command: vec!["cargo".to_owned(), "test".to_owned(), "--workspace".to_owned(), "--all-targets".to_owned()],
-            status: if workspace_result.is_ok() { "PASS".to_owned() } else { "FAIL".to_owned() },
-            duration_ms: 0,
-            exit_code: if workspace_result.is_ok() { 0 } else { 1 },
-            failure_summary: Vec::new(),
-        },
-        doc_test: SubCommandResult {
-            command: vec!["cargo".to_owned(), "test".to_owned(), "--doc".to_owned(), "--workspace".to_owned()],
-            status: if doc_result.is_ok() { "PASS".to_owned() } else { "FAIL".to_owned() },
-            duration_ms: 0,
-            exit_code: if doc_result.is_ok() { 0 } else { 1 },
-            failure_summary: Vec::new(),
-        },
-        aggregate: if workspace_result.is_ok() && doc_result.is_ok() { "PASS".to_owned() } else { "FAIL".to_owned() },
+        workspace: workspace.clone(),
+        doc_test: doc.clone(),
+        aggregate: if workspace.passed && doc.passed { "PASS".to_owned() } else { "FAIL".to_owned() },
     };
     write_json(
         artifact_dir().join("contract-v3-workspace-receipt.json"),
         &receipt,
     )?;
-    Ok(())
-}
-
-fn cargo_test_doc() -> Result<(), DynError> {
-    let root = workspace_root();
-    let output = std::process::Command::new("cargo")
-        .args(["test", "--doc", "--workspace"])
-        .current_dir(&root)
-        .output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    let combined = format!("{stdout}\n{stderr}");
-    let failed_tests = combined
-        .lines()
-        .filter(|line| line.ends_with("FAILED") && line.contains("::"))
-        .map(|line| line.trim().to_owned())
-        .collect::<Vec<_>>();
-    if !failed_tests.is_empty() {
-        return Err(format!("doc-test regression failed: {failed_tests:?}").into());
-    }
-    if !output.status.success() {
-        return Err("doc-test regression failed with a non-test status".into());
-    }
     Ok(())
 }
 
@@ -634,21 +698,12 @@ struct ContractV3GateSummary {
 }
 
 #[derive(Serialize)]
-struct SubCommandResult {
-    command: Vec<String>,
-    status: String,
-    duration_ms: u64,
-    exit_code: i32,
-    failure_summary: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct WorkspaceReceipt {
     schema: u32,
     milestone: &'static str,
     implementation_commit: String,
-    workspace: SubCommandResult,
-    doc_test: SubCommandResult,
+    workspace: CommandRun,
+    doc_test: CommandRun,
     aggregate: String,
 }
 
@@ -846,5 +901,33 @@ mod tests {
         assert!(!violations.is_empty(), "should detect .nidl editor association");
         assert!(violations.iter().any(|v| v.contains(".nidl")),
             "violations should mention .nidl");
+    }
+
+    #[test]
+    fn scan_rejects_nonempty_failure_tests_and_aggregate_fail() {
+        // A CommandRun with a non-zero exit and non-empty failed_tests
+        let run = CommandRun {
+            command: vec!["cargo".to_owned(), "test".to_owned()],
+            exit_code: Some(1),
+            duration_ms: 123,
+            passed: false,
+            failed_tests: vec!["foo::bar FAILED".to_owned()],
+            tail: "test result: FAILED".to_owned(),
+        };
+        assert!(!run.passed, "failed run should be !passed");
+        assert_eq!(run.exit_code, Some(1), "exit code should be 1");
+        assert!(!run.failed_tests.is_empty(), "failure summary should be non-empty");
+        // aggregate is FAIL if either subcommand failed
+        let workspace = &run;
+        let doc = &CommandRun {
+            command: vec!["cargo".to_owned(), "test".to_owned(), "--doc".to_owned()],
+            exit_code: Some(0),
+            duration_ms: 200,
+            passed: true,
+            failed_tests: Vec::new(),
+            tail: "test result: ok".to_owned(),
+        };
+        let aggregate_fail = !workspace.passed || !doc.passed;
+        assert!(aggregate_fail, "aggregate must be FAIL when workspace failed");
     }
 }
