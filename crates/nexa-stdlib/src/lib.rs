@@ -28,10 +28,10 @@ pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
 pub const PACKAGE_ID: &str = "nexa.stdlib";
 
 /// Version of the compiler-provided standard library.
-pub const VERSION: StandardLibraryVersion = StandardLibraryVersion::new(1, 0, 0);
+pub const VERSION: StandardLibraryVersion = StandardLibraryVersion::new(2, 0, 0);
 
 /// Versioned identity supplied to the compiler's canonical-symbol machinery.
-pub const CANONICAL_PACKAGE_ID: &str = "nexa.stdlib@1.0.0";
+pub const CANONICAL_PACKAGE_ID: &str = "nexa.stdlib@2.0.0";
 
 /// Domain and schema prefix for the exact standard-library identity embedded in build
 /// fingerprints.

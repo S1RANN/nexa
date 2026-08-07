@@ -293,11 +293,11 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
 
     assert_eq!(library.descriptor_schema, 1);
     assert_eq!(library.package_id, "nexa.stdlib");
-    assert_eq!(library.canonical_package_id, "nexa.stdlib@1.0.0");
-    assert_eq!(library.version.to_string(), "1.0.0");
+    assert_eq!(library.canonical_package_id, "nexa.stdlib@2.0.0");
+    assert_eq!(library.version.to_string(), "2.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0xcee4_2ccb_e8f4_20eb);
+    assert_eq!(library.descriptor_hash().0, 0xd2b7_e40c_28bf_3ddf);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
     assert_eq!(library.symbols().count(), 96);
 
@@ -324,7 +324,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0xcee4_2ccb_e8f4_20eb);
+    assert_eq!(library.descriptor_hash().0, 0xd2b7_e40c_28bf_3ddf);
 
     let symbols = library
         .symbols()
@@ -332,7 +332,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
         .collect::<Vec<_>>();
     assert_eq!(symbols.len(), symbols.iter().collect::<BTreeSet<_>>().len());
     assert!(symbols.iter().all(|symbol| {
-        symbol.starts_with("nexa.stdlib@1.0.0::std.")
+        symbol.starts_with("nexa.stdlib@2.0.0::std.")
             && (symbol.contains("::function::") || symbol.contains("::type::"))
     }));
 
