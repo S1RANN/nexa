@@ -1,7 +1,7 @@
 use crate::CompilationLimits;
 
 /// Canonical Nexa language revision embedded in every build fingerprint.
-pub const NEXA_LANGUAGE_VERSION: u16 = 2;
+pub const NEXA_LANGUAGE_VERSION: u16 = 3;
 pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_MAX_WHILE_ITERATIONS: u32 = 1_000_000;
 

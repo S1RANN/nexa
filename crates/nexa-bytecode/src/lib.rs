@@ -250,6 +250,48 @@ pub enum StandardIntrinsic {
         key: ValueType,
         value: ValueType,
     },
+    SetLen {
+        element: ValueType,
+    },
+    SetContains {
+        element: ValueType,
+    },
+    SetInsert {
+        element: ValueType,
+    },
+    SetRemove {
+        element: ValueType,
+    },
+    ArrayFirst {
+        element: ValueType,
+    },
+    ArrayLast {
+        element: ValueType,
+    },
+    ArraySwap {
+        element: ValueType,
+    },
+    ArrayReverse {
+        element: ValueType,
+    },
+    MapIsEmpty {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapGetOr {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapInsertIfAbsent {
+        key: ValueType,
+        value: ValueType,
+    },
+    BufferIsEmpty {
+        element: ValueType,
+    },
+    BufferFill {
+        element: ValueType,
+    },
     DebugAssert,
     DebugTrap,
 }
@@ -296,8 +338,8 @@ pub const STANDARD_STRING_FUEL_BLOCK_BYTES: u64 = 32;
 pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
 
 impl StandardIntrinsic {
-    /// Number of `StandardIntrinsic` tags reserved by the bytecode v7 wire codec.
-    pub const WIRE_VARIANT_COUNT: usize = 43;
+    /// Number of `StandardIntrinsic` tags reserved by the bytecode v8 wire codec.
+    pub const WIRE_VARIANT_COUNT: usize = 56;
 
     #[must_use]
     pub const fn canonical_name(self) -> &'static str {
@@ -343,6 +385,19 @@ impl StandardIntrinsic {
             Self::MapGet { .. } => "intrinsic.map.get.v1",
             Self::MapInsert { .. } => "intrinsic.map.insert.v1",
             Self::MapRemove { .. } => "intrinsic.map.remove.v1",
+            Self::SetLen { .. } => "intrinsic.set.len.v1",
+            Self::SetContains { .. } => "intrinsic.set.contains.v1",
+            Self::SetInsert { .. } => "intrinsic.set.insert.v1",
+            Self::SetRemove { .. } => "intrinsic.set.remove.v1",
+            Self::ArrayFirst { .. } => "intrinsic.array.first.v1",
+            Self::ArrayLast { .. } => "intrinsic.array.last.v1",
+            Self::ArraySwap { .. } => "intrinsic.array.swap.v1",
+            Self::ArrayReverse { .. } => "intrinsic.array.reverse.v1",
+            Self::MapIsEmpty { .. } => "intrinsic.map.is_empty.v1",
+            Self::MapGetOr { .. } => "intrinsic.map.get_or.v1",
+            Self::MapInsertIfAbsent { .. } => "intrinsic.map.insert_if_absent.v1",
+            Self::BufferIsEmpty { .. } => "intrinsic.buffer.is_empty.v1",
+            Self::BufferFill { .. } => "intrinsic.buffer.fill.v1",
             Self::DebugAssert => "intrinsic.debug.assert.v1",
             Self::DebugTrap => "intrinsic.debug.trap.v1",
         }
@@ -378,6 +433,12 @@ impl StandardIntrinsic {
             | Self::ArrayClear { .. }
             | Self::ArrayShrinkToFit { .. }
             | Self::MapLen { .. }
+            | Self::SetLen { .. }
+            | Self::ArrayFirst { .. }
+            | Self::ArrayLast { .. }
+            | Self::ArrayReverse { .. }
+            | Self::MapIsEmpty { .. }
+            | Self::BufferIsEmpty { .. }
             | Self::DebugAssert
             | Self::DebugTrap => 1,
             Self::OptionUnwrapOr { .. }
@@ -391,8 +452,13 @@ impl StandardIntrinsic {
             | Self::ArrayReserve { .. }
             | Self::MapContains { .. }
             | Self::MapGet { .. }
-            | Self::MapRemove { .. } => 2,
-            Self::StringSubstring | Self::MapInsert { .. } => 3,
+            | Self::MapRemove { .. }
+            | Self::SetContains { .. }
+            | Self::SetInsert { .. }
+            | Self::SetRemove { .. }
+            | Self::BufferFill { .. } => 2,
+            Self::StringSubstring | Self::MapInsert { .. } | Self::ArraySwap { .. } => 3,
+            Self::MapGetOr { .. } | Self::MapInsertIfAbsent { .. } => 3,
         }
     }
 
@@ -402,6 +468,8 @@ impl StandardIntrinsic {
         let result = |success, error| ValueType::Named(result_type(success, error).type_id);
         let array = |element| ValueType::Named(array_type(element));
         let map = |key, value| ValueType::Named(map_type(key, value));
+        let set = |element| ValueType::Named(set_type(element));
+        let buffer = |element| ValueType::Named(buffer_type(element));
         match (self, index) {
             (
                 Self::OptionIsSome { value }
@@ -420,10 +488,34 @@ impl StandardIntrinsic {
                 | Self::MapContains { key: ty, .. }
                 | Self::MapGet { key: ty, .. }
                 | Self::MapRemove { key: ty, .. }
-                | Self::MapInsert { key: ty, .. },
+                | Self::MapInsert { key: ty, .. }
+                | Self::SetContains { element: ty }
+                | Self::SetInsert { element: ty }
+                | Self::SetRemove { element: ty }
+                | Self::BufferFill { element: ty },
                 1,
             )
-            | (Self::MapInsert { value: ty, .. }, 2) => Some(ty),
+            | (Self::MapInsert { value: ty, .. }
+                | Self::MapGetOr { value: ty, .. }
+                | Self::MapInsertIfAbsent { value: ty, .. },
+                2) => Some(ty),
+            (
+                Self::ArrayFirst { element }
+                | Self::ArrayLast { element }
+                | Self::ArrayReverse { element },
+                0,
+            ) => Some(array(element)),
+            (Self::ArraySwap { element }, 0) => Some(array(element)),
+            (Self::ArraySwap { .. }, 1 | 2) => Some(ValueType::I32),
+            (Self::MapIsEmpty { key, value }, 0) => Some(map(key, value)),
+            (
+                Self::MapGetOr { key, value } | Self::MapInsertIfAbsent { key, value },
+                0,
+            ) => Some(map(key, value)),
+            (Self::MapGetOr { key: ty, .. } | Self::MapInsertIfAbsent { key: ty, .. }, 1) => {
+                Some(ty)
+            }
+            (Self::BufferIsEmpty { element }, 0) => Some(buffer(element)),
             (
                 Self::F32Floor
                 | Self::F32Ceil
@@ -479,6 +571,13 @@ impl StandardIntrinsic {
                 | Self::MapInsert { key, value },
                 0,
             ) => Some(map(key, value)),
+            (
+                Self::SetLen { element }
+                | Self::SetContains { element }
+                | Self::SetInsert { element }
+                | Self::SetRemove { element },
+                0,
+            ) => Some(set(element)),
             (Self::DebugAssert, 0) => Some(ValueType::Bool),
             (Self::ValueToString { value }, 0) => Some(value),
             _ => None,
@@ -502,6 +601,15 @@ impl StandardIntrinsic {
             | Self::ArrayShrinkToFit { .. }
             | Self::MapContains { .. }
             | Self::MapInsert { .. }
+            | Self::SetContains { .. }
+            | Self::SetInsert { .. }
+            | Self::SetRemove { .. }
+            | Self::ArraySwap { .. }
+            | Self::ArrayReverse { .. }
+            | Self::MapIsEmpty { .. }
+            | Self::MapInsertIfAbsent { .. }
+            | Self::BufferIsEmpty { .. }
+            | Self::BufferFill { .. }
             | Self::DebugAssert
             | Self::DebugTrap => ValueType::Bool,
             Self::OptionUnwrapOr { value } => value,
@@ -522,16 +630,21 @@ impl StandardIntrinsic {
             | Self::StringByteLen
             | Self::ArrayLen { .. }
             | Self::ArrayCapacity { .. }
-            | Self::MapLen { .. } => ValueType::I32,
+            | Self::MapLen { .. }
+            | Self::SetLen { .. } => ValueType::I32,
             Self::StringSubstring | Self::StringTrim | Self::ValueToString { .. } => {
                 ValueType::String
             }
             Self::StringSplit => ValueType::Named(array_type(ValueType::String)),
             Self::ArrayGet { element } => ValueType::Named(option_type(element).type_id),
+            Self::ArrayFirst { element } | Self::ArrayLast { element } => {
+                ValueType::Named(option_type(element).type_id)
+            }
             Self::ArrayPop { element } => element,
             Self::MapGet { value, .. } | Self::MapRemove { value, .. } => {
                 ValueType::Named(option_type(value).type_id)
             }
+            Self::MapGetOr { value, .. } => value,
         }
     }
 
@@ -546,10 +659,16 @@ impl StandardIntrinsic {
                 | Self::ArrayShrinkToFit { .. }
                 | Self::MapInsert { .. }
                 | Self::MapRemove { .. }
+                | Self::SetInsert { .. }
+                | Self::SetRemove { .. }
+                | Self::ArraySwap { .. }
+                | Self::ArrayReverse { .. }
+                | Self::MapInsertIfAbsent { .. }
+                | Self::BufferFill { .. }
         )
     }
 
-    /// Bytecode v7 opcode-cost-table deterministic base fuel cost.
+    /// Bytecode v8 opcode-cost-table deterministic base fuel cost.
     ///
     /// Variable work declared by [`Self::fuel_model`] is charged separately
     /// from read-only register and heap metadata before any mutation.
@@ -569,13 +688,23 @@ impl StandardIntrinsic {
             | Self::MapGet { .. }
             | Self::MapInsert { .. }
             | Self::MapRemove { .. }
+            | Self::SetContains { .. }
+            | Self::SetInsert { .. }
+            | Self::SetRemove { .. }
+            | Self::MapGetOr { .. }
+            | Self::MapInsertIfAbsent { .. }
             | Self::ValueToString { .. } => 8,
             Self::ArrayGet { .. }
             | Self::ArrayPush { .. }
             | Self::ArrayPop { .. }
             | Self::ArrayReserve { .. }
             | Self::ArrayClear { .. }
-            | Self::ArrayShrinkToFit { .. } => 4,
+            | Self::ArrayShrinkToFit { .. }
+            | Self::ArrayFirst { .. }
+            | Self::ArrayLast { .. }
+            | Self::ArraySwap { .. }
+            | Self::ArrayReverse { .. }
+            | Self::BufferFill { .. } => 4,
             Self::OptionUnwrapOr { .. }
             | Self::ResultUnwrapOr { .. }
             | Self::F32Floor
@@ -620,6 +749,16 @@ impl StandardIntrinsic {
                 StandardIntrinsicFuelModel::MapLookup
             }
             Self::MapInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
+            Self::SetContains { .. } | Self::SetRemove { .. } => {
+                StandardIntrinsicFuelModel::MapLookup
+            }
+            Self::SetInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
+            Self::MapGetOr { .. } => StandardIntrinsicFuelModel::MapLookup,
+            Self::MapInsertIfAbsent { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
+            Self::ArraySwap { .. } | Self::ArrayReverse { .. } => {
+                StandardIntrinsicFuelModel::ArrayCopy
+            }
+            Self::BufferFill { .. } => StandardIntrinsicFuelModel::ArrayCopy,
             Self::ValueToString { .. } => StandardIntrinsicFuelModel::ValueToString,
             _ => StandardIntrinsicFuelModel::Fixed,
         }
@@ -861,6 +1000,27 @@ impl BufferType {
 }
 
 #[must_use]
+pub const fn set_type(element: ValueType) -> StableId {
+    nexa_core::canonical_set_type_id(canonical_value_type(element))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetType {
+    pub type_id: StableId,
+    pub element: ValueType,
+}
+
+impl SetType {
+    #[must_use]
+    pub const fn new(element: ValueType) -> Self {
+        Self {
+            type_id: set_type(element),
+            element,
+        }
+    }
+}
+
+#[must_use]
 pub fn snapshot_type(content_type: StableId) -> StableId {
     parameterized_type_id("Snapshot", &[ValueType::Named(content_type)])
 }
@@ -1017,6 +1177,34 @@ pub struct ScriptExport {
     pub function: u32,
     pub signature: Signature,
     pub effect: FunctionEffect,
+}
+
+/// Collection shape iterated by `IterNew`/`IterNext`. The concrete element
+/// types are instantiated here so the verifier can prove the register and
+/// result contracts without runtime name resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionIteratorKind {
+    /// Scalar `start..end` range over `i32`; no collection reference.
+    Range,
+    Array { element: ValueType },
+    Buffer { element: ValueType },
+    Map { key: ValueType, value: ValueType },
+    Set { element: ValueType },
+}
+
+/// Heap-allocation-free iterator state carried in hidden scalar registers.
+///
+/// `collection` holds the collection reference (or the range start for
+/// `Range`), `phase` and `slot` form the phase/slot cursor into HashMap-style
+/// bucket storage, and `epoch` snapshots the collection mutation epoch. Every
+/// `IterNext` revalidates the live epoch; a mutation between `IterNew` and
+/// `IterNext` traps instead of iterating stale storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IteratorStateRegisters {
+    pub collection: u16,
+    pub phase: u16,
+    pub slot: u16,
+    pub epoch: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1489,6 +1677,48 @@ pub enum Instruction {
         destination_start: u16,
         length: u16,
     },
+    SetNew {
+        type_id: StableId,
+        dst: u16,
+    },
+    SetLen {
+        source: u16,
+        dst: u16,
+    },
+    SetContains {
+        source: u16,
+        value: u16,
+        dst: u16,
+    },
+    SetInsert {
+        source: u16,
+        value: u16,
+        dst: u16,
+    },
+    SetRemove {
+        source: u16,
+        value: u16,
+        dst: u16,
+    },
+    SetClear {
+        source: u16,
+    },
+    /// Initializes the heap-free iterator state registers for one collection
+    /// or range; `phase`, `slot`, and `epoch` are reset without allocation.
+    IterNew {
+        kind: CollectionIteratorKind,
+        state: IteratorStateRegisters,
+    },
+    /// Advances the iterator by one element. `dst` is the base of a
+    /// caller-owned result range receiving `Option<T>`, where `T` is the
+    /// element type for Array/Buffer/Set, the scalar type for Range, and the
+    /// `(key, value)` pair for Map. Traps when the live collection epoch
+    /// differs from `state.epoch`.
+    IterNext {
+        kind: CollectionIteratorKind,
+        state: IteratorStateRegisters,
+        dst: u16,
+    },
     StateFinish,
     StateOldFieldGet {
         object: u16,
@@ -1573,6 +1803,7 @@ pub struct Module {
     pub array_types: Vec<ArrayType>,
     pub map_types: Vec<MapType>,
     pub buffer_types: Vec<BufferType>,
+    pub set_types: Vec<SetType>,
     pub snapshot_types: Vec<SnapshotType>,
     pub resource_token_types: Vec<ResourceTokenType>,
     /// Host-defined scalar identities carried in `PhysicalSlotKind::Opaque`.
@@ -2181,6 +2412,7 @@ impl Module {
                     .saturating_add(self.array_types.len())
                     .saturating_add(self.map_types.len())
                     .saturating_add(self.buffer_types.len())
+                    .saturating_add(self.set_types.len())
                     .saturating_add(self.snapshot_types.len())
                     .saturating_add(self.resource_token_types.len())
                     .saturating_add(self.opaque_types.len()),
@@ -2207,6 +2439,11 @@ impl Module {
             types.push(4);
             put_u64(&mut types, buffer.type_id.0);
             encode_type(&mut types, buffer.element);
+        }
+        for set in &self.set_types {
+            types.push(8);
+            put_u64(&mut types, set.type_id.0);
+            encode_type(&mut types, set.element);
         }
         for snapshot in &self.snapshot_types {
             types.push(5);
@@ -2328,6 +2565,7 @@ impl Module {
         let mut array_types = Vec::new();
         let mut map_types = Vec::new();
         let mut buffer_types = Vec::new();
+        let mut set_types = Vec::new();
         let mut snapshot_types = Vec::new();
         let mut resource_token_types = Vec::new();
         let mut opaque_types = Vec::new();
@@ -2349,6 +2587,10 @@ impl Module {
                     value: decode_type(&mut types_reader)?,
                 }),
                 4 => buffer_types.push(BufferType {
+                    type_id,
+                    element: decode_type(&mut types_reader)?,
+                }),
+                8 => set_types.push(SetType {
                     type_id,
                     element: decode_type(&mut types_reader)?,
                 }),
@@ -2808,6 +3050,7 @@ impl Module {
             array_types,
             map_types,
             buffer_types,
+            set_types,
             snapshot_types,
             resource_token_types,
             opaque_types,
@@ -3246,6 +3489,19 @@ fn encode_standard_intrinsic(output: &mut Vec<u8>, intrinsic: StandardIntrinsic)
         StandardIntrinsic::MapGet { key, value } => (31, &[*key, *value]),
         StandardIntrinsic::MapInsert { key, value } => (32, &[*key, *value]),
         StandardIntrinsic::MapRemove { key, value } => (33, &[*key, *value]),
+        StandardIntrinsic::SetLen { element } => (43, std::slice::from_ref(element)),
+        StandardIntrinsic::SetContains { element } => (44, std::slice::from_ref(element)),
+        StandardIntrinsic::SetInsert { element } => (45, std::slice::from_ref(element)),
+        StandardIntrinsic::SetRemove { element } => (46, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayFirst { element } => (47, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayLast { element } => (48, std::slice::from_ref(element)),
+        StandardIntrinsic::ArraySwap { element } => (49, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayReverse { element } => (50, std::slice::from_ref(element)),
+        StandardIntrinsic::MapIsEmpty { key, value } => (51, &[*key, *value]),
+        StandardIntrinsic::MapGetOr { key, value } => (52, &[*key, *value]),
+        StandardIntrinsic::MapInsertIfAbsent { key, value } => (53, &[*key, *value]),
+        StandardIntrinsic::BufferIsEmpty { element } => (54, std::slice::from_ref(element)),
+        StandardIntrinsic::BufferFill { element } => (55, std::slice::from_ref(element)),
         StandardIntrinsic::DebugAssert => (34, &[]),
         StandardIntrinsic::DebugTrap => (35, &[]),
         StandardIntrinsic::StringLen => (36, &[]),
@@ -3358,6 +3614,48 @@ fn decode_standard_intrinsic(reader: &mut Reader<'_>) -> Result<StandardIntrinsi
         },
         42 => StandardIntrinsic::ValueToString {
             value: unary(reader)?,
+        },
+        43 => StandardIntrinsic::SetLen {
+            element: unary(reader)?,
+        },
+        44 => StandardIntrinsic::SetContains {
+            element: unary(reader)?,
+        },
+        45 => StandardIntrinsic::SetInsert {
+            element: unary(reader)?,
+        },
+        46 => StandardIntrinsic::SetRemove {
+            element: unary(reader)?,
+        },
+        47 => StandardIntrinsic::ArrayFirst {
+            element: unary(reader)?,
+        },
+        48 => StandardIntrinsic::ArrayLast {
+            element: unary(reader)?,
+        },
+        49 => StandardIntrinsic::ArraySwap {
+            element: unary(reader)?,
+        },
+        50 => StandardIntrinsic::ArrayReverse {
+            element: unary(reader)?,
+        },
+        51 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapIsEmpty { key, value }
+        }
+        52 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapGetOr { key, value }
+        }
+        53 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapInsertIfAbsent { key, value }
+        }
+        54 => StandardIntrinsic::BufferIsEmpty {
+            element: unary(reader)?,
+        },
+        55 => StandardIntrinsic::BufferFill {
+            element: unary(reader)?,
         },
         value => return Err(DecodeError::InvalidStandardIntrinsic(value)),
     })
@@ -3789,6 +4087,53 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, source_start);
             put_u16(output, destination_start);
             put_u16(output, length);
+        }
+        Instruction::SetNew { type_id, dst } => {
+            output.push(111);
+            put_u64(output, type_id.0);
+            put_u16(output, dst);
+        }
+        Instruction::SetLen { source, dst } => {
+            output.push(112);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::SetContains {
+            source,
+            value,
+            dst,
+        } => {
+            output.push(113);
+            put_u16(output, source);
+            put_u16(output, value);
+            put_u16(output, dst);
+        }
+        Instruction::SetInsert { source, value, dst } => {
+            output.push(114);
+            put_u16(output, source);
+            put_u16(output, value);
+            put_u16(output, dst);
+        }
+        Instruction::SetRemove { source, value, dst } => {
+            output.push(115);
+            put_u16(output, source);
+            put_u16(output, value);
+            put_u16(output, dst);
+        }
+        Instruction::SetClear { source } => {
+            output.push(116);
+            put_u16(output, source);
+        }
+        Instruction::IterNew { kind, state } => {
+            output.push(117);
+            encode_iterator_kind(output, kind);
+            encode_iterator_state(output, state);
+        }
+        Instruction::IterNext { kind, state, dst } => {
+            output.push(118);
+            encode_iterator_kind(output, kind);
+            encode_iterator_state(output, state);
+            put_u16(output, dst);
         }
         Instruction::Jump { target } => {
             output.push(7);
@@ -4423,7 +4768,101 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             destination_start: reader.u16()?,
             length: reader.u16()?,
         },
+        111 => Instruction::SetNew {
+            type_id: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        112 => Instruction::SetLen {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        113 => Instruction::SetContains {
+            source: reader.u16()?,
+            value: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        114 => Instruction::SetInsert {
+            source: reader.u16()?,
+            value: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        115 => Instruction::SetRemove {
+            source: reader.u16()?,
+            value: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        116 => Instruction::SetClear {
+            source: reader.u16()?,
+        },
+        117 => Instruction::IterNew {
+            kind: decode_iterator_kind(reader)?,
+            state: decode_iterator_state(reader)?,
+        },
+        118 => Instruction::IterNext {
+            kind: decode_iterator_kind(reader)?,
+            state: decode_iterator_state(reader)?,
+            dst: reader.u16()?,
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
+    })
+}
+
+fn encode_iterator_kind(output: &mut Vec<u8>, kind: CollectionIteratorKind) {
+    match kind {
+        CollectionIteratorKind::Range => output.push(0),
+        CollectionIteratorKind::Array { element } => {
+            output.push(1);
+            encode_type(output, element);
+        }
+        CollectionIteratorKind::Buffer { element } => {
+            output.push(2);
+            encode_type(output, element);
+        }
+        CollectionIteratorKind::Map { key, value } => {
+            output.push(3);
+            encode_type(output, key);
+            encode_type(output, value);
+        }
+        CollectionIteratorKind::Set { element } => {
+            output.push(4);
+            encode_type(output, element);
+        }
+    }
+}
+
+fn decode_iterator_kind(reader: &mut Reader<'_>) -> Result<CollectionIteratorKind, DecodeError> {
+    Ok(match reader.u8()? {
+        0 => CollectionIteratorKind::Range,
+        1 => CollectionIteratorKind::Array {
+            element: decode_type(reader)?,
+        },
+        2 => CollectionIteratorKind::Buffer {
+            element: decode_type(reader)?,
+        },
+        3 => CollectionIteratorKind::Map {
+            key: decode_type(reader)?,
+            value: decode_type(reader)?,
+        },
+        4 => CollectionIteratorKind::Set {
+            element: decode_type(reader)?,
+        },
+        value => return Err(DecodeError::InvalidType(value)),
+    })
+}
+
+fn encode_iterator_state(output: &mut Vec<u8>, state: IteratorStateRegisters) {
+    put_u16(output, state.collection);
+    put_u16(output, state.phase);
+    put_u16(output, state.slot);
+    put_u16(output, state.epoch);
+}
+
+fn decode_iterator_state(reader: &mut Reader<'_>) -> Result<IteratorStateRegisters, DecodeError> {
+    Ok(IteratorStateRegisters {
+        collection: reader.u16()?,
+        phase: reader.u16()?,
+        slot: reader.u16()?,
+        epoch: reader.u16()?,
     })
 }
 
@@ -4535,6 +4974,7 @@ pub struct ModuleBuilder {
     array_types: Vec<ArrayType>,
     map_types: Vec<MapType>,
     buffer_types: Vec<BufferType>,
+    set_types: Vec<SetType>,
     snapshot_types: Vec<SnapshotType>,
     resource_token_types: Vec<ResourceTokenType>,
     opaque_types: Vec<StableId>,
@@ -4560,6 +5000,7 @@ impl ModuleBuilder {
             array_types: Vec::new(),
             map_types: Vec::new(),
             buffer_types: Vec::new(),
+            set_types: Vec::new(),
             snapshot_types: Vec::new(),
             resource_token_types: Vec::new(),
             opaque_types: Vec::new(),
@@ -4656,6 +5097,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn set_type(&mut self, set_type: SetType) -> &mut Self {
+        self.set_types.push(set_type);
+        self
+    }
+
     pub fn snapshot_type(&mut self, snapshot_type: SnapshotType) -> &mut Self {
         self.snapshot_types.push(snapshot_type);
         self
@@ -4711,6 +5157,7 @@ impl ModuleBuilder {
             array_types: self.array_types,
             map_types: self.map_types,
             buffer_types: self.buffer_types,
+            set_types: self.set_types,
             snapshot_types: self.snapshot_types,
             resource_token_types: self.resource_token_types,
             opaque_types: self.opaque_types,
@@ -4881,6 +5328,14 @@ impl FunctionBuilder {
                         | Instruction::MapRemove { .. }
                         | Instruction::MapContains { .. }
                         | Instruction::MapClear { .. }
+                        | Instruction::SetNew { .. }
+                        | Instruction::SetLen { .. }
+                        | Instruction::SetContains { .. }
+                        | Instruction::SetInsert { .. }
+                        | Instruction::SetRemove { .. }
+                        | Instruction::SetClear { .. }
+                        | Instruction::IterNew { .. }
+                        | Instruction::IterNext { .. }
                         | Instruction::BufferLen { .. }
                         | Instruction::BufferGet { .. }
                         | Instruction::BufferSet { .. }
@@ -6235,6 +6690,19 @@ mod tests {
             StandardIntrinsic::MapGet { key, value },
             StandardIntrinsic::MapInsert { key, value },
             StandardIntrinsic::MapRemove { key, value },
+            StandardIntrinsic::SetLen { element: value },
+            StandardIntrinsic::SetContains { element: value },
+            StandardIntrinsic::SetInsert { element: value },
+            StandardIntrinsic::SetRemove { element: value },
+            StandardIntrinsic::ArrayFirst { element: value },
+            StandardIntrinsic::ArrayLast { element: value },
+            StandardIntrinsic::ArraySwap { element: value },
+            StandardIntrinsic::ArrayReverse { element: value },
+            StandardIntrinsic::MapIsEmpty { key, value },
+            StandardIntrinsic::MapGetOr { key, value },
+            StandardIntrinsic::MapInsertIfAbsent { key, value },
+            StandardIntrinsic::BufferIsEmpty { element: value },
+            StandardIntrinsic::BufferFill { element: value },
             StandardIntrinsic::DebugAssert,
             StandardIntrinsic::DebugTrap,
         ];

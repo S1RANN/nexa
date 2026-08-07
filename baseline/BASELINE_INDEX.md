@@ -41,6 +41,7 @@ ExecutableModule v1 = COMPLETE
 Incremental GC v1 = COMPLETE
 Runtime Fast Paths v1 = COMPLETE
 M6 LLVM JIT = DEFER
+Nexa Language v3 spec+wire foundation = IN PROGRESS
 ```
 
 This is the only normative entry point for the active Internal Language Pivot.
@@ -48,7 +49,7 @@ Precedence is:
 
 ```text
 Internal Language Scope
-> Language v2 and Object Model v2
+> Language v3, Language v2 and Object Model v2
 > Async v2, Standalone v1, and REPL v1
 > Contract Language v3, Contract Descriptor v2, and Binding Codegen v2
 > Host Binding
@@ -85,22 +86,26 @@ Descriptor v2 framing. Its final evidence and independent acceptance are tracked
 ## Frozen active versions
 
 ```text
-NEXA_LANGUAGE_VERSION = 2
+NEXA_LANGUAGE_VERSION = 3
 CONTRACT_SYNTAX_VERSION = 3
 HOST_CONTRACT_SCHEMA_VERSION = 2
 ABI_DESCRIPTOR_VERSION = 2
-BYTECODE_VERSION = 7
+BYTECODE_VERSION = 8
+OPCODE_COST_TABLE_VERSION = 8
 ```
 
 These are structured protocol values, not display strings. Contract syntax is
 version 3 while Host schema and Descriptor framing remain version 2; equality
 between these values is neither required nor implied. Active products reject
 every other source, Contract, Descriptor, or Bytecode version instead of
-selecting a compatibility parser or decoder.
+selecting a compatibility parser or decoder. Language v3 is specified in
+[`language/LANGUAGE_V3.md`](language/LANGUAGE_V3.md); its spec+wire foundation
+commit does not yet implement compiler or runtime support.
 
 ## Active specifications
 
 - [`internal/INTERNAL_LANGUAGE_SCOPE.md`](internal/INTERNAL_LANGUAGE_SCOPE.md)
+- [`language/LANGUAGE_V3.md`](language/LANGUAGE_V3.md)
 - [`language/LANGUAGE_V2.md`](language/LANGUAGE_V2.md)
 - [`language/OBJECT_MODEL_V2.md`](language/OBJECT_MODEL_V2.md)
 - [`language/ASYNC_V2.md`](language/ASYNC_V2.md)
@@ -161,6 +166,7 @@ selecting a compatibility parser or decoder.
 | D69 | Active | Standalone and REPL | `language/STANDALONE_V2.md`, `language/REPL_V1.md` | low-level function-index-only execution |
 | D70 | Active | M5 performance authority | `performance/M5_SCOPE.md` | benchmark-v6-only performance evidence |
 | D71 | Active | Contract Syntax v3 and generated bindings | `abi/CONTRACT_LANGUAGE_V3.md`, `abi/CONTRACT_DESCRIPTOR_V2.md`, `abi/BINDING_CODEGEN_V2.md`, `abi/CONTRACT_V3_ACCEPTANCE.md` | enclosing Contract source container, old file suffix, old public names, and old CLI/editor surface |
+| D72 | Active | Language v3 Set and dynamic iteration | `language/LANGUAGE_V3.md` | v2 collection surface; iteration-order and mutation guarantees |
 
 ## Historical boundary
 

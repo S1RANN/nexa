@@ -1,10 +1,10 @@
-# Nexa Internal Language Bytecode 7
+# Nexa Internal Language Bytecode 8
 
-Version: **7.0.0**
+Version: **8.0.0**
 
 Status: **COMPLETE**
 
-Bytecode v7 is Nexa's only portable execution artifact. It is a
+Bytecode v8 is Nexa's only portable execution artifact. It is a
 little-endian, sectioned, typed-register format whose logical values are
 lowered through the physical ABI defined by
 [`VALUE_LAYOUT_V1.md`](../performance/VALUE_LAYOUT_V1.md). Runtime execution
@@ -14,13 +14,13 @@ executed directly.
 ## Frozen versions
 
 ```text
-BYTECODE_VERSION = 7
-OPCODE_COST_TABLE_VERSION = 7
+BYTECODE_VERSION = 8
+OPCODE_COST_TABLE_VERSION = 8
 MANDATORY_SECTION_COUNT = 16
 ```
 
-The decoder rejects every wire version other than 7 from the envelope before
-section payload decoding. There is no v5/v6 compatibility decoder, feature
+The decoder rejects every wire version other than 8 from the envelope before
+section payload decoding. There is no v5/v6/v7 compatibility decoder, feature
 negotiation, or product fallback path. The opcode cost-table version is
 validated when an `ExecutableModule` is built and is part of deterministic
 fuel semantics.
@@ -32,7 +32,7 @@ Every integer is encoded little-endian. The envelope is:
 ```text
 offset  width  field
 0       4      magic = "NXBC"
-4       2      bytecode version = 7
+4       2      bytecode version = 8
 6       2      section-directory entry count
 8       20*N   section-directory entries
 ...            contiguous section payloads
@@ -57,12 +57,12 @@ consume the artifact exactly. Unknown mandatory sections fail closed.
 
 ## Mandatory sections
 
-The v7 encoder emits, and the decoder requires, these 16 sections:
+The v8 encoder emits, and the decoder requires, these 16 sections:
 
 | Kind | Name | Authority |
 | ---: | --- | --- |
 | 1 | Strings | UTF-8 module string pool |
-| 2 | Types | StateHandle, Array, Map, Buffer, Snapshot, resource token, and Host opaque nominal types |
+| 2 | Types | StateHandle, Array, Map, Buffer, Set, Snapshot, resource token, and Host opaque nominal types |
 | 3 | Constants | Reserved in v7; count must be zero |
 | 4 | Enums | Stable type/variant IDs, tags, and optional logical payload types |
 | 5 | Structs | Stable type/field IDs and logical field types |
@@ -136,7 +136,7 @@ preserving Struct/Enum value semantics and Class identity.
 
 ## Aggregate and collection instructions
 
-v7 instructions operate on physical ranges:
+v8 instructions operate on physical ranges:
 
 - `StructNew`, `StructGet`, `StructWith`, `StructEqual`, `EnumNew`,
   `EnumTag`, `EnumPayload`, and `EnumEqual` use verifier-derived layout widths
@@ -146,12 +146,20 @@ v7 instructions operate on physical ranges:
 - `CopyValue` copies one complete logical value across contiguous slots.
 - `StringBuild` converts and concatenates a bounded physical argument window
   into one published String.
+- `SetNew`, `SetLen`, `SetContains`, `SetInsert`, `SetRemove`, and `SetClear`
+  carry the Language v3 minimal `Set<T>` surface; the Types section kind 8
+  entry supplies the element type.
+- `IterNew` and `IterNext` carry dynamic iteration over
+  Range/Array/Buffer/Map/Set through `CollectionIteratorKind`. Iterator state
+  is heap-allocation-free: four hidden scalar registers hold the collection
+  reference, the phase/slot cursor, and the mutation epoch snapshot. Every
+  `IterNext` revalidates the epoch; mutation during iteration traps.
 - `StandardIntrinsic` encodes the fully instantiated logical types of generic
   standard-library operations; runtime name or generic resolution is
   forbidden.
 
 All remaining scalar, control-flow, Class, collection, state, migration,
-defer, Task, and Host instructions retain their v7 typed-register contracts.
+defer, Task, and Host instructions retain their v8 typed-register contracts.
 An unknown opcode or intrinsic is rejected during decoding.
 
 ## Precise roots and safepoints
@@ -189,21 +197,22 @@ fields, exports, source-map entries, and reload metadata.
 
 ## Fuel and failure atomicity
 
-`OPCODE_COST_TABLE_VERSION = 7` binds the static base cost of all 111 v7
-opcodes and every standard intrinsic. Value-dependent string, collection,
-map, buffer, hashing, conversion, and copy work reads bounded metadata and
-precharges its deterministic worst-case or exact dynamic surcharge before
-mutation or allocation. Fuel failure therefore cannot publish a partial
-String, collection update, Host result, or migration write.
+`OPCODE_COST_TABLE_VERSION = 8` binds the static base cost of all 119 v8
+opcodes and every standard intrinsic (56 wire variants). Value-dependent
+string, collection, map, set, buffer, hashing, conversion, and copy work reads
+bounded metadata and precharges its deterministic worst-case or exact dynamic
+surcharge before mutation or allocation. Fuel failure therefore cannot publish
+a partial String, collection update, Host result, or migration write.
 
 Portable and `ExecutableModule` interpreters must produce identical results,
 traps, charge settlement, suspend points, Task/Host lifecycles, identities,
-and source stacks for the same verified v7 artifact and cost table.
+and source stacks for the same verified v8 artifact and cost table.
 
 ## Version transition
 
-Bytecode 6 is retired. M5 changed the wire version exactly once to introduce
-the physical ValueLayout ABI, Host opaque scalar identities, physical
-aggregate operations, and cost table v7. Caches and persisted artifacts bind
-their build identity to the bytecode version and are rebuilt rather than
-decoded through a historical compatibility path.
+Bytecode 7 is retired. v8 changed the wire version exactly once to introduce
+the Language v3 `Set<T>` type metadata, Set operations, and dynamic
+collection iteration with epoch-trapped, heap-allocation-free iterator state.
+Caches and persisted artifacts bind their build identity to the bytecode
+version and are rebuilt rather than decoded through a historical compatibility
+path.

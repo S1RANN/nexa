@@ -25,7 +25,7 @@ pub enum PhysicalSlotKind {
     F64,
     Bool,
     Rune,
-    /// String, Class, Array, Map, and Buffer references traced by the GC.
+    /// String, Class, Array, Map, Set, and Buffer references traced by the GC.
     GcReference,
     /// Snapshot, resource-token, state-handle, and host-request handles;
     /// rooted through their own registries, never through frame bitmaps.
@@ -172,6 +172,12 @@ impl LayoutTable {
             table.named.insert(
                 map_type.type_id.0,
                 reference_layout(ValueType::Named(map_type.type_id)),
+            );
+        }
+        for set_type in &module.set_types {
+            table.named.insert(
+                set_type.type_id.0,
+                reference_layout(ValueType::Named(set_type.type_id)),
             );
         }
         for buffer_type in &module.buffer_types {
@@ -428,6 +434,11 @@ impl LayoutContext<'_> {
                 .map_types
                 .iter()
                 .any(|map_type| map_type.type_id == id)
+            || self
+                .module
+                .set_types
+                .iter()
+                .any(|set_type| set_type.type_id == id)
             || self
                 .module
                 .buffer_types
