@@ -5,9 +5,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use nexa_bytecode::{
-    ArrayType, EnumVariant, Function, FunctionEffect, HostCallMode, Instruction, MapType, Module,
+    ArrayType, BufferType, CollectionIteratorKind, EnumVariant, Function, FunctionEffect,
+    HostCallMode, Instruction, IteratorStateRegisters, MapType, Module,
     SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES,
-    StandardIntrinsic, StructField, StructType, ValueType, minimum_migration_limits,
+    SetType, StandardIntrinsic, StructField, StructType, ValueType, minimum_migration_limits,
 };
 use nexa_core::{FingerprintBuilder, SourceSpan, StableId};
 
@@ -67,12 +68,16 @@ pub enum VerifyErrorKind {
     InvalidStateMetadata,
     InvalidArrayMetadata,
     InvalidMapMetadata,
+    InvalidSetMetadata,
     InvalidBufferMetadata,
     InvalidSnapshotMetadata,
     InvalidResourceTokenMetadata,
     InvalidOpaqueMetadata,
     InvalidPhysicalAbi,
     InvalidSourceMap,
+    /// Language v3 iteration: `IterNew`/`IterNext` violate the kind/type,
+    /// state-register, result-layout, or Range/pair conventions.
+    InvalidIteratorContract,
     /// M5 WP35: every verified module must yield a deterministic layout
     /// table and function ABI; recursion, dangling types, and slot
     /// overflows are rejected before execution.
@@ -85,6 +90,7 @@ pub enum VerifyErrorKind {
     ClassFieldOutOfRange(u64),
     ArrayTypeOutOfRange(u64),
     MapTypeOutOfRange(u64),
+    SetTypeOutOfRange(u64),
     BufferTypeOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
@@ -838,10 +844,70 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
         });
     }
     verify_map_metadata(module)?;
+    verify_set_metadata(module)?;
     verify_buffer_metadata(module)?;
     verify_snapshot_metadata(module)?;
     verify_resource_token_metadata(module)?;
     verify_state_storage_metadata(module)?;
+    Ok(())
+}
+
+fn verify_set_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut set_ids = BTreeSet::new();
+    let invalid = module.set_types.iter().any(|set_type| {
+        !set_ids.insert(set_type.type_id.0)
+            || set_type.type_id != nexa_bytecode::set_type(set_type.element)
+            || !valid_map_key_type(module, set_type.element)
+            || module
+                .enum_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == set_type.type_id)
+            || module
+                .state_handle_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .array_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .map_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .buffer_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .snapshot_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module
+                .resource_token_types
+                .iter()
+                .any(|ty| ty.type_id == set_type.type_id)
+            || module.opaque_types.contains(&set_type.type_id)
+    });
+    if invalid {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidSetMetadata,
+        });
+    }
     Ok(())
 }
 
@@ -1386,6 +1452,8 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
             .map_types
             .contains(&nexa_bytecode::MapType::new(key, value))
     };
+    let has_set = |element| module.set_types.contains(&SetType::new(element));
+    let has_buffer = |element| module.buffer_types.contains(&BufferType::new(element));
     match intrinsic {
         StandardIntrinsic::OptionIsSome { value }
         | StandardIntrinsic::OptionIsNone { value }
@@ -1398,10 +1466,24 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
             has_enum(nexa_bytecode::result_type(success, error))
         }
         StandardIntrinsic::StringSplit => has_array(ValueType::String),
-        StandardIntrinsic::ArrayGet { element } => {
+        StandardIntrinsic::ArrayGet { element }
+        | StandardIntrinsic::ArrayFirst { element }
+        | StandardIntrinsic::ArrayLast { element } => {
             has_array(element) && has_enum(nexa_bytecode::option_type(element))
         }
-        StandardIntrinsic::ArrayLen { element }
+        StandardIntrinsic::MapLen { key, value }
+        | StandardIntrinsic::MapContains { key, value }
+        | StandardIntrinsic::MapInsert { key, value }
+        | StandardIntrinsic::MapIsEmpty { key, value }
+        | StandardIntrinsic::MapGetOr { key, value }
+        | StandardIntrinsic::MapInsertIfAbsent { key, value } => has_map(key, value),
+        StandardIntrinsic::SetLen { element }
+        | StandardIntrinsic::SetContains { element }
+        | StandardIntrinsic::SetInsert { element }
+        | StandardIntrinsic::SetRemove { element } => has_set(element),
+        StandardIntrinsic::ArraySwap { element }
+        | StandardIntrinsic::ArrayReverse { element }
+        | StandardIntrinsic::ArrayLen { element }
         | StandardIntrinsic::ArrayIsEmpty { element }
         | StandardIntrinsic::ArrayPush { element }
         | StandardIntrinsic::ArrayPop { element }
@@ -1409,12 +1491,8 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
         | StandardIntrinsic::ArrayCapacity { element }
         | StandardIntrinsic::ArrayClear { element }
         | StandardIntrinsic::ArrayShrinkToFit { element } => has_array(element),
-        StandardIntrinsic::MapGet { key, value } | StandardIntrinsic::MapRemove { key, value } => {
-            has_map(key, value) && has_enum(nexa_bytecode::option_type(value))
-        }
-        StandardIntrinsic::MapLen { key, value }
-        | StandardIntrinsic::MapContains { key, value }
-        | StandardIntrinsic::MapInsert { key, value } => has_map(key, value),
+        StandardIntrinsic::BufferIsEmpty { element }
+        | StandardIntrinsic::BufferFill { element } => has_buffer(element),
         StandardIntrinsic::ValueToString { value } => match value {
             ValueType::I32
             | ValueType::I64
@@ -1512,6 +1590,14 @@ const fn collection_instruction_requires_heap(instruction: Instruction) -> bool 
             | Instruction::BufferSet { .. }
             | Instruction::BufferSlice { .. }
             | Instruction::BufferCopy { .. }
+            | Instruction::SetNew { .. }
+            | Instruction::SetLen { .. }
+            | Instruction::SetContains { .. }
+            | Instruction::SetInsert { .. }
+            | Instruction::SetRemove { .. }
+            | Instruction::SetClear { .. }
+            | Instruction::IterNew { .. }
+            | Instruction::IterNext { .. }
     )
 }
 
@@ -1665,6 +1751,64 @@ fn array_row_slots(
     }
 }
 
+/// Logical register type an `IterNew`/`IterNext` state must carry for a
+/// kind, when the module metadata instantiates the iterated collection.
+/// `Range` iterates the scalar range start; the other kinds carry the
+/// collection reference.
+fn iterator_kind_collection_type(
+    module: &Module,
+    kind: CollectionIteratorKind,
+) -> Option<ValueType> {
+    match kind {
+        CollectionIteratorKind::Range => Some(ValueType::I32),
+        CollectionIteratorKind::Array { element } => module
+            .array_types
+            .contains(&ArrayType::new(element))
+            .then(|| ValueType::Named(nexa_bytecode::array_type(element))),
+        CollectionIteratorKind::Buffer { element } => module
+            .buffer_types
+            .contains(&nexa_bytecode::BufferType::new(element))
+            .then(|| ValueType::Named(nexa_bytecode::buffer_type(element))),
+        CollectionIteratorKind::Map { key, value } => module
+            .map_types
+            .contains(&MapType::new(key, value))
+            .then(|| ValueType::Named(nexa_bytecode::map_type(key, value))),
+        CollectionIteratorKind::Set { element } => module
+            .set_types
+            .contains(&nexa_bytecode::SetType::new(element))
+            .then(|| ValueType::Named(nexa_bytecode::set_type(element))),
+    }
+}
+
+/// Bounds and distinctness of the four hidden iterator state registers.
+/// The same state set must be pairwise distinct for both `IterNew` and
+/// `IterNext`; aliasing two roles would let one register be overwritten by
+/// cursor advance and collection reference simultaneously.
+fn verify_iterator_state_registers(
+    register: &impl Fn(u16) -> Result<usize, VerifyError>,
+    iterator: IteratorStateRegisters,
+) -> Result<(), VerifyErrorKind> {
+    let registers = [
+        iterator.collection,
+        iterator.phase,
+        iterator.slot,
+        iterator.epoch,
+    ];
+    for (index, current) in registers.iter().copied().enumerate() {
+        for other in registers.iter().copied().skip(index + 1) {
+            if current == other {
+                return Err(VerifyErrorKind::InvalidIteratorContract);
+            }
+        }
+        register(current).map_err(|_| VerifyErrorKind::RegisterOutOfRange(current))?;
+    }
+    Ok(())
+}
+
+fn ranges_overlap(lhs: u16, lhs_slots: u16, rhs: u16, rhs_slots: u16) -> bool {
+    lhs < rhs.saturating_add(rhs_slots) && rhs < lhs.saturating_add(lhs_slots)
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
@@ -1781,6 +1925,27 @@ fn verify_function(
                 .map(|buffer| buffer.element)
                 .ok_or_else(|| error(Some(pc), VerifyErrorKind::BufferTypeOutOfRange(type_id.0)))
         };
+        let set_layout = |state: &[Option<ValueType>], source: u16| {
+            let source = register(source)?;
+            let Some(ValueType::Named(type_id)) = state[source] else {
+                return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+            };
+            let (type_index, set_type) = module
+                .set_types
+                .iter()
+                .enumerate()
+                .find(|(_, set_type)| set_type.type_id == type_id)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::SetTypeOutOfRange(type_id.0)))?;
+            let layout = physical
+                .layouts
+                .layout_of(set_type.element)
+                .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+            Ok((type_index, set_type.element, layout))
+        };
+        let iterator_collection_type = |kind| {
+            iterator_kind_collection_type(module, kind)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidIteratorContract))
+        };
         let mut successors = Vec::with_capacity(2);
         if restricted_context && instruction_requires_heap(instruction) {
             return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
@@ -1810,6 +1975,14 @@ fn verify_function(
                 | Instruction::BufferSet { .. }
                 | Instruction::BufferSlice { .. }
                 | Instruction::BufferCopy { .. }
+                | Instruction::SetNew { .. }
+                | Instruction::SetLen { .. }
+                | Instruction::SetContains { .. }
+                | Instruction::SetInsert { .. }
+                | Instruction::SetRemove { .. }
+                | Instruction::SetClear { .. }
+                | Instruction::IterNew { .. }
+                | Instruction::IterNext { .. }
         ) && immediate_context
         {
             return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
@@ -3393,6 +3566,166 @@ fn verify_function(
                 require(&state, destination_start, ValueType::I32)?;
                 require(&state, length, ValueType::I32)?;
             }
+            Instruction::SetNew { type_id, dst } => {
+                if !module
+                    .set_types
+                    .iter()
+                    .any(|set_type| set_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::SetTypeOutOfRange(type_id.0),
+                    ));
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::SetLen { source, dst } => {
+                set_layout(&state, source)?;
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::SetContains { source, value, dst }
+            | Instruction::SetInsert { source, value, dst }
+            | Instruction::SetRemove { source, value, dst } => {
+                let (_, element, _) = set_layout(&state, source)?;
+                require(&state, value, element)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::SetClear { source } => {
+                set_layout(&state, source)?;
+            }
+            Instruction::IterNew {
+                kind,
+                state: iterator,
+            } => {
+                verify_iterator_state_registers(&register, iterator)
+                    .map_err(|kind| error(Some(pc), kind))?;
+                // IterNew never synthesizes the collection: the register must
+                // already carry the iterated collection reference (or the
+                // range start scalar). For Range the phase register is the
+                // caller-set end bound; for collection kinds phase, slot, and
+                // epoch are cursor state initialized here.
+                let collection_type = iterator_collection_type(kind)?;
+                require(&state, iterator.collection, collection_type)?;
+                match kind {
+                    CollectionIteratorKind::Range => {
+                        require(&state, iterator.phase, ValueType::I32)?;
+                    }
+                    CollectionIteratorKind::Array { .. }
+                    | CollectionIteratorKind::Buffer { .. }
+                    | CollectionIteratorKind::Map { .. }
+                    | CollectionIteratorKind::Set { .. } => {
+                        state[register(iterator.phase)?] = Some(ValueType::I32);
+                    }
+                }
+                state[register(iterator.slot)?] = Some(ValueType::I32);
+                // The epoch register carries the runtime mutation-epoch u64
+                // bit pattern as a scalar I64, never as a nominal handle.
+                state[register(iterator.epoch)?] = Some(ValueType::I64);
+            }
+            Instruction::IterNext {
+                kind,
+                state: iterator,
+                has_value_dst,
+                first_dst,
+                second_dst,
+            } => {
+                verify_iterator_state_registers(&register, iterator)
+                    .map_err(|kind| error(Some(pc), kind))?;
+                let collection_type = iterator_collection_type(kind)?;
+                require(&state, iterator.collection, collection_type)?;
+                require(&state, iterator.phase, ValueType::I32)?;
+                require(&state, iterator.slot, ValueType::I32)?;
+                require(&state, iterator.epoch, ValueType::I64)?;
+                let (first_type, second_type) = match kind {
+                    CollectionIteratorKind::Range => (ValueType::I32, None),
+                    CollectionIteratorKind::Array { element }
+                    | CollectionIteratorKind::Buffer { element }
+                    | CollectionIteratorKind::Set { element } => (element, None),
+                    CollectionIteratorKind::Map { key, value } => (key, Some(value)),
+                };
+                // Map iterates pairs and must carry a second payload slot;
+                // every other kind yields a single payload slot.
+                if (second_type.is_some()) != second_dst.is_some() {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidIteratorContract));
+                }
+                let first_slots = physical
+                    .layouts
+                    .layout_of(first_type)
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?
+                    .physical_slots;
+                let second_slots = second_type
+                    .map(|second_type| {
+                        physical
+                            .layouts
+                            .layout_of(second_type)
+                            .map(|layout| layout.physical_slots)
+                    })
+                    .transpose()
+                    .map_err(|kind| error(Some(pc), VerifyErrorKind::InvalidValueLayout(kind)))?;
+                let state_registers = [
+                    iterator.collection,
+                    iterator.phase,
+                    iterator.slot,
+                    iterator.epoch,
+                ];
+                // Payload ranges may span several physical registers: check
+                // the full [base, base + slots) ranges against the has-value
+                // slot, every iterator state register, and each other.
+                let mut payload_ranges = vec![(first_dst, first_slots)];
+                if let Some(second) = second_dst {
+                    let second_slots = second_slots.expect("map kind has a second type");
+                    for (other, other_slots) in &payload_ranges {
+                        if ranges_overlap(second, second_slots, *other, *other_slots) {
+                            return Err(error(Some(pc), VerifyErrorKind::InvalidIteratorContract));
+                        }
+                    }
+                    payload_ranges.push((second, second_slots));
+                }
+                for (base, slots) in payload_ranges {
+                    let end = base.checked_add(slots).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    if usize::from(end) > register_count {
+                        return Err(error(Some(pc), VerifyErrorKind::RegisterOutOfRange(base)));
+                    }
+                    if base <= has_value_dst && has_value_dst < end {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidIteratorContract));
+                    }
+                    if state_registers
+                        .iter()
+                        .any(|state| *state >= base && *state < end)
+                    {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidIteratorContract));
+                    }
+                }
+                // The has-value tag slot itself must stay clear of every
+                // iterator state register, not just the payload ranges.
+                if state_registers.contains(&has_value_dst) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidIteratorContract));
+                }
+                // has-value tag slot: the Option tag is a scalar Bool.
+                state[register(has_value_dst)?] = Some(ValueType::Bool);
+                let written =
+                    write_physical_value_range(&mut state, physical.layouts, first_dst, first_type)
+                        .map_err(|kind| error(Some(pc), kind))?;
+                if written != first_slots {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                if let Some(second) = second_dst
+                    && let Some(second_type) = second_type
+                {
+                    let written = write_physical_value_range(
+                        &mut state,
+                        physical.layouts,
+                        second,
+                        second_type,
+                    )
+                    .map_err(|kind| error(Some(pc), kind))?;
+                    if written != second_slots.expect("map kind has a second type") {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
+                }
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -3803,7 +4136,19 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::MapLen { source, .. }
         | Instruction::MapClear { source }
         | Instruction::BufferLen { source, .. }
+        | Instruction::SetLen { source, .. }
+        | Instruction::SetClear { source }
         | Instruction::Return { source } => vec![source],
+        Instruction::IterNew { kind, state } => match kind {
+            CollectionIteratorKind::Range => vec![state.collection, state.phase],
+            CollectionIteratorKind::Array { .. }
+            | CollectionIteratorKind::Buffer { .. }
+            | CollectionIteratorKind::Map { .. }
+            | CollectionIteratorKind::Set { .. } => vec![state.collection],
+        },
+        Instruction::IterNext { state, .. } => {
+            vec![state.collection, state.phase, state.slot, state.epoch]
+        }
         Instruction::Add { lhs, rhs, .. }
         | Instruction::Sub { lhs, rhs, .. }
         | Instruction::Mul { lhs, rhs, .. }
@@ -3881,7 +4226,10 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         } => range(fields_base, fields_count),
         Instruction::StructWith { source, value, .. }
         | Instruction::ClassSet { source, value, .. }
-        | Instruction::ArrayPush { source, value } => vec![source, value],
+        | Instruction::ArrayPush { source, value }
+        | Instruction::SetContains { source, value, .. }
+        | Instruction::SetInsert { source, value, .. }
+        | Instruction::SetRemove { source, value, .. } => vec![source, value],
         Instruction::ArrayPushRow {
             source,
             fields_base,
@@ -3944,6 +4292,7 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::StateDelete { .. }
         | Instruction::ArrayNew { .. }
         | Instruction::MapNew { .. }
+        | Instruction::SetNew { .. }
         | Instruction::StateFinish
         | Instruction::DeferPop
         | Instruction::CleanupReturn
@@ -4039,6 +4388,11 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::MapGet { dst, .. }
         | Instruction::MapRemove { dst, .. }
         | Instruction::MapContains { dst, .. }
+        | Instruction::SetNew { dst, .. }
+        | Instruction::SetLen { dst, .. }
+        | Instruction::SetContains { dst, .. }
+        | Instruction::SetInsert { dst, .. }
+        | Instruction::SetRemove { dst, .. }
         | Instruction::BufferLen { dst, .. }
         | Instruction::BufferGet { dst, .. }
         | Instruction::BufferSlice { dst, .. }
@@ -4063,6 +4417,9 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::ArrayClear { .. }
         | Instruction::MapSet { .. }
         | Instruction::MapClear { .. }
+        | Instruction::SetClear { .. }
+        | Instruction::IterNew { .. }
+        | Instruction::IterNext { .. }
         | Instruction::BufferSet { .. }
         | Instruction::BufferCopy { .. }
         | Instruction::StateFinish
@@ -4132,6 +4489,14 @@ fn instruction_requires_safepoint(
                 | Instruction::BufferSet { .. }
                 | Instruction::BufferSlice { .. }
                 | Instruction::BufferCopy { .. }
+                | Instruction::SetNew { .. }
+                | Instruction::SetLen { .. }
+                | Instruction::SetContains { .. }
+                | Instruction::SetInsert { .. }
+                | Instruction::SetRemove { .. }
+                | Instruction::SetClear { .. }
+                | Instruction::IterNew { .. }
+                | Instruction::IterNext { .. }
                 | Instruction::Call { .. }
                 | Instruction::HostCall { .. }
                 | Instruction::StateCurrentGet { .. }
@@ -4731,11 +5096,12 @@ fn wcet_successors(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
-        EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
-        Instruction, MapType, Module, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport,
-        Signature, SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType,
-        StateSchema, StateType, StructField, StructType, ValueType,
+        AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType,
+        CollectionIteratorKind, EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect,
+        HostCallMode, HostImport, Instruction, IteratorStateRegisters, MapType, Module,
+        ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, SetType, Signature, SnapshotType,
+        SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
+        StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -6814,12 +7180,25 @@ mod tests {
         MapGet,
         MapInsert,
         MapRemove,
+        SetLen,
+        SetContains,
+        SetInsert,
+        SetRemove,
+        ArrayFirst,
+        ArrayLast,
+        ArraySwap,
+        ArrayReverse,
+        MapIsEmpty,
+        MapGetOr,
+        MapInsertIfAbsent,
+        BufferIsEmpty,
+        BufferFill,
         DebugAssert,
         DebugTrap,
     }
 
     impl FrozenIntrinsicKind {
-        const ALL: [Self; 43] = [
+        const ALL: [Self; 56] = [
             Self::OptionIsSome,
             Self::OptionIsNone,
             Self::ResultIsOk,
@@ -6861,6 +7240,19 @@ mod tests {
             Self::MapGet,
             Self::MapInsert,
             Self::MapRemove,
+            Self::SetLen,
+            Self::SetContains,
+            Self::SetInsert,
+            Self::SetRemove,
+            Self::ArrayFirst,
+            Self::ArrayLast,
+            Self::ArraySwap,
+            Self::ArrayReverse,
+            Self::MapIsEmpty,
+            Self::MapGetOr,
+            Self::MapInsertIfAbsent,
+            Self::BufferIsEmpty,
+            Self::BufferFill,
             Self::DebugAssert,
             Self::DebugTrap,
         ];
@@ -6909,6 +7301,19 @@ mod tests {
             StandardIntrinsic::MapGet { .. } => FrozenIntrinsicKind::MapGet,
             StandardIntrinsic::MapInsert { .. } => FrozenIntrinsicKind::MapInsert,
             StandardIntrinsic::MapRemove { .. } => FrozenIntrinsicKind::MapRemove,
+            StandardIntrinsic::SetLen { .. } => FrozenIntrinsicKind::SetLen,
+            StandardIntrinsic::SetContains { .. } => FrozenIntrinsicKind::SetContains,
+            StandardIntrinsic::SetInsert { .. } => FrozenIntrinsicKind::SetInsert,
+            StandardIntrinsic::SetRemove { .. } => FrozenIntrinsicKind::SetRemove,
+            StandardIntrinsic::ArrayFirst { .. } => FrozenIntrinsicKind::ArrayFirst,
+            StandardIntrinsic::ArrayLast { .. } => FrozenIntrinsicKind::ArrayLast,
+            StandardIntrinsic::ArraySwap { .. } => FrozenIntrinsicKind::ArraySwap,
+            StandardIntrinsic::ArrayReverse { .. } => FrozenIntrinsicKind::ArrayReverse,
+            StandardIntrinsic::MapIsEmpty { .. } => FrozenIntrinsicKind::MapIsEmpty,
+            StandardIntrinsic::MapGetOr { .. } => FrozenIntrinsicKind::MapGetOr,
+            StandardIntrinsic::MapInsertIfAbsent { .. } => FrozenIntrinsicKind::MapInsertIfAbsent,
+            StandardIntrinsic::BufferIsEmpty { .. } => FrozenIntrinsicKind::BufferIsEmpty,
+            StandardIntrinsic::BufferFill { .. } => FrozenIntrinsicKind::BufferFill,
             StandardIntrinsic::DebugAssert => FrozenIntrinsicKind::DebugAssert,
             StandardIntrinsic::DebugTrap => FrozenIntrinsicKind::DebugTrap,
         }
@@ -6929,6 +7334,8 @@ mod tests {
         let array = ValueType::Named(nexa_bytecode::array_type(value));
         let string_array = ValueType::Named(nexa_bytecode::array_type(ValueType::String));
         let map = ValueType::Named(nexa_bytecode::map_type(key, value));
+        let set = ValueType::Named(nexa_bytecode::set_type(value));
+        let buffer = ValueType::Named(nexa_bytecode::buffer_type(value));
         let spec = |intrinsic, arguments, result| FrozenIntrinsicSpec {
             intrinsic,
             arguments,
@@ -7150,6 +7557,71 @@ mod tests {
                 option,
             ),
             spec(
+                StandardIntrinsic::SetLen { element: value },
+                vec![set],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::SetContains { element: value },
+                vec![set, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::SetInsert { element: value },
+                vec![set, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::SetRemove { element: value },
+                vec![set, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayFirst { element: value },
+                vec![array],
+                option,
+            ),
+            spec(
+                StandardIntrinsic::ArrayLast { element: value },
+                vec![array],
+                option,
+            ),
+            spec(
+                StandardIntrinsic::ArraySwap { element: value },
+                vec![array, ValueType::I32, ValueType::I32],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayReverse { element: value },
+                vec![array],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::MapIsEmpty { key, value },
+                vec![map],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::MapGetOr { key, value },
+                vec![map, key, value],
+                value,
+            ),
+            spec(
+                StandardIntrinsic::MapInsertIfAbsent { key, value },
+                vec![map, key, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::BufferIsEmpty { element: value },
+                vec![buffer],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::BufferFill { element: value },
+                vec![buffer, value],
+                ValueType::Bool,
+            ),
+            spec(
                 StandardIntrinsic::DebugAssert,
                 vec![ValueType::Bool],
                 ValueType::Bool,
@@ -7182,7 +7654,9 @@ mod tests {
             ))
             .array_type(ArrayType::new(ValueType::I32))
             .array_type(ArrayType::new(ValueType::String))
-            .map_type(MapType::new(ValueType::String, ValueType::I32));
+            .map_type(MapType::new(ValueType::String, ValueType::I32))
+            .set_type(SetType::new(ValueType::I32))
+            .buffer_type(BufferType::new(ValueType::I32));
         let mut module = module.finish();
         let table = nexa_bytecode::layout::LayoutTable::for_module(&module).unwrap();
         let signature = Signature {
@@ -7785,6 +8259,585 @@ mod tests {
                 },
             )
             .is_ok()
+        );
+    }
+
+    fn language_v3_function(
+        code: Vec<Instruction>,
+        registers: u16,
+        safepoints: Vec<u32>,
+        roots_at: impl Fn(u32) -> Vec<u16>,
+    ) -> Function {
+        let root_maps = safepoints
+            .iter()
+            .map(|&pc| {
+                let mut bitmap = vec![false; usize::from(registers)];
+                for root in roots_at(pc) {
+                    bitmap[usize::from(root)] = true;
+                }
+                RootMap { pc, bitmap }
+            })
+            .collect::<Vec<_>>();
+        let root_bitmap =
+            root_maps
+                .iter()
+                .fold(vec![false; usize::from(registers)], |mut acc, map| {
+                    for (slot, root) in map.bitmap.iter().copied().enumerate() {
+                        acc[slot] |= root;
+                    }
+                    acc
+                });
+        Function {
+            signature: Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            parameter_slots: 0,
+            registers,
+            frame_bytes: u32::from(registers) * 8,
+            root_bitmap,
+            root_maps,
+            safepoints,
+            loop_bounds: Vec::new(),
+            effect: FunctionEffect::Ordinary,
+            max_static_call_depth: 1,
+            code,
+        }
+    }
+
+    fn set_i32_module(function: Function) -> Module {
+        let mut builder = ModuleBuilder::new();
+        builder.set_type(SetType::new(ValueType::I32));
+        builder.function(function);
+        builder.finish()
+    }
+
+    #[test]
+    fn language_v3_set_operations_verify_with_exact_roots() {
+        let type_id = nexa_bytecode::set_type(ValueType::I32);
+        let code = vec![
+            Instruction::LoadI32 { dst: 2, value: 7 },
+            Instruction::SetNew { type_id, dst: 1 },
+            Instruction::SetInsert {
+                source: 1,
+                value: 2,
+                dst: 3,
+            },
+            Instruction::SetLen { source: 1, dst: 4 },
+            Instruction::SetContains {
+                source: 1,
+                value: 2,
+                dst: 5,
+            },
+            Instruction::SetRemove {
+                source: 1,
+                value: 2,
+                dst: 6,
+            },
+            Instruction::SetClear { source: 1 },
+            Instruction::ReturnVoid,
+        ];
+        let function = language_v3_function(
+            code,
+            16,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            // pc 0 has no live set yet; pc 1 kills the register it writes;
+            // the return pc has no live collection.
+            |pc| {
+                if pc <= 1 || pc == 7 {
+                    Vec::new()
+                } else {
+                    vec![1]
+                }
+            },
+        );
+        let module = set_i32_module(function);
+        match verify(module, VerifierLimits::default()) {
+            Ok(_) => {}
+            Err(error) => panic!("Set opcodes must verify, got {:?}", error.kind),
+        }
+    }
+
+    #[test]
+    fn language_v3_set_iteration_and_range_iteration_verify() {
+        let type_id = nexa_bytecode::set_type(ValueType::I32);
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let set_code = vec![
+            Instruction::SetNew { type_id, dst: 1 },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::I32,
+                },
+                state,
+            },
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::I32,
+                },
+                state,
+                has_value_dst: 5,
+                first_dst: 6,
+                second_dst: None,
+            },
+            Instruction::ReturnVoid,
+        ];
+        let set_function = language_v3_function(set_code, 16, vec![0, 1, 2, 3], |pc| {
+            if pc == 0 || pc == 3 {
+                Vec::new()
+            } else {
+                vec![1]
+            }
+        });
+        let set_module = set_i32_module(set_function);
+        assert!(
+            verify(set_module, VerifierLimits::default()).is_ok(),
+            "Set iteration must verify with the collection rooted"
+        );
+        let range_code = vec![
+            Instruction::LoadI32 { dst: 1, value: 0 },
+            Instruction::LoadI32 { dst: 2, value: 8 },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Range,
+                state,
+            },
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Range,
+                state,
+                has_value_dst: 5,
+                first_dst: 6,
+                second_dst: None,
+            },
+            Instruction::ReturnVoid,
+        ];
+        let range_function = language_v3_function(range_code, 16, vec![0, 2, 3, 4], |_| Vec::new());
+        let mut range_module = ModuleBuilder::new();
+        range_module.function(range_function);
+        assert!(
+            verify(range_module.finish(), VerifierLimits::default()).is_ok(),
+            "Range iteration must verify as pure scalar state"
+        );
+    }
+
+    #[test]
+    fn language_v3_map_iteration_verifies_with_independent_pair_bases() {
+        let map = MapType::new(ValueType::I32, ValueType::I32);
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let code = vec![
+            Instruction::MapNew {
+                type_id: map.type_id,
+                dst: 1,
+            },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Map {
+                    key: ValueType::I32,
+                    value: ValueType::I32,
+                },
+                state,
+            },
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Map {
+                    key: ValueType::I32,
+                    value: ValueType::I32,
+                },
+                state,
+                has_value_dst: 5,
+                first_dst: 6,
+                second_dst: Some(7),
+            },
+            Instruction::ReturnVoid,
+        ];
+        let function = language_v3_function(code, 16, vec![0, 1, 2, 3], |pc| {
+            if pc == 0 || pc == 3 {
+                Vec::new()
+            } else {
+                vec![1]
+            }
+        });
+        let mut module = ModuleBuilder::new();
+        module.map_type(map);
+        module.function(function);
+        assert!(
+            verify(module.finish(), VerifierLimits::default()).is_ok(),
+            "Map pair iteration with independent payload bases must verify"
+        );
+    }
+
+    #[test]
+    fn language_v3_set_metadata_rejects_non_canonical_duplicate_and_invalid_elements() {
+        let mut non_canonical = ModuleBuilder::new();
+        non_canonical.set_type(SetType {
+            type_id: StableId(0x5e7_a11_5e7_a11),
+            element: ValueType::I32,
+        });
+        non_canonical.function(language_v3_function(
+            vec![Instruction::ReturnVoid],
+            0,
+            vec![0],
+            |_| Vec::new(),
+        ));
+        assert_eq!(
+            verify(non_canonical.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSetMetadata
+        );
+
+        let mut duplicate = ModuleBuilder::new();
+        duplicate.set_type(SetType::new(ValueType::I32));
+        duplicate.set_type(SetType::new(ValueType::I32));
+        duplicate.function(language_v3_function(
+            vec![Instruction::ReturnVoid],
+            0,
+            vec![0],
+            |_| Vec::new(),
+        ));
+        assert_eq!(
+            verify(duplicate.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSetMetadata
+        );
+
+        let mut invalid_element = ModuleBuilder::new();
+        invalid_element.set_type(SetType::new(ValueType::Bool));
+        invalid_element.function(language_v3_function(
+            vec![Instruction::ReturnVoid],
+            0,
+            vec![0],
+            |_| Vec::new(),
+        ));
+        assert_eq!(
+            verify(invalid_element.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSetMetadata
+        );
+    }
+
+    #[test]
+    fn language_v3_set_operations_reject_unknown_types_and_element_mismatches() {
+        let type_id = nexa_bytecode::set_type(ValueType::I32);
+        let unknown = language_v3_function(
+            vec![
+                Instruction::SetNew {
+                    type_id: StableId(0xdead_beef),
+                    dst: 1,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1],
+            |_| Vec::new(),
+        );
+        assert_eq!(
+            verify(set_i32_module(unknown), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::SetTypeOutOfRange(0xdead_beef)
+        );
+
+        let mut strings = ModuleBuilder::new();
+        strings.string("x");
+        strings.set_type(SetType::new(ValueType::I32));
+        let mismatched = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::LoadString { dst: 2, string: 0 },
+                Instruction::SetContains {
+                    source: 1,
+                    value: 2,
+                    dst: 3,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        strings.function(mismatched);
+        assert_eq!(
+            verify(strings.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+    }
+
+    #[test]
+    fn language_v3_iter_new_rejects_forged_collection_registers() {
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let function = language_v3_function(
+            vec![
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1],
+            |_| Vec::new(),
+        );
+        assert_eq!(
+            verify(set_i32_module(function), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch,
+            "IterNew must not synthesize an uninitialized collection register"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn language_v3_iter_next_rejects_interior_overlaps_and_aliased_state() {
+        let type_id = nexa_bytecode::set_type(ValueType::I32);
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let overlaps_state = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 5,
+                    first_dst: 3,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        assert_eq!(
+            verify(set_i32_module(overlaps_state), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "payload base inside the slot cursor register must be rejected"
+        );
+
+        let overlaps_tag = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 5,
+                    first_dst: 5,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        assert_eq!(
+            verify(set_i32_module(overlaps_tag), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "payload overlapping the has-value slot must be rejected"
+        );
+
+        let tag_aliases_state = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 4,
+                    first_dst: 6,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        assert_eq!(
+            verify(set_i32_module(tag_aliases_state), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "the has-value slot aliasing the epoch register must be rejected"
+        );
+
+        let aliased = language_v3_function(
+            vec![
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Range,
+                    state: IteratorStateRegisters {
+                        collection: 1,
+                        phase: 1,
+                        slot: 3,
+                        epoch: 4,
+                    },
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1],
+            |_| Vec::new(),
+        );
+        assert_eq!(
+            verify(set_i32_module(aliased), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "aliased iterator state registers must be rejected"
+        );
+    }
+
+    #[test]
+    fn language_v3_iter_next_rejects_wrong_pair_arity_and_clobbered_epoch() {
+        let type_id = nexa_bytecode::set_type(ValueType::I32);
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let missing_second = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Map {
+                        key: ValueType::I32,
+                        value: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 5,
+                    first_dst: 6,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        assert_eq!(
+            verify(set_i32_module(missing_second), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "Map iteration without a second payload slot must be rejected"
+        );
+
+        let stray_second = language_v3_function(
+            vec![
+                Instruction::SetNew { type_id, dst: 1 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Set {
+                        element: ValueType::I32,
+                    },
+                    state,
+                    has_value_dst: 5,
+                    first_dst: 6,
+                    second_dst: Some(7),
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2],
+            |pc| if pc == 0 { Vec::new() } else { vec![1] },
+        );
+        assert_eq!(
+            verify(set_i32_module(stray_second), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidIteratorContract,
+            "non-Map iteration with a second payload slot must be rejected"
+        );
+
+        let clobbered_epoch = language_v3_function(
+            vec![
+                Instruction::LoadI32 { dst: 1, value: 0 },
+                Instruction::LoadI32 { dst: 2, value: 8 },
+                Instruction::IterNew {
+                    kind: CollectionIteratorKind::Range,
+                    state,
+                },
+                Instruction::LoadI32 { dst: 4, value: 0 },
+                Instruction::IterNext {
+                    kind: CollectionIteratorKind::Range,
+                    state,
+                    has_value_dst: 5,
+                    first_dst: 6,
+                    second_dst: None,
+                },
+                Instruction::ReturnVoid,
+            ],
+            16,
+            vec![0, 1, 2, 3, 4],
+            |_| Vec::new(),
+        );
+        assert_eq!(
+            verify(set_i32_module(clobbered_epoch), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch,
+            "the epoch register must still carry I64 at IterNext"
         );
     }
 }
