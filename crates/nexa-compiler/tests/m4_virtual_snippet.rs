@@ -121,6 +121,29 @@ activation = "default-enabled"
     nexa_compiler::compile_typed_package(&ir).expect("evidence typed IR compiles")
 }
 
+#[test]
+fn generics_are_monomorphized_before_bytecode_compilation() {
+    let compiled = compile_typed_evidence_package(
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn inferred() -> i32 {
+    return identity(10);
+}
+
+fn explicit() -> i64 {
+    return identity<i64>(20);
+}
+",
+    );
+    assert!(
+        compiled.module.functions.len() >= 4,
+        "two wrappers and two concrete generic instances reach bytecode"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn compile_dependency_host_evidence(environment: &AnalysisEnvironment) -> PackageCompileOutput {
     const ROOT: &str = "nexa.compiler.host.root";
@@ -408,6 +431,28 @@ fn add(left: i32, right: i32) -> i32 {
             value: Some(RuntimeValue::I32(42)),
             ..
         }
+    ));
+}
+
+#[test]
+fn generics_numeric_receiver_method_executes_existing_intrinsic() {
+    let verified = nexa_compiler::compile(
+        r"
+fn floor_value(value: f64) -> f64 {
+    return value.floor();
+}
+",
+    )
+    .expect("numeric receiver method lowers to the existing floor intrinsic");
+    let outcome =
+        CheckedInterpreter::run(&verified, 0, &[RuntimeValue::F64(2.75_f64.to_bits())], 100)
+            .expect("numeric receiver method executes");
+    assert!(matches!(
+        outcome,
+        InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::F64(value)),
+            ..
+        } if value == 2.0_f64.to_bits()
     ));
 }
 

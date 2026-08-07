@@ -117,6 +117,724 @@ fn first_for_statement(outcome: &AnalysisOutcome) -> &TypedStatementIr {
 }
 
 #[test]
+fn generics_identity_supports_inferred_and_explicit_calls() {
+    let outcome = analyze_main(
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn wrap<T>(value: T) -> Option<T> {
+    return Option::Some(value);
+}
+
+fn main() -> i32 {
+    let inferred = identity(10);
+    let explicit = identity<i32>(20);
+    let contextual: Option<i64> = wrap(30);
+    return inferred + explicit;
+}
+",
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    let ir = outcome.ir.expect("generic calls produce concrete typed IR");
+    let instances = ir
+        .definitions()
+        .iter()
+        .filter(|definition| definition.name.starts_with("identity$instance$"))
+        .collect::<Vec<_>>();
+    assert_eq!(instances.len(), 1, "same concrete type reuses one instance");
+    assert_eq!(instances[0].ty, IrType::I32);
+    assert!(
+        ir.definitions()
+            .iter()
+            .all(|definition| definition.ty != IrType::TypeParameter(0)),
+        "type parameters must not escape into executable IR"
+    );
+}
+
+#[test]
+fn generics_identity_emits_distinct_concrete_instances() {
+    let outcome = analyze_main(
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn main() -> i32 {
+    let integer = identity(10);
+    let wide = identity<i64>(20);
+    return integer;
+}
+",
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    let ir = outcome.ir.expect("generic calls produce concrete typed IR");
+    let instance_types = ir
+        .definitions()
+        .iter()
+        .filter(|definition| definition.name.starts_with("identity$instance$"))
+        .map(|definition| definition.ty.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(instance_types, BTreeSet::from([IrType::I32, IrType::I64]));
+}
+
+#[test]
+fn generics_can_call_another_generic_function() {
+    let outcome = analyze_main(
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn forward<T>(value: T) -> T {
+    return identity(value);
+}
+
+fn main() -> i32 {
+    return forward(42);
+}
+",
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    let ir = outcome
+        .ir
+        .expect("nested generic calls produce concrete IR");
+    for prefix in ["identity$instance$", "forward$instance$"] {
+        assert_eq!(
+            ir.definitions()
+                .iter()
+                .filter(|definition| definition.name.starts_with(prefix))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn generics_report_type_argument_arity_and_inference_conflicts() {
+    let wrong_arity = analyze_main(
+        r"
+fn pair<T, U>(left: T, right: U) -> T {
+    return left;
+}
+
+fn main() -> i32 {
+    return pair<i32>(1, 2);
+}
+",
+    );
+    assert!(
+        wrong_arity
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("expected 2 type arguments for `pair`, found 1")
+            })
+    );
+
+    let conflict = analyze_main(
+        r#"
+fn same<T>(left: T, right: T) -> T {
+    return left;
+}
+
+fn main() -> i32 {
+    return same(1, "two");
+}
+"#,
+    );
+    assert!(conflict.diagnostics.diagnostics().iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("conflicts with an earlier type inference")
+    }));
+}
+
+#[test]
+fn generics_builtin_bounds_enable_abstract_operations_and_check_instances() {
+    let outcome = analyze_main(
+        r#"
+fn equal<T: PartialEq>(left: T, right: T) -> bool {
+    return left == right;
+}
+
+fn smaller<T>(left: T, right: T) -> T
+where
+    T: Copy + PartialOrd,
+{
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn show<T: Display>(value: T) -> string {
+    return value.to_string();
+}
+
+fn main() -> i32 {
+    let text = show(10);
+    if equal(text, "10") {
+        return smaller(20, 30);
+    }
+    return 1;
+}
+"#,
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    assert!(outcome.ir.is_some());
+
+    let missing_bound = analyze_main(
+        r"
+fn invalid<T>(left: T, right: T) -> bool {
+    return left == right;
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        missing_bound
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("missing `PartialEq` or `Eq`") })
+    );
+
+    let unsatisfied = analyze_main(
+        r"
+fn ordered<T: PartialOrd>(left: T, right: T) -> bool {
+    return left < right;
+}
+
+fn main() -> i32 {
+    let values = [1, 2];
+    if ordered(values, values) {
+        return 1;
+    }
+    return 0;
+}
+",
+    );
+    assert!(
+        unsatisfied
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("does not satisfy `PartialOrd`") })
+    );
+}
+
+#[test]
+fn generics_operator_and_nominal_type_bounds_are_closed_and_checked() {
+    let valid = analyze_main(
+        r#"
+struct LookupTable<K, V>
+where
+    K: Eq + Hash,
+{
+    values: Map<K, V>,
+}
+
+struct WrappedLookup<K, V>
+where
+    K: Eq + Hash,
+{
+    table: LookupTable<K, V>,
+}
+
+fn add<T>(left: T, right: T) -> T
+where
+    T: Add<Output = T>,
+{
+    return left + right;
+}
+
+fn negate<T: Neg<Output = T>>(value: T) -> T {
+    return -value;
+}
+
+fn equal<T: PartialEq>(left: T, right: T) -> bool {
+    return left == right;
+}
+
+fn equal_ordered<T: Eq>(left: T, right: T) -> bool {
+    return equal(left, right);
+}
+
+fn main() -> i32 {
+    let table: LookupTable<string, i32> = LookupTable {
+        values: Map::new(),
+    };
+    if equal_ordered("same", "same") {
+        return add(negate(-20), 22) + table.values.len();
+    }
+    return 0;
+}
+"#,
+    );
+    assert!(
+        valid.diagnostics.is_empty(),
+        "{:?}",
+        valid.diagnostics.diagnostics()
+    );
+
+    let missing_map_bounds = analyze_main(
+        r"
+struct LookupTable<K, V> {
+    values: Map<K, V>,
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        missing_map_bounds
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("does not have the bounds required by `Map<K, V>`")),
+        "{:?}",
+        missing_map_bounds.diagnostics.diagnostics()
+    );
+
+    let unsatisfied = analyze_main(
+        r"
+fn add<T: Add<Output = T>>(left: T, right: T) -> T {
+    return left + right;
+}
+
+fn main() -> bool {
+    return add(true, false);
+}
+",
+    );
+    assert!(
+        unsatisfied
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("does not satisfy `Add`")),
+        "{:?}",
+        unsatisfied.diagnostics.diagnostics()
+    );
+}
+
+#[test]
+fn generics_numeric_receiver_method_surface_type_checks() {
+    let outcome = analyze_main(
+        r#"
+fn integer_methods(value: i32) -> i32 {
+    return value.abs().min(20).max(5).clamp(0, 15);
+}
+
+fn wide_methods(value: i64) -> i64 {
+    return value.abs().min(30).max(10).clamp(0, 25);
+}
+
+fn single_methods(value: f32) -> f32 {
+    return value.abs().min(5.0).max(1.0).clamp(0.0, 4.0)
+        + value.floor() + value.ceil() + value.round()
+        + value.sqrt() + value.sin() + value.cos();
+}
+
+fn double_methods(value: f64) -> f64 {
+    return value.abs().min(3.0).max(1.0).clamp(0.0, 3.0)
+        + value.floor() + value.ceil() + value.round()
+        + value.sqrt() + value.sin() + value.cos();
+}
+
+fn main() -> i32 {
+    let integer = integer_methods(-10);
+    let wide = wide_methods(20);
+    let single = single_methods(4.0);
+    let double = double_methods(2.75);
+    let text = integer.to_string();
+    if wide > 0 && single > 0.0 && double > 0.0 && text == "15" {
+        return integer;
+    }
+    return 0;
+}
+"#,
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    assert!(outcome.ir.is_some());
+
+    let removed_static_surface = analyze_main(
+        r"
+use std::math as math;
+
+fn main() -> i32 {
+    return math::abs_i32(-1);
+}
+",
+    );
+    assert!(
+        removed_static_surface
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("was replaced by receiver method `value.abs()`")),
+        "{:?}",
+        removed_static_surface.diagnostics.diagnostics()
+    );
+}
+
+#[test]
+fn generics_nominal_types_support_struct_enum_and_class_vertical_slices() {
+    let outcome = analyze_main(
+        r#"
+struct Holder<T> {
+    value: T,
+}
+
+struct Pair<T, U> {
+    first: T,
+    second: U,
+}
+
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+class Box<T> {
+    value: T,
+}
+
+fn unwrap<T>(holder: Holder<T>) -> T {
+    return holder.value;
+}
+
+fn unwrap_or<T>(value: Maybe<T>, fallback: T) -> T {
+    return match value {
+        Maybe::Some(payload) => payload,
+        Maybe::None => fallback,
+    };
+}
+
+fn main() -> i32 {
+    let holder = Holder { value: 10 };
+    let explicit = Holder<i32> { value: 20 };
+    let pair = Pair { first: "score", second: 100 };
+    let updated = Pair<string, i32> { second: 200, ..pair };
+    let present = Maybe::Some(30);
+    let absent: Maybe<i32> = Maybe::None;
+    let explicit_present = Maybe<i32>::Some(50);
+    let explicit_absent = Maybe<i32>::None;
+    let boxed = Box { value: 40 };
+
+    return unwrap(holder)
+        + unwrap(explicit)
+        + unwrap_or(present, 0)
+        + unwrap_or(absent, 0)
+        + unwrap_or(explicit_present, 0)
+        + unwrap_or(explicit_absent, 0)
+        + updated.second
+        + boxed.value;
+}
+"#,
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    let ir = outcome
+        .ir
+        .expect("generic nominal types lower to concrete typed IR");
+    for instance in ["Holder<i32>", "Pair<string, i32>", "Maybe<i32>", "Box<i32>"] {
+        assert_eq!(
+            ir.definitions()
+                .iter()
+                .filter(|definition| definition.name == instance)
+                .count(),
+            1,
+            "repeated uses must reuse `{instance}`"
+        );
+    }
+}
+
+#[test]
+fn generics_named_enum_variants_infer_and_accept_explicit_arguments() {
+    let outcome = analyze_main(
+        r"
+enum Event<T> {
+    Payload { value: T },
+}
+
+fn main() -> i32 {
+    let inferred = Event::Payload { value: 20 };
+    let explicit = Event<i32>::Payload { value: 22 };
+    return match inferred {
+        Event::Payload { value } => value,
+    } + match explicit {
+        Event::Payload { value } => value,
+    };
+}
+",
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    outcome
+        .ir
+        .expect("named generic Enum variants lower to concrete IR");
+}
+
+#[test]
+fn generics_reject_non_converging_and_inline_recursive_nominal_layouts() {
+    let recursive_class = analyze_main(
+        r"
+class Node<T> {
+    value: T,
+    next: Option<Node<T>>,
+}
+
+fn consume(value: Node<i32>) -> i32 {
+    return value.value;
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        recursive_class.diagnostics.is_empty(),
+        "{:?}",
+        recursive_class.diagnostics.diagnostics()
+    );
+
+    let inline = analyze_main(
+        r"
+struct Node<T> {
+    value: T,
+    next: Node<T>,
+}
+
+fn consume(value: Node<i32>) -> i32 {
+    return value.value;
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        inline
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("recursive inline value layout")),
+        "{:?}",
+        inline.diagnostics.diagnostics()
+    );
+
+    let expanding = analyze_main(
+        r"
+class Expanding<T> {
+    next: Expanding<Array<T>>,
+}
+
+fn consume(value: Expanding<i32>) -> i32 {
+    return 0;
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        expanding
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("generic type instantiation does not converge")),
+        "{:?}",
+        expanding.diagnostics.diagnostics()
+    );
+
+    let generic_state = analyze_main(
+        r"
+@state(version = 1)
+class Store<T> {
+    value: T,
+}
+
+fn main() -> i32 {
+    return 0;
+}
+",
+    );
+    assert!(
+        generic_state
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("generic @state Class declarations are not supported")),
+        "{:?}",
+        generic_state.diagnostics.diagnostics()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn generic_parameter_names_do_not_change_public_api_identity() {
+    let first = analyze_main(
+        r"
+pub struct Pair<T, U> {
+    first: T,
+    second: U,
+}
+
+pub fn identity<T: Copy>(value: T) -> T {
+    return value;
+}
+",
+    );
+    let renamed = analyze_main(
+        r"
+pub struct Pair<First, Second> {
+    first: First,
+    second: Second,
+}
+
+pub fn identity<Value: Copy>(value: Value) -> Value {
+    return value;
+}
+",
+    );
+    assert!(first.diagnostics.is_empty());
+    assert!(renamed.diagnostics.is_empty());
+    assert_eq!(
+        first.public_api_fingerprint, renamed.public_api_fingerprint,
+        "generic parameter spelling is not semantic identity"
+    );
+
+    let changed_bound = analyze_main(
+        r"
+pub struct Pair<T: Copy, U> {
+    first: T,
+    second: U,
+}
+
+pub fn identity<T: Eq>(value: T) -> T {
+    return value;
+}
+",
+    );
+    assert!(changed_bound.diagnostics.is_empty());
+    assert_ne!(
+        first.public_api_fingerprint, changed_bound.public_api_fingerprint,
+        "generic bounds participate in public API identity"
+    );
+
+    let instantiated_first = analyze_main(
+        r"
+struct Holder<T> {
+    value: T,
+}
+
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn main() -> i32 {
+    let holder = Holder { value: 42 };
+    return identity(holder.value);
+}
+",
+    )
+    .ir
+    .expect("first generic instance");
+    let instantiated_renamed = analyze_main(
+        r"
+struct Holder<Value> {
+    value: Value,
+}
+
+fn identity<Value>(value: Value) -> Value {
+    return value;
+}
+
+fn main() -> i32 {
+    let holder = Holder { value: 42 };
+    return identity(holder.value);
+}
+",
+    )
+    .ir
+    .expect("renamed generic instance");
+    let instance_id = |ir: &nexa_analysis::TypedPackageIr| {
+        ir.definitions()
+            .iter()
+            .find(|definition| definition.name.starts_with("identity$instance$"))
+            .and_then(|definition| definition.stable_symbol.as_ref())
+            .map(|identity| identity.runtime_id)
+            .expect("concrete instance has stable identity")
+    };
+    assert_eq!(
+        instance_id(&instantiated_first),
+        instance_id(&instantiated_renamed),
+        "renaming a type parameter must not perturb concrete instance identity"
+    );
+    let type_instance_id = |ir: &nexa_analysis::TypedPackageIr| {
+        ir.definitions()
+            .iter()
+            .find(|definition| definition.name == "Holder<i32>")
+            .and_then(|definition| definition.stable_symbol.as_ref())
+            .map(|identity| identity.runtime_id)
+            .expect("concrete generic type has stable identity")
+    };
+    assert_eq!(
+        type_instance_id(&instantiated_first),
+        type_instance_id(&instantiated_renamed),
+        "renaming a type parameter must not perturb concrete type identity"
+    );
+}
+
+#[test]
 fn set_new_and_methods_type_check() {
     const SOURCE: &str = r"
 pub fn run() -> i32 {

@@ -157,9 +157,32 @@ pub enum DeclarationKind {
 pub struct FunctionDeclaration {
     pub is_async: bool,
     pub name: Identifier,
+    pub type_parameters: Vec<GenericParameter>,
+    pub where_constraints: Vec<GenericConstraint>,
     pub parameters: Vec<Parameter>,
     pub result: Option<TypeRef>,
     pub body: Block,
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericParameter {
+    pub name: Identifier,
+    pub bounds: Vec<GenericBound>,
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericBound {
+    pub name: Identifier,
+    pub output: Option<TypeRef>,
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericConstraint {
+    pub parameter: Identifier,
+    pub bounds: Vec<GenericBound>,
     pub range: TextRange,
 }
 
@@ -182,6 +205,8 @@ pub enum TypeDeclarationKind {
 pub struct TypeDeclaration {
     pub kind: TypeDeclarationKind,
     pub name: Identifier,
+    pub type_parameters: Vec<GenericParameter>,
+    pub where_constraints: Vec<GenericConstraint>,
     pub fields: Vec<FieldDeclaration>,
     pub variants: Vec<VariantDeclaration>,
     pub range: TextRange,
@@ -380,6 +405,7 @@ pub enum ExpressionKind {
     },
     Construct {
         ty: QualifiedName,
+        type_arguments: Vec<TypeRef>,
         fields: Vec<FieldInitializer>,
         update: Option<Box<Expression>>,
     },
@@ -886,6 +912,106 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn function_type_parameters(&mut self) -> Vec<GenericParameter> {
+        if self.take(TokenKind::Less).is_none() {
+            return Vec::new();
+        }
+        let mut parameters = Vec::new();
+        while !self.at_end() && !self.at(TokenKind::Greater) {
+            let parameter = self.identifier();
+            self.require_pascal_case(&parameter, "type parameter");
+            let bounds = if self.take(TokenKind::Colon).is_some() {
+                self.generic_bounds()
+            } else {
+                Vec::new()
+            };
+            parameters.push(GenericParameter {
+                range: bounds
+                    .last()
+                    .map_or(parameter.range, |bound| cover(parameter.range, bound.range)),
+                name: parameter,
+                bounds,
+            });
+            if self.take(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::Greater,
+            "expected `>` after function type parameters",
+        );
+        parameters
+    }
+
+    fn generic_bounds(&mut self) -> Vec<GenericBound> {
+        let mut bounds = vec![self.generic_bound()];
+        while self.take(TokenKind::Plus).is_some() {
+            bounds.push(self.generic_bound());
+        }
+        bounds
+    }
+
+    fn generic_bound(&mut self) -> GenericBound {
+        let name = self.identifier();
+        let output = if self.take(TokenKind::Less).is_some() {
+            let associated = self.identifier();
+            if associated.text != "Output" {
+                self.error(
+                    associated.range,
+                    "generic operator bounds only support the `Output` associated type",
+                );
+            }
+            self.expect(
+                TokenKind::Equal,
+                "expected `=` after `Output` in generic bound",
+            );
+            let output = self.ty();
+            self.expect(
+                TokenKind::Greater,
+                "expected `>` after generic bound arguments",
+            );
+            Some(output)
+        } else {
+            None
+        };
+        let range = output
+            .as_ref()
+            .map_or(name.range, |output| cover(name.range, output.range));
+        GenericBound {
+            name,
+            output,
+            range,
+        }
+    }
+
+    fn function_where_constraints(&mut self) -> Vec<GenericConstraint> {
+        if self.take_keyword(Keyword::Where).is_none() {
+            return Vec::new();
+        }
+        let mut constraints = Vec::new();
+        while !self.at_end() && !self.at(TokenKind::LBrace) {
+            let parameter = self.identifier();
+            self.expect(
+                TokenKind::Colon,
+                "expected `:` after constrained type parameter",
+            );
+            let bounds = self.generic_bounds();
+            let range = bounds
+                .last()
+                .map_or(parameter.range, |bound| cover(parameter.range, bound.range));
+            constraints.push(GenericConstraint {
+                parameter,
+                bounds,
+                range,
+            });
+            if self.take(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        constraints
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn function(&mut self) -> FunctionDeclaration {
         let start = self.current_range();
         let is_async = self.take_keyword(Keyword::Async).is_some();
@@ -907,6 +1033,11 @@ impl<'a> Parser<'a> {
             self.identifier()
         };
         self.require_snake_case(&name, "function");
+        let type_parameters = if missing_name {
+            Vec::new()
+        } else {
+            self.function_type_parameters()
+        };
         let mut parameters = Vec::new();
         let mut parameter_error = false;
         let mut header_broken = missing_name;
@@ -966,6 +1097,11 @@ impl<'a> Parser<'a> {
         } else {
             self.take(TokenKind::Arrow).map(|_| self.ty())
         };
+        let where_constraints = if missing_name {
+            Vec::new()
+        } else {
+            self.function_where_constraints()
+        };
         let body = if self.at(TokenKind::LBrace) {
             self.block()
         } else if header_broken {
@@ -982,6 +1118,8 @@ impl<'a> Parser<'a> {
         FunctionDeclaration {
             is_async,
             name,
+            type_parameters,
+            where_constraints,
             parameters,
             result,
             range: cover(start, body.range),
@@ -993,6 +1131,8 @@ impl<'a> Parser<'a> {
         let start = self.bump_range();
         let name = self.identifier();
         self.require_pascal_case(&name, "type");
+        let type_parameters = self.function_type_parameters();
+        let where_constraints = self.function_where_constraints();
         self.expect(TokenKind::LBrace, "expected `{` after type name");
         let mut fields = Vec::new();
         let mut variants = Vec::new();
@@ -1067,6 +1207,8 @@ impl<'a> Parser<'a> {
         TypeDeclaration {
             kind,
             name,
+            type_parameters,
+            where_constraints,
             fields,
             variants,
             range: cover(start, end),
@@ -1590,7 +1732,48 @@ impl<'a> Parser<'a> {
             }
             Some(TokenKind::StringStart) => self.string_expression(),
             Some(TokenKind::Identifier) => {
-                let name = self.qualified_name();
+                let mut name = self.qualified_name();
+                let type_arguments = if name.last().is_some_and(|last| starts_uppercase(&last.text))
+                    && self.at(TokenKind::Less)
+                    && self.type_arguments_ahead()
+                {
+                    self.type_arguments()
+                } else {
+                    Vec::new()
+                };
+                if !type_arguments.is_empty() && self.take(TokenKind::ColonColon).is_some() {
+                    let member = self.identifier();
+                    name.range = cover(name.range, member.range);
+                    name.segments.push(member);
+                    if self.at(TokenKind::LBrace) {
+                        let (fields, update) = self.field_initializers();
+                        return Expression {
+                            range: cover(start, self.previous_range()),
+                            kind: ExpressionKind::Construct {
+                                ty: name,
+                                type_arguments,
+                                fields,
+                                update,
+                            },
+                        };
+                    }
+                    let arguments = if self.at(TokenKind::LParen) {
+                        self.call_arguments()
+                    } else {
+                        Vec::new()
+                    };
+                    return Expression {
+                        range: cover(start, self.previous_range()),
+                        kind: ExpressionKind::Call {
+                            callee: Box::new(Expression {
+                                range: name.range,
+                                kind: ExpressionKind::Name(name),
+                            }),
+                            type_arguments,
+                            arguments,
+                        },
+                    };
+                }
                 if self.at(TokenKind::LBrace)
                     && name.last().is_some_and(|last| starts_uppercase(&last.text))
                 {
@@ -1599,9 +1782,19 @@ impl<'a> Parser<'a> {
                         range: cover(start, self.previous_range()),
                         kind: ExpressionKind::Construct {
                             ty: name,
+                            type_arguments,
                             fields,
                             update,
                         },
+                    }
+                } else if !type_arguments.is_empty() {
+                    self.error(
+                        cover(start, self.previous_range()),
+                        "explicit type arguments here require a constructor or Enum variant",
+                    );
+                    Expression {
+                        range: cover(start, self.previous_range()),
+                        kind: ExpressionKind::Error,
                     }
                 } else {
                     Expression {
@@ -2096,7 +2289,12 @@ impl<'a> Parser<'a> {
                             .significant
                             .get(cursor + 1)
                             .map(|index| self.tree.tokens[*index].kind)
-                            == Some(TokenKind::LParen);
+                            .is_some_and(|kind| {
+                                matches!(
+                                    kind,
+                                    TokenKind::LParen | TokenKind::LBrace | TokenKind::ColonColon
+                                )
+                            });
                     }
                 }
                 TokenKind::Semicolon | TokenKind::LBrace | TokenKind::RBrace => return false,

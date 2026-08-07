@@ -3,8 +3,12 @@ fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
+fn singleton<T>(value: T) -> Array<T> {
+    return [value];
+}
+
 fn ready() -> Array<host::SnakeCommand> {
-    return [host::SnakeCommand::ShowToast("Classic rules enabled")];
+    return singleton(host::SnakeCommand::ShowToast("Classic rules enabled"));
 }
 
 pub fn on_event(event: host::SnakeEvent) -> Array<host::SnakeCommand> {

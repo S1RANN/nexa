@@ -354,7 +354,9 @@ impl AstReferenceScanner<'_> {
                 self.scan_expression(receiver);
                 self.scan_expression(index);
             }
-            ExpressionKind::Construct { ty, fields, update } => {
+            ExpressionKind::Construct {
+                ty, fields, update, ..
+            } => {
                 self.scan_type_path(ty);
                 for field in fields {
                     self.scan_expression(&field.value);

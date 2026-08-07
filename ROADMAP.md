@@ -261,8 +261,10 @@ can change this decision.
 Language v3 = IN PROGRESS
 ```
 
-Language v3 adds `Set<T>` as a built-in compiler-provided hash set type and
-collection iteration for `for` loops. `for item in collection` iterates over
+Language v3 adds `Set<T>`, collection iteration, monomorphized generic
+functions and nominal Struct/Enum/Class types, closed
+`Copy`/`PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash`/`Display` and arithmetic
+operator bounds, and numeric receiver methods. `for item in collection` iterates over
 `Array`, `Buffer`, and `Set`; `for (key, value) in map` iterates over
 `Map<K, V>` with key-value pair bindings. The existing range-based `for i in
 start..end` remains unchanged.
@@ -270,7 +272,7 @@ start..end` remains unchanged.
 Version identifiers: Language3, Bytecode8, OpcodeCost8, stdlib2.0.0.
 Contract/Host/Descriptor versions unchanged.
 
-M4R1 does not include user generics, traits or interfaces, closures,
+M4R1 does not include user-defined traits or interfaces, closures,
 inheritance, dynamic dispatch, operator overloading, macros, reflection,
 `dynamic`/`any`, unwind exceptions, pointer syntax, a borrow checker, shared
 memory threads, remote registries, untrusted-code sandboxing, JIT/AOT, a full

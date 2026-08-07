@@ -25,7 +25,11 @@ class CombatFrame {
     next: Option<CombatFrame>,
 }
 
-fn identity(value: i32) -> i32 {
+struct Sample<T> {
+    value: T,
+}
+
+fn identity<T>(value: T) -> T {
     return value;
 }
 
@@ -97,7 +101,8 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
         Result::Ok(value) => value,
         Result::Err(error) => 0,
     };
-    return amount + mapped_length + values.len();
+    let sample = Sample { value: identity(amount) };
+    return sample.value + mapped_length + values.len();
 }
 
 fn state_probe(handle: StateHandle<EnemyBrain>) -> i32 {

@@ -814,6 +814,7 @@ fn restricted_name(operation: RestrictedOperation) -> &'static str {
 fn definition_fingerprint_payload(
     definition: &Definition,
     signature: Option<&FunctionSignature>,
+    type_bounds: Option<&[BTreeSet<BuiltinBound>]>,
     constant: Option<&ConstValue>,
     metadata: Option<&TypeMetadata>,
     variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
@@ -827,12 +828,41 @@ fn definition_fingerprint_payload(
     if let Some(signature) = signature {
         append_u32(
             &mut payload,
+            u32::try_from(signature.type_parameters.len()).unwrap_or(u32::MAX),
+        );
+        for index in 0..signature.type_parameters.len() {
+            let bounds = signature.bounds.get(index);
+            append_u32(
+                &mut payload,
+                bounds
+                    .map_or(0, |bounds| u32::try_from(bounds.len()).unwrap_or(u32::MAX)),
+            );
+            for bound in bounds.into_iter().flatten() {
+                append_string(&mut payload, builtin_bound_name(*bound));
+            }
+        }
+        append_u32(
+            &mut payload,
             u32::try_from(signature.parameter_types.len()).unwrap_or(u32::MAX),
         );
         for parameter in &signature.parameter_types {
             encode_type(parameter, definitions, &mut payload);
         }
         encode_type(&signature.result, definitions, &mut payload);
+    } else if let Some(type_bounds) = type_bounds {
+        append_u32(
+            &mut payload,
+            u32::try_from(type_bounds.len()).unwrap_or(u32::MAX),
+        );
+        for bounds in type_bounds {
+            append_u32(
+                &mut payload,
+                u32::try_from(bounds.len()).unwrap_or(u32::MAX),
+            );
+            for bound in bounds {
+                append_string(&mut payload, builtin_bound_name(*bound));
+            }
+        }
     }
     if let Some(constant) = constant {
         encode_const(constant, definitions, &mut payload);

@@ -122,6 +122,12 @@ Nexa support follows the current compiler Lexer and Parser:
   migration, activation, cleanup, and immediate functions
 - strings, interpolation, Unicode runes, integers, floats, built-in generic
   collections, `Option`, `Result`, and Reload intrinsics
+- monomorphized generic functions and Struct/Enum/Class declarations,
+  inline/`where` built-in bounds, inferred or fully explicit type arguments
+- closed equality, ordering, hashing, display, and arithmetic
+  `Operator<Output = T>` bounds; no user traits, runtime generics, or turbofish
+- numeric receiver methods such as `value.abs()`, `value.clamp(...)`, and
+  `value.floor()`
 - namespace and associated-item `::`, member `.`, Range and update `..`
 - `Set<T>` built-in generic type with `Set::new`, `insert`, `contains`, `remove`, `clear`, `len`
 - single-binding collection `for` iteration over `Array`, `Buffer`, and `Set`

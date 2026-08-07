@@ -1,1 +1,1 @@
-fn main() -> i32 { let mut i: i32 = 1; i++; return i; }
+fn main() -> i32 { let i: i32 = 1; i++; return i; }

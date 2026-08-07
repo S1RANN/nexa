@@ -160,6 +160,7 @@ pub enum Keyword {
     Const,
     Break,
     Continue,
+    Where,
     Contract,
     Host,
     Nexa,

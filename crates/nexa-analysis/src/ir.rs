@@ -202,7 +202,7 @@ pub enum BuiltinOperationIr {
     ValueToString,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IrType {
     /// A failed type/name resolution whose true type is unknown. Downstream type checks must not
     /// emit cascading diagnostics against this value.
@@ -227,7 +227,8 @@ pub enum IrType {
     Snapshot(Box<Self>),
     Buffer(Box<Self>),
     StateHandle(Box<Self>),
-    /// A generic parameter in compiler-provided standard-library signature metadata.
+    /// A generic parameter in an abstract function signature or compiler-provided
+    /// standard-library signature metadata.
     ///
     /// Executable source expressions and call-site substitutions must never retain this form.
     TypeParameter(u16),

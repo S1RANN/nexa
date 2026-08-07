@@ -3924,17 +3924,18 @@ mod tests {
     }
 
     #[test]
-    fn lsp_v2_locates_immutable_class_field_assignment() {
+    fn lsp_v2_locates_immutable_struct_field_assignment() {
         let path = Path::new("/tmp/nexa-lsp-v2-field-mutability.nexa");
-        let source = "class Counter {\n    locked: i32,\n}\n\
-                      fn change(counter: Counter) {\n\
+        let source = "struct Counter {\n    locked: i32,\n}\n\
+                      fn change() {\n\
+                          const counter: Counter = Counter { locked: 1 };\n\
                           counter.locked = 2;\n\
                       }\n\
                       fn main(args: Array<string>) -> i32 { return 0; }\n";
         let diagnostic = nexa_diagnostic_with_code(path, source, nexa::ErrorCode::NX2501);
         let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
-        let start = source.rfind("locked").expect("assigned field");
-        lsp_range_contains_source_range(&rendered, source, start, start + "locked".len());
+        let start = source.rfind("counter").expect("assigned binding");
+        lsp_range_contains_source_range(&rendered, source, start, start + "counter".len());
     }
 
     #[test]

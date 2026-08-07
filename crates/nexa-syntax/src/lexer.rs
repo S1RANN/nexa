@@ -500,6 +500,7 @@ fn nexa_keyword(text: &str) -> Option<Keyword> {
         "const" => Keyword::Const,
         "break" => Keyword::Break,
         "continue" => Keyword::Continue,
+        "where" => Keyword::Where,
         _ => return None,
     })
 }

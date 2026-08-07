@@ -11,7 +11,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
 
 use nexa_core::{
-    CanonicalSymbolIdentity, StableId, StableSymbolId, StableSymbolRegistry, SymbolKind,
+    CanonicalSymbolIdentity, FingerprintBuilder, StableId, StableSymbolId, StableSymbolRegistry,
+    SymbolKind,
     deterministic_math::{rem_f32 as deterministic_rem_f32, rem_f64 as deterministic_rem_f64},
 };
 use nexa_diagnostics::{
@@ -470,6 +471,37 @@ struct FunctionSignature {
     parameter_types: Vec<IrType>,
     result: IrType,
     effect: IrEffect,
+    type_parameters: Vec<String>,
+    bounds: Vec<BTreeSet<BuiltinBound>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BuiltinBound {
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Neg,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GenericInstanceKey {
+    function: DefinitionId,
+    arguments: Vec<IrType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GenericTypeInstanceKey {
+    definition: DefinitionId,
+    arguments: Vec<IrType>,
 }
 
 #[derive(Clone)]
@@ -562,6 +594,16 @@ struct Analyzer<'a> {
     members: BTreeMap<(DefinitionId, String), DefinitionId>,
     declaration_records: Vec<DeclRecord>,
     function_signatures: BTreeMap<DefinitionId, FunctionSignature>,
+    generic_instances: BTreeMap<GenericInstanceKey, DefinitionId>,
+    pending_generic_instances: Vec<GenericInstanceKey>,
+    generic_instance_origins: BTreeMap<DefinitionId, GenericInstanceKey>,
+    generic_type_instances: BTreeMap<GenericTypeInstanceKey, DefinitionId>,
+    pending_generic_type_instances: Vec<GenericTypeInstanceKey>,
+    generic_type_instance_origins: BTreeMap<DefinitionId, GenericTypeInstanceKey>,
+    populated_generic_type_instances: BTreeSet<DefinitionId>,
+    generic_type_instance_stack: Vec<GenericTypeInstanceKey>,
+    generic_type_bounds: BTreeMap<DefinitionId, Vec<BTreeSet<BuiltinBound>>>,
+    declaration_signatures_resolved: bool,
     external_functions: BTreeMap<DefinitionId, ExternalFunctionMetadata>,
     type_metadata: BTreeMap<DefinitionId, TypeMetadata>,
     variant_payloads: BTreeMap<DefinitionId, Vec<IrType>>,
@@ -775,6 +817,16 @@ impl<'a> Analyzer<'a> {
             members: BTreeMap::new(),
             declaration_records: Vec::new(),
             function_signatures: BTreeMap::new(),
+            generic_instances: BTreeMap::new(),
+            pending_generic_instances: Vec::new(),
+            generic_instance_origins: BTreeMap::new(),
+            generic_type_instances: BTreeMap::new(),
+            pending_generic_type_instances: Vec::new(),
+            generic_type_instance_origins: BTreeMap::new(),
+            populated_generic_type_instances: BTreeSet::new(),
+            generic_type_instance_stack: Vec::new(),
+            generic_type_bounds: BTreeMap::new(),
+            declaration_signatures_resolved: false,
             external_functions: BTreeMap::new(),
             type_metadata: BTreeMap::new(),
             variant_payloads: BTreeMap::new(),
@@ -914,6 +966,8 @@ impl<'a> Analyzer<'a> {
                                 parameter_types,
                                 result: function.return_type.clone(),
                                 effect: function.effect,
+                                type_parameters: Vec::new(),
+                                bounds: Vec::new(),
                             },
                         );
                     }
@@ -1366,10 +1420,10 @@ impl<'a> Analyzer<'a> {
         }
         self.resolve_imports();
         self.resolve_declaration_signatures();
-        self.validate_recursive_value_layouts();
         self.validate_entry_and_exports();
         self.evaluate_constants();
         self.check_bodies();
+        self.validate_recursive_value_layouts();
         self.validate_tests();
         self.build_semantic_records();
 
@@ -1412,6 +1466,11 @@ impl<'a> Analyzer<'a> {
                     StateSchemaFingerprint::default()
                 }
             };
+        for definition in &mut self.definitions {
+            if ir_type_contains_type_parameter(&definition.ty) {
+                definition.ty = IrType::Unit;
+            }
+        }
         let source_set_fingerprint = source_set_fingerprint(&self.input.root_source_set);
         let has_errors = self
             .diagnostics
@@ -2027,6 +2086,8 @@ impl<'a> Analyzer<'a> {
                     kind: DeclarationKind::Function(ast::FunctionDeclaration {
                         is_async,
                         name: identifier(&generated_name),
+                        type_parameters: Vec::new(),
+                        where_constraints: Vec::new(),
                         parameters: Vec::new(),
                         result: None,
                         body: ast::Block {
@@ -2085,6 +2146,8 @@ impl<'a> Analyzer<'a> {
                 kind: DeclarationKind::Function(ast::FunctionDeclaration {
                     is_async,
                     name: identifier("main"),
+                    type_parameters: Vec::new(),
+                    where_constraints: Vec::new(),
                     parameters: vec![ast::Parameter {
                         mutable: false,
                         name: identifier("args"),
@@ -2473,6 +2536,12 @@ impl<'a> Analyzer<'a> {
                                 parameter_types: Vec::new(),
                                 result: IrType::Unit,
                                 effect,
+                                type_parameters: function
+                                    .type_parameters
+                                    .iter()
+                                    .map(|parameter| parameter.name.text.clone())
+                                    .collect(),
+                                bounds: vec![BTreeSet::new(); function.type_parameters.len()],
                             },
                         );
                     }
@@ -2738,6 +2807,19 @@ impl<'a> Analyzer<'a> {
                         byte_range(declaration.range),
                         format!("`@{}` does not allow `async fn`", special[0]),
                         "special lifecycle/effect functions must be synchronous",
+                    );
+                }
+                if !function.type_parameters.is_empty()
+                    && ["migration", "activation", "cleanup", "test"]
+                        .iter()
+                        .any(|attribute| has_attribute(&declaration.attributes, attribute))
+                {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(function.name.range),
+                        "lifecycle, migration, and test entrypoints cannot be generic",
+                        "entrypoint boundaries must use fully concrete parameter and result types",
                     );
                 }
             }
@@ -3397,6 +3479,47 @@ impl<'a> Analyzer<'a> {
                 byte_range(range),
                 collision.to_string(),
                 "generated runtime StableId collision",
+            ),
+        }
+        canonical
+    }
+
+    fn generated_explicit_canonical_identity(
+        &mut self,
+        module: &ParsedModule,
+        kind: SymbolKind,
+        stable_name: &str,
+        range: TextRange,
+    ) -> String {
+        let package = if module.compiler_provided {
+            nexa_stdlib::CANONICAL_PACKAGE_ID
+        } else {
+            module.key.package.as_str()
+        };
+        let identity = CanonicalSymbolIdentity::explicit(package, kind, stable_name);
+        let canonical = canonical_identity_text(&identity);
+        let next = DefinitionId(u32::try_from(self.definitions.len()).unwrap_or(u32::MAX));
+        match self.stable_registry.insert(identity) {
+            Ok(stable_id) => {
+                self.stable_ids.insert(next, stable_id);
+                self.pending_stable_symbols.insert(
+                    next,
+                    StableSymbolIdentity {
+                        canonical: self
+                            .stable_registry
+                            .identity(stable_id)
+                            .expect("inserted generated generic identity exists")
+                            .clone(),
+                        runtime_id: stable_id,
+                    },
+                );
+            }
+            Err(collision) => self.push_source_error(
+                ErrorCode::NX2711,
+                &module.source,
+                byte_range(range),
+                collision.to_string(),
+                "generated generic runtime StableId collision",
             ),
         }
         canonical
@@ -4963,6 +5086,277 @@ impl<'a> Analyzer<'a> {
             .then_some(ImportTarget::Static(static_module))
     }
 
+    fn resolve_generic_bounds(
+        &mut self,
+        module: &ParsedModule,
+        owner: &str,
+        type_parameters: &[ast::GenericParameter],
+        where_constraints: &[ast::GenericConstraint],
+    ) -> Vec<BTreeSet<BuiltinBound>> {
+        let indices = type_parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| (parameter.name.text.as_str(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved = vec![BTreeSet::new(); type_parameters.len()];
+        let mut add_bounds = |parameter: &ast::Identifier, bounds: &[ast::GenericBound]| {
+            let Some(index) = indices.get(parameter.text.as_str()).copied() else {
+                self.push_source_error(
+                    ErrorCode::NX2101,
+                    &module.source,
+                    byte_range(parameter.range),
+                    format!("unknown {owner} type parameter `{}`", parameter.text),
+                    format!(
+                        "`where` constraints must name a type parameter declared by this {owner}"
+                    ),
+                );
+                return;
+            };
+            for bound in bounds {
+                let builtin = match bound.name.text.as_str() {
+                    "Copy" => Some(BuiltinBound::Copy),
+                    "PartialEq" => Some(BuiltinBound::PartialEq),
+                    "Eq" => Some(BuiltinBound::Eq),
+                    "PartialOrd" => Some(BuiltinBound::PartialOrd),
+                    "Ord" => Some(BuiltinBound::Ord),
+                    "Hash" => Some(BuiltinBound::Hash),
+                    "Display" => Some(BuiltinBound::Display),
+                    "Add" => Some(BuiltinBound::Add),
+                    "Sub" => Some(BuiltinBound::Sub),
+                    "Mul" => Some(BuiltinBound::Mul),
+                    "Div" => Some(BuiltinBound::Div),
+                    "Rem" => Some(BuiltinBound::Rem),
+                    "Neg" => Some(BuiltinBound::Neg),
+                    _ => None,
+                };
+                if let Some(builtin) = builtin {
+                    let operator = matches!(
+                        builtin,
+                        BuiltinBound::Add
+                            | BuiltinBound::Sub
+                            | BuiltinBound::Mul
+                            | BuiltinBound::Div
+                            | BuiltinBound::Rem
+                            | BuiltinBound::Neg
+                    );
+                    let output_is_self = bound.output.as_ref().is_some_and(|output| {
+                        matches!(
+                            &output.kind,
+                            ast::TypeKind::Named(name)
+                                if name.segments.len() == 1
+                                    && name.segments[0].text == parameter.text
+                        )
+                    });
+                    if operator && !output_is_self {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(bound.range),
+                            format!(
+                                "operator bound `{}` must declare `Output = {}`",
+                                bound.name.text, parameter.text
+                            ),
+                            "Nexa operator bounds are closed and always return the constrained type",
+                        );
+                        continue;
+                    }
+                    if !operator && bound.output.is_some() {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(bound.range),
+                            format!(
+                                "bound `{}` does not accept an `Output` constraint",
+                                bound.name.text
+                            ),
+                            "only Add, Sub, Mul, Div, Rem, and Neg use `Output = T`",
+                        );
+                        continue;
+                    }
+                    resolved[index].insert(builtin);
+                } else {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(bound.range),
+                        format!("unsupported generic bound `{}`", bound.name.text),
+                        "supported bounds are Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, Add, Sub, Mul, Div, Rem, and Neg",
+                    );
+                }
+            }
+        };
+        for parameter in type_parameters {
+            add_bounds(&parameter.name, &parameter.bounds);
+        }
+        for constraint in where_constraints {
+            add_bounds(&constraint.parameter, &constraint.bounds);
+        }
+        resolved
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_generic_container_bounds(
+        &mut self,
+        module: &ParsedModule,
+        range: TextRange,
+        ty: &IrType,
+        type_parameters: &[ast::GenericParameter],
+        parameter_bounds: &[BTreeSet<BuiltinBound>],
+    ) {
+        if let IrType::Map(key, _) = ty {
+            let valid = match key.as_ref() {
+                IrType::TypeParameter(index) => parameter_bounds
+                    .get(usize::from(*index))
+                    .is_some_and(|bounds| {
+                        bounds.contains(&BuiltinBound::Eq) && bounds.contains(&BuiltinBound::Hash)
+                    }),
+                concrete => {
+                    type_satisfies_bound(
+                        concrete,
+                        BuiltinBound::Eq,
+                        &self.definitions,
+                        &self.type_metadata,
+                        &self.variant_payloads,
+                        &self.host_types,
+                    ) && type_satisfies_bound(
+                        concrete,
+                        BuiltinBound::Hash,
+                        &self.definitions,
+                        &self.type_metadata,
+                        &self.variant_payloads,
+                        &self.host_types,
+                    )
+                }
+            };
+            if !valid {
+                let message = match key.as_ref() {
+                    IrType::TypeParameter(index) => format!(
+                        "type parameter `{}` does not have the bounds required by `Map<K, V>`",
+                        type_parameters
+                            .get(usize::from(*index))
+                            .map_or("<unknown>", |parameter| parameter.name.text.as_str())
+                    ),
+                    concrete => format!(
+                        "Map key type `{}` must satisfy Eq + Hash",
+                        display_ir_type(concrete, &self.definitions)
+                    ),
+                };
+                self.push_source_error(
+                    ErrorCode::NX2101,
+                    &module.source,
+                    byte_range(range),
+                    message,
+                    "add `Eq + Hash` to the key parameter or choose a hashable key type",
+                );
+            }
+        }
+        if let IrType::Named(instance) = ty
+            && let Some(origin) = self.generic_type_instance_origins.get(instance).cloned()
+        {
+            let required = self
+                .generic_type_bounds
+                .get(&origin.definition)
+                .cloned()
+                .unwrap_or_default();
+            for (index, argument) in origin.arguments.iter().enumerate() {
+                for bound in required.get(index).into_iter().flatten().copied() {
+                    let valid = match argument {
+                        IrType::TypeParameter(parameter) => parameter_bounds
+                            .get(usize::from(*parameter))
+                            .is_some_and(|bounds| bound_set_satisfies(bounds, bound)),
+                        concrete => type_satisfies_bound(
+                            concrete,
+                            bound,
+                            &self.definitions,
+                            &self.type_metadata,
+                            &self.variant_payloads,
+                            &self.host_types,
+                        ),
+                    };
+                    if !valid {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(range),
+                            format!(
+                                "generic argument {} does not satisfy `{}` required by `{}`",
+                                index + 1,
+                                builtin_bound_name(bound),
+                                self.definitions[origin.definition.0 as usize].name
+                            ),
+                            "propagate the required bound to the enclosing type parameter",
+                        );
+                    }
+                }
+            }
+        }
+        match ty {
+            IrType::Option(inner)
+            | IrType::Array(inner)
+            | IrType::Set(inner)
+            | IrType::Snapshot(inner)
+            | IrType::Buffer(inner)
+            | IrType::StateHandle(inner) => {
+                self.validate_generic_container_bounds(
+                    module,
+                    range,
+                    inner,
+                    type_parameters,
+                    parameter_bounds,
+                );
+            }
+            IrType::Result(ok, error) | IrType::Map(ok, error) => {
+                self.validate_generic_container_bounds(
+                    module,
+                    range,
+                    ok,
+                    type_parameters,
+                    parameter_bounds,
+                );
+                self.validate_generic_container_bounds(
+                    module,
+                    range,
+                    error,
+                    type_parameters,
+                    parameter_bounds,
+                );
+            }
+            IrType::HostRequest(inner) | IrType::ResourceToken(inner) => {
+                if let Some(inner) = inner {
+                    self.validate_generic_container_bounds(
+                        module,
+                        range,
+                        inner,
+                        type_parameters,
+                        parameter_bounds,
+                    );
+                }
+            }
+            IrType::Tuple(values) => {
+                for value in values {
+                    self.validate_generic_container_bounds(
+                        module,
+                        range,
+                        value,
+                        type_parameters,
+                        parameter_bounds,
+                    );
+                }
+            }
+            IrType::Error
+            | IrType::Unit
+            | IrType::Bool
+            | IrType::I32
+            | IrType::I64
+            | IrType::F32
+            | IrType::F64
+            | IrType::String
+            | IrType::Rune
+            | IrType::Named(_)
+            | IrType::TypeParameter(_) => {}
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn resolve_declaration_signatures(&mut self) {
         let records = self.declaration_records.clone();
@@ -4970,6 +5364,40 @@ impl<'a> Analyzer<'a> {
             let module = self.modules[record.module_index].clone();
             match &record.declaration.kind {
                 DeclarationKind::Function(function) => {
+                    let bounds = self.resolve_generic_bounds(
+                        &module,
+                        "function",
+                        &function.type_parameters,
+                        &function.where_constraints,
+                    );
+                    let mut type_parameter_bindings = BTreeMap::new();
+                    for (index, parameter) in function.type_parameters.iter().enumerate() {
+                        let Ok(index) = u16::try_from(index) else {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(parameter.range),
+                                "too many function type parameters",
+                                "a function may declare at most 65536 type parameters",
+                            );
+                            continue;
+                        };
+                        if type_parameter_bindings
+                            .insert(parameter.name.text.clone(), IrType::TypeParameter(index))
+                            .is_some()
+                        {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(parameter.range),
+                                format!(
+                                    "duplicate function type parameter `{}`",
+                                    parameter.name.text
+                                ),
+                                "each function type parameter must have a unique name",
+                            );
+                        }
+                    }
                     let parameter_ids = self
                         .function_signatures
                         .get(&record.definition)
@@ -4980,7 +5408,11 @@ impl<'a> Analyzer<'a> {
                         .iter()
                         .zip(parameter_ids.iter().copied())
                     {
-                        let ty = self.resolve_type_ref(&module, &parameter.ty);
+                        let ty = self.resolve_type_ref_with_parameters(
+                            &module,
+                            &parameter.ty,
+                            &type_parameter_bindings,
+                        );
                         self.definitions[definition.0 as usize].ty = ty.clone();
                         self.validate_public_type_ref(
                             &module,
@@ -4988,15 +5420,33 @@ impl<'a> Analyzer<'a> {
                             &parameter.ty,
                             &ty,
                         );
+                        self.validate_generic_container_bounds(
+                            &module,
+                            parameter.ty.range,
+                            &ty,
+                            &function.type_parameters,
+                            &bounds,
+                        );
                         parameter_types.push(ty);
                     }
                     let result = function.result.as_ref().map_or(IrType::Unit, |syntax| {
-                        let resolved = self.resolve_type_ref(&module, syntax);
+                        let resolved = self.resolve_type_ref_with_parameters(
+                            &module,
+                            syntax,
+                            &type_parameter_bindings,
+                        );
                         self.validate_public_type_ref(
                             &module,
                             record.definition,
                             syntax,
                             &resolved,
+                        );
+                        self.validate_generic_container_bounds(
+                            &module,
+                            syntax.range,
+                            &resolved,
+                            &function.type_parameters,
+                            &bounds,
                         );
                         resolved
                     });
@@ -5018,10 +5468,63 @@ impl<'a> Analyzer<'a> {
                             parameter_types: parameter_types.clone(),
                             result: result.clone(),
                             effect,
+                            type_parameters: function
+                                .type_parameters
+                                .iter()
+                                .map(|parameter| parameter.name.text.clone())
+                                .collect(),
+                            bounds,
                         },
                     );
                 }
                 DeclarationKind::Type(ty) => {
+                    let bounds = self.resolve_generic_bounds(
+                        &module,
+                        "type",
+                        &ty.type_parameters,
+                        &ty.where_constraints,
+                    );
+                    self.generic_type_bounds
+                        .insert(record.definition, bounds.clone());
+                    let mut type_parameter_bindings = BTreeMap::new();
+                    for (index, parameter) in ty.type_parameters.iter().enumerate() {
+                        let Ok(index) = u16::try_from(index) else {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(parameter.range),
+                                "too many type parameters",
+                                "a type may declare at most 65536 type parameters",
+                            );
+                            continue;
+                        };
+                        if type_parameter_bindings
+                            .insert(parameter.name.text.clone(), IrType::TypeParameter(index))
+                            .is_some()
+                        {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(parameter.range),
+                                format!("duplicate type parameter `{}`", parameter.name.text),
+                                "each type parameter must have a unique name",
+                            );
+                        }
+                    }
+                    if !ty.type_parameters.is_empty()
+                        && self
+                            .type_metadata
+                            .get(&record.definition)
+                            .is_some_and(|metadata| metadata.state.is_some())
+                    {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(ty.name.range),
+                            "generic @state Class declarations are not supported",
+                            "put fully concrete generic type instances inside a non-generic @state Class",
+                        );
+                    }
                     let metadata = self
                         .type_metadata
                         .get(&record.definition)
@@ -5034,13 +5537,24 @@ impl<'a> Analyzer<'a> {
                             .copied()
                             .map(|id| (field, id))
                     }) {
-                        let resolved = self.resolve_type_ref(&module, &field.ty);
+                        let resolved = self.resolve_type_ref_with_parameters(
+                            &module,
+                            &field.ty,
+                            &type_parameter_bindings,
+                        );
                         self.definitions[definition.0 as usize].ty = resolved.clone();
                         self.validate_public_type_ref(
                             &module,
                             record.definition,
                             &field.ty,
                             &resolved,
+                        );
+                        self.validate_generic_container_bounds(
+                            &module,
+                            field.ty.range,
+                            &resolved,
+                            &ty.type_parameters,
+                            &bounds,
                         );
                     }
                     for (variant, definition) in ty.variants.iter().filter_map(|variant| {
@@ -5060,12 +5574,23 @@ impl<'a> Analyzer<'a> {
                         let payload = payload_syntax
                             .into_iter()
                             .map(|syntax| {
-                                let resolved = self.resolve_type_ref(&module, syntax);
+                                let resolved = self.resolve_type_ref_with_parameters(
+                                    &module,
+                                    syntax,
+                                    &type_parameter_bindings,
+                                );
                                 self.validate_public_type_ref(
                                     &module,
                                     record.definition,
                                     syntax,
                                     &resolved,
+                                );
+                                self.validate_generic_container_bounds(
+                                    &module,
+                                    syntax.range,
+                                    &resolved,
+                                    &ty.type_parameters,
+                                    &bounds,
                                 );
                                 resolved
                             })
@@ -5116,6 +5641,8 @@ impl<'a> Analyzer<'a> {
                 DeclarationKind::Error => {}
             }
         }
+        self.declaration_signatures_resolved = true;
+        self.populate_pending_generic_type_instances();
         self.state_types.sort_by_key(|state| state.definition);
     }
 
@@ -5277,7 +5804,23 @@ impl<'a> Analyzer<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn resolve_type_ref(&mut self, module: &ParsedModule, ty: &TypeRef) -> IrType {
+        self.resolve_type_ref_with_parameters(module, ty, &BTreeMap::new())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resolve_type_ref_with_parameters(
+        &mut self,
+        module: &ParsedModule,
+        ty: &TypeRef,
+        type_parameters: &BTreeMap<String, IrType>,
+    ) -> IrType {
         match &ty.kind {
+            TypeKind::Named(name)
+                if name.segments.len() == 1
+                    && type_parameters.contains_key(&name.segments[0].text) =>
+            {
+                type_parameters[&name.segments[0].text].clone()
+            }
             TypeKind::Named(name) => match name.text().as_str() {
                 "HostRequest" => {
                     self.push_source_error(
@@ -5325,21 +5868,39 @@ impl<'a> Analyzer<'a> {
             TypeKind::Generic { base, arguments } => {
                 let base_name = base.text();
                 match (base_name.as_str(), arguments.as_slice()) {
-                    ("Option", [inner]) => {
-                        IrType::Option(Box::new(self.resolve_type_ref(module, inner)))
-                    }
+                    ("Option", [inner]) => IrType::Option(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
                     ("Result", [ok, error]) => IrType::Result(
-                        Box::new(self.resolve_type_ref(module, ok)),
-                        Box::new(self.resolve_type_ref(module, error)),
+                        Box::new(self.resolve_type_ref_with_parameters(
+                            module,
+                            ok,
+                            type_parameters,
+                        )),
+                        Box::new(self.resolve_type_ref_with_parameters(
+                            module,
+                            error,
+                            type_parameters,
+                        )),
                     ),
-                    ("Array", [inner]) => {
-                        IrType::Array(Box::new(self.resolve_type_ref(module, inner)))
-                    }
+                    ("Array", [inner]) => IrType::Array(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
                     ("Map", [key, value]) => IrType::Map(
-                        Box::new(self.resolve_type_ref(module, key)),
-                        Box::new(self.resolve_type_ref(module, value)),
+                        Box::new(self.resolve_type_ref_with_parameters(
+                            module,
+                            key,
+                            type_parameters,
+                        )),
+                        Box::new(self.resolve_type_ref_with_parameters(
+                            module,
+                            value,
+                            type_parameters,
+                        )),
                     ),
-                    ("Set", [inner]) => IrType::Set(Box::new(self.resolve_type_ref(module, inner))),
+                    ("Set", [inner]) => IrType::Set(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
                     ("HostRequest", [_]) => {
                         self.push_source_error(
                             ErrorCode::NX2101,
@@ -5350,9 +5911,9 @@ impl<'a> Analyzer<'a> {
                         );
                         IrType::Error
                     }
-                    ("Token", [inner]) => {
-                        IrType::ResourceToken(Some(Box::new(self.resolve_type_ref(module, inner))))
-                    }
+                    ("Token", [inner]) => IrType::ResourceToken(Some(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    ))),
                     ("ResourceToken", _) => {
                         self.push_source_error(
                             ErrorCode::NX2101,
@@ -5363,15 +5924,15 @@ impl<'a> Analyzer<'a> {
                         );
                         IrType::Error
                     }
-                    ("Snapshot", [inner]) => {
-                        IrType::Snapshot(Box::new(self.resolve_type_ref(module, inner)))
-                    }
-                    ("Buffer", [inner]) => {
-                        IrType::Buffer(Box::new(self.resolve_type_ref(module, inner)))
-                    }
-                    ("StateHandle", [inner]) => {
-                        IrType::StateHandle(Box::new(self.resolve_type_ref(module, inner)))
-                    }
+                    ("Snapshot", [inner]) => IrType::Snapshot(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
+                    ("Buffer", [inner]) => IrType::Buffer(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
+                    ("StateHandle", [inner]) => IrType::StateHandle(Box::new(
+                        self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+                    )),
                     (
                         "Option" | "Result" | "Array" | "Map" | "Set" | "HostRequest" | "Token"
                         | "Snapshot" | "Buffer" | "StateHandle",
@@ -5387,35 +5948,85 @@ impl<'a> Analyzer<'a> {
                         IrType::Error
                     }
                     _ => {
-                        self.push_source_error(
-                            ErrorCode::NX2101,
-                            &module.source,
-                            byte_range(ty.range),
-                            format!("user generic type `{base_name}` is not supported"),
-                            "M4 only permits the built-in generic types",
-                        );
-                        IrType::Error
+                        let Some(definition) =
+                            self.resolve_symbol_path(module, base, SymbolUse::Type)
+                        else {
+                            return IrType::Error;
+                        };
+                        let Some((_record, declaration)) =
+                            self.generic_type_declaration(definition)
+                        else {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(ty.range),
+                                format!("type `{base_name}` does not accept type arguments"),
+                                "remove the type arguments or declare the type as generic",
+                            );
+                            return IrType::Error;
+                        };
+                        if declaration.type_parameters.len() != arguments.len() {
+                            self.push_source_error(
+                                ErrorCode::NX2101,
+                                &module.source,
+                                byte_range(ty.range),
+                                format!(
+                                    "expected {} type arguments for `{base_name}`, found {}",
+                                    declaration.type_parameters.len(),
+                                    arguments.len()
+                                ),
+                                "generic types require all type arguments explicitly in type positions",
+                            );
+                        }
+                        let arguments = arguments
+                            .iter()
+                            .map(|argument| {
+                                self.resolve_type_ref_with_parameters(
+                                    module,
+                                    argument,
+                                    type_parameters,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let instance = self.request_generic_type_instance(GenericTypeInstanceKey {
+                            definition,
+                            arguments,
+                        });
+                        if self.declaration_signatures_resolved
+                            && self.generic_type_instance_stack.is_empty()
+                        {
+                            self.populate_pending_generic_type_instances();
+                        }
+                        instance.map_or(IrType::Error, IrType::Named)
                     }
                 }
             }
             TypeKind::Tuple(values) => IrType::Tuple(
                 values
                     .iter()
-                    .map(|value| self.resolve_type_ref(module, value))
+                    .map(|value| {
+                        self.resolve_type_ref_with_parameters(module, value, type_parameters)
+                    })
                     .collect(),
             ),
-            TypeKind::Array(inner) => IrType::Array(Box::new(self.resolve_type_ref(module, inner))),
+            TypeKind::Array(inner) => IrType::Array(Box::new(
+                self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+            )),
             TypeKind::Map { key, value } => IrType::Map(
-                Box::new(self.resolve_type_ref(module, key)),
-                Box::new(self.resolve_type_ref(module, value)),
+                Box::new(self.resolve_type_ref_with_parameters(module, key, type_parameters)),
+                Box::new(self.resolve_type_ref_with_parameters(module, value, type_parameters)),
             ),
-            TypeKind::Set(inner) => IrType::Set(Box::new(self.resolve_type_ref(module, inner))),
-            TypeKind::Option(inner) => {
-                IrType::Option(Box::new(self.resolve_type_ref(module, inner)))
-            }
+            TypeKind::Set(inner) => IrType::Set(Box::new(self.resolve_type_ref_with_parameters(
+                module,
+                inner,
+                type_parameters,
+            ))),
+            TypeKind::Option(inner) => IrType::Option(Box::new(
+                self.resolve_type_ref_with_parameters(module, inner, type_parameters),
+            )),
             TypeKind::Result { ok, error } => IrType::Result(
-                Box::new(self.resolve_type_ref(module, ok)),
-                Box::new(self.resolve_type_ref(module, error)),
+                Box::new(self.resolve_type_ref_with_parameters(module, ok, type_parameters)),
+                Box::new(self.resolve_type_ref_with_parameters(module, error, type_parameters)),
             ),
             TypeKind::Error => IrType::Unit,
         }
@@ -5436,6 +6047,16 @@ impl<'a> Analyzer<'a> {
             (TypeKind::Named(name), IrType::Named(target)) => {
                 let range = name.last().map_or(name.range, |segment| segment.range);
                 self.validate_public_type_target(module, visibility, *target, range);
+            }
+            (TypeKind::Generic { base, arguments }, IrType::Named(instance))
+                if self.generic_type_instance_origins.contains_key(instance) =>
+            {
+                let origin = self.generic_type_instance_origins[instance].clone();
+                let range = base.last().map_or(base.range, |segment| segment.range);
+                self.validate_public_type_target(module, visibility, origin.definition, range);
+                for (syntax, resolved) in arguments.iter().zip(&origin.arguments) {
+                    self.validate_public_type_ref(module, owner, syntax, resolved);
+                }
             }
             (
                 TypeKind::Generic { arguments, .. },
@@ -6082,6 +6703,7 @@ impl<'a> Analyzer<'a> {
                     || signature.parameter_types == [IrType::Array(Box::new(IrType::String))])
                     && matches!(signature.result, IrType::Unit | IrType::I32)
                     && matches!(signature.effect, IrEffect::Ordinary | IrEffect::Task)
+                    && signature.type_parameters.is_empty()
             });
         if valid {
             return;
@@ -6304,7 +6926,9 @@ impl<'a> Analyzer<'a> {
                     None
                 })
             }
-            ExpressionKind::Construct { ty, fields, update } => {
+            ExpressionKind::Construct {
+                ty, fields, update, ..
+            } => {
                 if update.is_some() {
                     self.invalid_const(
                         module,
@@ -6485,11 +7109,531 @@ impl<'a> Analyzer<'a> {
         );
     }
 
+    fn generic_type_declaration(
+        &self,
+        definition: DefinitionId,
+    ) -> Option<(DeclRecord, ast::TypeDeclaration)> {
+        self.declaration_records
+            .iter()
+            .find(|record| record.definition == definition)
+            .and_then(|record| {
+                let DeclarationKind::Type(declaration) = &record.declaration.kind else {
+                    return None;
+                };
+                (!declaration.type_parameters.is_empty())
+                    .then(|| (record.clone(), declaration.clone()))
+            })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn request_generic_type_instance(
+        &mut self,
+        key: GenericTypeInstanceKey,
+    ) -> Option<DefinitionId> {
+        if let Some(definition) = self.generic_type_instances.get(&key) {
+            return Some(*definition);
+        }
+        let (record, declaration) = self.generic_type_declaration(key.definition)?;
+        if declaration.type_parameters.len() != key.arguments.len() {
+            return None;
+        }
+        let bounds = self
+            .generic_type_bounds
+            .get(&key.definition)
+            .cloned()
+            .unwrap_or_default();
+        for (index, argument) in key.arguments.iter().enumerate() {
+            if ir_type_contains_type_parameter(argument) {
+                continue;
+            }
+            for bound in bounds.get(index).into_iter().flatten().copied() {
+                if !type_satisfies_bound(
+                    argument,
+                    bound,
+                    &self.definitions,
+                    &self.type_metadata,
+                    &self.variant_payloads,
+                    &self.host_types,
+                ) {
+                    let module = self.modules[record.module_index].clone();
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(declaration.type_parameters[index].name.range),
+                        format!(
+                            "type argument `{}` does not satisfy `{}` for `{}`",
+                            display_ir_type(argument, &self.definitions),
+                            builtin_bound_name(bound),
+                            declaration.name.text
+                        ),
+                        format!(
+                            "type parameter `{}` requires this bound",
+                            declaration.type_parameters[index].name.text
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(active) = self
+            .generic_type_instance_stack
+            .iter()
+            .find(|active| active.definition == key.definition)
+            .cloned()
+            && active != key
+        {
+            let module = self.modules[record.module_index].clone();
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(declaration.name.range),
+                format!(
+                    "generic type instantiation does not converge: `{}` changes its type arguments recursively",
+                    declaration.name.text
+                ),
+                "recursive generic Class edges must preserve the same concrete type arguments",
+            );
+            return self.generic_type_instances.get(&active).copied();
+        }
+        let per_declaration = self
+            .generic_type_instances
+            .keys()
+            .filter(|candidate| candidate.definition == key.definition)
+            .count();
+        if per_declaration >= 256 || self.generic_type_instances.len() >= 4096 {
+            let module = self.modules[record.module_index].clone();
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(declaration.name.range),
+                "generic type instance limit exceeded",
+                "reduce the number or nesting depth of concrete generic type arguments",
+            );
+            return None;
+        }
+        let source = self.definitions[key.definition.0 as usize].clone();
+        let module = self.modules[record.module_index].clone();
+        let arguments = key
+            .arguments
+            .iter()
+            .map(|argument| display_ir_type(argument, &self.definitions))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let instance_name = format!("{}<{arguments}>", declaration.name.text);
+        let mut identity_payload = Vec::new();
+        append_string(&mut identity_payload, &source.canonical_identity);
+        append_u32(
+            &mut identity_payload,
+            u32::try_from(key.arguments.len()).unwrap_or(u32::MAX),
+        );
+        for argument in &key.arguments {
+            encode_type(argument, &self.definitions, &mut identity_payload);
+        }
+        let mut builder = FingerprintBuilder::new("nexa.generic-type-instance", 1);
+        builder.field_bytes("identity", &identity_payload);
+        let mut identity_name = String::from("generic-type-");
+        for byte in builder.finish_bytes() {
+            let _ = write!(&mut identity_name, "{byte:02x}");
+        }
+        let canonical_identity = self.generated_explicit_canonical_identity(
+            &module,
+            SymbolKind::Type,
+            &identity_name,
+            declaration.name.range,
+        );
+        let instance = self.allocate_definition(
+            source.package_id,
+            source.module,
+            instance_name,
+            source.kind,
+            DeclarationVisibility::Private,
+            IrType::Unit,
+            IrEffect::Immediate,
+            source.span,
+            canonical_identity,
+        );
+        self.type_metadata.insert(
+            instance,
+            TypeMetadata {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                field_mutability: BTreeMap::new(),
+                variants: BTreeMap::new(),
+                variant_order: Vec::new(),
+                variant_fields: BTreeMap::new(),
+                variant_field_order: BTreeMap::new(),
+                state: None,
+            },
+        );
+        self.generic_type_instances.insert(key.clone(), instance);
+        self.generic_type_instance_origins
+            .insert(instance, key.clone());
+        self.pending_generic_type_instances.push(key);
+        Some(instance)
+    }
+
+    fn materialize_generic_type(&mut self, ty: &IrType, arguments: &[IrType]) -> IrType {
+        match ty {
+            IrType::TypeParameter(index) => arguments
+                .get(usize::from(*index))
+                .cloned()
+                .unwrap_or(IrType::Error),
+            IrType::Named(definition) => {
+                let Some(origin) = self.generic_type_instance_origins.get(definition).cloned()
+                else {
+                    return ty.clone();
+                };
+                let concrete_arguments = origin
+                    .arguments
+                    .iter()
+                    .map(|argument| self.materialize_generic_type(argument, arguments))
+                    .collect::<Vec<_>>();
+                self.request_generic_type_instance(GenericTypeInstanceKey {
+                    definition: origin.definition,
+                    arguments: concrete_arguments,
+                })
+                .map_or(IrType::Error, IrType::Named)
+            }
+            IrType::Option(inner) => {
+                IrType::Option(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            IrType::Result(ok, error) => IrType::Result(
+                Box::new(self.materialize_generic_type(ok, arguments)),
+                Box::new(self.materialize_generic_type(error, arguments)),
+            ),
+            IrType::Array(inner) => {
+                IrType::Array(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            IrType::Map(key, value) => IrType::Map(
+                Box::new(self.materialize_generic_type(key, arguments)),
+                Box::new(self.materialize_generic_type(value, arguments)),
+            ),
+            IrType::Set(inner) => {
+                IrType::Set(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            IrType::Tuple(values) => IrType::Tuple(
+                values
+                    .iter()
+                    .map(|value| self.materialize_generic_type(value, arguments))
+                    .collect(),
+            ),
+            IrType::HostRequest(inner) => IrType::HostRequest(
+                inner
+                    .as_deref()
+                    .map(|inner| Box::new(self.materialize_generic_type(inner, arguments))),
+            ),
+            IrType::ResourceToken(inner) => IrType::ResourceToken(
+                inner
+                    .as_deref()
+                    .map(|inner| Box::new(self.materialize_generic_type(inner, arguments))),
+            ),
+            IrType::Snapshot(inner) => {
+                IrType::Snapshot(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            IrType::Buffer(inner) => {
+                IrType::Buffer(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            IrType::StateHandle(inner) => {
+                IrType::StateHandle(Box::new(self.materialize_generic_type(inner, arguments)))
+            }
+            concrete => concrete.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn populate_pending_generic_type_instances(&mut self) {
+        let mut cursor = 0;
+        while cursor < self.pending_generic_type_instances.len() {
+            let key = self.pending_generic_type_instances[cursor].clone();
+            cursor += 1;
+            let Some(instance) = self.generic_type_instances.get(&key).copied() else {
+                continue;
+            };
+            if self.populated_generic_type_instances.contains(&instance) {
+                continue;
+            }
+            let Some((record, declaration)) = self.generic_type_declaration(key.definition) else {
+                continue;
+            };
+            let Some(template) = self.type_metadata.get(&key.definition).cloned() else {
+                continue;
+            };
+            let module = self.modules[record.module_index].clone();
+            self.generic_type_instance_stack.push(key.clone());
+            let mut metadata = TypeMetadata {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                field_mutability: BTreeMap::new(),
+                variants: BTreeMap::new(),
+                variant_order: Vec::new(),
+                variant_fields: BTreeMap::new(),
+                variant_field_order: BTreeMap::new(),
+                state: None,
+            };
+            for template_field in &template.field_order {
+                let field = self.definitions[template_field.0 as usize].clone();
+                let ty = self.materialize_generic_type(&field.ty, &key.arguments);
+                let canonical_identity = self.member_canonical_identity(
+                    &module,
+                    instance,
+                    &field.name,
+                    &[],
+                    TextRange::default(),
+                    SymbolKind::Field,
+                    false,
+                );
+                let concrete = self.allocate_definition(
+                    field.package_id,
+                    field.module,
+                    field.name.clone(),
+                    DefinitionKind::Field,
+                    DeclarationVisibility::Private,
+                    ty,
+                    IrEffect::Immediate,
+                    field.span,
+                    canonical_identity,
+                );
+                metadata.fields.insert(field.name.clone(), concrete);
+                metadata.field_order.push(concrete);
+                metadata.field_mutability.insert(
+                    concrete,
+                    template
+                        .field_mutability
+                        .get(template_field)
+                        .copied()
+                        .unwrap_or(true),
+                );
+                self.members.insert((instance, field.name), concrete);
+            }
+            for template_variant in &template.variant_order {
+                let variant = self.definitions[template_variant.0 as usize].clone();
+                let canonical_identity = self.member_canonical_identity(
+                    &module,
+                    instance,
+                    &variant.name,
+                    &[],
+                    TextRange::default(),
+                    SymbolKind::Variant,
+                    false,
+                );
+                let concrete = self.allocate_definition(
+                    variant.package_id,
+                    variant.module,
+                    variant.name.clone(),
+                    DefinitionKind::Variant,
+                    DeclarationVisibility::Private,
+                    IrType::Named(instance),
+                    IrEffect::Immediate,
+                    variant.span,
+                    canonical_identity,
+                );
+                metadata.variants.insert(variant.name.clone(), concrete);
+                metadata.variant_order.push(concrete);
+                self.members
+                    .insert((instance, variant.name.clone()), concrete);
+                let payload = self
+                    .variant_payloads
+                    .get(template_variant)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|ty| self.materialize_generic_type(ty, &key.arguments))
+                    .collect::<Vec<_>>();
+                self.variant_payloads.insert(concrete, payload);
+                if let Some(template_fields) = template.variant_fields.get(template_variant) {
+                    let mut fields = BTreeMap::new();
+                    let mut field_order = Vec::new();
+                    for template_field in template
+                        .variant_field_order
+                        .get(template_variant)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let field = self.definitions[template_field.0 as usize].clone();
+                        let ty = self.materialize_generic_type(&field.ty, &key.arguments);
+                        let canonical_identity = self.member_canonical_identity(
+                            &module,
+                            concrete,
+                            &field.name,
+                            &[],
+                            TextRange::default(),
+                            SymbolKind::Field,
+                            false,
+                        );
+                        let concrete_field = self.allocate_definition(
+                            field.package_id,
+                            field.module,
+                            field.name.clone(),
+                            DefinitionKind::Field,
+                            DeclarationVisibility::Private,
+                            ty,
+                            IrEffect::Immediate,
+                            field.span,
+                            canonical_identity,
+                        );
+                        fields.insert(field.name.clone(), concrete_field);
+                        field_order.push(concrete_field);
+                    }
+                    debug_assert_eq!(fields.len(), template_fields.len());
+                    metadata.variant_fields.insert(concrete, fields);
+                    metadata.variant_field_order.insert(concrete, field_order);
+                }
+            }
+            let popped = self.generic_type_instance_stack.pop();
+            debug_assert_eq!(popped.as_ref(), Some(&key));
+            self.type_metadata.insert(instance, metadata);
+            self.populated_generic_type_instances.insert(instance);
+            let _ = declaration;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn request_generic_instance(&mut self, key: GenericInstanceKey) -> Option<DefinitionId> {
+        if let Some(definition) = self.generic_instances.get(&key) {
+            return Some(*definition);
+        }
+        let template = self.function_signatures.get(&key.function)?.clone();
+        if template.type_parameters.len() != key.arguments.len()
+            || key.arguments.iter().any(ir_type_contains_type_parameter)
+        {
+            return None;
+        }
+        let source = self.definitions.get(key.function.0 as usize)?.clone();
+        let substituted_result = substitute_type_parameters(&template.result, &key.arguments);
+        let result = self.materialize_generic_type(&substituted_result, &key.arguments);
+        let parameter_types = template
+            .parameter_types
+            .iter()
+            .map(|ty| {
+                let substituted = substitute_type_parameters(ty, &key.arguments);
+                self.materialize_generic_type(&substituted, &key.arguments)
+            })
+            .collect::<Vec<_>>();
+        self.populate_pending_generic_type_instances();
+        let display_arguments = key
+            .arguments
+            .iter()
+            .map(|argument| display_ir_type(argument, &self.definitions))
+            .collect::<Vec<_>>()
+            .join(",");
+        let instance_name = format!("{}$instance$<{display_arguments}>", source.name);
+        let module = self
+            .modules
+            .iter()
+            .find(|module| {
+                module.key.package == source.package_id && module.key.module == source.module
+            })
+            .cloned()?;
+        let mut identity_payload = Vec::new();
+        append_string(&mut identity_payload, &source.canonical_identity);
+        append_u32(
+            &mut identity_payload,
+            u32::try_from(key.arguments.len()).unwrap_or(u32::MAX),
+        );
+        for argument in &key.arguments {
+            encode_type(argument, &self.definitions, &mut identity_payload);
+        }
+        let mut builder = FingerprintBuilder::new("nexa.generic-function-instance", 1);
+        builder.field_bytes("identity", &identity_payload);
+        let mut identity_name = String::from("generic-function-");
+        for byte in builder.finish_bytes() {
+            let _ = write!(&mut identity_name, "{byte:02x}");
+        }
+        let canonical_identity = self.generated_explicit_canonical_identity(
+            &module,
+            if source.kind == DefinitionKind::Task {
+                SymbolKind::Task
+            } else {
+                SymbolKind::Function
+            },
+            &identity_name,
+            TextRange::default(),
+        );
+        let instance = self.allocate_definition(
+            source.package_id.clone(),
+            source.module.clone(),
+            instance_name,
+            source.kind,
+            DeclarationVisibility::Private,
+            result.clone(),
+            template.effect,
+            source.span.clone(),
+            canonical_identity,
+        );
+        let mut parameters = Vec::with_capacity(template.parameters.len());
+        let mut mutable_parameters = Vec::new();
+        for ((template_parameter, ty), index) in template
+            .parameters
+            .iter()
+            .zip(parameter_types.iter())
+            .zip(0usize..)
+        {
+            let original = self.definitions[template_parameter.0 as usize].clone();
+            let parameter = self.allocate_definition(
+                source.package_id.clone(),
+                source.module.clone(),
+                original.name.clone(),
+                DefinitionKind::Parameter,
+                DeclarationVisibility::Private,
+                ty.clone(),
+                IrEffect::Immediate,
+                original.span,
+                format!(
+                    "{}::parameter::{index}::{}",
+                    self.definitions[instance.0 as usize].canonical_identity, original.name
+                ),
+            );
+            if template.mutable_parameters.contains(template_parameter) {
+                mutable_parameters.push(parameter);
+            }
+            parameters.push(parameter);
+        }
+        self.function_signatures.insert(
+            instance,
+            FunctionSignature {
+                parameters,
+                mutable_parameters,
+                parameter_types,
+                result,
+                effect: template.effect,
+                type_parameters: Vec::new(),
+                bounds: Vec::new(),
+            },
+        );
+        self.generic_instances.insert(key.clone(), instance);
+        self.generic_instance_origins.insert(instance, key.clone());
+        self.pending_generic_instances.push(key);
+        Some(instance)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_bodies(&mut self) {
         let records = self.declaration_records.clone();
         for record in records {
             let module = self.modules[record.module_index].clone();
+            if let DeclarationKind::Function(function) = &record.declaration.kind
+                && !function.type_parameters.is_empty()
+            {
+                let signature = self
+                    .function_signatures
+                    .get(&record.definition)
+                    .cloned()
+                    .expect("generic function signature was resolved");
+                let mut checker =
+                    BodyChecker::new(self, module, Some(record.definition), &signature);
+                let body = checker.check_block(&function.body);
+                checker.validate_migration_body(&function.body, &body);
+                let locals = checker.locals;
+                self.definitions[record.definition.0 as usize].ty = IrType::Unit;
+                for definition in signature.parameters.iter().chain(locals.iter()) {
+                    self.definitions[definition.0 as usize].ty = IrType::Unit;
+                }
+                continue;
+            }
+            if let DeclarationKind::Type(declaration) = &record.declaration.kind
+                && !declaration.type_parameters.is_empty()
+            {
+                continue;
+            }
             let typed = match &record.declaration.kind {
                 DeclarationKind::Function(function) => {
                     let mut signature = self
@@ -6565,6 +7709,8 @@ impl<'a> Analyzer<'a> {
                         parameter_types: Vec::new(),
                         result: self.definitions[record.definition.0 as usize].ty.clone(),
                         effect: IrEffect::Immediate,
+                        type_parameters: Vec::new(),
+                        bounds: Vec::new(),
                     };
                     let mut checker = BodyChecker::new(self, module, None, &signature);
                     let expression =
@@ -6644,6 +7790,124 @@ impl<'a> Analyzer<'a> {
                 .or_default()
                 .push(typed);
         }
+        let mut next_instance = 0;
+        while next_instance < self.pending_generic_instances.len() {
+            let key = self.pending_generic_instances[next_instance].clone();
+            next_instance += 1;
+            let Some(instance) = self.generic_instances.get(&key).copied() else {
+                continue;
+            };
+            let Some(record) = self
+                .declaration_records
+                .iter()
+                .find(|record| record.definition == key.function)
+                .cloned()
+            else {
+                continue;
+            };
+            let DeclarationKind::Function(function) = &record.declaration.kind else {
+                continue;
+            };
+            let module = self.modules[record.module_index].clone();
+            let signature = self
+                .function_signatures
+                .get(&instance)
+                .cloned()
+                .expect("generic instance signature exists");
+            let type_bindings = function
+                .type_parameters
+                .iter()
+                .zip(key.arguments.iter().cloned())
+                .map(|(parameter, argument)| (parameter.name.text.clone(), argument))
+                .collect();
+            let mut checker = BodyChecker::new(self, module, Some(instance), &signature)
+                .with_type_bindings(type_bindings);
+            let body = checker.check_block(&function.body);
+            checker.validate_migration_body(&function.body, &body);
+            let locals = checker.locals;
+            self.typed_declarations
+                .entry(record.module_index)
+                .or_default()
+                .push(TypedDeclarationIr {
+                    definition: instance,
+                    body: TypedDeclarationBody::Function(TypedFunctionIr {
+                        parameters: signature.parameters,
+                        mutable_parameters: signature.mutable_parameters,
+                        locals,
+                        return_type: signature.result,
+                        effect: signature.effect,
+                        body,
+                    }),
+                });
+        }
+        let type_instances = self
+            .generic_type_instance_origins
+            .iter()
+            .map(|(instance, origin)| (*instance, origin.clone()))
+            .collect::<Vec<_>>();
+        for (instance, origin) in type_instances {
+            if !self.populated_generic_type_instances.contains(&instance)
+                || origin.arguments.iter().any(ir_type_contains_type_parameter)
+            {
+                continue;
+            }
+            let Some((record, declaration)) = self.generic_type_declaration(origin.definition)
+            else {
+                continue;
+            };
+            let metadata = self
+                .type_metadata
+                .get(&instance)
+                .expect("populated generic type metadata exists");
+            let fields = metadata
+                .field_order
+                .iter()
+                .enumerate()
+                .map(|(order, definition)| FieldLayoutIr {
+                    definition: *definition,
+                    ty: self.definitions[definition.0 as usize].ty.clone(),
+                    order: u32::try_from(order).unwrap_or(u32::MAX),
+                    mutable: declaration.kind == TypeDeclarationKind::Class,
+                })
+                .collect::<Vec<_>>();
+            let variants = metadata
+                .variant_order
+                .iter()
+                .enumerate()
+                .map(|(tag, definition)| {
+                    let values = self
+                        .variant_payloads
+                        .get(definition)
+                        .cloned()
+                        .unwrap_or_default();
+                    let payload = match values.as_slice() {
+                        [] => None,
+                        [value] => Some(value.clone()),
+                        _ => Some(IrType::Tuple(values)),
+                    };
+                    VariantLayoutIr {
+                        definition: *definition,
+                        tag: u32::try_from(tag).unwrap_or(u32::MAX),
+                        payload,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let layout = match declaration.kind {
+                TypeDeclarationKind::Struct => TypedTypeLayoutIr::Struct { fields },
+                TypeDeclarationKind::Class => TypedTypeLayoutIr::Class {
+                    fields,
+                    state: None,
+                },
+                TypeDeclarationKind::Enum => TypedTypeLayoutIr::Enum { variants },
+            };
+            self.typed_declarations
+                .entry(record.module_index)
+                .or_default()
+                .push(TypedDeclarationIr {
+                    definition: instance,
+                    body: TypedDeclarationBody::TypeLayout(layout),
+                });
+        }
         for declarations in self.typed_declarations.values_mut() {
             declarations.sort_by_key(|declaration| declaration.definition);
         }
@@ -6672,6 +7936,7 @@ impl<'a> Analyzer<'a> {
                 && module.key.module.as_str().starts_with("test.")
                 && record.declaration.visibility == Visibility::Private
                 && signature.parameters.is_empty()
+                && signature.type_parameters.is_empty()
                 && signature.result == IrType::Bool
                 && signature.effect == IrEffect::Immediate;
             if !declaration_is_valid {
@@ -6771,6 +8036,9 @@ impl<'a> Analyzer<'a> {
             let payload = definition_fingerprint_payload(
                 definition,
                 self.function_signatures.get(&definition.id),
+                self.generic_type_bounds
+                    .get(&definition.id)
+                    .map(Vec::as_slice),
                 self.const_values.get(&definition.id),
                 self.type_metadata.get(&definition.id),
                 &self.variant_payloads,
@@ -7119,6 +8387,9 @@ struct BodyChecker<'analyzer, 'input> {
     current_function: Option<DefinitionId>,
     return_type: IrType,
     effect: IrEffect,
+    type_bindings: BTreeMap<String, IrType>,
+    type_parameter_bounds: Vec<BTreeSet<BuiltinBound>>,
+    abstract_generic: bool,
     scopes: Vec<BTreeMap<String, DefinitionId>>,
     locals: Vec<DefinitionId>,
     mutable_bindings: BTreeSet<DefinitionId>,
@@ -7155,6 +8426,18 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             current_function,
             return_type: signature.result.clone(),
             effect: signature.effect,
+            type_bindings: signature
+                .type_parameters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    u16::try_from(index)
+                        .ok()
+                        .map(|index| (name.clone(), IrType::TypeParameter(index)))
+                })
+                .collect(),
+            type_parameter_bounds: signature.bounds.clone(),
+            abstract_generic: !signature.type_parameters.is_empty(),
             scopes: vec![parameters],
             locals: Vec::new(),
             mutable_bindings: signature.mutable_parameters.iter().copied().collect(),
@@ -7168,6 +8451,26 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             migration_path_limit_reported: false,
             recovery_unit_spans: BTreeSet::new(),
         }
+    }
+
+    fn with_type_bindings(mut self, type_bindings: BTreeMap<String, IrType>) -> Self {
+        self.abstract_generic = type_bindings.values().any(ir_type_contains_type_parameter);
+        self.type_bindings = type_bindings;
+        self
+    }
+
+    fn resolve_type_ref(&mut self, ty: &TypeRef) -> IrType {
+        self.analyzer
+            .resolve_type_ref_with_parameters(&self.module, ty, &self.type_bindings)
+    }
+
+    fn type_parameter_has_bound(&self, ty: &IrType, bound: BuiltinBound) -> bool {
+        let IrType::TypeParameter(index) = ty else {
+            return false;
+        };
+        self.type_parameter_bounds
+            .get(usize::from(*index))
+            .is_some_and(|bounds| bound_set_satisfies(bounds, bound))
     }
 
     fn check_block(&mut self, block: &ast::Block) -> TypedBlockIr {
@@ -7455,9 +8758,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             name,
             "local variable names must use snake_case",
         );
-        let expected = ty
-            .as_ref()
-            .map(|ty| self.analyzer.resolve_type_ref(&self.module, ty));
+        let expected = ty.as_ref().map(|ty| self.resolve_type_ref(ty));
         let value = self.check_expression(value, expected.as_ref());
         let resolved = expected.unwrap_or_else(|| value.ty.clone());
         self.expect_type(&value.ty, &resolved, &value.span);
@@ -7526,9 +8827,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     name,
                     "local variable names must use snake_case",
                 );
-                let expected = ty
-                    .as_ref()
-                    .map(|ty| self.analyzer.resolve_type_ref(&self.module, ty));
+                let expected = ty.as_ref().map(|ty| self.resolve_type_ref(ty));
                 let value = self.check_expression(value, expected.as_ref());
                 let resolved = expected.unwrap_or_else(|| value.ty.clone());
                 self.expect_type(&value.ty, &resolved, &value.span);
@@ -7862,6 +9161,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     self.analyzer
                         .resolve_symbol_path(&self.module, path, SymbolUse::Value);
                 if let Some(definition) = definition {
+                    let definition = self.variant_for_expected_type(definition, expected);
                     self.reference_or_unit_variant(definition, span)
                 } else {
                     self.error_expression(span)
@@ -7928,13 +9228,25 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 };
                 let result = match operator {
                     UnaryOperator::Negate if is_numeric(&operand.ty) => operand.ty.clone(),
+                    UnaryOperator::Negate
+                        if self.type_parameter_has_bound(&operand.ty, BuiltinBound::Neg) =>
+                    {
+                        operand.ty.clone()
+                    }
                     UnaryOperator::Not if operand.ty == IrType::Bool => IrType::Bool,
                     _ => {
                         if contains_ir_error(&operand.ty) {
                             self.record_suppressed();
                             IrType::Error
                         } else {
-                            self.type_error(operand.span.clone(), "invalid unary operand type");
+                            let message = if matches!(operand.ty, IrType::TypeParameter(_))
+                                && operator == UnaryOperator::Negate
+                            {
+                                "generic negation is missing `Neg<Output = T>`"
+                            } else {
+                                "invalid unary operand type"
+                            };
+                            self.type_error(operand.span.clone(), message);
                             self.recovery_unit_type(&span)
                         }
                     }
@@ -7954,25 +9266,129 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 operator,
                 right,
             } => {
-                let left = self.check_expression(left, expected);
+                let operand_expected = match operator.kind {
+                    BinaryOperatorKind::Add
+                    | BinaryOperatorKind::Subtract
+                    | BinaryOperatorKind::Multiply
+                    | BinaryOperatorKind::Divide
+                    | BinaryOperatorKind::Remainder => expected,
+                    BinaryOperatorKind::And | BinaryOperatorKind::Or => Some(&IrType::Bool),
+                    BinaryOperatorKind::Equal
+                    | BinaryOperatorKind::NotEqual
+                    | BinaryOperatorKind::Less
+                    | BinaryOperatorKind::LessEqual
+                    | BinaryOperatorKind::Greater
+                    | BinaryOperatorKind::GreaterEqual => None,
+                };
+                let left = self.check_expression(left, operand_expected);
                 let right = self.check_expression(right, Some(&left.ty));
                 self.expect_type(&right.ty, &left.ty, &right.span);
-                let result = binary_result(
-                    operator.kind,
-                    &left.ty,
-                    &self.analyzer.definitions,
-                    &self.analyzer.type_metadata,
-                    &self.analyzer.variant_payloads,
-                    &self.analyzer.host_types,
-                )
-                .unwrap_or_else(|| {
-                    if contains_ir_error(&left.ty) || contains_ir_error(&right.ty) {
-                        self.record_suppressed();
-                        return IrType::Error;
+                let abstract_result = match operator.kind {
+                    BinaryOperatorKind::Equal | BinaryOperatorKind::NotEqual
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::PartialEq) =>
+                    {
+                        Some(IrType::Bool)
                     }
-                    self.type_error(span.clone(), "invalid binary operand type");
-                    self.recovery_unit_type(&span)
-                });
+                    BinaryOperatorKind::Less
+                    | BinaryOperatorKind::LessEqual
+                    | BinaryOperatorKind::Greater
+                    | BinaryOperatorKind::GreaterEqual
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::PartialOrd) =>
+                    {
+                        Some(IrType::Bool)
+                    }
+                    BinaryOperatorKind::Equal | BinaryOperatorKind::NotEqual
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Eq) =>
+                    {
+                        Some(IrType::Bool)
+                    }
+                    BinaryOperatorKind::Less
+                    | BinaryOperatorKind::LessEqual
+                    | BinaryOperatorKind::Greater
+                    | BinaryOperatorKind::GreaterEqual
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Ord) =>
+                    {
+                        Some(IrType::Bool)
+                    }
+                    BinaryOperatorKind::Add
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Add) =>
+                    {
+                        Some(left.ty.clone())
+                    }
+                    BinaryOperatorKind::Subtract
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Sub) =>
+                    {
+                        Some(left.ty.clone())
+                    }
+                    BinaryOperatorKind::Multiply
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Mul) =>
+                    {
+                        Some(left.ty.clone())
+                    }
+                    BinaryOperatorKind::Divide
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Div) =>
+                    {
+                        Some(left.ty.clone())
+                    }
+                    BinaryOperatorKind::Remainder
+                        if self.type_parameter_has_bound(&left.ty, BuiltinBound::Rem) =>
+                    {
+                        Some(left.ty.clone())
+                    }
+                    _ => None,
+                };
+                let result = abstract_result
+                    .or_else(|| {
+                        binary_result(
+                            operator.kind,
+                            &left.ty,
+                            &self.analyzer.definitions,
+                            &self.analyzer.type_metadata,
+                            &self.analyzer.variant_payloads,
+                            &self.analyzer.host_types,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        if contains_ir_error(&left.ty) || contains_ir_error(&right.ty) {
+                            self.record_suppressed();
+                            return IrType::Error;
+                        }
+                        let message = if matches!(left.ty, IrType::TypeParameter(_)) {
+                            match operator.kind {
+                                BinaryOperatorKind::Equal | BinaryOperatorKind::NotEqual => {
+                                    "generic equality is missing `PartialEq` or `Eq`"
+                                }
+                                BinaryOperatorKind::Less
+                                | BinaryOperatorKind::LessEqual
+                                | BinaryOperatorKind::Greater
+                                | BinaryOperatorKind::GreaterEqual => {
+                                    "generic comparison is missing `PartialOrd` or `Ord`"
+                                }
+                                BinaryOperatorKind::Add => {
+                                    "generic addition is missing `Add<Output = T>`"
+                                }
+                                BinaryOperatorKind::Subtract => {
+                                    "generic subtraction is missing `Sub<Output = T>`"
+                                }
+                                BinaryOperatorKind::Multiply => {
+                                    "generic multiplication is missing `Mul<Output = T>`"
+                                }
+                                BinaryOperatorKind::Divide => {
+                                    "generic division is missing `Div<Output = T>`"
+                                }
+                                BinaryOperatorKind::Remainder => {
+                                    "generic remainder is missing `Rem<Output = T>`"
+                                }
+                                BinaryOperatorKind::And | BinaryOperatorKind::Or => {
+                                    "generic boolean operation is not supported"
+                                }
+                            }
+                        } else {
+                            "invalid binary operand type"
+                        };
+                        self.type_error(span.clone(), message);
+                        self.recovery_unit_type(&span)
+                    });
                 TypedExpressionIr {
                     ty: result,
                     effect: max_effect(left.effect, right.effect),
@@ -7996,9 +9412,19 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 expected,
                 awaited,
             ),
-            ExpressionKind::Construct { ty, fields, update } => {
-                self.check_construct(expression, ty, fields, update.as_deref())
-            }
+            ExpressionKind::Construct {
+                ty,
+                type_arguments,
+                fields,
+                update,
+            } => self.check_construct(
+                expression,
+                ty,
+                type_arguments,
+                fields,
+                update.as_deref(),
+                expected,
+            ),
             ExpressionKind::Member { receiver, member } => {
                 let receiver = self.check_expression(receiver, None);
                 self.check_field_access(receiver, member, expression.range)
@@ -8158,7 +9584,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         }
                         InterpolationPart::Expression(expression) => {
                             let value = self.check_expression(expression, None);
-                            if is_scalar(&value.ty) {
+                            if is_scalar(&value.ty)
+                                || self.type_parameter_has_bound(&value.ty, BuiltinBound::Display)
+                            {
                                 values.push(value);
                             } else if is_interpolatable(
                                 &value.ty,
@@ -8406,6 +9834,49 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         }
     }
 
+    fn variant_for_expected_type(
+        &self,
+        definition: DefinitionId,
+        expected: Option<&IrType>,
+    ) -> DefinitionId {
+        if self.analyzer.definitions[definition.0 as usize].kind != DefinitionKind::Variant {
+            return definition;
+        }
+        let Some(template) = self
+            .analyzer
+            .type_metadata
+            .iter()
+            .find_map(|(owner, metadata)| {
+                metadata
+                    .variant_order
+                    .contains(&definition)
+                    .then_some(*owner)
+            })
+            .filter(|owner| self.analyzer.generic_type_declaration(*owner).is_some())
+        else {
+            return definition;
+        };
+        let Some(IrType::Named(expected)) = expected else {
+            return definition;
+        };
+        let matches_template = *expected == template
+            || self
+                .analyzer
+                .generic_type_instance_origins
+                .get(expected)
+                .is_some_and(|origin| origin.definition == template);
+        if !matches_template {
+            return definition;
+        }
+        let name = &self.analyzer.definitions[definition.0 as usize].name;
+        self.analyzer
+            .type_metadata
+            .get(expected)
+            .and_then(|metadata| metadata.variants.get(name))
+            .copied()
+            .unwrap_or(definition)
+    }
+
     fn check_empty_builtin_variant(
         &mut self,
         variant: BuiltinVariantIr,
@@ -8568,7 +10039,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         let resolved_type_arguments = if type_arguments.len() == arity {
             type_arguments
                 .iter()
-                .map(|argument| self.analyzer.resolve_type_ref(&self.module, argument))
+                .map(|argument| self.resolve_type_ref(argument))
                 .collect::<Vec<_>>()
         } else if type_arguments.is_empty() {
             match (operation, expected) {
@@ -8625,6 +10096,138 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn check_numeric_method_call(
+        &mut self,
+        whole: &Expression,
+        receiver: TypedExpressionIr,
+        member: &ast::Identifier,
+        type_arguments: &[TypeRef],
+        arguments: &[Expression],
+    ) -> Option<TypedExpressionIr> {
+        let (suffix, supported) = match receiver.ty {
+            IrType::I32 => ("i32", &["abs", "min", "max", "clamp"][..]),
+            IrType::I64 => ("i64", &["abs", "min", "max", "clamp"][..]),
+            IrType::F32 => (
+                "f32",
+                &[
+                    "abs", "min", "max", "clamp", "floor", "ceil", "round", "sqrt", "sin", "cos",
+                ][..],
+            ),
+            IrType::F64 => (
+                "f64",
+                &[
+                    "abs", "min", "max", "clamp", "floor", "ceil", "round", "sqrt", "sin", "cos",
+                ][..],
+            ),
+            _ => return None,
+        };
+        let method = member.text.as_str();
+        let span = source_range(&self.module.source, whole.range);
+        if !supported.contains(&method) {
+            return None;
+        }
+        if !type_arguments.is_empty() {
+            self.type_error(
+                span.clone(),
+                "numeric receiver methods do not accept explicit type arguments",
+            );
+        }
+        let function_name = format!("{method}_{suffix}");
+        let package =
+            PackageId::new(nexa_stdlib::PACKAGE_ID).expect("standard-library package ID is valid");
+        let module = ModulePath::new(if matches!(method, "min" | "max") {
+            "std.core"
+        } else {
+            "std.math"
+        })
+        .expect("numeric receiver method target module is valid");
+        let definition = self
+            .analyzer
+            .symbols
+            .get(&(package, module, function_name.clone()))
+            .copied()
+            .expect("numeric receiver method target exists in the standard library");
+        let (parameters, result, effect, intrinsic) = self
+            .analyzer
+            .function_signatures
+            .get(&definition)
+            .map(|signature| {
+                (
+                    signature.parameter_types.clone(),
+                    signature.result.clone(),
+                    signature.effect,
+                    None,
+                )
+            })
+            .or_else(|| {
+                self.analyzer
+                    .external_functions
+                    .get(&definition)
+                    .map(|function| {
+                        (
+                            function.parameters.clone(),
+                            function.result.clone(),
+                            function.effect,
+                            function.intrinsic,
+                        )
+                    })
+            })
+            .expect("numeric receiver method has a callable signature");
+        let expected_arguments = parameters.get(1..).unwrap_or_default();
+        if expected_arguments.len() != arguments.len() {
+            self.type_error(
+                span.clone(),
+                &format!(
+                    "`{method}` expects {} arguments, found {}",
+                    expected_arguments.len(),
+                    arguments.len()
+                ),
+            );
+        }
+        let mut checked = Vec::with_capacity(arguments.len().saturating_add(1));
+        checked.push(receiver);
+        checked.extend(arguments.iter().enumerate().map(|(index, argument)| {
+            let expected = expected_arguments.get(index);
+            let value = self.check_expression(argument, expected);
+            if let Some(expected) = expected {
+                self.expect_type_for(
+                    &value.ty,
+                    expected,
+                    &value.span,
+                    &format!("argument {} to `{method}`", index + 1),
+                );
+            }
+            value
+        }));
+        if let Some(caller) = self.current_function {
+            self.analyzer
+                .call_edges
+                .entry(caller)
+                .or_default()
+                .insert(definition);
+        }
+        let kind = if let Some(intrinsic) = intrinsic {
+            TypedExpressionKind::StandardCall {
+                function: definition,
+                intrinsic,
+                type_arguments: Vec::new(),
+                arguments: checked,
+            }
+        } else {
+            TypedExpressionKind::Call {
+                callee: definition,
+                arguments: checked,
+            }
+        };
+        Some(TypedExpressionIr {
+            ty: result,
+            effect,
+            span,
+            kind,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn check_builtin_method_call(
         &mut self,
         whole: &Expression,
@@ -8633,6 +10236,49 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         type_arguments: &[TypeRef],
         arguments: &[Expression],
     ) -> Option<TypedExpressionIr> {
+        if member.text == "to_string" {
+            let receiver_ty = receiver.ty.clone();
+            let displayable = is_interpolatable(
+                &receiver_ty,
+                &self.analyzer.definitions,
+                &self.analyzer.type_metadata,
+            ) || self
+                .type_parameter_has_bound(&receiver_ty, BuiltinBound::Display);
+            if !displayable && matches!(receiver_ty, IrType::TypeParameter(_)) {
+                self.type_error(
+                    source_range(&self.module.source, whole.range),
+                    "generic `to_string` requires a Display bound",
+                );
+                return Some(self.error_expression(source_range(&self.module.source, whole.range)));
+            }
+            if displayable {
+                if !type_arguments.is_empty() || !arguments.is_empty() {
+                    self.type_error(
+                        source_range(&self.module.source, whole.range),
+                        "`to_string` does not accept type or value arguments",
+                    );
+                }
+                return Some(TypedExpressionIr {
+                    ty: IrType::String,
+                    effect: receiver.effect,
+                    span: source_range(&self.module.source, whole.range),
+                    kind: TypedExpressionKind::BuiltinCall {
+                        operation: BuiltinOperationIr::ValueToString,
+                        type_arguments: vec![receiver_ty],
+                        arguments: vec![receiver],
+                    },
+                });
+            }
+        }
+        if let Some(call) = self.check_numeric_method_call(
+            whole,
+            receiver.clone(),
+            member,
+            type_arguments,
+            arguments,
+        ) {
+            return Some(call);
+        }
         let receiver_ty = receiver.ty.clone();
         let method = member.text.as_str();
         let stable_id = || {
@@ -9754,20 +11400,165 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         if let Some(definition) = self.analyzer.lookup_symbol_path(&self.module, path)
             && self.analyzer.definitions[definition.0 as usize].kind == DefinitionKind::Variant
         {
+            let generic_owner = self
+                .analyzer
+                .type_metadata
+                .iter()
+                .find_map(|(owner, metadata)| {
+                    metadata
+                        .variant_order
+                        .contains(&definition)
+                        .then_some(*owner)
+                })
+                .filter(|owner| self.analyzer.generic_type_declaration(*owner).is_some());
+            if let Some(owner) = generic_owner {
+                let (_record, declaration) = self
+                    .analyzer
+                    .generic_type_declaration(owner)
+                    .expect("generic enum declaration exists");
+                let mut bindings = vec![None; declaration.type_parameters.len()];
+                let mut inferred_values = None;
+                if type_arguments.is_empty() {
+                    if let Some(IrType::Named(expected)) = expected
+                        && let Some(origin) =
+                            self.analyzer.generic_type_instance_origins.get(expected)
+                        && origin.definition == owner
+                    {
+                        for (binding, argument) in
+                            bindings.iter_mut().zip(origin.arguments.iter().cloned())
+                        {
+                            *binding = Some(argument);
+                        }
+                    }
+                    let payload_types = self
+                        .analyzer
+                        .variant_payloads
+                        .get(&definition)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut values = Vec::new();
+                    for (payload, argument) in payload_types.iter().zip(arguments) {
+                        let partial_arguments = bindings
+                            .iter()
+                            .enumerate()
+                            .map(|(index, binding)| {
+                                binding.clone().unwrap_or_else(|| {
+                                    IrType::TypeParameter(u16::try_from(index).unwrap_or(u16::MAX))
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let payload_expected =
+                            substitute_type_parameters(payload, &partial_arguments);
+                        let payload_expected =
+                            (!ir_type_contains_type_parameter(&payload_expected))
+                                .then_some(payload_expected);
+                        let value = self.check_expression(argument, payload_expected.as_ref());
+                        if !unify_type_parameters(
+                            payload,
+                            &value.ty,
+                            &mut bindings,
+                            &self.analyzer.generic_type_instance_origins,
+                        ) {
+                            self.type_error(
+                                value.span.clone(),
+                                "Enum payload conflicts with generic type inference",
+                            );
+                        }
+                        values.push(value);
+                    }
+                    inferred_values = Some(values);
+                } else {
+                    if type_arguments.len() != declaration.type_parameters.len() {
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "expected {} type arguments for `{}`, found {}",
+                                declaration.type_parameters.len(),
+                                declaration.name.text,
+                                type_arguments.len()
+                            ),
+                        );
+                    }
+                    for (binding, argument) in bindings.iter_mut().zip(
+                        type_arguments
+                            .iter()
+                            .map(|argument| self.resolve_type_ref(argument)),
+                    ) {
+                        *binding = Some(argument);
+                    }
+                }
+                let concrete_type_arguments = bindings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, binding)| {
+                        binding.unwrap_or_else(|| {
+                            self.type_error(
+                                span.clone(),
+                                &format!(
+                                    "cannot infer type parameter `{}` for `{}`",
+                                    declaration.type_parameters[index].name.text,
+                                    declaration.name.text
+                                ),
+                            );
+                            IrType::Error
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let instance =
+                    self.analyzer
+                        .request_generic_type_instance(GenericTypeInstanceKey {
+                            definition: owner,
+                            arguments: concrete_type_arguments,
+                        });
+                self.analyzer.populate_pending_generic_type_instances();
+                if let Some(instance) = instance
+                    && let Some(variant) = self
+                        .analyzer
+                        .type_metadata
+                        .get(&instance)
+                        .and_then(|metadata| {
+                            metadata
+                                .variants
+                                .get(&self.analyzer.definitions[definition.0 as usize].name)
+                        })
+                        .copied()
+                {
+                    return self.check_enum_variant_call(
+                        whole,
+                        variant,
+                        arguments,
+                        inferred_values,
+                    );
+                }
+            }
             let Some(definition) =
                 self.analyzer
                     .resolve_symbol_path(&self.module, path, SymbolUse::Value)
             else {
                 return self.error_expression(span);
             };
-            return self.check_enum_variant_call(whole, definition, arguments);
+            return self.check_enum_variant_call(whole, definition, arguments, None);
         }
-        let Some(definition) =
+        let Some(mut definition) =
             self.analyzer
                 .resolve_symbol_path(&self.module, path, SymbolUse::Callable)
         else {
             return self.error_expression(span);
         };
+        let resolved_callable = &self.analyzer.definitions[definition.0 as usize];
+        if !self.module.compiler_provided
+            && resolved_callable.package_id.as_str() == nexa_stdlib::PACKAGE_ID
+            && let Some(replacement) = numeric_receiver_replacement(&resolved_callable.name)
+        {
+            self.type_error(
+                span.clone(),
+                &format!(
+                    "standard function `{}` was replaced by receiver method `{replacement}`",
+                    resolved_callable.name
+                ),
+            );
+            return self.error_expression(span);
+        }
         let signature = self
             .analyzer
             .function_signatures
@@ -9780,7 +11571,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     None,
                     None,
                     None,
-                    Vec::new(),
+                    signature.type_parameters.clone(),
+                    !signature.type_parameters.is_empty(),
+                    signature.bounds.clone(),
                 )
             })
             .or_else(|| {
@@ -9796,11 +11589,22 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             signature.generic.clone(),
                             signature.intrinsic,
                             signature.type_parameters.clone(),
+                            false,
+                            Vec::new(),
                         )
                     })
             });
-        let Some((mut parameters, mut result, effect, host, generic, intrinsic, type_parameters)) =
-            signature
+        let Some((
+            mut parameters,
+            mut result,
+            effect,
+            host,
+            generic,
+            intrinsic,
+            type_parameters,
+            user_generic,
+            user_bounds,
+        )) = signature
         else {
             self.type_error(span.clone(), "symbol has no callable signature");
             return self.error_expression(span);
@@ -9819,11 +11623,168 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             .clone();
         let explicit_type_arguments = type_arguments
             .iter()
-            .map(|argument| self.analyzer.resolve_type_ref(&self.module, argument))
+            .map(|argument| self.resolve_type_ref(argument))
             .collect::<Vec<_>>();
         let mut generic_arguments = None;
         let mut call_type_arguments = Vec::new();
-        if let Some((surface_parameters, surface_result)) = generic {
+        if user_generic {
+            let mut bindings = vec![None; type_parameters.len()];
+            let mut values = Vec::with_capacity(arguments.len());
+            if explicit_type_arguments.is_empty() {
+                if let Some(expected) = expected {
+                    let _ = unify_type_parameters(
+                        &result,
+                        expected,
+                        &mut bindings,
+                        &self.analyzer.generic_type_instance_origins,
+                    );
+                }
+                for (index, argument) in arguments.iter().enumerate() {
+                    let partial_arguments = bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(index, binding)| {
+                            binding.clone().unwrap_or_else(|| {
+                                IrType::TypeParameter(u16::try_from(index).unwrap_or(u16::MAX))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let parameter_expected = parameters
+                        .get(index)
+                        .map(|parameter| substitute_type_parameters(parameter, &partial_arguments));
+                    let parameter_expected = parameter_expected
+                        .filter(|parameter| !ir_type_contains_type_parameter(parameter));
+                    let value = self.check_expression(argument, parameter_expected.as_ref());
+                    if let Some(parameter) = parameters.get(index)
+                        && !unify_type_parameters(
+                            parameter,
+                            &value.ty,
+                            &mut bindings,
+                            &self.analyzer.generic_type_instance_origins,
+                        )
+                    {
+                        self.type_error(
+                            value.span.clone(),
+                            &format!(
+                                "generic argument {} to `{callable_name}` conflicts with an earlier type inference",
+                                index + 1
+                            ),
+                        );
+                    }
+                    values.push(value);
+                }
+            } else {
+                if explicit_type_arguments.len() != type_parameters.len() {
+                    self.type_error(
+                        span.clone(),
+                        &format!(
+                            "expected {} type arguments for `{callable_name}`, found {}",
+                            type_parameters.len(),
+                            explicit_type_arguments.len()
+                        ),
+                    );
+                }
+                for (binding, argument) in bindings
+                    .iter_mut()
+                    .zip(explicit_type_arguments.iter().cloned())
+                {
+                    *binding = Some(argument);
+                }
+            }
+            let concrete_arguments = bindings
+                .into_iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    binding.unwrap_or_else(|| {
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "cannot infer function type parameter `{}` from arguments",
+                                type_parameters[index]
+                            ),
+                        );
+                        IrType::Error
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (argument, bounds)) in
+                concrete_arguments.iter().zip(&user_bounds).enumerate()
+            {
+                for bound in bounds {
+                    let satisfies = match argument {
+                        IrType::TypeParameter(_) => self.type_parameter_has_bound(argument, *bound),
+                        concrete => type_satisfies_bound(
+                            concrete,
+                            *bound,
+                            &self.analyzer.definitions,
+                            &self.analyzer.type_metadata,
+                            &self.analyzer.variant_payloads,
+                            &self.analyzer.host_types,
+                        ),
+                    };
+                    if !satisfies {
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "type `{}` does not satisfy `{}` for `{}`",
+                                display_ir_type(argument, &self.analyzer.definitions),
+                                builtin_bound_name(*bound),
+                                type_parameters[index]
+                            ),
+                        );
+                    }
+                }
+            }
+            parameters = parameters
+                .iter()
+                .map(|parameter| {
+                    let substituted = substitute_type_parameters(parameter, &concrete_arguments);
+                    self.analyzer
+                        .materialize_generic_type(&substituted, &concrete_arguments)
+                })
+                .collect();
+            let substituted_result = substitute_type_parameters(&result, &concrete_arguments);
+            result = self
+                .analyzer
+                .materialize_generic_type(&substituted_result, &concrete_arguments);
+            self.analyzer.populate_pending_generic_type_instances();
+            if !explicit_type_arguments.is_empty() {
+                values = arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, argument)| self.check_expression(argument, parameters.get(index)))
+                    .collect();
+            }
+            for (index, value) in values.iter().enumerate() {
+                if let Some(expected) = parameters.get(index) {
+                    self.expect_type_for(
+                        &value.ty,
+                        expected,
+                        &value.span,
+                        &format!("argument {} to `{callable_name}`", index + 1),
+                    );
+                }
+            }
+            let key = GenericInstanceKey {
+                function: definition,
+                arguments: concrete_arguments,
+            };
+            let recursive = self
+                .current_function
+                .and_then(|current| self.analyzer.generic_instance_origins.get(&current))
+                == Some(&key);
+            if recursive {
+                self.type_error(
+                    span.clone(),
+                    "recursive generic function instantiation is not supported yet",
+                );
+            } else if !self.abstract_generic
+                && let Some(instance) = self.analyzer.request_generic_instance(key)
+            {
+                definition = instance;
+            }
+            generic_arguments = Some(values);
+        } else if let Some((surface_parameters, surface_result)) = generic {
             let mut bindings = BTreeMap::new();
             if !explicit_type_arguments.is_empty()
                 && explicit_type_arguments.len() != type_parameters.len()
@@ -10084,7 +12045,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ));
                 }
                 let value_type = if let Some(ty) = type_arguments.first() {
-                    self.analyzer.resolve_type_ref(&self.module, ty)
+                    self.resolve_type_ref(ty)
                 } else if let Some(expected) = expected {
                     expected.clone()
                 } else {
@@ -10119,10 +12080,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     return Some(self.error_expression(span));
                 };
                 let field_type = self.analyzer.definitions[field.0 as usize].ty.clone();
-                let value_type = type_arguments.first().map_or_else(
-                    || field_type.clone(),
-                    |ty| self.analyzer.resolve_type_ref(&self.module, ty),
-                );
+                let value_type = type_arguments
+                    .first()
+                    .map_or_else(|| field_type.clone(), |ty| self.resolve_type_ref(ty));
                 self.expect_type(
                     &field_type,
                     &value_type,
@@ -10150,7 +12110,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ));
                 }
                 let ty = if let Some(ty) = type_arguments.first() {
-                    self.analyzer.resolve_type_ref(&self.module, ty)
+                    self.resolve_type_ref(ty)
                 } else if let Some(expected) = expected {
                     expected.clone()
                 } else {
@@ -10952,7 +12912,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         }
         let explicit = type_arguments
             .iter()
-            .map(|ty| self.analyzer.resolve_type_ref(&self.module, ty))
+            .map(|ty| self.resolve_type_ref(ty))
             .collect::<Vec<_>>();
         let (payload_expected, result_type) = match variant {
             BuiltinVariantIr::OptionSome => {
@@ -11052,6 +13012,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         whole: &Expression,
         variant: DefinitionId,
         arguments: &[Expression],
+        checked_values: Option<Vec<TypedExpressionIr>>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
         let expected = self
@@ -11070,18 +13031,23 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 ),
             );
         }
-        let values = arguments
-            .iter()
-            .enumerate()
-            .map(|(index, argument)| {
-                let expected = expected.get(index);
-                let value = self.check_expression(argument, expected);
-                if let Some(expected) = expected {
-                    self.expect_type(&value.ty, expected, &value.span);
-                }
-                value
-            })
-            .collect::<Vec<_>>();
+        let values = checked_values.unwrap_or_else(|| {
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let expected = expected.get(index);
+                    let value = self.check_expression(argument, expected);
+                    if let Some(expected) = expected {
+                        self.expect_type(&value.ty, expected, &value.span);
+                    }
+                    value
+                })
+                .collect::<Vec<_>>()
+        });
+        for (value, expected) in values.iter().zip(&expected) {
+            self.expect_type(&value.ty, expected, &value.span);
+        }
         let payload = match values.len() {
             0 => None,
             1 => values.into_iter().next().map(Box::new),
@@ -11116,19 +13082,171 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         &mut self,
         whole: &Expression,
         ty: &ast::QualifiedName,
+        type_arguments: &[TypeRef],
         fields: &[ast::FieldInitializer],
         update: Option<&Expression>,
+        expected: Option<&IrType>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
-        if let Some(variant) = self.analyzer.lookup_symbol_path(&self.module, ty)
+        let resolved_construct = self.analyzer.lookup_symbol_path(&self.module, ty);
+        let generic_variant_template = resolved_construct
+            .filter(|definition| {
+                self.analyzer.definitions[definition.0 as usize].kind == DefinitionKind::Variant
+            })
+            .and_then(|variant| {
+                self.analyzer
+                    .type_metadata
+                    .iter()
+                    .find_map(|(owner, metadata)| {
+                        metadata
+                            .variant_order
+                            .contains(&variant)
+                            .then_some((*owner, variant))
+                    })
+            })
+            .filter(|(owner, _)| self.analyzer.generic_type_declaration(*owner).is_some());
+        let generic_template = resolved_construct
+            .and_then(|definition| {
+                self.analyzer
+                    .generic_type_declaration(definition)
+                    .map(|_| definition)
+            })
+            .or_else(|| generic_variant_template.map(|(owner, _)| owner));
+        let mut inferred_fields = None;
+        let mut generic_variant_definition = None;
+        let generic_definition = generic_template.and_then(|template| {
+            let (_record, declaration) = self
+                .analyzer
+                .generic_type_declaration(template)
+                .expect("generic template exists");
+            let mut bindings = vec![None; declaration.type_parameters.len()];
+            if type_arguments.is_empty() {
+                if let Some(IrType::Named(expected)) = expected
+                    && let Some(origin) = self.analyzer.generic_type_instance_origins.get(expected)
+                    && origin.definition == template
+                {
+                    for (binding, argument) in
+                        bindings.iter_mut().zip(origin.arguments.iter().cloned())
+                    {
+                        *binding = Some(argument);
+                    }
+                }
+                let metadata = self
+                    .analyzer
+                    .type_metadata
+                    .get(&template)
+                    .cloned()
+                    .expect("generic type metadata exists");
+                let field_definitions = generic_variant_template
+                    .and_then(|(_, variant)| metadata.variant_fields.get(&variant).cloned())
+                    .unwrap_or_else(|| metadata.fields.clone());
+                let mut values = Vec::new();
+                for field in fields {
+                    let Some(field_definition) = field_definitions.get(&field.name.text).copied()
+                    else {
+                        self.type_error(
+                            source_range(&self.module.source, field.range),
+                            &format!("unknown field `{}`", field.name.text),
+                        );
+                        continue;
+                    };
+                    let pattern = self.analyzer.definitions[field_definition.0 as usize]
+                        .ty
+                        .clone();
+                    let partial_arguments = bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(index, binding)| {
+                            binding.clone().unwrap_or_else(|| {
+                                IrType::TypeParameter(u16::try_from(index).unwrap_or(u16::MAX))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let field_expected = substitute_type_parameters(&pattern, &partial_arguments);
+                    let field_expected = (!ir_type_contains_type_parameter(&field_expected))
+                        .then_some(field_expected);
+                    let value = self.check_expression(&field.value, field_expected.as_ref());
+                    if !unify_type_parameters(
+                        &pattern,
+                        &value.ty,
+                        &mut bindings,
+                        &self.analyzer.generic_type_instance_origins,
+                    ) {
+                        self.type_error(
+                            value.span.clone(),
+                            &format!(
+                                "field `{}` conflicts with an earlier generic type inference",
+                                field.name.text
+                            ),
+                        );
+                    }
+                    values.push((field.name.text.clone(), field.name.range, value));
+                }
+                inferred_fields = Some(values);
+            } else {
+                if type_arguments.len() != declaration.type_parameters.len() {
+                    self.type_error(
+                        span.clone(),
+                        &format!(
+                            "expected {} type arguments for `{}`, found {}",
+                            declaration.type_parameters.len(),
+                            declaration.name.text,
+                            type_arguments.len()
+                        ),
+                    );
+                }
+                for (binding, argument) in bindings.iter_mut().zip(
+                    type_arguments
+                        .iter()
+                        .map(|argument| self.resolve_type_ref(argument)),
+                ) {
+                    *binding = Some(argument);
+                }
+            }
+            let arguments = bindings
+                .into_iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    binding.unwrap_or_else(|| {
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "cannot infer type parameter `{}` for `{}`",
+                                declaration.type_parameters[index].name.text, declaration.name.text
+                            ),
+                        );
+                        IrType::Error
+                    })
+                })
+                .collect::<Vec<_>>();
+            let instance = self
+                .analyzer
+                .request_generic_type_instance(GenericTypeInstanceKey {
+                    definition: template,
+                    arguments,
+                });
+            self.analyzer.populate_pending_generic_type_instances();
+            if let Some(instance) = instance
+                && let Some((_, template_variant)) = generic_variant_template
+            {
+                let name = &self.analyzer.definitions[template_variant.0 as usize].name;
+                generic_variant_definition = self
+                    .analyzer
+                    .type_metadata
+                    .get(&instance)
+                    .and_then(|metadata| metadata.variants.get(name))
+                    .copied();
+            }
+            instance
+        });
+        if let Some(variant) = generic_variant_definition.or(resolved_construct)
             && self.analyzer.definitions[variant.0 as usize].kind == DefinitionKind::Variant
         {
-            let Some(variant) =
-                self.analyzer
-                    .resolve_symbol_path(&self.module, ty, SymbolUse::Value)
-            else {
-                return self.error_expression(span);
-            };
+            self.analyzer.record_reference(
+                &self.module,
+                ty.range,
+                generic_variant_template.map_or(variant, |(_, variant)| variant),
+            );
             if update.is_some() {
                 self.type_error(
                     span.clone(),
@@ -11147,7 +13265,22 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 );
                 return self.error_expression(span);
             };
-            let values = self.check_named_variant_fields(variant, &named, fields);
+            let values = if let Some(values) = inferred_fields.take() {
+                let mut values = values
+                    .into_iter()
+                    .filter_map(|(name, range, value)| {
+                        let field = named.get(&name).copied()?;
+                        let expected = self.analyzer.definitions[field.0 as usize].ty.clone();
+                        self.expect_type(&value.ty, &expected, &value.span);
+                        self.analyzer.record_reference(&self.module, range, field);
+                        Some((field, value))
+                    })
+                    .collect::<Vec<_>>();
+                values.sort_by_key(|(definition, _)| *definition);
+                values
+            } else {
+                self.check_named_variant_fields(variant, &named, fields)
+            };
             let payload = match values.len() {
                 0 => None,
                 1 => values.into_iter().next().map(|(_, value)| Box::new(value)),
@@ -11181,15 +13314,44 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 },
             };
         }
-        let Some(definition) = self
-            .analyzer
-            .resolve_symbol_path(&self.module, ty, SymbolUse::Type)
-        else {
-            return self.error_expression(span);
+        let definition = if let Some(definition) = generic_definition {
+            definition
+        } else {
+            if !type_arguments.is_empty() {
+                self.type_error(
+                    span.clone(),
+                    "non-generic type does not accept explicit type arguments",
+                );
+            }
+            let Some(definition) =
+                self.analyzer
+                    .resolve_symbol_path(&self.module, ty, SymbolUse::Type)
+            else {
+                return self.error_expression(span);
+            };
+            definition
         };
         let definition_kind = self.analyzer.definitions[definition.0 as usize].kind;
+        let inferred_fields = inferred_fields.map(|values| {
+            let metadata = self
+                .analyzer
+                .type_metadata
+                .get(&definition)
+                .cloned()
+                .expect("generic instance metadata exists");
+            values
+                .into_iter()
+                .filter_map(|(name, range, value)| {
+                    let field = metadata.fields.get(&name).copied()?;
+                    let expected = self.analyzer.definitions[field.0 as usize].ty.clone();
+                    self.expect_type(&value.ty, &expected, &value.span);
+                    self.analyzer.record_reference(&self.module, range, field);
+                    Some((field, value))
+                })
+                .collect::<Vec<_>>()
+        });
         if definition_kind == DefinitionKind::Class {
-            return self.check_class_construct(whole, definition, fields, update);
+            return self.check_class_construct(whole, definition, fields, inferred_fields, update);
         }
         let is_host_struct = definition_kind == DefinitionKind::HostContract
             && self.analyzer.host_types.iter().any(|host_type| {
@@ -11202,7 +13364,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             );
             return self.error_expression(span);
         }
-        let checked_fields = self.check_fields(definition, fields);
+        let checked_fields = if let Some(values) = inferred_fields {
+            values
+        } else {
+            self.check_fields(definition, fields)
+        };
         self.check_missing_fields(whole, definition, &checked_fields, update.is_some());
         if let Some(update) = update {
             let base = self.check_expression(update, Some(&IrType::Named(definition)));
@@ -11309,7 +13475,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         &mut self,
         whole: &Expression,
         definition: DefinitionId,
-        fields: &[ast::FieldInitializer],
+        source_fields: &[ast::FieldInitializer],
+        inferred_fields: Option<Vec<(DefinitionId, TypedExpressionIr)>>,
         update: Option<&Expression>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
@@ -11327,7 +13494,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             );
             return self.error_expression(span);
         }
-        let fields = self.check_fields(definition, fields);
+        let fields =
+            inferred_fields.unwrap_or_else(|| self.check_fields(definition, source_fields));
         self.check_missing_fields(whole, definition, &fields, update.is_some());
         let update = update.map(|update| {
             let base = self.check_expression(update, Some(&IrType::Named(definition)));
@@ -11603,6 +13771,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         kind: TypedPatternKind::Wildcard,
                     };
                 };
+                let definition = self.variant_for_expected_type(definition, Some(expected));
                 let expected_payload = self
                     .analyzer
                     .variant_payloads
@@ -11635,6 +13804,61 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             PatternKind::Struct { path, fields } => {
+                if let Some(template_variant) = self.analyzer.lookup_symbol_path(&self.module, path)
+                    && self.analyzer.definitions[template_variant.0 as usize].kind
+                        == DefinitionKind::Variant
+                {
+                    let definition =
+                        self.variant_for_expected_type(template_variant, Some(expected));
+                    let variant_type = self.analyzer.definitions[definition.0 as usize].ty.clone();
+                    self.expect_type(&variant_type, expected, &span);
+                    self.analyzer
+                        .record_reference(&self.module, path.range, template_variant);
+                    let (named, order) = self
+                        .analyzer
+                        .type_metadata
+                        .values()
+                        .find_map(|metadata| {
+                            Some((
+                                metadata.variant_fields.get(&definition)?.clone(),
+                                metadata.variant_field_order.get(&definition)?.clone(),
+                            ))
+                        })
+                        .unwrap_or_default();
+                    let mut payload = Vec::new();
+                    for field_definition in order {
+                        let name = &self.analyzer.definitions[field_definition.0 as usize].name;
+                        let Some(field) = fields.iter().find(|field| field.name.text == *name)
+                        else {
+                            self.type_error(
+                                span.clone(),
+                                &format!("missing Enum variant pattern field `{name}`"),
+                            );
+                            continue;
+                        };
+                        let field_definition = named
+                            .get(&field.name.text)
+                            .copied()
+                            .unwrap_or(field_definition);
+                        let ty = self.analyzer.definitions[field_definition.0 as usize]
+                            .ty
+                            .clone();
+                        self.analyzer.record_reference(
+                            &self.module,
+                            field.name.range,
+                            field_definition,
+                        );
+                        payload.push(self.check_pattern(&field.pattern, &ty));
+                    }
+                    return TypedPatternIr {
+                        ty: expected.clone(),
+                        span,
+                        kind: TypedPatternKind::Variant {
+                            definition,
+                            payload,
+                        },
+                    };
+                }
                 let Some(definition) =
                     self.analyzer
                         .resolve_symbol_path(&self.module, path, SymbolUse::Type)
@@ -13073,6 +15297,355 @@ fn unify_surface_type(
             .zip(right)
             .all(|(left, right)| unify_surface_type(left, right, bindings)),
         _ => false,
+    }
+}
+
+fn substitute_type_parameters(ty: &IrType, arguments: &[IrType]) -> IrType {
+    match ty {
+        IrType::TypeParameter(index) => arguments
+            .get(usize::from(*index))
+            .cloned()
+            .unwrap_or(IrType::Error),
+        IrType::Option(inner) => {
+            IrType::Option(Box::new(substitute_type_parameters(inner, arguments)))
+        }
+        IrType::Result(ok, error) => IrType::Result(
+            Box::new(substitute_type_parameters(ok, arguments)),
+            Box::new(substitute_type_parameters(error, arguments)),
+        ),
+        IrType::Array(inner) => {
+            IrType::Array(Box::new(substitute_type_parameters(inner, arguments)))
+        }
+        IrType::Map(key, value) => IrType::Map(
+            Box::new(substitute_type_parameters(key, arguments)),
+            Box::new(substitute_type_parameters(value, arguments)),
+        ),
+        IrType::Set(inner) => IrType::Set(Box::new(substitute_type_parameters(inner, arguments))),
+        IrType::Tuple(values) => IrType::Tuple(
+            values
+                .iter()
+                .map(|value| substitute_type_parameters(value, arguments))
+                .collect(),
+        ),
+        IrType::HostRequest(inner) => IrType::HostRequest(
+            inner
+                .as_deref()
+                .map(|inner| Box::new(substitute_type_parameters(inner, arguments))),
+        ),
+        IrType::ResourceToken(inner) => IrType::ResourceToken(
+            inner
+                .as_deref()
+                .map(|inner| Box::new(substitute_type_parameters(inner, arguments))),
+        ),
+        IrType::Snapshot(inner) => {
+            IrType::Snapshot(Box::new(substitute_type_parameters(inner, arguments)))
+        }
+        IrType::Buffer(inner) => {
+            IrType::Buffer(Box::new(substitute_type_parameters(inner, arguments)))
+        }
+        IrType::StateHandle(inner) => {
+            IrType::StateHandle(Box::new(substitute_type_parameters(inner, arguments)))
+        }
+        concrete => concrete.clone(),
+    }
+}
+
+fn ir_type_contains_type_parameter(ty: &IrType) -> bool {
+    match ty {
+        IrType::TypeParameter(_) => true,
+        IrType::Option(inner)
+        | IrType::Array(inner)
+        | IrType::Set(inner)
+        | IrType::Snapshot(inner)
+        | IrType::Buffer(inner)
+        | IrType::StateHandle(inner) => ir_type_contains_type_parameter(inner),
+        IrType::HostRequest(inner) | IrType::ResourceToken(inner) => inner
+            .as_deref()
+            .is_some_and(ir_type_contains_type_parameter),
+        IrType::Result(ok, error) | IrType::Map(ok, error) => {
+            ir_type_contains_type_parameter(ok) || ir_type_contains_type_parameter(error)
+        }
+        IrType::Tuple(values) => values.iter().any(ir_type_contains_type_parameter),
+        IrType::Error
+        | IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_) => false,
+    }
+}
+
+const fn builtin_bound_name(bound: BuiltinBound) -> &'static str {
+    match bound {
+        BuiltinBound::Copy => "Copy",
+        BuiltinBound::PartialEq => "PartialEq",
+        BuiltinBound::Eq => "Eq",
+        BuiltinBound::PartialOrd => "PartialOrd",
+        BuiltinBound::Ord => "Ord",
+        BuiltinBound::Hash => "Hash",
+        BuiltinBound::Display => "Display",
+        BuiltinBound::Add => "Add",
+        BuiltinBound::Sub => "Sub",
+        BuiltinBound::Mul => "Mul",
+        BuiltinBound::Div => "Div",
+        BuiltinBound::Rem => "Rem",
+        BuiltinBound::Neg => "Neg",
+    }
+}
+
+fn bound_set_satisfies(bounds: &BTreeSet<BuiltinBound>, required: BuiltinBound) -> bool {
+    bounds.contains(&required)
+        || match required {
+            BuiltinBound::PartialEq => {
+                bounds.contains(&BuiltinBound::Eq) || bounds.contains(&BuiltinBound::Ord)
+            }
+            BuiltinBound::Eq | BuiltinBound::PartialOrd => bounds.contains(&BuiltinBound::Ord),
+            BuiltinBound::Copy
+            | BuiltinBound::Ord
+            | BuiltinBound::Hash
+            | BuiltinBound::Display
+            | BuiltinBound::Add
+            | BuiltinBound::Sub
+            | BuiltinBound::Mul
+            | BuiltinBound::Div
+            | BuiltinBound::Rem
+            | BuiltinBound::Neg => false,
+        }
+}
+
+fn numeric_receiver_replacement(name: &str) -> Option<&'static str> {
+    let (operation, suffix) = name.rsplit_once('_')?;
+    if !matches!(
+        suffix,
+        "i32" | "i64" | "f32" | "f64" | "string" | "bool" | "rune"
+    ) {
+        return None;
+    }
+    match operation {
+        "abs" => Some("value.abs()"),
+        "min" => Some("value.min(other)"),
+        "max" => Some("value.max(other)"),
+        "clamp" => Some("value.clamp(low, high)"),
+        "floor" => Some("value.floor()"),
+        "ceil" => Some("value.ceil()"),
+        "round" => Some("value.round()"),
+        "sqrt" => Some("value.sqrt()"),
+        "sin" => Some("value.sin()"),
+        "cos" => Some("value.cos()"),
+        "to_string" => Some("value.to_string()"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn type_satisfies_bound(
+    ty: &IrType,
+    bound: BuiltinBound,
+    definitions: &[Definition],
+    type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+    variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+    host_types: &[AnalyzedHostType],
+) -> bool {
+    #[allow(clippy::too_many_lines)]
+    fn recursive(
+        ty: &IrType,
+        bound: BuiltinBound,
+        definitions: &[Definition],
+        type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+        variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> bool {
+        match ty {
+            IrType::Unit
+            | IrType::Bool
+            | IrType::I32
+            | IrType::I64
+            | IrType::String
+            | IrType::Rune => true,
+            IrType::F32
+            | IrType::F64
+            | IrType::Map(_, _)
+            | IrType::Array(_)
+            | IrType::Set(_)
+            | IrType::Snapshot(_)
+            | IrType::Buffer(_) => bound == BuiltinBound::Copy,
+            IrType::Option(inner) => recursive(
+                inner,
+                bound,
+                definitions,
+                type_metadata,
+                variant_payloads,
+                visiting,
+            ),
+            IrType::Result(ok, error) => {
+                recursive(
+                    ok,
+                    bound,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    visiting,
+                ) && recursive(
+                    error,
+                    bound,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    visiting,
+                )
+            }
+            IrType::Tuple(values) => values.iter().all(|value| {
+                recursive(
+                    value,
+                    bound,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    visiting,
+                )
+            }),
+            IrType::Named(definition) => {
+                let Some(declaration) = definitions.get(definition.0 as usize) else {
+                    return false;
+                };
+                if declaration.kind == DefinitionKind::Class {
+                    return matches!(
+                        bound,
+                        BuiltinBound::Copy | BuiltinBound::Eq | BuiltinBound::Hash
+                    );
+                }
+                if !visiting.insert(*definition) {
+                    return true;
+                }
+                let satisfied = match declaration.kind {
+                    DefinitionKind::Struct => {
+                        type_metadata.get(definition).is_some_and(|metadata| {
+                            metadata.field_order.iter().all(|field| {
+                                definitions.get(field.0 as usize).is_some_and(|field| {
+                                    recursive(
+                                        &field.ty,
+                                        bound,
+                                        definitions,
+                                        type_metadata,
+                                        variant_payloads,
+                                        visiting,
+                                    )
+                                })
+                            })
+                        })
+                    }
+                    DefinitionKind::Enum => type_metadata.get(definition).is_some_and(|metadata| {
+                        metadata.variant_order.iter().all(|variant| {
+                            variant_payloads.get(variant).is_none_or(|payload| {
+                                payload.iter().all(|value| {
+                                    recursive(
+                                        value,
+                                        bound,
+                                        definitions,
+                                        type_metadata,
+                                        variant_payloads,
+                                        visiting,
+                                    )
+                                })
+                            })
+                        })
+                    }),
+                    _ => false,
+                };
+                visiting.remove(definition);
+                satisfied
+            }
+            IrType::StateHandle(_) => matches!(
+                bound,
+                BuiltinBound::Copy | BuiltinBound::Eq | BuiltinBound::Hash
+            ),
+            IrType::ResourceToken(_)
+            | IrType::HostRequest(_)
+            | IrType::TypeParameter(_)
+            | IrType::Error => false,
+        }
+    }
+
+    match bound {
+        BuiltinBound::PartialEq => {
+            equality_supported(ty, definitions, type_metadata, variant_payloads, host_types)
+        }
+        BuiltinBound::PartialOrd
+        | BuiltinBound::Sub
+        | BuiltinBound::Mul
+        | BuiltinBound::Div
+        | BuiltinBound::Rem
+        | BuiltinBound::Neg => is_numeric(ty),
+        BuiltinBound::Eq | BuiltinBound::Copy | BuiltinBound::Hash => recursive(
+            ty,
+            bound,
+            definitions,
+            type_metadata,
+            variant_payloads,
+            &mut BTreeSet::new(),
+        ),
+        BuiltinBound::Ord => matches!(ty, IrType::I32 | IrType::I64),
+        BuiltinBound::Display => is_interpolatable(ty, definitions, type_metadata),
+        BuiltinBound::Add => is_numeric(ty) || ty == &IrType::String,
+    }
+}
+
+fn unify_type_parameters(
+    pattern: &IrType,
+    actual: &IrType,
+    bindings: &mut [Option<IrType>],
+    generic_types: &BTreeMap<DefinitionId, GenericTypeInstanceKey>,
+) -> bool {
+    match (pattern, actual) {
+        (IrType::TypeParameter(index), actual) => {
+            let Some(binding) = bindings.get_mut(usize::from(*index)) else {
+                return false;
+            };
+            if let Some(bound) = binding {
+                bound == actual
+            } else {
+                *binding = Some(actual.clone());
+                true
+            }
+        }
+        (IrType::Option(left), IrType::Option(right))
+        | (IrType::Array(left), IrType::Array(right))
+        | (IrType::Set(left), IrType::Set(right))
+        | (IrType::Snapshot(left), IrType::Snapshot(right))
+        | (IrType::Buffer(left), IrType::Buffer(right))
+        | (IrType::StateHandle(left), IrType::StateHandle(right)) => {
+            unify_type_parameters(left, right, bindings, generic_types)
+        }
+        (IrType::Result(left_ok, left_error), IrType::Result(right_ok, right_error))
+        | (IrType::Map(left_ok, left_error), IrType::Map(right_ok, right_error)) => {
+            unify_type_parameters(left_ok, right_ok, bindings, generic_types)
+                && unify_type_parameters(left_error, right_error, bindings, generic_types)
+        }
+        (IrType::Tuple(left), IrType::Tuple(right)) if left.len() == right.len() => left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| unify_type_parameters(left, right, bindings, generic_types)),
+        (IrType::Named(left), IrType::Named(right)) => {
+            match (generic_types.get(left), generic_types.get(right)) {
+                (Some(left), Some(right))
+                    if left.definition == right.definition
+                        && left.arguments.len() == right.arguments.len() =>
+                {
+                    left.arguments
+                        .iter()
+                        .zip(&right.arguments)
+                        .all(|(left, right)| {
+                            unify_type_parameters(left, right, bindings, generic_types)
+                        })
+                }
+                _ => left == right,
+            }
+        }
+        (left, right) => left == right,
     }
 }
 

@@ -293,6 +293,144 @@ fn canonical_compiler_accepts_an_imported_namespace_value_field_method_chain() {
     assert!(!artifact.encode_module().is_empty());
 }
 
+#[test]
+fn generics_identity_executes_in_the_canonical_test_realm() {
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
+    let product = resolved_product(application_manifest(), &contract);
+    let tests = test_input_with_source(
+        &product,
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+@test
+fn generics_identity_returns_concrete_values() -> bool {
+    let inferred = identity(10);
+    let explicit = identity<i32>(20);
+    return inferred + explicit == 30;
+}
+",
+    );
+    let artifact = PackageBuildSession::new()
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
+        .expect("generic test source compiles through concrete bytecode");
+    let run = artifact
+        .run(PackageTestOptions::default())
+        .expect("generic test executes in a fresh Realm");
+    assert_eq!(run.results.len(), 1);
+    assert_eq!(run.results[0].status, TestStatus::Pass);
+}
+
+#[test]
+fn generics_nominal_types_execute_in_the_canonical_test_realm() {
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
+    let product = resolved_product(application_manifest(), &contract);
+    let tests = test_input_with_source(
+        &product,
+        r"
+struct Holder<T> {
+    value: T,
+}
+
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+enum Event<T> {
+    Payload { value: T },
+}
+
+class Box<T> {
+    value: T,
+}
+
+fn unwrap<T>(holder: Holder<T>) -> T {
+    return holder.value;
+}
+
+fn unwrap_or<T>(value: Maybe<T>, fallback: T) -> T {
+    return match value {
+        Maybe::Some(payload) => payload,
+        Maybe::None => fallback,
+    };
+}
+
+@test
+fn generic_nominal_values_are_concrete_at_runtime() -> bool {
+    let holder = Holder { value: 10 };
+    let value = Maybe::Some(20);
+    let empty: Maybe<i32> = Maybe::None;
+    let event = Event<i32>::Payload { value: 40 };
+    let boxed = Box { value: 30 };
+    let event_value = match event {
+        Event::Payload { value } => value,
+    };
+    return unwrap(holder) + unwrap_or(value, 0) + unwrap_or(empty, 0)
+        + boxed.value + event_value == 100;
+}
+",
+    );
+    let artifact = PackageBuildSession::new()
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
+        .expect("generic nominal types compile through concrete bytecode");
+    let run = artifact
+        .run(PackageTestOptions::default())
+        .expect("generic nominal types execute in a fresh Realm");
+    assert_eq!(run.results.len(), 1);
+    assert_eq!(run.results[0].status, TestStatus::Pass);
+}
+
+#[test]
+fn generics_cross_module_function_and_type_compile_to_concrete_instances() {
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
+    let product = resolved_product_with_sources(
+        application_manifest(),
+        &contract,
+        [
+            (
+                "src/main.nexa",
+                Arc::from(
+                    r"
+use package::util as util;
+
+fn main() -> i32 {
+    let holder = util::Holder { value: 42 };
+    return util::identity(util::unwrap(holder));
+}
+",
+                ),
+            ),
+            (
+                "src/util.nexa",
+                Arc::from(
+                    r"
+pub(package) fn identity<T>(value: T) -> T {
+    return value;
+}
+
+pub(package) struct Holder<T> {
+    value: T,
+}
+
+pub(package) fn unwrap<T>(holder: Holder<T>) -> T {
+    return holder.value;
+}
+",
+                ),
+            ),
+        ],
+    );
+    let artifact = PackageBuildSession::new()
+        .compile_package_with_contract(&product, &contract, identity(&product))
+        .expect("cross-module generic call is monomorphized before compilation");
+    assert!(!artifact.encode_module().is_empty());
+}
+
 fn query_key_belongs_to_tests(key: &QueryKey) -> bool {
     match key {
         QueryKey::Parse(source) => source.path.as_str().starts_with("tests/"),

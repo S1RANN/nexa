@@ -6976,14 +6976,13 @@ mod audit_tests {
     use std::fs;
 
     #[test]
-    fn m5_release_authority_matches_code_and_normative_documents() {
-        let authority = super::validate_m5_release_authority(&super::workspace_root())
-            .expect("M5 release authority must be internally consistent");
-        assert_eq!(authority.bytecode_version, 7);
-        assert_eq!(authority.opcode_cost_table_version, 7);
-        assert_eq!(authority.summary["status"], "COMPLETE");
-        assert_eq!(authority.summary["jitDecision"], "DEFER");
-        assert_eq!(authority.summary_blake3.len(), 64);
+    fn m5_release_authority_rejects_a_later_active_bytecode_version() {
+        let Err(error) = super::validate_m5_release_authority(&super::workspace_root()) else {
+            panic!("Bytecode v8 main must not reproduce the frozen M5 v7 receipt");
+        };
+        let message = error.to_string();
+        assert!(message.contains("M5 requires BYTECODE_VERSION=7"));
+        assert!(message.contains("code has"));
     }
 
     fn formal_aggregate_case_fixture(name: &str) -> serde_json::Value {

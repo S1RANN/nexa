@@ -1,11 +1,12 @@
 # Nexa Language v3 Surface
 
-Status: Language v3 IN PROGRESS — Set type, collection iteration for loops
+Status: Language v3 IN PROGRESS — generics, receiver methods, Set, collection iteration
 
 Nexa Language v3 defines one source language for Packages, standalone programs, and
-REPL cells. It deliberately does not add user-defined generics, traits,
-closures, dynamic dispatch, inheritance, operator overloading, macros,
-reflection, raw pointers, or nullable references.
+REPL cells. It includes monomorphized user functions and nominal types with
+closed built-in bounds, but does not add user-defined traits, closures, dynamic
+dispatch, inheritance, operator overloading, macros, reflection, raw pointers,
+or nullable references.
 
 ## Naming and paths
 
@@ -18,13 +19,82 @@ field, method, or postfix operation:
 ```nexa
 use std::core;
 
-let limit = core::max_i32(8, MAX_SCORE);
+let limit = 8.max(MAX_SCORE);
 let effect = FoodEffect::Grow(limit);
 let label = effect.name;
 ```
 
 Source files do not declare their Module. Their package-relative path is the
 Module identity; see [Source Modules](MODULES.md).
+
+## Generics
+
+Functions, Structs, Enums, and non-state Classes may declare type parameters:
+
+```nexa
+struct Pair<T, U> {
+    first: T,
+    second: U,
+}
+
+enum Maybe<T> {
+    None,
+    Some(T),
+}
+
+class Box<T> {
+    value: T,
+}
+
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn smaller<T>(left: T, right: T) -> T
+where
+    T: Copy + PartialOrd,
+{
+    if left < right {
+        return left;
+    }
+    return right;
+}
+```
+
+Calls and constructors either provide every type argument or infer every type
+argument. Inference uses function arguments, constructor fields, Enum payloads,
+and an available expected result type. Direct angle brackets are used; there is
+no turbofish and no partial `_` argument list.
+
+```nexa
+let inferred = Pair { first: "score", second: 100 };
+let explicit = Pair<string, i32> { first: "score", second: 100 };
+let present = Maybe::Some(10);
+let empty: Maybe<i32> = Maybe::None;
+let also_present = Maybe<i32>::Some(20);
+```
+
+The compiler monomorphizes each distinct concrete function and type argument
+list and reuses identical instances. Type parameters never enter Bytecode or
+the Runtime. A generic declaration's stable identity and canonical concrete
+argument identities determine each instance identity; type parameter spelling
+does not.
+
+The closed bounds are `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
+`Display`, and `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg` with `Output = T`. These
+names do not form a user-extensible trait system. `Map<K, V>` requires
+`K: Eq + Hash`.
+
+Generic `@state` Classes are rejected. A non-generic state Class may contain
+fully concrete generic instances. Migration, lifecycle, test, Contract, and
+Host boundaries must remain fully concrete. Inline recursive Struct and Enum
+layouts and non-converging recursive generic instances are rejected; Class
+recursion that preserves its concrete arguments is allowed.
+
+Numeric values expose `abs`, `min`, `max`, `clamp`, and `to_string`. `f32` and
+`f64` also expose `floor`, `ceil`, `round`, `sqrt`, `sin`, and `cos`. The old
+public type-suffixed functions such as `math::abs_i32` and `core::max_f64` are
+not part of the language surface.
 
 ## Comments and documentation
 
