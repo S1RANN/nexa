@@ -1663,6 +1663,25 @@ fn render_repl_value_inner(
             }
             renderer.push_char('}')
         }
+        IrType::Set(element) => {
+            let type_id = expected_named_runtime_type_id(ty, ir)?;
+            let set = source.set_ref(type_id).map_err(decode)?;
+            renderer.push_str("set{")?;
+            for (index, value) in set.iter().enumerate() {
+                if index != 0 {
+                    renderer.push_str(", ")?;
+                }
+                render_repl_value_inner(
+                    renderer,
+                    reader,
+                    value.runtime_value(),
+                    element,
+                    ir,
+                    depth + 1,
+                )?;
+            }
+            renderer.push_char('}')
+        }
         IrType::HostRequest(_) => Err(ReplSessionError::Internal(
             "a HostRequest escaped the typed await boundary into the REPL reader".into(),
         )),
@@ -1948,6 +1967,9 @@ fn repl_bytecode_value_type(
             repl_bytecode_value_type(key, ir)?,
             repl_bytecode_value_type(value, ir)?,
         ))),
+        IrType::Set(element) => Ok(ValueType::Named(nexa_bytecode::set_type(
+            repl_bytecode_value_type(element, ir)?,
+        ))),
         IrType::Tuple(elements) => {
             let elements = elements
                 .iter()
@@ -2068,9 +2090,10 @@ fn initialize_runtime(
     console: Arc<Mutex<ReplConsoleState>>,
     builds: &mut PackageBuildSession,
 ) -> Result<InitializedRuntime, ReplSessionError> {
-    let parsed_contract = nexa_contract::parse_contract(CONSOLE_HOST_CONTRACT).map_err(|error| {
-        ReplSessionError::Internal(format!("invalid built-in Console NIDL: {error}"))
-    })?;
+    let parsed_contract =
+        nexa_contract::parse_contract(CONSOLE_HOST_CONTRACT).map_err(|error| {
+            ReplSessionError::Internal(format!("invalid built-in Console NIDL: {error}"))
+        })?;
     let contract = HostContractInput::with_source(
         &parsed_contract,
         SourceIdentity::standalone(CONSOLE_HOST_SOURCE_IDENTITY),

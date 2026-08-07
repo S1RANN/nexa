@@ -1377,6 +1377,26 @@ impl<'a> HostValueRef<'a> {
         })
     }
 
+    pub fn set_ref(self, type_id: StableId) -> Result<HostSetRef<'a>, HostTrap> {
+        if !matches!(
+            self.value,
+            crate::RuntimeValue::NamedRef {
+                type_id: actual,
+                ..
+            } if actual == type_id
+        ) {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let len = heap.set_len(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostSetRef {
+            type_id,
+            value: self.value,
+            len,
+            heap,
+        })
+    }
+
     fn heap(self) -> Result<&'a crate::Heap, HostTrap> {
         self.heap.ok_or(HostTrap::Type)
     }
@@ -1705,6 +1725,88 @@ impl<'a> HostMapRef<'a> {
             .map(move |(key, value)| HostMapEntryRef { key, value, heap })
     }
 }
+
+/// A named set whose elements remain in the VM heap.
+///
+/// Iteration exposes the VM's current hash-table traversal order without
+/// allocating. The order is intentionally not a language-level guarantee.
+#[derive(Clone, Copy, Debug)]
+pub struct HostSetRef<'a> {
+    type_id: StableId,
+    value: crate::RuntimeValue,
+    len: usize,
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostSetRef<'a> {
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn element(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+        self.iter().nth(index).ok_or(HostTrap::Type)
+    }
+
+    #[must_use]
+    pub const fn iter(self) -> HostSetIter<'a> {
+        HostSetIter {
+            value: self.value,
+            remaining: self.len,
+            phase: 0,
+            slot: 0,
+            heap: self.heap,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostSetIter<'a> {
+    value: crate::RuntimeValue,
+    remaining: usize,
+    phase: u8,
+    slot: usize,
+    heap: &'a crate::Heap,
+}
+
+impl<'a> Iterator for HostSetIter<'a> {
+    type Item = HostValueRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let (phase, slot, value) = self
+            .heap
+            .set_iter_advance(self.value, self.phase, self.slot)
+            .expect("validated immutable set reference remains valid")?;
+        self.phase = phase;
+        self.slot = slot;
+        self.remaining -= 1;
+        Some(HostValueRef {
+            value,
+            heap: Some(self.heap),
+            physical: None,
+            row: None,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for HostSetIter<'_> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostOptionRef<'a, T> {
