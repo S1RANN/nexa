@@ -62,7 +62,7 @@ pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
     CollectionStats, CollectionStorage, CollectionView, GcBudget, GcCycleTelemetry, GcPhase, GcRef,
     GcRoots, Heap, HeapByteInspection, HeapError, IncrementalGcReport, MapSetOutcome, Object,
-    VmAllocationCounters,
+    SetInsertOutcome, VmAllocationCounters,
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,

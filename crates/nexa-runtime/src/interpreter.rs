@@ -1,8 +1,8 @@
 use std::fmt::{self, Write as _};
 
 use nexa_bytecode::{
-    AsyncResultType, HostCallMode, Instruction, SCALAR_TO_STRING_BUFFER_BYTES,
-    SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
+    AsyncResultType, CollectionIteratorKind, HostCallMode, Instruction,
+    SCALAR_TO_STRING_BUFFER_BYTES, SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
     STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, StandardIntrinsic,
     StandardIntrinsicFuelModel, ValueType,
 };
@@ -517,7 +517,8 @@ impl Trap {
             | TrapKind::ArrayIndexOutOfBounds
             | TrapKind::BufferIndexOutOfBounds
             | TrapKind::StandardLibrary
-            | TrapKind::CleanupBudgetExceeded => "NX5001",
+            | TrapKind::CleanupBudgetExceeded
+            | TrapKind::CollectionMutatedDuringIteration => "NX5001",
         }
     }
 
@@ -593,6 +594,9 @@ pub enum TrapKind {
     BufferIndexOutOfBounds,
     StandardLibrary,
     CleanupBudgetExceeded,
+    /// `LANGUAGE_V3` 4.3: a collection was mutated between `IterNew` and an
+    /// `IterNext`; iteration over stale storage is impossible from here.
+    CollectionMutatedDuringIteration,
     Host,
 }
 
@@ -678,7 +682,7 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 111],
+    costs: [u16; 119],
 }
 
 static CANONICAL_OPCODE_COST_TABLE: OpcodeCostTable = OpcodeCostTable {
@@ -693,8 +697,8 @@ impl Default for OpcodeCostTable {
 }
 
 impl OpcodeCostTable {
-    /// Shared immutable v7 schedule for the overwhelmingly common canonical
-    /// runtime. Avoids copying the 111-entry table at every convenience API
+    /// Shared immutable v8 schedule for the overwhelmingly common canonical
+    /// runtime. Avoids copying the 119-entry table at every convenience API
     /// call while custom-version tests can still own a mutable table.
     #[must_use]
     pub const fn canonical() -> &'static Self {
@@ -1539,6 +1543,17 @@ fn resolved_map_layout(
         .map_type(type_id.0)
         .filter(|map_type| map_type.key == key && map_type.value == value)
         .map(|_| (key, value))
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn resolved_set_element(
+    module: &VerifiedModule,
+    type_id: StableId,
+) -> Result<ValueType, InterpreterError> {
+    module
+        .set_type(type_id.0)
+        .filter(|set_type| set_type.type_id == type_id)
+        .map(|set_type| set_type.element)
         .ok_or(InterpreterError::TypeMismatch)
 }
 
@@ -4714,6 +4729,394 @@ impl CheckedInterpreter {
                         .map_clear(map)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::SetNew { type_id, dst } => {
+                    let element = resolved_set_element(module, type_id)?;
+                    let value = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .allocate_set(type_id, element)?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::SetLen { source, dst } => {
+                    let set = register(&continuation.arena, source)?;
+                    let length = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_len(set)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(
+                            i32::try_from(length)
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::SetContains { source, value, dst } => {
+                    let set = register(&continuation.arena, source)?;
+                    let value = register(&continuation.arena, value)?;
+                    let contains = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_contains(set, value)?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(contains))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::SetInsert { source, value, dst } => {
+                    let set = register(&continuation.arena, source)?;
+                    let value = register(&continuation.arena, value)?;
+                    match heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_insert(set, value)?
+                    {
+                        crate::SetInsertOutcome::Complete(inserted) => {
+                            set_register(
+                                &mut continuation.arena,
+                                dst,
+                                RuntimeValue::Bool(inserted),
+                            )?;
+                            increment_pc(&mut continuation.arena)?;
+                        }
+                        crate::SetInsertOutcome::RehashPending => {}
+                    }
+                }
+                Instruction::SetRemove { source, value, dst } => {
+                    let set = register(&continuation.arena, source)?;
+                    let value = register(&continuation.arena, value)?;
+                    let removed = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_remove(set, value)?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(removed))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::SetClear { source } => {
+                    let set = register(&continuation.arena, source)?;
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_clear(set)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::IterNew { kind, state } => {
+                    match kind {
+                        CollectionIteratorKind::Range => {
+                            // Range: `collection` holds start and `phase`
+                            // holds end (pre-populated by the lowering).
+                            let RuntimeValue::I32(start) =
+                                register(&continuation.arena, state.collection)?
+                            else {
+                                return Err(InterpreterError::TypeMismatch);
+                            };
+                            let RuntimeValue::I32(end) =
+                                register(&continuation.arena, state.phase)?
+                            else {
+                                return Err(InterpreterError::TypeMismatch);
+                            };
+                            set_register(
+                                &mut continuation.arena,
+                                state.slot,
+                                RuntimeValue::I32(start),
+                            )?;
+                            // The epoch I64 register carries the remaining
+                            // count/limit state for the range cursor.
+                            let remaining = (i64::from(end) - i64::from(start)).max(0);
+                            set_register(
+                                &mut continuation.arena,
+                                state.epoch,
+                                RuntimeValue::I64(remaining),
+                            )?;
+                        }
+                        CollectionIteratorKind::Array { .. }
+                        | CollectionIteratorKind::Buffer { .. }
+                        | CollectionIteratorKind::Map { .. }
+                        | CollectionIteratorKind::Set { .. } => {
+                            let collection = register(&continuation.arena, state.collection)?;
+                            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                            let epoch = match kind {
+                                CollectionIteratorKind::Array { .. } => {
+                                    heap.array_mutation_epoch(collection)?
+                                }
+                                CollectionIteratorKind::Buffer { .. } => {
+                                    heap.buffer_mutation_epoch(collection)?
+                                }
+                                CollectionIteratorKind::Map { .. } => {
+                                    heap.map_mutation_epoch(collection)?
+                                }
+                                CollectionIteratorKind::Set { .. } => {
+                                    heap.set_mutation_epoch(collection)?
+                                }
+                                CollectionIteratorKind::Range => unreachable!(),
+                            };
+                            set_register(
+                                &mut continuation.arena,
+                                state.phase,
+                                RuntimeValue::I32(0),
+                            )?;
+                            set_register(
+                                &mut continuation.arena,
+                                state.slot,
+                                RuntimeValue::I32(0),
+                            )?;
+                            set_register(
+                                &mut continuation.arena,
+                                state.epoch,
+                                RuntimeValue::I64(epoch_bits(epoch)),
+                            )?;
+                        }
+                    }
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::IterNext {
+                    kind,
+                    state,
+                    has_value_dst,
+                    first_dst,
+                    second_dst,
+                } => {
+                    let (phase, slot, epoch_snapshot) = {
+                        let RuntimeValue::I32(phase) = register(&continuation.arena, state.phase)?
+                        else {
+                            return Err(InterpreterError::TypeMismatch);
+                        };
+                        let RuntimeValue::I32(slot) = register(&continuation.arena, state.slot)?
+                        else {
+                            return Err(InterpreterError::TypeMismatch);
+                        };
+                        let RuntimeValue::I64(epoch_bits) =
+                            register(&continuation.arena, state.epoch)?
+                        else {
+                            return Err(InterpreterError::TypeMismatch);
+                        };
+                        (phase, slot, epoch_from_bits(epoch_bits))
+                    };
+                    let mut has_value = false;
+                    match kind {
+                        CollectionIteratorKind::Range => {
+                            if second_dst.is_some() {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            let RuntimeValue::I32(end) =
+                                register(&continuation.arena, state.phase)?
+                            else {
+                                return Err(InterpreterError::TypeMismatch);
+                            };
+                            let RuntimeValue::I32(current) =
+                                register(&continuation.arena, state.slot)?
+                            else {
+                                return Err(InterpreterError::TypeMismatch);
+                            };
+                            if epoch_snapshot > 0 {
+                                set_register(
+                                    &mut continuation.arena,
+                                    first_dst,
+                                    RuntimeValue::I32(current),
+                                )?;
+                                let next = current.saturating_add(1);
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.slot,
+                                    RuntimeValue::I32(next),
+                                )?;
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.epoch,
+                                    RuntimeValue::I64(epoch_bits(epoch_snapshot - 1)),
+                                )?;
+                                has_value = true;
+                            }
+                            let _ = end;
+                        }
+                        CollectionIteratorKind::Array { element }
+                        | CollectionIteratorKind::Buffer { element } => {
+                            if second_dst.is_some() {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            let collection = register(&continuation.arena, state.collection)?;
+                            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                            let live_epoch = match kind {
+                                CollectionIteratorKind::Array { .. } => {
+                                    heap.array_mutation_epoch(collection)?
+                                }
+                                CollectionIteratorKind::Buffer { .. } => {
+                                    heap.buffer_mutation_epoch(collection)?
+                                }
+                                _ => unreachable!(),
+                            };
+                            if live_epoch != epoch_snapshot {
+                                settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                                let trap = Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::CollectionMutatedDuringIteration,
+                                    "collection was mutated during iteration",
+                                );
+                                reclaim_storage!();
+                                return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
+                            }
+                            let slot = usize::try_from(slot)
+                                .map_err(|_| InterpreterError::TypeMismatch)?;
+                            let length = match kind {
+                                CollectionIteratorKind::Array { .. } => {
+                                    heap.array_len(collection)?
+                                }
+                                CollectionIteratorKind::Buffer { .. } => {
+                                    heap.buffer_len(collection)?
+                                }
+                                _ => unreachable!(),
+                            };
+                            if slot < length {
+                                match kind {
+                                    CollectionIteratorKind::Array { .. } => {
+                                        let values = heap.array_value_range(collection, slot)?;
+                                        let element_slots = module
+                                            .layout_table()
+                                            .physical_slots(element)
+                                            .map_err(|_| InterpreterError::TypeMismatch)?;
+                                        let destination = continuation
+                                            .arena
+                                            .register_range_mut(first_dst, element_slots)?;
+                                        write_collection_element_physical(
+                                            values,
+                                            destination,
+                                            element,
+                                            module.layout_table(),
+                                            heap,
+                                        )?;
+                                    }
+                                    CollectionIteratorKind::Buffer { .. } => {
+                                        // Buffer elements are single-slot
+                                        // values, identical to `BufferGet`.
+                                        let value = heap.buffer_get(collection, slot)?;
+                                        set_register(&mut continuation.arena, first_dst, value)?;
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.slot,
+                                    RuntimeValue::I32(
+                                        i32::try_from(slot + 1)
+                                            .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                                    ),
+                                )?;
+                                has_value = true;
+                            }
+                        }
+                        CollectionIteratorKind::Set { element } => {
+                            if second_dst.is_some() {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            let collection = register(&continuation.arena, state.collection)?;
+                            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                            let live_epoch = heap.set_mutation_epoch(collection)?;
+                            if live_epoch != epoch_snapshot {
+                                settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                                let trap = Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::CollectionMutatedDuringIteration,
+                                    "collection was mutated during iteration",
+                                );
+                                reclaim_storage!();
+                                return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
+                            }
+                            let slot = usize::try_from(slot)
+                                .map_err(|_| InterpreterError::TypeMismatch)?;
+                            if let Some((next_phase, next_slot, value)) = heap.set_iter_advance(
+                                collection,
+                                u8::try_from(phase).map_err(|_| InterpreterError::TypeMismatch)?,
+                                slot,
+                            )? {
+                                let element_slots = module
+                                    .layout_table()
+                                    .physical_slots(element)
+                                    .map_err(|_| InterpreterError::TypeMismatch)?;
+                                let destination = continuation
+                                    .arena
+                                    .register_range_mut(first_dst, element_slots)?;
+                                write_collection_element_physical(
+                                    crate::CollectionView::Values(std::slice::from_ref(&value)),
+                                    destination,
+                                    element,
+                                    module.layout_table(),
+                                    heap,
+                                )?;
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.phase,
+                                    RuntimeValue::I32(i32::from(next_phase)),
+                                )?;
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.slot,
+                                    RuntimeValue::I32(
+                                        i32::try_from(next_slot)
+                                            .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                                    ),
+                                )?;
+                                has_value = true;
+                            }
+                        }
+                        CollectionIteratorKind::Map { key: _, value } => {
+                            let second_dst = second_dst.ok_or(InterpreterError::TypeMismatch)?;
+                            let collection = register(&continuation.arena, state.collection)?;
+                            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                            let live_epoch = heap.map_mutation_epoch(collection)?;
+                            if live_epoch != epoch_snapshot {
+                                settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                                let trap = Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::CollectionMutatedDuringIteration,
+                                    "collection was mutated during iteration",
+                                );
+                                reclaim_storage!();
+                                return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
+                            }
+                            let slot = usize::try_from(slot)
+                                .map_err(|_| InterpreterError::TypeMismatch)?;
+                            let value_slots = module
+                                .layout_table()
+                                .physical_slots(value)
+                                .map_err(|_| InterpreterError::TypeMismatch)?;
+                            let destination = continuation
+                                .arena
+                                .register_range_mut(second_dst, value_slots)?;
+                            let found = heap.map_iter_advance_into(
+                                collection,
+                                u8::try_from(phase).map_err(|_| InterpreterError::TypeMismatch)?,
+                                slot,
+                                destination,
+                            )?;
+                            if let Some((next_phase, next_slot, map_key)) = found {
+                                set_register(&mut continuation.arena, first_dst, map_key)?;
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.phase,
+                                    RuntimeValue::I32(i32::from(next_phase)),
+                                )?;
+                                set_register(
+                                    &mut continuation.arena,
+                                    state.slot,
+                                    RuntimeValue::I32(
+                                        i32::try_from(next_slot)
+                                            .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                                    ),
+                                )?;
+                                has_value = true;
+                            }
+                        }
+                    }
+                    set_register(
+                        &mut continuation.arena,
+                        has_value_dst,
+                        RuntimeValue::Bool(has_value),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::BufferLen { source, dst } => {
                     let buffer = register(&continuation.arena, source)?;
                     let length = heap
@@ -5157,6 +5560,11 @@ pub(crate) fn static_instruction_fuel(
         | Instruction::MapContains { .. }
         | Instruction::MapSet { .. }
         | Instruction::MapClear { .. }
+        | Instruction::SetContains { .. }
+        | Instruction::SetInsert { .. }
+        | Instruction::SetRemove { .. }
+        | Instruction::SetClear { .. }
+        | Instruction::IterNext { .. }
         | Instruction::BufferSlice { .. }
         | Instruction::BufferCopy { .. }
         | Instruction::Return { .. }
@@ -5194,6 +5602,7 @@ pub(crate) fn static_instruction_fuel(
         Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
         Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
         Instruction::MapNew { .. } => nominal_index_lookup_fuel(nominal_shape.map_types)?,
+        Instruction::SetNew { .. } => nominal_index_lookup_fuel(nominal_shape.set_types)?,
         _ => 0,
     };
     Ok(Some(fuel_add(costs.cost(instruction), work)?))
@@ -5500,6 +5909,38 @@ fn dynamic_instruction_fuel(
                 .ok_or(InterpreterError::FuelCostOverflow)?;
             fuel_blocks(slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
         }
+        Instruction::SetContains { source, value, .. }
+        | Instruction::SetRemove { source, value, .. } => set_lookup_fuel(
+            heap_required()?,
+            register(arena, source)?,
+            register(arena, value)?,
+        )?,
+        Instruction::SetInsert { source, value, .. } => set_insert_attempt_fuel(
+            heap_required()?,
+            register(arena, source)?,
+            register(arena, value)?,
+        )?,
+        Instruction::SetClear { source } => {
+            let shape = heap_required()?.set_fuel_shape(register(arena, source)?)?;
+            let slots = fuel_usize(shape.current_slots)?
+                .checked_add(fuel_usize(shape.old_slots)?)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            let slots = slots
+                .checked_add(fuel_usize(shape.new_slots)?)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            fuel_blocks(slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+        }
+        Instruction::IterNext { kind, state, .. } => {
+            // Range iteration is heap-free: the dynamic work is zero and
+            // no collection reference is read (the `collection` register
+            // holds the range start scalar).
+            if matches!(kind, CollectionIteratorKind::Range) {
+                0
+            } else {
+                let collection = register(arena, state.collection)?;
+                iter_next_attempt_fuel(heap_required()?, kind, collection)?
+            }
+        }
         Instruction::BufferSlice { length, .. } => {
             let work = match register(arena, length)? {
                 RuntimeValue::I32(length) => u64::try_from(length).unwrap_or(0),
@@ -5614,6 +6055,102 @@ fn nominal_index_lookup_fuel(entries: usize) -> Result<u64, InterpreterError> {
         .checked_add(1)
         .ok_or(InterpreterError::FuelCostOverflow)?;
     fuel_blocks(comparisons, 8)
+}
+
+fn set_lookup_fuel(
+    heap: &Heap,
+    set: RuntimeValue,
+    element: RuntimeValue,
+) -> Result<u64, InterpreterError> {
+    let shape = heap.set_fuel_shape(set)?;
+    let slots = fuel_usize(shape.current_slots)?
+        .checked_add(fuel_usize(shape.old_slots)?)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let slots = slots
+        .checked_add(fuel_usize(shape.new_slots)?)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let slot_scan = fuel_blocks(slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+
+    let key_hash = runtime_value_hash_fuel(heap, element)?;
+    let comparison_per_slot = runtime_value_comparison_fuel(heap, element)?;
+    key_hash
+        .checked_add(slot_scan)
+        .ok_or(InterpreterError::FuelCostOverflow)?
+        .checked_add(
+            comparison_per_slot
+                .checked_mul(slots)
+                .ok_or(InterpreterError::FuelCostOverflow)?,
+        )
+        .ok_or(InterpreterError::FuelCostOverflow)
+}
+
+fn set_insert_attempt_fuel(
+    heap: &Heap,
+    set: RuntimeValue,
+    element: RuntimeValue,
+) -> Result<u64, InterpreterError> {
+    let shape = heap.set_fuel_shape(set)?;
+    if shape.rehash_remaining != 0 {
+        let probe_work = fuel_usize(shape.rehash_remaining)?
+            .checked_mul(fuel_usize(shape.new_slots)?)
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+        return fuel_blocks(probe_work, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS);
+    }
+    let scan = set_lookup_fuel(heap, set, element)?;
+    let mutation_slots = if shape.next_rehash_slots == 0 {
+        shape.current_slots
+    } else {
+        shape.next_rehash_slots
+    };
+    let mutation = fuel_blocks(
+        fuel_usize(mutation_slots)?,
+        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+    )?;
+    scan.checked_add(mutation)
+        .ok_or(InterpreterError::FuelCostOverflow)
+}
+
+/// Bit-pattern round-trip for the `LANGUAGE_V3` mutation epoch carried in
+/// hidden I64 iterator registers. The u64 epoch is never interpreted as a
+/// signed count; the bit pattern is preserved verbatim.
+#[allow(clippy::cast_possible_wrap)]
+const fn epoch_bits(epoch: u64) -> i64 {
+    epoch as i64
+}
+
+#[allow(clippy::cast_sign_loss)]
+const fn epoch_from_bits(bits: i64) -> u64 {
+    bits as u64
+}
+
+/// Deterministic `IterNext` attempt bound: one full slot walk across the
+/// collection's current/old/new tables (or the live element count for
+/// Array/Buffer). `IterNext` never allocates.
+fn iter_next_attempt_fuel(
+    heap: &Heap,
+    kind: CollectionIteratorKind,
+    collection: RuntimeValue,
+) -> Result<u64, InterpreterError> {
+    let slots = match kind {
+        CollectionIteratorKind::Range => 0,
+        CollectionIteratorKind::Array { .. } => heap.array_len(collection)?,
+        CollectionIteratorKind::Buffer { .. } => heap.buffer_len(collection)?,
+        CollectionIteratorKind::Map { .. } => {
+            let shape = heap.map_fuel_shape(collection)?;
+            shape
+                .current_slots
+                .saturating_add(shape.old_slots)
+                .saturating_add(shape.new_slots)
+        }
+        CollectionIteratorKind::Set { .. } => {
+            let shape = heap.set_fuel_shape(collection)?;
+            shape
+                .current_slots
+                .saturating_add(shape.old_slots)
+                .saturating_add(shape.new_slots)
+        }
+    };
+    fuel_blocks(fuel_usize(slots)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
 }
 
 fn register_string_bytes(
@@ -5756,6 +6293,7 @@ fn standard_intrinsic_arguments(
     Ok(arguments)
 }
 
+#[allow(clippy::too_many_lines)]
 fn standard_intrinsic_attempt_fuel(
     module: &nexa_bytecode::Module,
     intrinsic: StandardIntrinsic,
@@ -5810,6 +6348,12 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::ArrayCopy => {
             let heap = heap_required()?;
+            if matches!(intrinsic, StandardIntrinsic::BufferFill { .. }) {
+                // Fill rewrites the whole live prefix; charge the element
+                // count without touching the array fuel shape.
+                let length = heap.buffer_len(arguments[0])?;
+                return fuel_blocks(fuel_usize(length)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS);
+            }
             let (live, capacity, stride) = heap.array_physical_fuel_shape(arguments[0])?;
             if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
                 // Amortized push (WP49): in-place unless the extent is full.
@@ -5839,10 +6383,21 @@ fn standard_intrinsic_attempt_fuel(
             fuel_blocks(fuel_usize(cells)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
         }
         StandardIntrinsicFuelModel::MapLookup => {
-            map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
+            if matches!(
+                intrinsic,
+                StandardIntrinsic::SetContains { .. } | StandardIntrinsic::SetRemove { .. }
+            ) {
+                set_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
+            } else {
+                map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
+            }
         }
         StandardIntrinsicFuelModel::MapInsertAttempt => {
-            map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
+            if matches!(intrinsic, StandardIntrinsic::SetInsert { .. }) {
+                set_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
+            } else {
+                map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
+            }
         }
         StandardIntrinsicFuelModel::ValueToString => {
             formattable_attempt_fuel(module, intrinsic, arguments[0], heap_required()?)?
@@ -6133,6 +6688,55 @@ fn run_physical_standard_intrinsic(
                 write_collection_element_physical(value, destination, element, layouts, heap)?;
             }
             heap.array_pop_value_discard(array)?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::ArrayFirst { element } | Intrinsic::ArrayLast { element } => {
+            let array = argument(arena, 0)?;
+            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+            let length = heap.array_len(array)?;
+            arena.clear_register_range(dst, abi.result_slots)?;
+            if length == 0 {
+                // Only an empty array encodes None; every heap error from a
+                // populated array must propagate instead of degrading.
+                set_register(arena, dst, RuntimeValue::I32(0))?;
+                return Ok(PhysicalStandardIntrinsicOutcome::Returned);
+            }
+            let index = match intrinsic {
+                Intrinsic::ArrayFirst { .. } => 0,
+                Intrinsic::ArrayLast { .. } => length - 1,
+                _ => unreachable!(),
+            };
+            let value = heap.array_value_range(array, index)?;
+            let payload_slots = abi
+                .result_slots
+                .checked_sub(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let payload = dst
+                .checked_add(PHYSICAL_ENUM_PAYLOAD_OFFSET)
+                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+            let destination = arena.register_range_mut(payload, payload_slots)?;
+            write_collection_element_physical(value, destination, element, layouts, heap)?;
+            set_register(arena, dst, RuntimeValue::I32(1))?;
+            Ok(PhysicalStandardIntrinsicOutcome::Returned)
+        }
+        Intrinsic::MapGetOr { .. } => {
+            if abi.argument_slots[0] != 1
+                || abi.argument_slots[1] != 1
+                || abi.argument_slots[2] != abi.result_slots
+                || abi.result_slots == 0
+            {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            let map = argument(arena, 0)?;
+            let key = argument(arena, 1)?;
+            let destination = arena.register_range_mut(dst, abi.result_slots)?;
+            let found = heap
+                .as_deref()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .map_get_value_into(map, key, destination)?;
+            if !found {
+                arena.copy_register_range(argument_base(2)?, dst, abi.result_slots)?;
+            }
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
         Intrinsic::MapGet { .. } | Intrinsic::MapRemove { .. } => {
@@ -6464,6 +7068,130 @@ fn run_standard_intrinsic(
             heap.as_deref_mut()
                 .ok_or(InterpreterError::HeapUnavailable)?
                 .array_clear(arguments[0])?;
+            returned(RuntimeValue::Bool(true))
+        }
+        Intrinsic::ArrayFirst { element } | Intrinsic::ArrayLast { element } => {
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let length = heap.array_len(arguments[0])?;
+            let index = match intrinsic {
+                Intrinsic::ArrayFirst { .. } => Some(0),
+                Intrinsic::ArrayLast { .. } => length.checked_sub(1),
+                _ => unreachable!(),
+            };
+            let value = match index {
+                Some(index) => match heap.array_get(arguments[0], index) {
+                    Ok(value) => Some(value),
+                    Err(HeapError::IndexOutOfBounds { .. }) => None,
+                    Err(error) => return Err(InterpreterError::Heap(error)),
+                },
+                None => None,
+            };
+            let value = allocate_option(heap, element, value)?;
+            returned(value)
+        }
+        Intrinsic::MapGetOr { .. } => {
+            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+            let value = heap
+                .map_get(arguments[0], arguments[1])?
+                .unwrap_or(arguments[2]);
+            returned(value)
+        }
+        Intrinsic::SetLen { .. } => {
+            let length = heap
+                .as_deref()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .set_len(arguments[0])?;
+            returned(RuntimeValue::I32(
+                i32::try_from(length).map_err(|_| InterpreterError::StringLengthOverflow)?,
+            ))
+        }
+        Intrinsic::SetContains { .. } | Intrinsic::SetRemove { .. } => {
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let result = if matches!(intrinsic, Intrinsic::SetContains { .. }) {
+                heap.set_contains(arguments[0], arguments[1])?
+            } else {
+                heap.set_remove(arguments[0], arguments[1])?
+            };
+            returned(RuntimeValue::Bool(result))
+        }
+        Intrinsic::SetInsert { .. } => {
+            match heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .set_insert(arguments[0], arguments[1])?
+            {
+                crate::SetInsertOutcome::Complete(inserted) => {
+                    returned(RuntimeValue::Bool(inserted))
+                }
+                crate::SetInsertOutcome::RehashPending => Ok(StandardIntrinsicOutcome::Retry),
+            }
+        }
+        Intrinsic::MapIsEmpty { .. } => {
+            let length = heap
+                .as_deref()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .map_len(arguments[0])?;
+            returned(RuntimeValue::Bool(length == 0))
+        }
+        Intrinsic::MapInsertIfAbsent { .. } => {
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            if heap.map_contains(arguments[0], arguments[1])? {
+                return returned(RuntimeValue::Bool(false));
+            }
+            match heap.map_set(arguments[0], arguments[1], arguments[2])? {
+                MapSetOutcome::Complete => returned(RuntimeValue::Bool(true)),
+                MapSetOutcome::RehashPending => Ok(StandardIntrinsicOutcome::Retry),
+            }
+        }
+        Intrinsic::BufferIsEmpty { .. } => {
+            let length = heap
+                .as_deref()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .buffer_len(arguments[0])?;
+            returned(RuntimeValue::Bool(length == 0))
+        }
+        Intrinsic::BufferFill { .. } => {
+            let heap = heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?;
+            let length = heap.buffer_len(arguments[0])?;
+            heap.buffer_fill(arguments[0], 0, length, arguments[1])?;
+            returned(RuntimeValue::Bool(true))
+        }
+        Intrinsic::ArraySwap { .. } => {
+            let RuntimeValue::I32(lhs) = arguments[1] else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let RuntimeValue::I32(rhs) = arguments[2] else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let (Ok(lhs), Ok(rhs)) = (usize::try_from(lhs), usize::try_from(rhs)) else {
+                return Ok(StandardIntrinsicOutcome::Trapped(
+                    "array swap indices must be non-negative".into(),
+                ));
+            };
+            match heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_swap(arguments[0], lhs, rhs)
+            {
+                Ok(()) => returned(RuntimeValue::Bool(true)),
+                Err(HeapError::IndexOutOfBounds { .. }) => Ok(StandardIntrinsicOutcome::Trapped(
+                    "array swap index out of bounds".into(),
+                )),
+                Err(error) => Err(InterpreterError::Heap(error)),
+            }
+        }
+        Intrinsic::ArrayReverse { .. } => {
+            heap.as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_reverse(arguments[0])?;
             returned(RuntimeValue::Bool(true))
         }
         Intrinsic::ArrayShrinkToFit { .. } => {
@@ -7415,6 +8143,14 @@ pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::MapRemove { .. }
         | Instruction::MapContains { .. }
         | Instruction::MapClear { .. }
+        | Instruction::SetNew { .. }
+        | Instruction::SetLen { .. }
+        | Instruction::SetContains { .. }
+        | Instruction::SetInsert { .. }
+        | Instruction::SetRemove { .. }
+        | Instruction::SetClear { .. }
+        | Instruction::IterNew { .. }
+        | Instruction::IterNext { .. }
         | Instruction::BufferLen { .. }
         | Instruction::BufferGet { .. }
         | Instruction::BufferSet { .. }
@@ -7475,13 +8211,13 @@ macro_rules! define_opcode_cost_schedule {
             }
         ),+ $(,)?
     ) => {
-        const DEFAULT_OPCODE_COSTS: [u16; 111] = [$($base_cost),+];
+        const DEFAULT_OPCODE_COSTS: [u16; 119] = [$($base_cost),+];
 
         /// Stable opcode display names indexed by `opcode_index` (WP15).
-        pub(crate) const OPCODE_NAMES: [&str; 111] = [$($name),+];
+        pub(crate) const OPCODE_NAMES: [&str; 119] = [$($name),+];
 
         #[cfg(test)]
-        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 111] = [
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 119] = [
             $(
                 OpcodeCostScheduleEntry {
                     index: $index,
@@ -7846,6 +8582,44 @@ define_opcode_cost_schedule! {
         base_cost: 1,
         dynamic_work: "ceil(physical_slots/8)"
     },
+    Instruction::SetNew { .. } => {
+        index: 111,
+        name: "SetNew",
+        base_cost: 1,
+        dynamic_work: "set_type_index_scan"
+    },
+    Instruction::SetLen { .. } => { index: 112, name: "SetLen", base_cost: 1 },
+    Instruction::SetContains { .. } => {
+        index: 113,
+        name: "SetContains",
+        base_cost: 1,
+        dynamic_work: "set_lookup_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::SetInsert { .. } => {
+        index: 114,
+        name: "SetInsert",
+        base_cost: 1,
+        dynamic_work: "set_insert_attempt_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::SetRemove { .. } => {
+        index: 115,
+        name: "SetRemove",
+        base_cost: 1,
+        dynamic_work: "set_lookup_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::SetClear { .. } => {
+        index: 116,
+        name: "SetClear",
+        base_cost: 1,
+        dynamic_work: "ceil((current_slots+old_slots+new_slots)/8)"
+    },
+    Instruction::IterNew { .. } => { index: 117, name: "IterNew", base_cost: 1 },
+    Instruction::IterNext { .. } => {
+        index: 118,
+        name: "IterNext",
+        base_cost: 1,
+        dynamic_work: "collection_scan_bound"
+    },
 }
 
 #[cfg(test)]
@@ -7853,23 +8627,26 @@ mod tests {
     use std::fmt::Write as _;
 
     use nexa_bytecode::{
-        AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-        ModuleBuilder, RootMap, SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
-        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, Signature,
-        SourceMapEntry, StandardIntrinsic, StructField, StructType, ValueType,
+        AsyncResultType, CollectionIteratorKind, FunctionBuilder, FunctionEffect, HostCallMode,
+        HostImport, Instruction, IteratorStateRegisters, ModuleBuilder, RootMap,
+        SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
+        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, SetType,
+        Signature, SourceMapEntry, StandardIntrinsic, StructField, StructType, ValueType,
     };
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{
-        CheckedInterpreter, FuelState, InterpreterError, InterpreterHost, InterpreterHostArguments,
-        InterpreterHostOutcome, InterpreterMigration, InterpreterOutcome, OPCODE_COST_SCHEDULE,
-        StandardIntrinsicOutcome, SuspendReason, allocate_runtime_string,
-        ensure_host_call_available, fuel_add, fuel_blocks, run_standard_intrinsic,
+        CheckedInterpreter, DynamicFuelPlan, FuelState, InterpreterError, InterpreterHost,
+        InterpreterHostArguments, InterpreterHostOutcome, InterpreterMigration, InterpreterOutcome,
+        OPCODE_COST_SCHEDULE, StandardIntrinsicOutcome, SuspendReason, TrapKind,
+        allocate_runtime_string, dynamic_instruction_fuel, ensure_host_call_available, fuel_add,
+        fuel_blocks, run_standard_intrinsic,
     };
     use crate::{
-        ContinuationReservation, ExecutableModule, FrameError, FrameLimits, GcRoots, Heap,
-        HeapError, HostTrap, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
+        ContinuationReservation, ExecutableModule, FrameArena, FrameError, FrameLimits, GcRoots,
+        Heap, HeapError, HostTrap, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
+        executable::ExecutableNominalOperand,
     };
 
     #[test]
@@ -8590,9 +9367,9 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
-    fn bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture() {
-        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 7);
-        assert_eq!(OPCODE_COST_SCHEDULE.len(), 111);
+    fn bytecode_v8_opcode_cost_schedule_matches_the_frozen_fixture() {
+        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 8);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 119);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
         assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);
@@ -8636,7 +9413,7 @@ fn work(x: i32) -> i32 {
         .unwrap();
         assert_eq!(
             rendered,
-            include_str!("../fixtures/opcode-cost-table-v7.txt")
+            include_str!("../fixtures/opcode-cost-table-v8.txt")
         );
 
         let mut mismatched = table;
@@ -11319,6 +12096,318 @@ fn work(x: i32) -> i32 {
         assert_eq!(
             fuel_blocks(u64::MAX, STANDARD_STRING_FUEL_BLOCK_BYTES),
             Ok(576_460_752_303_423_488)
+        );
+    }
+
+    // ---- `LANGUAGE_V3` runtime tests (compiled source fixtures) ----
+
+    const V3_SET_SUM: &str = r"
+pub fn run() -> i32 {
+    let s: Set<i32> = Set::new();
+    s.insert(10);
+    s.insert(20);
+    s.insert(30);
+    let total: i32 = 0;
+    for item in s { let total: i32 = total + item; }
+    return total;
+}
+";
+
+    const V3_INDIRECT_INSERT_TRAP: &str = r"
+fn mutate(s: Set<i32>) {
+    s.insert(20);
+}
+pub fn run() -> i32 {
+    let s: Set<i32> = Set::new();
+    s.insert(10);
+    let total: i32 = 0;
+    for item in s { let total: i32 = total + item; mutate(s); }
+    return total;
+}
+";
+
+    const V3_INDIRECT_OVERWRITE_TRAP: &str = r"
+fn overwrite(m: Map<i32, i32>) {
+    m.set(1, 9);
+}
+pub fn run() -> i32 {
+    let m: Map<i32, i32> = Map::new();
+    m.set(1, 7);
+    let total: i32 = 0;
+    for (k, v) in m { let total: i32 = total + k + v; overwrite(m); }
+    return total;
+}
+";
+
+    const V3_READS_AND_DUPLICATE_INSERT: &str = r"
+fn touch(s: Set<i32>) -> i32 {
+    let duplicate: bool = s.insert(10);
+    return s.len();
+}
+pub fn run() -> i32 {
+    let s: Set<i32> = Set::new();
+    s.insert(10);
+    let total: i32 = 0;
+    for item in s {
+        let total: i32 = total + item;
+        let present: bool = s.contains(item);
+        let length: i32 = touch(s);
+    }
+    return total;
+}
+";
+
+    const V3_MAP_SUM: &str = r"
+pub fn run() -> i32 {
+    let m: Map<i32, i32> = Map::new();
+    m.set(5, 7);
+    let total: i32 = 0;
+    for (k, v) in m { let total: i32 = total + k + v; }
+    return total;
+}
+";
+
+    const V3_DYNAMIC_RANGE: &str = r"
+pub fn run(start: i32, end: i32) -> i32 {
+    let total: i32 = 0;
+    for i in start..end { let total: i32 = total + i; }
+    return total;
+}
+";
+
+    fn v3_source(source: &str) -> (nexa_verifier::VerifiedModule, ExecutableModule) {
+        let module = nexa_compiler::compile(source).expect("language v3 source compiles");
+        let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
+            .expect("language v3 executable");
+        (module, executable)
+    }
+
+    fn v3_module_contains(
+        module: &nexa_verifier::VerifiedModule,
+        expected: impl Fn(Instruction) -> bool,
+    ) -> bool {
+        module
+            .module()
+            .functions
+            .iter()
+            .flat_map(|function| function.code.iter().copied())
+            .any(expected)
+    }
+
+    fn v3_returned_value(outcome: InterpreterOutcome) -> RuntimeValue {
+        match outcome {
+            InterpreterOutcome::Returned { value, .. } => value.expect("i32 result"),
+            other => panic!("expected Returned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_set_source_iteration_exhausts_without_iterator_allocation() {
+        let (module, executable) = v3_source(V3_SET_SUM);
+        // The source fixture must lower to the v8 wire, not a fabricated
+        // tuple path.
+        assert!(v3_module_contains(&module, |i| matches!(
+            i,
+            Instruction::SetNew { .. }
+        )));
+        assert!(v3_module_contains(&module, |i| matches!(
+            i,
+            Instruction::IterNew { .. }
+        )));
+        assert!(v3_module_contains(&module, |i| matches!(
+            i,
+            Instruction::IterNext { .. }
+        )));
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let portable = CheckedInterpreter::run_with_heap(&module, 0, &[], 4_096, &mut heap)
+            .expect("portable language v3 execution");
+        assert_eq!(v3_returned_value(portable), RuntimeValue::I32(60));
+        let dense = CheckedInterpreter::run_with_heap_and_executable(
+            &module,
+            0,
+            &[],
+            4_096,
+            &mut heap,
+            &executable,
+        )
+        .expect("dense language v3 execution");
+        assert_eq!(v3_returned_value(dense), RuntimeValue::I32(60));
+        assert_eq!(
+            heap.vm_allocation_counters().object_allocations,
+            1,
+            "only the set object is allocated; iteration is heap-free"
+        );
+    }
+
+    #[test]
+    fn v3_iteration_traps_on_indirect_insert_and_value_overwrite() {
+        for source in [V3_INDIRECT_INSERT_TRAP, V3_INDIRECT_OVERWRITE_TRAP] {
+            let (module, executable) = v3_source(source);
+            let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+            let outcome = CheckedInterpreter::run_with_heap_and_executable(
+                &module,
+                0,
+                &[],
+                4_096,
+                &mut heap,
+                &executable,
+            )
+            .expect("language v3 execution");
+            assert!(
+                matches!(
+                    &outcome,
+                    InterpreterOutcome::Trapped { trap, .. }
+                        if trap.kind == TrapKind::CollectionMutatedDuringIteration
+                ),
+                "indirect mutation inside the loop must trap: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_reads_and_duplicate_insert_do_not_trap_during_iteration() {
+        let (module, executable) = v3_source(V3_READS_AND_DUPLICATE_INSERT);
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let outcome = CheckedInterpreter::run_with_heap_and_executable(
+            &module,
+            0,
+            &[],
+            4_096,
+            &mut heap,
+            &executable,
+        )
+        .expect("language v3 execution");
+        assert_eq!(v3_returned_value(outcome), RuntimeValue::I32(10));
+    }
+
+    #[test]
+    fn v3_map_iteration_writes_key_and_value_payloads() {
+        let (module, executable) = v3_source(V3_MAP_SUM);
+        assert!(v3_module_contains(&module, |i| matches!(
+            i,
+            Instruction::IterNext { .. }
+        )));
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let outcome = CheckedInterpreter::run_with_heap_and_executable(
+            &module,
+            0,
+            &[],
+            4_096,
+            &mut heap,
+            &executable,
+        )
+        .expect("language v3 execution");
+        assert_eq!(v3_returned_value(outcome), RuntimeValue::I32(12));
+    }
+
+    #[test]
+    fn v3_range_iteration_handles_i32_boundaries() {
+        let (module, executable) = v3_source(V3_DYNAMIC_RANGE);
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let run = |arguments: &[RuntimeValue], heap: &mut Heap| {
+            v3_returned_value(
+                CheckedInterpreter::run_with_heap_and_executable(
+                    &module,
+                    0,
+                    arguments,
+                    4_096,
+                    heap,
+                    &executable,
+                )
+                .expect("language v3 execution"),
+            )
+        };
+        // MAX-2..MAX yields exactly three values summing to 2147483642.
+        assert_eq!(
+            run(
+                &[RuntimeValue::I32(i32::MAX - 2), RuntimeValue::I32(i32::MAX)],
+                &mut heap
+            ),
+            RuntimeValue::I32(2_147_483_642)
+        );
+        // The full i32 span counts in i64: MIN..MIN+2 wraps to 1.
+        assert_eq!(
+            run(
+                &[RuntimeValue::I32(i32::MIN), RuntimeValue::I32(i32::MIN + 2)],
+                &mut heap
+            ),
+            RuntimeValue::I32(1)
+        );
+        // A descending range yields nothing.
+        assert_eq!(
+            run(&[RuntimeValue::I32(5), RuntimeValue::I32(3)], &mut heap),
+            RuntimeValue::I32(0)
+        );
+    }
+
+    #[test]
+    fn v3_range_iternext_attempt_fuel_never_touches_the_heap() {
+        let (module, _) = v3_source(V3_DYNAMIC_RANGE);
+        let instruction = Instruction::IterNext {
+            kind: CollectionIteratorKind::Range,
+            state: IteratorStateRegisters {
+                collection: 0,
+                phase: 1,
+                slot: 2,
+                epoch: 3,
+            },
+            has_value_dst: 4,
+            first_dst: 5,
+            second_dst: None,
+        };
+        let arena = FrameArena::new(FrameLimits::default());
+        let work = dynamic_instruction_fuel(
+            instruction,
+            &arena,
+            None,
+            DynamicFuelPlan {
+                module: module.module(),
+                nominal_shape: module.nominal_index_shape(),
+                costs: OpcodeCostTable::canonical(),
+                resolved: ExecutableNominalOperand::None,
+                predecoded_base: None,
+            },
+        )
+        .expect("heap-free range IterNext fuel");
+        assert_eq!(work, 1, "Range IterNext charges only the base cost");
+    }
+
+    #[test]
+    fn v3_fuel_shortage_does_not_advance_iterator_state() {
+        let (module, executable) = v3_source(V3_SET_SUM);
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        // A budget that settles the set construction but cannot settle the
+        // first IterNext attempt suspends before any iterator state moves.
+        let outcome = CheckedInterpreter::run_with_heap_and_executable(
+            &module,
+            0,
+            &[],
+            8,
+            &mut heap,
+            &executable,
+        )
+        .expect("language v3 execution");
+        let continuation = match outcome {
+            InterpreterOutcome::Suspended {
+                continuation,
+                reason: SuspendReason::Fuel,
+                ..
+            } => continuation,
+            other => panic!("expected fuel suspension, got {other:?}"),
+        };
+        let resumed = CheckedInterpreter::poll_with_heap_and_executable(
+            &module,
+            continuation,
+            FuelState::new(4_096, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            &mut heap,
+            &executable,
+        )
+        .expect("resumed language v3 execution");
+        assert_eq!(
+            v3_returned_value(resumed),
+            RuntimeValue::I32(60),
+            "the suspended IterNext must still yield from the start: state was not advanced"
         );
     }
 }
