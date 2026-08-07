@@ -11,6 +11,8 @@ pub mod collections;
 pub mod core;
 pub mod debug;
 pub mod math;
+pub mod set;
+pub mod buffer;
 pub mod string;
 
 pub use model::{
@@ -35,11 +37,13 @@ pub const CANONICAL_PACKAGE_ID: &str = "nexa.stdlib@1.0.0";
 /// fingerprints.
 const DESCRIPTOR_IDENTITY_PREFIX: &[u8] = b"nexa.stdlib.descriptor.v1\0";
 
-static MODULES: [ModuleDescriptor; 5] = [
+static MODULES: [ModuleDescriptor; 7] = [
     core::MODULE,
     math::MODULE,
     string::MODULE,
     collections::MODULE,
+    set::MODULE,
+    buffer::MODULE,
     debug::MODULE,
 ];
 

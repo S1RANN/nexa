@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::{
     CANONICAL_PACKAGE_ID, DESCRIPTOR_SCHEMA_VERSION, Effect, Intrinsic, Lowering, PACKAGE_ID,
-    Termination, VERSION, canonical_descriptor_identity, collections, core as std_core, debug,
-    math, standard_library, string,
+    Termination, VERSION, canonical_descriptor_identity, buffer, collections, core as std_core,
+    debug, math, set, standard_library, string,
 };
 
 #[test]
@@ -24,6 +24,8 @@ fn versioned_module_set_is_fixed_and_resolvable() {
             ("math", "std.math"),
             ("string", "std.string"),
             ("collections", "std.collections"),
+            ("set", "std.set"),
+            ("buffer", "std.buffer"),
             ("debug", "std.debug"),
         ]
     );
@@ -135,6 +137,33 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
                 "map_get",
                 "map_insert",
                 "map_remove",
+                "array_first",
+                "array_last",
+                "array_swap",
+                "array_reverse",
+                "map_is_empty",
+                "map_get_or",
+                "map_insert_if_absent",
+            ],
+        ),
+        (
+            "set",
+            &["Set"],
+            &[
+                "set_new",
+                "set_len",
+                "set_contains",
+                "set_insert",
+                "set_remove",
+                "set_clear",
+            ],
+        ),
+        (
+            "buffer",
+            &["Buffer"],
+            &[
+                "buffer_is_empty",
+                "buffer_fill",
             ],
         ),
         ("debug", &[], &["assert", "trap"]),
@@ -206,6 +235,24 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
         ),
         ("collections::map_insert", Intrinsic::MapInsert),
         ("collections::map_remove", Intrinsic::MapRemove),
+        ("collections::map_is_empty", Intrinsic::MapIsEmpty),
+        ("collections::map_get_or", Intrinsic::MapGetOr),
+        (
+            "collections::map_insert_if_absent",
+            Intrinsic::MapInsertIfAbsent,
+        ),
+        ("collections::array_first", Intrinsic::ArrayFirst),
+        ("collections::array_last", Intrinsic::ArrayLast),
+        ("collections::array_swap", Intrinsic::ArraySwap),
+        ("collections::array_reverse", Intrinsic::ArrayReverse),
+        ("set::set_new", Intrinsic::SetNew),
+        ("set::set_len", Intrinsic::SetLen),
+        ("set::set_contains", Intrinsic::SetContains),
+        ("set::set_insert", Intrinsic::SetInsert),
+        ("set::set_remove", Intrinsic::SetRemove),
+        ("set::set_clear", Intrinsic::SetClear),
+        ("buffer::buffer_is_empty", Intrinsic::BufferIsEmpty),
+        ("buffer::buffer_fill", Intrinsic::BufferFill),
         ("debug::assert", Intrinsic::DebugAssert),
         ("debug::trap", Intrinsic::DebugTrap),
     ];
@@ -250,9 +297,9 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(library.version.to_string(), "1.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0xf8b2_fd21_0b5d_acbf);
+    assert_eq!(library.descriptor_hash().0, 0xdf66_59e1_02e8_ed06);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.symbols().count(), 79);
+    assert_eq!(library.symbols().count(), 96);
 
     let canonical_lower = canonical.to_ascii_lowercase();
     for forbidden in [
@@ -277,7 +324,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0xf8b2_fd21_0b5d_acbf);
+    assert_eq!(library.descriptor_hash().0, 0xdf66_59e1_02e8_ed06);
 
     let symbols = library
         .symbols()
@@ -618,6 +665,40 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
     assert_eq!(collections::map_remove(&mut map, &"key"), Some(7));
     assert!(map.is_empty());
 
+    let mut values = vec![1, 2, 3];
+    assert_eq!(collections::array_first(&values), Ok(&1));
+    assert_eq!(collections::array_last(&values), Ok(&3));
+    assert!(collections::array_swap(&mut values, 0, 2).is_ok());
+    assert_eq!(values, [3, 2, 1]);
+    assert!(collections::array_reverse(&mut values));
+    assert_eq!(values, [1, 2, 3]);
+    assert!(collections::array_first::<i32>(&[]).is_err());
+    assert!(collections::array_swap(&mut [1], 0, 1).is_err());
+
+    let mut map = BTreeMap::from([("a", 1), ("b", 2)]);
+    assert!(!collections::map_is_empty(&map));
+    assert_eq!(collections::map_get_or(&map, &"a", 0), 1);
+    assert_eq!(collections::map_get_or(&map, &"z", 99), 99);
+    assert!(collections::map_insert_if_absent(&mut map, "c", 3));
+    assert!(!collections::map_insert_if_absent(&mut map, "a", 99));
+
+    let mut set = HashSet::new();
+    assert!(set::set_insert(&mut set, 1));
+    assert!(set::set_insert(&mut set, 2));
+    assert_eq!(set::set_len(&set), 2);
+    assert!(set::set_contains(&set, &1));
+    assert!(!set::set_contains(&set, &3));
+    assert!(set::set_remove(&mut set, &1));
+    assert!(!set::set_remove(&mut set, &1));
+    assert!(set::set_clear(&mut set));
+    assert_eq!(set::set_len(&set), 0);
+
+    let mut buf = vec![0i32; 5];
+    assert!(!buffer::buffer_is_empty(&buf));
+    assert!(buffer::buffer_fill(&mut buf, 42));
+    assert_eq!(buf, [42, 42, 42, 42, 42]);
+    assert!(buffer::buffer_is_empty::<i32>(&[]));
+
     let library = standard_library();
     for (name, intrinsic) in [
         ("collections::array_push", Intrinsic::ArrayPush),
@@ -630,6 +711,16 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
         ),
         ("collections::map_insert", Intrinsic::MapInsert),
         ("collections::map_remove", Intrinsic::MapRemove),
+        ("collections::array_swap", Intrinsic::ArraySwap),
+        ("collections::array_reverse", Intrinsic::ArrayReverse),
+        (
+            "collections::map_insert_if_absent",
+            Intrinsic::MapInsertIfAbsent,
+        ),
+        ("set::set_insert", Intrinsic::SetInsert),
+        ("set::set_remove", Intrinsic::SetRemove),
+        ("set::set_clear", Intrinsic::SetClear),
+        ("buffer::buffer_fill", Intrinsic::BufferFill),
     ] {
         let (_, function) = library.function(name).expect("collection descriptor");
         assert_eq!(function.lowering, Lowering::CompilerIntrinsic(intrinsic));

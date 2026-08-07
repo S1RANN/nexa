@@ -159,6 +159,81 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         behavior: FunctionBehavior::MUTATES_AND_ALLOCATES,
         contract: "removes and returns the value associated with key, or None",
     },
+    FunctionDescriptor {
+        name: "array_first",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "T",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayFirst),
+        behavior: FunctionBehavior::MAY_TRAP,
+        contract: "first element, or traps when the array is empty",
+    },
+    FunctionDescriptor {
+        name: "array_last",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "T",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayLast),
+        behavior: FunctionBehavior::MAY_TRAP,
+        contract: "last element, or traps when the array is empty",
+    },
+    FunctionDescriptor {
+        name: "array_swap",
+        type_parameters: &["T"],
+        parameters: &[
+            ParameterDescriptor::new("values", "Array<T>"),
+            ParameterDescriptor::new("a", "i32"),
+            ParameterDescriptor::new("b", "i32"),
+        ],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArraySwap),
+        behavior: FunctionBehavior::MUTATES_OR_TRAPS,
+        contract: "swaps two elements by index and returns true; traps when either index is out of bounds",
+    },
+    FunctionDescriptor {
+        name: "array_reverse",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayReverse),
+        behavior: FunctionBehavior::MUTATES,
+        contract: "reverses the array in place and returns true",
+    },
+    FunctionDescriptor {
+        name: "map_is_empty",
+        type_parameters: &["K", "V"],
+        parameters: &[ParameterDescriptor::new("values", "Map<K,V>")],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::MapIsEmpty),
+        behavior: FunctionBehavior::TOTAL,
+        contract: "true exactly when the map has no entries",
+    },
+    FunctionDescriptor {
+        name: "map_get_or",
+        type_parameters: &["K", "V"],
+        parameters: &[
+            ParameterDescriptor::new("values", "Map<K,V>"),
+            ParameterDescriptor::new("key", "K"),
+            ParameterDescriptor::new("default", "V"),
+        ],
+        result: "V",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::MapGetOr),
+        behavior: FunctionBehavior::TOTAL,
+        contract: "value associated with key, or the default value when key is absent",
+    },
+    FunctionDescriptor {
+        name: "map_insert_if_absent",
+        type_parameters: &["K", "V"],
+        parameters: &[
+            ParameterDescriptor::new("values", "Map<K,V>"),
+            ParameterDescriptor::new("key", "K"),
+            ParameterDescriptor::new("value", "V"),
+        ],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::MapInsertIfAbsent),
+        behavior: FunctionBehavior::MUTATES_AND_ALLOCATES,
+        contract: "inserts value only when key is absent and returns true on insertion",
+    },
 ];
 
 pub(crate) const MODULE: ModuleDescriptor = ModuleDescriptor {
@@ -173,12 +248,14 @@ pub(crate) const MODULE: ModuleDescriptor = ModuleDescriptor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectionError {
     EmptyArray,
+    IndexOutOfBounds,
 }
 
 impl fmt::Display for CollectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyArray => formatter.write_str("cannot pop an empty array"),
+            Self::IndexOutOfBounds => formatter.write_str("index out of bounds"),
         }
     }
 }
@@ -252,4 +329,46 @@ pub fn map_insert<K: Ord, V>(values: &mut BTreeMap<K, V>, key: K, value: V) -> b
 
 pub fn map_remove<K: Ord, V>(values: &mut BTreeMap<K, V>, key: &K) -> Option<V> {
     values.remove(key)
+}
+
+pub fn array_first<T>(values: &[T]) -> Result<&T, CollectionError> {
+    values.first().ok_or(CollectionError::EmptyArray)
+}
+
+pub fn array_last<T>(values: &[T]) -> Result<&T, CollectionError> {
+    values.last().ok_or(CollectionError::EmptyArray)
+}
+
+pub fn array_swap<T>(values: &mut [T], a: usize, b: usize) -> Result<bool, CollectionError> {
+    if a >= values.len() || b >= values.len() {
+        return Err(CollectionError::IndexOutOfBounds);
+    }
+    values.swap(a, b);
+    Ok(true)
+}
+
+pub fn array_reverse<T>(values: &mut [T]) -> bool {
+    values.reverse();
+    true
+}
+
+#[must_use]
+pub fn map_is_empty<K, V>(values: &BTreeMap<K, V>) -> bool {
+    values.is_empty()
+}
+
+#[must_use]
+pub fn map_get_or<K: Ord, V: Clone>(values: &BTreeMap<K, V>, key: &K, default: V) -> V {
+    values.get(key).cloned().unwrap_or(default)
+}
+
+pub fn map_insert_if_absent<K: Ord, V>(values: &mut BTreeMap<K, V>, key: K, value: V) -> bool {
+    use std::collections::btree_map::Entry;
+    match values.entry(key) {
+        Entry::Vacant(entry) => {
+            entry.insert(value);
+            true
+        }
+        Entry::Occupied(_) => false,
+    }
 }
