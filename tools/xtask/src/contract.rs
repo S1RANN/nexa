@@ -388,19 +388,24 @@ fn walk_editor(root: &Path, relative: &Path, violations: &mut Vec<String>) {
         return;
     }
     let content = fs::read_to_string(&path).unwrap_or_default();
-    if content.contains("*.nidl") || content.contains("\".nidl\"") {
-        // Only allowlist specific lines where `*.nidl` appears in migration-guide context
-        if relative.ends_with("editors/README.md") {
-            let is_allowed = content.lines().any(|line| {
-                line.contains("*.nidl") && line.contains("migration diagnostic")
-            });
-            if is_allowed {
-                return;
-            }
+    // Iterate every hit line. Only a hit line that itself is the specific
+    // migration-guide line in editors/README.md is skipped; any other hit fails.
+    for (index, line) in content.lines().enumerate() {
+        if !line.contains("*.nidl") && !line.contains("\".nidl\"") {
+            continue;
+        }
+        // Exact allowlist: a single line in editors/README.md that both names
+        // the old extension and describes the migration diagnostic.
+        if relative.ends_with("editors/README.md")
+            && line.contains("migration diagnostic")
+        {
+            continue;
         }
         violations.push(format!(
-            "old `*.nidl` editor association survives in {}",
-            relative.display()
+            "old `*.nidl` editor association survives in {}:{}: {}",
+            relative.display(),
+            index + 1,
+            line.trim()
         ));
     }
 }
@@ -929,5 +934,20 @@ mod tests {
         };
         let aggregate_fail = !workspace.passed || !doc.passed;
         assert!(aggregate_fail, "aggregate must be FAIL when workspace failed");
+    }
+
+    #[test]
+    fn scanner_rejects_second_nidl_association_line_in_readme() {
+        let root = test_root("rejects_readme_two_lines");
+        std::fs::create_dir_all(root.join("editors")).unwrap();
+        // Line 1: valid migration diagnostic. Line 2: a second illegal .nidl association.
+        write_file(&root, "editors/README.md",
+            "Legacy `*.nidl` files receive a migration diagnostic pointing at the new suffix.\naddBlockComment: {begin: \".nidl\"}\n");
+        // Exercise walk_editor over the editors directory so README is scanned recursively.
+        let mut violations = Vec::new();
+        walk_editor(&root, Path::new("editors"), &mut violations);
+        assert!(!violations.is_empty(), "should detect the second illegal .nidl association line");
+        assert!(violations.iter().any(|v| v.contains(".nidl") && v.contains("README.md")),
+            "violations should cite the README line with the illegal association");
     }
 }
