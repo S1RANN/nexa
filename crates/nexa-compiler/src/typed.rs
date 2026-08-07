@@ -11,22 +11,23 @@ use crate::package::{
     standard_library_info,
 };
 use nexa_analysis::{
-    BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, DeclarationVisibility, Definition,
-    DefinitionId, DefinitionKind, HostAsyncResultIr, HostTypeLayoutIr, IrAbandonPolicy,
-    IrCancelPolicy, IrCompilationKind, IrEffect, IrHostFunctionMode, IrLiteral, IrType,
-    MigrationIntrinsicIr, ModulePath, SourceKey, SourceRange, StateTypeIr, TypedBlockIr,
-    TypedDeclarationBody, TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedPackageIr,
-    TypedPatternIr, TypedPatternKind, TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr,
-    UnaryOperator,
+    BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, CollectionIterationKindIr,
+    DeclarationVisibility, Definition, DefinitionId, DefinitionKind, HostAsyncResultIr,
+    HostTypeLayoutIr, IrAbandonPolicy, IrCancelPolicy, IrCompilationKind, IrEffect,
+    IrHostFunctionMode, IrLiteral, IrType, MigrationIntrinsicIr, ModulePath, SourceKey,
+    SourceRange, StateTypeIr, TypedBlockIr, TypedDeclarationBody, TypedExpressionIr,
+    TypedExpressionKind, TypedFunctionIr, TypedPackageIr, TypedPatternIr, TypedPatternKind,
+    TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr, UnaryOperator,
 };
 use nexa_bytecode::layout::LayoutTable;
 use nexa_bytecode::{
-    AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
-    EnumVariant, Function, FunctionEffect, HostCallMode, HostImport, Instruction, LoopBound,
-    MapType, Module, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature,
-    SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema,
-    StateType, StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type,
-    map_type, option_type, parameterized_type_id, resource_token_type, result_type, snapshot_type,
+    AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType,
+    CollectionIteratorKind, EnumType, EnumVariant, Function, FunctionEffect, HostCallMode,
+    HostImport, Instruction, IteratorStateRegisters, LoopBound, MapType, Module, ModuleBuilder,
+    ResourceTokenType, RootMap, ScriptExport, SetType, Signature, SnapshotType, SourceMapEntry,
+    StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
+    StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type, map_type,
+    option_type, parameterized_type_id, resource_token_type, result_type, set_type, snapshot_type,
     state_handle_type,
 };
 use nexa_core::{CanonicalSymbolIdentity, FileId, SourceSpan, StableId, StableSymbolId};
@@ -79,6 +80,15 @@ struct LoopPatch {
 enum TypedStandardLowering {
     Intrinsic(StandardIntrinsic),
     ToString(TypedScalarToString),
+    /// `Set::new` has no intrinsic form: the bytecode surface is a plain
+    /// `SetNew` instruction carrying the instantiated type id.
+    SetNew {
+        element: ValueType,
+    },
+    /// `Set::clear` returns `()` and has no intrinsic form.
+    SetClear {
+        element: ValueType,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1603,7 +1613,9 @@ fn validate_repl_defer_block<'a>(
                 }
             }
             TypedStatementIr::While { body, .. }
-            | TypedStatementIr::StaticRangeFor { body, .. } => {
+            | TypedStatementIr::StaticRangeFor { body, .. }
+            | TypedStatementIr::DynamicRangeFor { body, .. }
+            | TypedStatementIr::CollectionFor { body, .. } => {
                 validate_repl_defer_block(package, functions, body, referenced_helpers, span)?;
             }
             TypedStatementIr::Let { .. }
@@ -1728,7 +1740,9 @@ fn validate_repl_new_field_writes(
                 }
             }
             TypedStatementIr::While { body, .. }
-            | TypedStatementIr::StaticRangeFor { body, .. } => {
+            | TypedStatementIr::StaticRangeFor { body, .. }
+            | TypedStatementIr::DynamicRangeFor { body, .. }
+            | TypedStatementIr::CollectionFor { body, .. } => {
                 let pending = expected
                     .difference(&initialized)
                     .copied()
@@ -1796,6 +1810,16 @@ fn repl_statement_reads_pending_field(
             reads(start)
                 || reads(end)
                 || repl_block_reads_pending_field(body, expected, initialized)
+        }
+        TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
+        } => {
+            reads(start)
+                || reads(end)
+                || repl_block_reads_pending_field(body, expected, initialized)
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            reads(iterable) || repl_block_reads_pending_field(body, expected, initialized)
         }
         TypedStatementIr::Defer { captures, .. } => captures.iter().any(reads),
         TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {
@@ -1949,7 +1973,10 @@ fn repl_block_writes_any_field(block: &TypedBlockIr, expected: &BTreeSet<Definit
                     .as_ref()
                     .is_some_and(|block| repl_block_writes_any_field(block, expected))
         }
-        TypedStatementIr::While { body, .. } | TypedStatementIr::StaticRangeFor { body, .. } => {
+        TypedStatementIr::While { body, .. }
+        | TypedStatementIr::StaticRangeFor { body, .. }
+        | TypedStatementIr::DynamicRangeFor { body, .. }
+        | TypedStatementIr::CollectionFor { body, .. } => {
             repl_block_writes_any_field(body, expected)
         }
         TypedStatementIr::Let { .. }
@@ -2410,6 +2437,8 @@ fn inline_array_candidate_capacity(
             TypedStatementIr::If { .. }
             | TypedStatementIr::While { .. }
             | TypedStatementIr::StaticRangeFor { .. }
+            | TypedStatementIr::DynamicRangeFor { .. }
+            | TypedStatementIr::CollectionFor { .. }
             | TypedStatementIr::Defer { .. } => {
                 if statement_references_definition(statement, definition) {
                     return None;
@@ -2592,6 +2621,8 @@ fn inline_map_candidate_is_scalar(function: &TypedFunctionIr, definition: Defini
             TypedStatementIr::If { .. }
             | TypedStatementIr::While { .. }
             | TypedStatementIr::StaticRangeFor { .. }
+            | TypedStatementIr::DynamicRangeFor { .. }
+            | TypedStatementIr::CollectionFor { .. }
             | TypedStatementIr::Defer { .. } => {
                 if statement_references_definition(statement, definition) {
                     return false;
@@ -2759,6 +2790,17 @@ fn statement_references_definition(statement: &TypedStatementIr, definition: Def
                 || expression_references_definition(end, definition)
                 || block_references_definition(body, definition)
         }
+        TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
+        } => {
+            expression_references_definition(start, definition)
+                || expression_references_definition(end, definition)
+                || block_references_definition(body, definition)
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            expression_references_definition(iterable, definition)
+                || block_references_definition(body, definition)
+        }
         TypedStatementIr::Defer { captures, .. } => captures
             .iter()
             .any(|capture| expression_references_definition(capture, definition)),
@@ -2817,7 +2859,9 @@ fn collect_inline_class_candidates(
                 }
             }
             TypedStatementIr::While { body, .. }
-            | TypedStatementIr::StaticRangeFor { body, .. } => {
+            | TypedStatementIr::StaticRangeFor { body, .. }
+            | TypedStatementIr::DynamicRangeFor { body, .. }
+            | TypedStatementIr::CollectionFor { body, .. } => {
                 collect_inline_class_candidates(body, candidates);
             }
             _ => {}
@@ -2874,6 +2918,17 @@ fn inline_class_statement_is_scalar(
         } => {
             inline_class_expression_is_scalar(start, definition)
                 && inline_class_expression_is_scalar(end, definition)
+                && inline_class_block_is_scalar(body, definition)
+        }
+        TypedStatementIr::DynamicRangeFor {
+            start, end, body, ..
+        } => {
+            inline_class_expression_is_scalar(start, definition)
+                && inline_class_expression_is_scalar(end, definition)
+                && inline_class_block_is_scalar(body, definition)
+        }
+        TypedStatementIr::CollectionFor { iterable, body, .. } => {
+            inline_class_expression_is_scalar(iterable, definition)
                 && inline_class_block_is_scalar(body, definition)
         }
         TypedStatementIr::Defer { captures, .. } => captures
@@ -3585,6 +3640,134 @@ impl<'a> FunctionEmitter<'a> {
                     self.patch_target(patch, continue_target)?;
                 }
             }
+            TypedStatementIr::DynamicRangeFor {
+                binding,
+                start,
+                end,
+                body,
+                max_iterations,
+            } => {
+                let start_register = self.allocate_expression(start)?;
+                self.emit_expression(start, start_register)?;
+                let end_register = self.allocate_expression(end)?;
+                self.emit_expression(end, end_register)?;
+                let binding_register = self.local(*binding)?;
+                let first_dst = self.allocate(ValueType::I32)?;
+                let has_value_dst = self.allocate(ValueType::Bool)?;
+                let slot = self.allocate(ValueType::I32)?;
+                let epoch = self.allocate(ValueType::I64)?;
+                self.emit_iteration_loop(
+                    CollectionIteratorKind::Range,
+                    IteratorStateRegisters {
+                        collection: start_register,
+                        phase: end_register,
+                        slot,
+                        epoch,
+                    },
+                    has_value_dst,
+                    first_dst,
+                    None,
+                    &[(binding_register, first_dst, ValueType::I32)],
+                    body,
+                    *max_iterations,
+                    self.function_span,
+                )?;
+            }
+            TypedStatementIr::CollectionFor {
+                iterable,
+                bindings,
+                key_type,
+                element_type,
+                collection,
+                body,
+                max_iterations,
+            } => {
+                let iterable_register = self.allocate_expression(iterable)?;
+                self.emit_expression(iterable, iterable_register)?;
+                let (kind, first_type, second_type) = match collection {
+                    CollectionIterationKindIr::Array => (
+                        CollectionIteratorKind::Array {
+                            element: lower_type(self.package, element_type, self.function_span)?,
+                        },
+                        lower_type(self.package, element_type, self.function_span)?,
+                        None,
+                    ),
+                    CollectionIterationKindIr::Buffer => (
+                        CollectionIteratorKind::Buffer {
+                            element: lower_type(self.package, element_type, self.function_span)?,
+                        },
+                        lower_type(self.package, element_type, self.function_span)?,
+                        None,
+                    ),
+                    CollectionIterationKindIr::Set => (
+                        CollectionIteratorKind::Set {
+                            element: lower_type(self.package, element_type, self.function_span)?,
+                        },
+                        lower_type(self.package, element_type, self.function_span)?,
+                        None,
+                    ),
+                    CollectionIterationKindIr::Map => {
+                        let key = key_type.as_ref().ok_or_else(|| {
+                            CompileError::type_mismatch(None, None, self.function_span)
+                        })?;
+                        (
+                            CollectionIteratorKind::Map {
+                                key: lower_type(self.package, key, self.function_span)?,
+                                value: lower_type(self.package, element_type, self.function_span)?,
+                            },
+                            lower_type(self.package, key, self.function_span)?,
+                            Some(lower_type(self.package, element_type, self.function_span)?),
+                        )
+                    }
+                };
+                let first_dst = self.allocate(first_type)?;
+                let second_dst = second_type
+                    .map(|second_type| self.allocate(second_type))
+                    .transpose()?;
+                let mut binding_copies = Vec::with_capacity(bindings.len());
+                for (index, binding) in bindings.iter().enumerate() {
+                    let binding_register = self.local(*binding)?;
+                    let binding_type = self
+                        .register_types
+                        .get(usize::from(binding_register))
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| {
+                            CompileError::unknown_name(
+                                self.definition_name(*binding),
+                                self.function_span,
+                            )
+                        })?;
+                    let source = if index == 0 {
+                        first_dst
+                    } else {
+                        second_dst.ok_or_else(|| {
+                            CompileError::type_mismatch(None, None, self.function_span)
+                        })?
+                    };
+                    binding_copies.push((binding_register, source, binding_type));
+                }
+                let phase = self.allocate(ValueType::I32)?;
+                let slot = self.allocate(ValueType::I32)?;
+                let epoch = self.allocate(ValueType::I64)?;
+                let has_value_dst = self.allocate(ValueType::Bool)?;
+                self.emit_iteration_loop(
+                    kind,
+                    IteratorStateRegisters {
+                        collection: iterable_register,
+                        phase,
+                        slot,
+                        epoch,
+                    },
+                    has_value_dst,
+                    first_dst,
+                    second_dst,
+                    &binding_copies,
+                    body,
+                    *max_iterations,
+                    self.function_span,
+                )?;
+            }
             TypedStatementIr::Break => {
                 let patch = self.push(Instruction::Jump { target: 0 }, self.function_span);
                 let Some(loop_patch) = self.loop_stack.last_mut() else {
@@ -3623,6 +3806,73 @@ impl<'a> FunctionEmitter<'a> {
             TypedStatementIr::Yield { span } => {
                 self.push(Instruction::Yield, self.span(span)?);
             }
+        }
+        Ok(())
+    }
+
+    /// Shared `IterNew`/`IterNext` loop shape for `DynamicRangeFor` and
+    /// `CollectionFor`. The collection register (or range start) and the
+    /// caller-set end bound are evaluated exactly once before `IterNew`;
+    /// every iteration copies the explicit `first`/`second` payload registers
+    /// into the loop bindings before the body runs.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_iteration_loop(
+        &mut self,
+        kind: CollectionIteratorKind,
+        state: IteratorStateRegisters,
+        has_value_dst: u16,
+        first_dst: u16,
+        second_dst: Option<u16>,
+        binding_copies: &[(u16, u16, ValueType)],
+        body: &TypedBlockIr,
+        max_iterations: u32,
+        span: SourceSpan,
+    ) -> Result<(), CompileError> {
+        self.push(Instruction::IterNew { kind, state }, span);
+        let loop_start = self.position();
+        self.push(
+            Instruction::IterNext {
+                kind,
+                state,
+                has_value_dst,
+                first_dst,
+                second_dst,
+            },
+            span,
+        );
+        let exit = self.push(
+            Instruction::JumpIfFalse {
+                condition: has_value_dst,
+                target: 0,
+            },
+            span,
+        );
+        self.loop_stack.push(LoopPatch {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        for &(binding, source, ty) in binding_copies {
+            self.push(
+                self.copy_value_instruction(ty, binding, source, span)?,
+                span,
+            );
+        }
+        self.emit_nested_block(body)?;
+        let continue_target = self.position();
+        let back_edge = self.push(Instruction::Jump { target: loop_start }, span);
+        self.loop_bounds.push(LoopBound {
+            back_edge: u32::try_from(back_edge)
+                .map_err(|_| CompileError::too_many_registers(span))?,
+            max_iterations,
+        });
+        let loop_end = self.position();
+        self.patch_target(exit, loop_end)?;
+        let patches = self.loop_stack.pop().expect("loop stack was pushed");
+        for patch in patches.breaks {
+            self.patch_target(patch, loop_end)?;
+        }
+        for patch in patches.continues {
+            self.patch_target(patch, continue_target)?;
         }
         Ok(())
     }
@@ -4758,6 +5008,21 @@ impl<'a> FunctionEmitter<'a> {
                 }
                 self.push(ty.instruction(destination, args_base), span)
             }
+            TypedStandardLowering::SetNew { .. } => {
+                let ValueType::Named(type_id) = lower_type(self.package, result, span)? else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.push(
+                    Instruction::SetNew {
+                        type_id,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
+            TypedStandardLowering::SetClear { .. } => {
+                self.push(Instruction::SetClear { source: args_base }, span)
+            }
         };
         Ok(())
     }
@@ -5331,6 +5596,55 @@ impl<'a> FunctionEmitter<'a> {
                 );
                 load_true(self)
             }
+            BuiltinOperationIr::SetNew => {
+                let ValueType::Named(type_id) = lower_type(self.package, result, span)? else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.push(
+                    Instruction::SetNew {
+                        type_id,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
+            BuiltinOperationIr::SetLen => self.push(
+                Instruction::SetLen {
+                    source: argument(0)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::SetContains => self.push(
+                Instruction::SetContains {
+                    source: argument(0)?,
+                    value: argument(1)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::SetInsert => self.push(
+                Instruction::SetInsert {
+                    source: argument(0)?,
+                    value: argument(1)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::SetRemove => self.push(
+                Instruction::SetRemove {
+                    source: argument(0)?,
+                    value: argument(1)?,
+                    dst: destination,
+                },
+                span,
+            ),
+            BuiltinOperationIr::SetClear => self.push(
+                Instruction::SetClear {
+                    source: argument(0)?,
+                },
+                span,
+            ),
             BuiltinOperationIr::BufferLen => self.push(
                 Instruction::BufferLen {
                     source: argument(0)?,
@@ -7153,6 +7467,40 @@ fn validate_builtin_call_signature(
                 _ => unreachable!("map operations are matched above"),
             }
         }
+        BuiltinOperationIr::SetNew
+        | BuiltinOperationIr::SetLen
+        | BuiltinOperationIr::SetContains
+        | BuiltinOperationIr::SetInsert
+        | BuiltinOperationIr::SetRemove
+        | BuiltinOperationIr::SetClear => {
+            let [element] = type_arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            let set = IrType::Set(Box::new(element.clone()));
+            match operation {
+                BuiltinOperationIr::SetNew => {
+                    validate_builtin_arguments(arguments, &[], span)?;
+                    validate_builtin_result(result, &set, span)
+                }
+                BuiltinOperationIr::SetLen => {
+                    validate_builtin_arguments(arguments, &[set], span)?;
+                    validate_builtin_result(result, &IrType::I32, span)
+                }
+                BuiltinOperationIr::SetContains => {
+                    validate_builtin_arguments(arguments, &[set, element.clone()], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
+                BuiltinOperationIr::SetInsert | BuiltinOperationIr::SetRemove => {
+                    validate_builtin_arguments(arguments, &[set, element.clone()], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
+                BuiltinOperationIr::SetClear => {
+                    validate_builtin_arguments(arguments, &[set], span)?;
+                    validate_builtin_result(result, &IrType::Unit, span)
+                }
+                _ => unreachable!("set operations are matched above"),
+            }
+        }
         BuiltinOperationIr::BufferLen
         | BuiltinOperationIr::BufferGet
         | BuiltinOperationIr::BufferSet
@@ -7443,7 +7791,7 @@ fn typed_exact_root_maps(
         let Some(mut state) = states[pc].clone() else {
             continue;
         };
-        if let Some(destination) = typed_instruction_destination(code[pc]) {
+        for destination in typed_instruction_destinations(code[pc]) {
             let destination = usize::from(destination);
             if destination >= register_count {
                 return Err(CompileError::verify(
@@ -7500,7 +7848,7 @@ fn typed_exact_root_maps(
                     }
                 }
             }
-            if let Some(destination) = typed_instruction_liveness_destination(code[pc]) {
+            for destination in typed_instruction_liveness_destinations(code[pc]) {
                 let destination = usize::from(destination);
                 if destination >= register_count {
                     return Err(CompileError::verify(
@@ -7636,9 +7984,9 @@ fn optimize_emitted_bytecode(
                 continue;
             };
             if (pc + 1..=last_use).any(|candidate| {
-                typed_instruction_destination(code[candidate]).is_some_and(|written| {
-                    written == source || (written == dst && candidate != last_use)
-                })
+                typed_instruction_destinations(code[candidate])
+                    .iter()
+                    .any(|written| *written == source || (*written == dst && candidate != last_use))
             }) {
                 continue;
             }
@@ -7663,7 +8011,7 @@ fn optimize_emitted_bytecode(
             .flat_map(|instruction| {
                 typed_instruction_sources(*instruction)
                     .into_iter()
-                    .chain(typed_instruction_destination(*instruction))
+                    .chain(typed_instruction_destinations(*instruction))
             })
             .map(usize::from)
             .max()
@@ -7680,8 +8028,11 @@ fn optimize_emitted_bytecode(
             .iter()
             .copied()
             .map(|instruction| {
-                let dead_destination = typed_instruction_destination(instruction)
-                    .is_some_and(|dst| !used.get(usize::from(dst)).copied().unwrap_or(false));
+                let destinations = typed_instruction_destinations(instruction);
+                let dead_destination = !destinations.is_empty()
+                    && destinations
+                        .iter()
+                        .all(|dst| !used.get(usize::from(*dst)).copied().unwrap_or(false));
                 !(dead_destination && emitted_instruction_is_dead_pure(instruction))
             })
             .collect::<Vec<_>>();
@@ -7703,7 +8054,7 @@ fn emitted_register_count(code: &[Instruction], parameter_count: usize) -> usize
         .flat_map(|instruction| {
             typed_instruction_sources(instruction)
                 .into_iter()
-                .chain(typed_instruction_destination(instruction))
+                .chain(typed_instruction_destinations(instruction))
         })
         .map(usize::from)
         .max()
@@ -8087,6 +8438,8 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::MapLen { source, .. }
         | Instruction::MapClear { source }
         | Instruction::BufferLen { source, .. }
+        | Instruction::SetLen { source, .. }
+        | Instruction::SetClear { source }
         | Instruction::Return { source } => vec![source],
         Instruction::Add { lhs, rhs, .. }
         | Instruction::Sub { lhs, rhs, .. }
@@ -8194,6 +8547,31 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::MapRemove { source, key, .. }
         | Instruction::MapContains { source, key, .. } => vec![source, key],
         Instruction::MapSet { source, key, value } => vec![source, key, value],
+        Instruction::SetContains {
+            source,
+            value,
+            dst: _,
+        }
+        | Instruction::SetInsert {
+            source,
+            value,
+            dst: _,
+        }
+        | Instruction::SetRemove {
+            source,
+            value,
+            dst: _,
+        } => vec![source, value],
+        Instruction::IterNew { kind, state } => match kind {
+            CollectionIteratorKind::Range => vec![state.collection, state.phase],
+            CollectionIteratorKind::Array { .. }
+            | CollectionIteratorKind::Buffer { .. }
+            | CollectionIteratorKind::Map { .. }
+            | CollectionIteratorKind::Set { .. } => vec![state.collection],
+        },
+        Instruction::IterNext { state, .. } => {
+            vec![state.collection, state.phase, state.slot, state.epoch]
+        }
         Instruction::BufferSlice {
             source,
             start,
@@ -8228,6 +8606,7 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::StateDelete { .. }
         | Instruction::ArrayNew { .. }
         | Instruction::MapNew { .. }
+        | Instruction::SetNew { .. }
         | Instruction::StateFinish
         | Instruction::DeferPop
         | Instruction::CleanupReturn
@@ -8319,7 +8698,12 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::BufferLen { dst, .. }
         | Instruction::BufferGet { dst, .. }
         | Instruction::BufferSlice { dst, .. }
-        | Instruction::StateOldFieldGet { dst, .. }
+        | Instruction::SetNew { dst, .. }
+        | Instruction::SetLen { dst, .. }
+        | Instruction::SetContains { dst, .. }
+        | Instruction::SetInsert { dst, .. }
+        | Instruction::SetRemove { dst, .. } => Some(dst),
+        Instruction::StateOldFieldGet { dst, .. }
         | Instruction::StateCurrentGet { dst, .. }
         | Instruction::StateHandleResolve { dst, .. }
         | Instruction::StateHandleIsAlive { dst, .. }
@@ -8343,6 +8727,11 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::MapClear { .. }
         | Instruction::BufferSet { .. }
         | Instruction::BufferCopy { .. }
+        | Instruction::SetClear { .. }
+        // IterNew and IterNext write multiple registers; see
+        // typed_instruction_destinations.
+        | Instruction::IterNew { .. }
+        | Instruction::IterNext { .. }
         | Instruction::StateFinish
         | Instruction::DeferPush { .. }
         | Instruction::DeferPop
@@ -8355,14 +8744,51 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
     }
 }
 
-fn typed_instruction_liveness_destination(instruction: Instruction) -> Option<u16> {
+/// Every physical register written by an instruction.
+///
+/// Iterator instructions are multi-target: `IterNew` initializes the cursor
+/// state (`phase`/`slot`/`epoch`; for `Range` the caller-set end bound in
+/// `phase` is only read, never written) and `IterNext` writes the has-value
+/// tag plus both payload registers. All write-target consumers (definite
+/// initialization, liveness kills, optimizer conflict/dead/register-count
+/// analysis) must iterate this list, never the single-destination wrapper.
+fn typed_instruction_destinations(instruction: Instruction) -> Vec<u16> {
+    match instruction {
+        Instruction::IterNew { kind, state } => match kind {
+            CollectionIteratorKind::Range => vec![state.slot, state.epoch],
+            CollectionIteratorKind::Array { .. }
+            | CollectionIteratorKind::Buffer { .. }
+            | CollectionIteratorKind::Map { .. }
+            | CollectionIteratorKind::Set { .. } => vec![state.phase, state.slot, state.epoch],
+        },
+        Instruction::IterNext {
+            has_value_dst,
+            first_dst,
+            second_dst,
+            ..
+        } => {
+            let mut destinations = Vec::with_capacity(3);
+            destinations.push(has_value_dst);
+            destinations.push(first_dst);
+            if let Some(second_dst) = second_dst {
+                destinations.push(second_dst);
+            }
+            destinations
+        }
+        _ => typed_instruction_destination(instruction)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn typed_instruction_liveness_destinations(instruction: Instruction) -> Vec<u16> {
     // Typed emission allocates a fresh destination for every call expression.
     // Keeping it live before the call is therefore filtered by definite
     // initialization, while also matching void calls, whose encoded `dst` is
     // not written at all.
     match instruction {
-        Instruction::Call { .. } | Instruction::HostCall { .. } => None,
-        _ => typed_instruction_destination(instruction),
+        Instruction::Call { .. } | Instruction::HostCall { .. } => Vec::new(),
+        _ => typed_instruction_destinations(instruction),
     }
 }
 
@@ -8784,6 +9210,7 @@ fn emit_typed_type_metadata(
         array_types: generics.arrays.values().copied().collect(),
         map_types: generics.maps.values().copied().collect(),
         buffer_types: generics.buffers.values().copied().collect(),
+        set_types: generics.sets.values().copied().collect(),
         snapshot_types: generics.snapshots.values().copied().collect(),
         resource_token_types: generics.resource_tokens.values().copied().collect(),
         opaque_types: opaque_types.into_iter().collect(),
@@ -8812,6 +9239,9 @@ fn emit_typed_type_metadata(
     }
     for value in generics.buffers.into_values() {
         builder.buffer_type(value);
+    }
+    for value in generics.sets.into_values() {
+        builder.set_type(value);
     }
     for value in generics.snapshots.into_values() {
         builder.snapshot_type(value);
@@ -8863,6 +9293,7 @@ struct GenericTypeMetadata {
     arrays: BTreeMap<StableId, ArrayType>,
     maps: BTreeMap<StableId, MapType>,
     buffers: BTreeMap<StableId, BufferType>,
+    sets: BTreeMap<StableId, SetType>,
     snapshots: BTreeMap<StableId, SnapshotType>,
     state_handles: BTreeMap<StableId, StateHandleType>,
     resource_tokens: BTreeMap<StableId, ResourceTokenType>,
@@ -8911,6 +9342,11 @@ fn collect_ir_type_metadata(
             collect_ir_type_metadata(package, element, span, metadata)?;
             let value = BufferType::new(lower_type(package, element, span)?);
             metadata.buffers.insert(value.type_id, value);
+        }
+        IrType::Set(element) => {
+            collect_ir_type_metadata(package, element, span, metadata)?;
+            let value = SetType::new(lower_type(package, element, span)?);
+            metadata.sets.insert(value.type_id, value);
         }
         IrType::Snapshot(content) => {
             collect_ir_type_metadata(package, content, span, metadata)?;
@@ -9041,6 +9477,17 @@ fn collect_block_type_metadata(
             } => {
                 collect_expression_type_metadata(package, start, span, metadata)?;
                 collect_expression_type_metadata(package, end, span, metadata)?;
+                collect_block_type_metadata(package, body, span, metadata)?;
+            }
+            TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
+            } => {
+                collect_expression_type_metadata(package, start, span, metadata)?;
+                collect_expression_type_metadata(package, end, span, metadata)?;
+                collect_block_type_metadata(package, body, span, metadata)?;
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                collect_expression_type_metadata(package, iterable, span, metadata)?;
                 collect_block_type_metadata(package, body, span, metadata)?;
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -9336,6 +9783,7 @@ fn validate_standard_signature_type(
         }
         IrType::Option(value)
         | IrType::Array(value)
+        | IrType::Set(value)
         | IrType::Snapshot(value)
         | IrType::Buffer(value)
         | IrType::StateHandle(value) => {
@@ -9418,6 +9866,7 @@ fn instantiate_standard_type(
             Box::new(instantiate(error)?),
         ),
         IrType::Array(value) => IrType::Array(Box::new(instantiate(value)?)),
+        IrType::Set(value) => IrType::Set(Box::new(instantiate(value)?)),
         IrType::Map(key, value) => {
             IrType::Map(Box::new(instantiate(key)?), Box::new(instantiate(value)?))
         }
@@ -9445,6 +9894,7 @@ fn ir_type_contains_type_parameter(ty: &IrType) -> bool {
         IrType::TypeParameter(_) => true,
         IrType::Option(value)
         | IrType::Array(value)
+        | IrType::Set(value)
         | IrType::Snapshot(value)
         | IrType::Buffer(value)
         | IrType::StateHandle(value) => ir_type_contains_type_parameter(value),
@@ -9567,6 +10017,56 @@ fn standard_call_lowering(
             key: type_argument(0)?,
             value: type_argument(1)?,
         }),
+        I::SetNew => TypedStandardLowering::SetNew {
+            element: type_argument(0)?,
+        },
+        I::SetLen => TypedStandardLowering::Intrinsic(StandardIntrinsic::SetLen {
+            element: type_argument(0)?,
+        }),
+        I::SetContains => TypedStandardLowering::Intrinsic(StandardIntrinsic::SetContains {
+            element: type_argument(0)?,
+        }),
+        I::SetInsert => TypedStandardLowering::Intrinsic(StandardIntrinsic::SetInsert {
+            element: type_argument(0)?,
+        }),
+        I::SetRemove => TypedStandardLowering::Intrinsic(StandardIntrinsic::SetRemove {
+            element: type_argument(0)?,
+        }),
+        I::SetClear => TypedStandardLowering::SetClear {
+            element: type_argument(0)?,
+        },
+        I::ArrayFirst => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayFirst {
+            element: type_argument(0)?,
+        }),
+        I::ArrayLast => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayLast {
+            element: type_argument(0)?,
+        }),
+        I::ArraySwap => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArraySwap {
+            element: type_argument(0)?,
+        }),
+        I::ArrayReverse => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayReverse {
+            element: type_argument(0)?,
+        }),
+        I::MapIsEmpty => TypedStandardLowering::Intrinsic(StandardIntrinsic::MapIsEmpty {
+            key: type_argument(0)?,
+            value: type_argument(1)?,
+        }),
+        I::MapGetOr => TypedStandardLowering::Intrinsic(StandardIntrinsic::MapGetOr {
+            key: type_argument(0)?,
+            value: type_argument(1)?,
+        }),
+        I::MapInsertIfAbsent => {
+            TypedStandardLowering::Intrinsic(StandardIntrinsic::MapInsertIfAbsent {
+                key: type_argument(0)?,
+                value: type_argument(1)?,
+            })
+        }
+        I::BufferIsEmpty => TypedStandardLowering::Intrinsic(StandardIntrinsic::BufferIsEmpty {
+            element: type_argument(0)?,
+        }),
+        I::BufferFill => TypedStandardLowering::Intrinsic(StandardIntrinsic::BufferFill {
+            element: type_argument(0)?,
+        }),
         I::DebugAssert => TypedStandardLowering::Intrinsic(StandardIntrinsic::DebugAssert),
         I::DebugTrap => TypedStandardLowering::Intrinsic(StandardIntrinsic::DebugTrap),
     };
@@ -9605,6 +10105,7 @@ fn validate_concrete_standard_lowering(
         .iter()
         .map(|argument| lower_type(package, &argument.ty, span))
         .collect::<Result<Vec<_>, _>>()?;
+    let result_ir = result;
     let result = lower_type(package, result, span)?;
     match lowering {
         TypedStandardLowering::ToString(ty) => {
@@ -9619,6 +10120,18 @@ fn validate_concrete_standard_lowering(
                         != Some(*actual)
                 })
                 || intrinsic.result_type() != result
+            {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+        }
+        TypedStandardLowering::SetNew { element } => {
+            if !parameters.is_empty() || result != ValueType::Named(set_type(element)) {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+        }
+        TypedStandardLowering::SetClear { element } => {
+            if parameters.as_slice() != [ValueType::Named(set_type(element))]
+                || *result_ir != IrType::Unit
             {
                 return Err(CompileError::type_mismatch(None, None, span));
             }
@@ -9937,6 +10450,9 @@ fn lower_type(
             lower_type(package, key, span)?,
             lower_type(package, value, span)?,
         ))),
+        IrType::Set(element) => Ok(ValueType::Named(set_type(lower_type(
+            package, element, span,
+        )?))),
         IrType::Tuple(items) => {
             let items = items
                 .iter()
@@ -10096,6 +10612,7 @@ fn equality_instruction(
         }
         IrType::Array(_)
         | IrType::Map(_, _)
+        | IrType::Set(_)
         | IrType::HostRequest(_)
         | IrType::ResourceToken(_)
         | IrType::Snapshot(_)
@@ -10182,6 +10699,17 @@ fn collect_block_codegen_inputs(block: &TypedBlockIr, inputs: &mut CodegenInputs
             } => {
                 collect_expression_codegen_inputs(start, inputs);
                 collect_expression_codegen_inputs(end, inputs);
+                collect_block_codegen_inputs(body, inputs);
+            }
+            TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
+            } => {
+                collect_expression_codegen_inputs(start, inputs);
+                collect_expression_codegen_inputs(end, inputs);
+                collect_block_codegen_inputs(body, inputs);
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                collect_expression_codegen_inputs(iterable, inputs);
                 collect_block_codegen_inputs(body, inputs);
             }
             TypedStatementIr::Defer { captures, .. } => {
@@ -10822,6 +11350,46 @@ fn collect_block_call_graph(
                         effects,
                     );
                 }
+                collect_block_call_graph(
+                    package,
+                    body,
+                    function_indices,
+                    state_fields,
+                    calls,
+                    effects,
+                );
+            }
+            TypedStatementIr::DynamicRangeFor {
+                start, end, body, ..
+            } => {
+                for value in [start, end] {
+                    collect_expression_call_graph(
+                        package,
+                        value,
+                        function_indices,
+                        state_fields,
+                        calls,
+                        effects,
+                    );
+                }
+                collect_block_call_graph(
+                    package,
+                    body,
+                    function_indices,
+                    state_fields,
+                    calls,
+                    effects,
+                );
+            }
+            TypedStatementIr::CollectionFor { iterable, body, .. } => {
+                collect_expression_call_graph(
+                    package,
+                    iterable,
+                    function_indices,
+                    state_fields,
+                    calls,
+                    effects,
+                );
                 collect_block_call_graph(
                     package,
                     body,
@@ -11732,5 +12300,401 @@ mod tests {
         module.string("");
         module.function(function);
         verify(module.finish(), VerifierLimits::default()).unwrap();
+    }
+
+    fn test_package() -> nexa_analysis::TypedPackageIr {
+        use nexa_analysis::{LifecycleBindingsIr, PackageSemanticMetadata, StateSchemaFingerprint};
+        use nexa_core::PublicApiFingerprint;
+        nexa_analysis::TypedPackageIr::new_product(
+            PackageId::new("tests.compiler").expect("test package id"),
+            1,
+            Vec::new(),
+            Vec::new(),
+            PackageSemanticMetadata {
+                entry_module: None,
+                state_types: std::sync::Arc::new([]),
+                host_bindings: std::sync::Arc::new([]),
+                exports: std::sync::Arc::new([]),
+                tests: std::sync::Arc::new([]),
+                external_sources: std::sync::Arc::new([]),
+                lifecycle: LifecycleBindingsIr::default(),
+                repl_entry: None,
+                standard_functions: std::sync::Arc::new([]),
+                public_api_fingerprint: PublicApiFingerprint::default(),
+                state_schema_fingerprint: StateSchemaFingerprint::default(),
+            },
+        )
+        .expect("empty test package constructs")
+    }
+
+    #[test]
+    fn set_metadata_and_stdlib_lowering_are_concrete() {
+        use super::{
+            GenericTypeMetadata, TypedStandardLowering, collect_ir_type_metadata, lower_type,
+            standard_call_lowering, validate_concrete_standard_lowering,
+        };
+        use nexa_bytecode::SetType;
+        use nexa_stdlib::Intrinsic as I;
+
+        let package = test_package();
+        let span = SourceSpan::default();
+        let range = SourceRange {
+            source: SourceKey::new(
+                PackageId::new("tests.compiler").expect("test package id"),
+                NormalizedPackagePath::new("src/main.nexa").expect("test module path"),
+            ),
+            start: 0,
+            end: 0,
+        };
+        let set_of_i32 = IrType::Set(Box::new(IrType::I32));
+        let set_type = |element| ValueType::Named(nexa_bytecode::set_type(element));
+
+        assert_eq!(
+            lower_type(&package, &set_of_i32, span).expect("Set lowers"),
+            set_type(ValueType::I32)
+        );
+
+        let mut metadata = GenericTypeMetadata::default();
+        collect_ir_type_metadata(&package, &set_of_i32, span, &mut metadata)
+            .expect("Set metadata collects");
+        assert_eq!(
+            metadata.sets.get(&nexa_bytecode::set_type(ValueType::I32)),
+            Some(&SetType::new(ValueType::I32))
+        );
+        assert!(metadata.maps.is_empty());
+        assert!(metadata.arrays.is_empty());
+
+        let no_args: [TypedExpressionIr; 0] = [];
+        assert!(matches!(
+            standard_call_lowering(
+                &package,
+                I::SetNew,
+                &[IrType::I32],
+                &no_args,
+                &set_of_i32,
+                span
+            )
+            .expect("SetNew lowers"),
+            TypedStandardLowering::SetNew {
+                element: ValueType::I32
+            }
+        ));
+        assert!(matches!(
+            standard_call_lowering(
+                &package,
+                I::SetLen,
+                &[IrType::I32],
+                &no_args,
+                &IrType::I32,
+                span,
+            )
+            .expect("SetLen lowers"),
+            TypedStandardLowering::Intrinsic(StandardIntrinsic::SetLen {
+                element: ValueType::I32
+            })
+        ));
+        let set_argument = TypedExpressionIr {
+            ty: set_of_i32,
+            effect: IrEffect::Immediate,
+            span: range,
+            kind: TypedExpressionKind::Reference(DefinitionId(0)),
+        };
+        assert!(
+            validate_concrete_standard_lowering(
+                &package,
+                &[set_argument.clone()],
+                &IrType::Unit,
+                TypedStandardLowering::SetClear {
+                    element: ValueType::I32,
+                },
+                span,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_concrete_standard_lowering(
+                &package,
+                &[set_argument],
+                &IrType::Bool,
+                TypedStandardLowering::SetClear {
+                    element: ValueType::I32,
+                },
+                span,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            StandardIntrinsic::SetInsert {
+                element: ValueType::I32,
+            }
+            .result_type(),
+            ValueType::Bool,
+            "SetInsert carries the duplicate/absent boolean in its own dst"
+        );
+    }
+
+    #[test]
+    fn iteration_instruction_shapes_match_the_v8_wire() {
+        use super::{typed_instruction_destinations, typed_instruction_sources};
+        use nexa_bytecode::CollectionIteratorKind;
+
+        let state = IteratorStateRegisters {
+            collection: 1,
+            phase: 2,
+            slot: 3,
+            epoch: 4,
+        };
+        let iter_next = Instruction::IterNext {
+            kind: CollectionIteratorKind::Set {
+                element: ValueType::String,
+            },
+            state,
+            has_value_dst: 5,
+            first_dst: 6,
+            second_dst: None,
+        };
+        assert_eq!(typed_instruction_destinations(iter_next), vec![5, 6]);
+        assert_eq!(typed_instruction_sources(iter_next), vec![1, 2, 3, 4]);
+        let map_next = Instruction::IterNext {
+            kind: CollectionIteratorKind::Map {
+                key: ValueType::I32,
+                value: ValueType::String,
+            },
+            state,
+            has_value_dst: 5,
+            first_dst: 6,
+            second_dst: Some(7),
+        };
+        assert_eq!(typed_instruction_destinations(map_next), vec![5, 6, 7]);
+        assert_eq!(
+            typed_instruction_sources(Instruction::IterNew {
+                kind: CollectionIteratorKind::Range,
+                state,
+            }),
+            vec![1, 2],
+            "Range carries start in collection and end in phase"
+        );
+        assert_eq!(
+            typed_instruction_destinations(Instruction::IterNew {
+                kind: CollectionIteratorKind::Range,
+                state,
+            }),
+            vec![3, 4],
+            "Range initializes slot and epoch; the caller-set end in phase is only read"
+        );
+        assert_eq!(
+            typed_instruction_sources(Instruction::IterNew {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+            }),
+            vec![1],
+            "collection kinds read only the collection reference"
+        );
+        assert_eq!(
+            typed_instruction_destinations(Instruction::IterNew {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+            }),
+            vec![2, 3, 4],
+            "collection kinds initialize phase, slot, and epoch"
+        );
+    }
+
+    #[test]
+    fn iter_new_initializes_the_full_cursor_state_before_the_loop() {
+        use nexa_bytecode::set_type;
+
+        let set_of_string = set_type(ValueType::String);
+        let state = IteratorStateRegisters {
+            collection: 0,
+            phase: 1,
+            slot: 2,
+            epoch: 3,
+        };
+        let code = vec![
+            Instruction::SetNew {
+                type_id: set_of_string,
+                dst: 0,
+            },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+            },
+            Instruction::Safepoint,
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+                has_value_dst: 4,
+                first_dst: 5,
+                second_dst: None,
+            },
+            Instruction::JumpIfFalse {
+                condition: 4,
+                target: 8,
+            },
+            Instruction::Move { dst: 6, source: 5 },
+            Instruction::Return { source: 6 },
+            Instruction::Jump { target: 3 },
+            Instruction::ReturnVoid,
+        ];
+        let register_types = vec![
+            Some(ValueType::Named(set_of_string)),
+            Some(ValueType::I32),
+            Some(ValueType::I32),
+            Some(ValueType::I64),
+            Some(ValueType::Bool),
+            Some(ValueType::String),
+            Some(ValueType::String),
+        ];
+        let (_, maps) =
+            typed_exact_root_maps(&register_types, None, 0, &code, &[2], SourceSpan::default())
+                .expect("cursor root maps compute");
+        assert_eq!(
+            maps[0].bitmap,
+            vec![true, false, false, false, false, false, false],
+            "after IterNew only the collection ref is rooted; the scalar cursor is initialized"
+        );
+    }
+
+    #[test]
+    fn iter_next_root_maps_root_the_collection_and_live_bindings() {
+        use nexa_bytecode::set_type;
+
+        let set_of_string = set_type(ValueType::String);
+        let state = IteratorStateRegisters {
+            collection: 0,
+            phase: 1,
+            slot: 2,
+            epoch: 3,
+        };
+        let code = vec![
+            Instruction::SetNew {
+                type_id: set_of_string,
+                dst: 0,
+            },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+            },
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Set {
+                    element: ValueType::String,
+                },
+                state,
+                has_value_dst: 4,
+                first_dst: 5,
+                second_dst: None,
+            },
+            Instruction::JumpIfFalse {
+                condition: 4,
+                target: 8,
+            },
+            Instruction::Move { dst: 6, source: 5 },
+            Instruction::Safepoint,
+            Instruction::Return { source: 6 },
+            Instruction::Jump { target: 2 },
+            Instruction::ReturnVoid,
+        ];
+        let register_types = vec![
+            Some(ValueType::Named(set_of_string)),
+            Some(ValueType::I32),
+            Some(ValueType::I32),
+            Some(ValueType::I64),
+            Some(ValueType::Bool),
+            Some(ValueType::String),
+            Some(ValueType::String),
+        ];
+        let safepoints = vec![5];
+        let (bitmap, maps) = typed_exact_root_maps(
+            &register_types,
+            None,
+            0,
+            &code,
+            &safepoints,
+            SourceSpan::default(),
+        )
+        .expect("iteration root maps compute");
+        assert!(bitmap[0], "collection ref is a root candidate");
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].bitmap,
+            vec![false, false, false, false, false, false, true],
+            "safepoint roots the moved binding but not the dead payload"
+        );
+    }
+
+    #[test]
+    fn map_iter_next_roots_a_live_second_payload() {
+        use nexa_bytecode::map_type;
+
+        let map = map_type(ValueType::I32, ValueType::String);
+        let state = IteratorStateRegisters {
+            collection: 0,
+            phase: 1,
+            slot: 2,
+            epoch: 3,
+        };
+        let code = vec![
+            Instruction::MapNew {
+                type_id: map,
+                dst: 0,
+            },
+            Instruction::IterNew {
+                kind: CollectionIteratorKind::Map {
+                    key: ValueType::I32,
+                    value: ValueType::String,
+                },
+                state,
+            },
+            Instruction::IterNext {
+                kind: CollectionIteratorKind::Map {
+                    key: ValueType::I32,
+                    value: ValueType::String,
+                },
+                state,
+                has_value_dst: 4,
+                first_dst: 5,
+                second_dst: Some(6),
+            },
+            Instruction::JumpIfFalse {
+                condition: 4,
+                target: 9,
+            },
+            Instruction::Safepoint,
+            Instruction::Move { dst: 7, source: 5 },
+            Instruction::Move { dst: 8, source: 6 },
+            Instruction::Return { source: 8 },
+            Instruction::Jump { target: 2 },
+            Instruction::ReturnVoid,
+        ];
+        let register_types = vec![
+            Some(ValueType::Named(map)),
+            Some(ValueType::I32),
+            Some(ValueType::I32),
+            Some(ValueType::I64),
+            Some(ValueType::Bool),
+            Some(ValueType::I32),
+            Some(ValueType::String),
+            Some(ValueType::I32),
+            Some(ValueType::String),
+        ];
+        let (_, maps) =
+            typed_exact_root_maps(&register_types, None, 0, &code, &[4], SourceSpan::default())
+                .expect("map iteration root maps compute");
+        assert_eq!(
+            maps[0].bitmap,
+            vec![false, false, false, false, false, false, true, false, false],
+            "the still-live Map value payload is rooted at the safepoint before its move"
+        );
     }
 }
