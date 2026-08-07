@@ -254,10 +254,10 @@ pub struct MultiFileRuntimeDiagnosticEvidence {
     pub true_host_call_boundary: bool,
     pub host_boundary_source: String,
     pub host_boundary_text: String,
-    pub nidl_origin: String,
-    pub nidl_origin_text: String,
-    pub nidl_binding_verified: bool,
-    pub nidl_exact_source_preserved: bool,
+    pub contract_origin: String,
+    pub contract_origin_text: String,
+    pub contract_binding_verified: bool,
+    pub contract_exact_source_preserved: bool,
     pub crlf_preserved: bool,
     pub astral_utf16_verified: bool,
     pub human_position: [u32; 2],
@@ -603,7 +603,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         .source_files
         .source(nidl_span.file)
         .ok_or("compiled artifact did not retain the canonical NIDL source origin")?;
-    let nidl_origin_text = nidl_source
+    let contract_origin_text = nidl_source
         .text
         .get(nidl_span.start as usize..nidl_span.end as usize)
         .ok_or("NIDL declaration span is out of bounds")?
@@ -619,7 +619,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
                 ..host_import_debug.contract_span.end as usize,
         )
         .ok_or("Host contract debug span is out of bounds")?;
-    let nidl_binding_verified = host_import_debug.stable_id == host_import.stable_id
+    let contract_binding_verified = host_import_debug.stable_id == host_import.stable_id
         && host_import_debug.contract_id == host_hash
         && host_import_debug.contract_name == "DiagnosticStackHost"
         && host_import_debug.function_name == "fail"
@@ -629,8 +629,8 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         && nidl_source.text.as_ref() == IDL_SOURCE
         && interface_source.identity == expected_nidl_identity
         && interface_text.contains("DiagnosticStackHost")
-        && nidl_origin_text.contains("fn fail(");
-    let nidl_exact_source_preserved =
+        && contract_origin_text.contains("fn fail(");
+    let contract_exact_source_preserved =
         nidl_source.text.as_ref() == IDL_SOURCE && nidl_source.text.contains("\r\n");
     let nidl_range = byte_range(nidl_span);
 
@@ -761,8 +761,8 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         && boundary_source.identity.to_string() == stack_sources[0]
         && host_boundary_text.contains("test_host::fail()")
         && nidl_range.start < nidl_range.end
-        && nidl_binding_verified
-        && nidl_exact_source_preserved
+        && contract_binding_verified
+        && contract_exact_source_preserved
         && root_source.text.contains("\r\n")
         && astral_utf16_verified
         && human_output.contains("NX4003")
@@ -783,10 +783,10 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         true_host_call_boundary,
         host_boundary_source: boundary_source.identity.to_string(),
         host_boundary_text,
-        nidl_origin: nidl_identity,
-        nidl_origin_text,
-        nidl_binding_verified,
-        nidl_exact_source_preserved,
+        contract_origin: nidl_identity,
+        contract_origin_text,
+        contract_binding_verified,
+        contract_exact_source_preserved,
         crlf_preserved: root_source.text.contains("\r\n"),
         astral_utf16_verified,
         human_position: [human.start.line, human.start.column],

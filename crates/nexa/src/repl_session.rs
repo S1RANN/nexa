@@ -35,7 +35,7 @@ pub const CONSOLE_HOST_CONTRACT: &str = "contract Console;\n\
     }\n";
 
 /// Reader-facing identity of the built-in Console contract.
-pub const CONSOLE_HOST_SOURCE_IDENTITY: &str = "nidl://builtin/console.nidl";
+pub const CONSOLE_HOST_SOURCE_IDENTITY: &str = "contract://builtin/console.contract.nexa";
 
 const CONSOLE_HOST_PARAMETERS: &[ValueType] = &[ValueType::String];
 const CONSOLE_HOST_CAPABILITIES: &[&str] = &[];

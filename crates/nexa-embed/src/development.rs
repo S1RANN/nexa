@@ -298,7 +298,7 @@ pub struct CompileJob {
     pub source_id: SourceId,
     pub identity: CandidateIdentity,
     pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
-    pub idl: nexa::ValidatedContract,
+    pub contract: nexa::ValidatedContract,
     pub required_exports: Vec<ExportRequirement>,
     host_contract_source_identity: nexa::SourceIdentity,
     host_contract_source: Arc<str>,
@@ -319,7 +319,7 @@ impl CompileJob {
             source_id,
             identity,
             build_input,
-            idl,
+            contract: idl,
             required_exports,
             host_contract_source_identity,
             host_contract_source,
@@ -329,7 +329,7 @@ impl CompileJob {
 
     fn from_request(request: DevelopmentCompileRequest) -> Self {
         let (host_contract_source_identity, host_contract_source) = {
-            let contract = nexa::HostContractInput::canonical(&request.idl);
+            let contract = nexa::HostContractInput::canonical(&request.contract);
             (
                 contract.source().identity().clone(),
                 Arc::clone(contract.source().text()),
@@ -339,7 +339,7 @@ impl CompileJob {
             request.source_id,
             request.identity,
             request.build_input,
-            request.idl,
+            request.contract,
             request.required_exports,
             host_contract_source_identity,
             host_contract_source,
@@ -604,7 +604,7 @@ pub struct DevelopmentCompileRequest {
     pub source_id: SourceId,
     pub identity: CandidateIdentity,
     pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
-    pub idl: nexa::ValidatedContract,
+    pub contract: nexa::ValidatedContract,
     pub required_exports: Vec<ExportRequirement>,
 }
 
@@ -1029,7 +1029,7 @@ fn worker_loop(shared: &WorkerShared) {
 
         let work_started = Instant::now();
         let host_contract = nexa::HostContractInput::with_source(
-            &job.idl,
+            &job.contract,
             job.host_contract_source_identity.clone(),
             Arc::clone(&job.host_contract_source),
         )

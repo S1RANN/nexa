@@ -37,30 +37,30 @@ but may not self-waive a required row.
 
 | ID | Surface | Acceptance | Evidence / gate | Owner | Status |
 | --- | --- | --- | --- | --- | --- |
-| C01 | Source profile | Shared `SourceProfile::{Executable, Contract}` selects the same profile in compiler, CLI, LSP, and editor paths | `cargo xtask test-contract-syntax`; profile isolation fixtures | task #4, task #6, task #7 | PENDING |
-| C02 | File identity | Only `*.contract.nexa` is active; Contract source stays outside the Source Module Graph and has no path-derived module identity | discovery fixtures; `contract-migration-check` | task #4, task #6 | PENDING |
-| C03 | Header grammar | Exactly one first non-comment `contract Name;`; Header docs, `@stable`, and exact span retained | `cargo xtask test-contract-syntax` | task #4 | PENDING |
-| C04 | Parser recovery | Missing semicolon/Header, duplicate/late Header, invalid top-level item, and executable-profile Header have precise diagnostics; later declarations survive recovery | syntax fixture snapshots | task #4 | PENDING |
-| C05 | Semantic ownership | Flat declarations resolve under the Header Contract Stable ID; type/direction/attribute validation remains centralized | `cargo xtask test-contract-semantics` | task #4, task #5 | PENDING |
-| C06 | Public names | Public crate is `nexa-contract`; public syntax/model/error/functions use `Contract*`, `parse_contract`, and `validate_contract` only | public API scan; workspace build | task #5 | PENDING |
-| C07 | Stable IDs | Equivalent migration preserves Contract, type, function, field, parameter, and Variant Stable IDs | Stable-ID Golden corpus | task #5 | PENDING |
-| C08 | Descriptor | Descriptor v2 framing/schema stays unchanged; equivalent migration preserves normalized payload and canonical bytes | `cargo xtask test-contract-descriptor`; byte Goldens | task #5 | PENDING |
-| C09 | Build fingerprint | Build Fingerprint records `CONTRACT_SYNTAX_VERSION = 3`; any one-time outer-envelope difference is exact and reviewed | fingerprint Golden and review note | task #5, task #9 | PENDING |
-| C10 | Codegen model | Pipeline is `ValidatedContract → ContractDescriptor → BindingModel → generated Rust`; no backend semantic redecision | `cargo xtask test-contract-codegen` | task #5 | PENDING |
-| C11 | Binding behavior | Host/Nexa direction, `handle`, `Token<T>`, `Snapshot<T>`, async policies, Fuel, and capabilities remain in Descriptor/fingerprint and generated behavior | structured-codegen and real Host consumer gates | task #5, task #9 | PENDING |
-| C12 | Binding determinism | Equivalent migration preserves Host/Nexa binding shapes apart from required provenance renames; generated file names the new source; repeated generation is byte-identical | generated binding Goldens; reviewed diff | task #5 | PENDING |
-| C13 | CLI surface | `nexa contract check/generate` are the only direct commands; generic project commands accept the selected Contract; JSON/NDJSON exposes only Contract-named fields | `cargo xtask test-contract-cli` | task #6 | PENDING |
-| C14 | Discovery safety | Resolver checks existence, suffix, project root, symlink/`..` escape, and one current Host Contract | CLI/project discovery fixtures | task #6 | PENDING |
-| C15 | Migration diagnostic | An old file receives one actionable suffix/Header diagnostic without invoking a compatibility parser | CLI and parser diagnostic snapshots | task #6 | PENDING |
-| C16 | Product migration | Snake, Combat, Language Scale, Hello Runtime, Standalone, REPL, CLI/editor fixtures, diagnostic corpus, and codegen fixtures use Contract v3 | `contract-migration-check`; product corpus | task #6 | PENDING |
-| C17 | Editor registration | VS Code and Zed register `*.contract.nexa` as **Nexa Contract** and remove the old association | extension manifest checks | task #7 | PENDING |
-| C18 | Editor parsing | Tree-sitter/TextMate support flat Header and Contract keywords | grammar/highlighting fixtures | task #7 | PENDING |
-| C19 | LSP semantics | URI/config selects Contract profile; diagnostics include syntax, naming, type, attribute/direction, Stable-ID, and generated-Rust-name collisions | `cargo xtask test-contract-lsp` | task #7 | PENDING |
-| C20 | Outline | Outline contains Contract, Struct, Enum, Handle, Host Function, and Nexa Function symbols | LSP snapshot fixtures | task #7 | PENDING |
-| C21 | Documentation | Contract Language, Descriptor, Codegen, Host Binding, CLI/development loop, editor support, migration guide, Roadmap, and Baseline Index agree on v3 boundaries | link check; terminology scan | task #8 | PENDING |
+| C01 | Source profile | Shared `SourceProfile::{Executable, Contract}` selects the same profile in compiler, CLI, LSP, and editor paths | `cargo xtask test-contract-syntax`; profile isolation fixtures | task #4, task #6, task #7 | PASS |
+| C02 | File identity | Only `*.contract.nexa` is active; Contract source stays outside the Source Module Graph and has no path-derived module identity | discovery fixtures; `contract-migration-check` PASS | task #4, task #6, task #9 | PASS |
+| C03 | Header grammar | Exactly one first non-comment `contract Name;`; Header docs, `@stable`, and exact span retained | `cargo xtask test-contract-syntax` PASS | task #4 | PASS |
+| C04 | Parser recovery | Missing semicolon/Header, duplicate/late Header, invalid top-level item, and executable-profile Header have precise diagnostics; later declarations survive recovery | syntax fixture snapshots | task #4 | PASS |
+| C05 | Semantic ownership | Flat declarations resolve under the Header Contract Stable ID; type/direction/attribute validation remains centralized | `cargo xtask test-contract-semantics` PASS | task #4, task #5 | PASS |
+| C06 | Public names | Public crate is `nexa-contract`; public syntax/model/error/functions use `Contract*`, `parse_contract`, and `validate_contract` only | public API scan; workspace build; `contract-migration-check` PASS | task #5, task #9 | PASS |
+| C07 | Stable IDs | Equivalent migration preserves Contract, type, function, field, parameter, and Variant Stable IDs | Stable-ID Golden corpus; `test-contract-codegen` PASS | task #5, task #9 | PASS |
+| C08 | Descriptor | Descriptor v2 framing/schema stays unchanged; equivalent migration preserves normalized payload and canonical bytes | `cargo xtask test-contract-descriptor` PASS; byte Goldens | task #5, task #9 | PASS |
+| C09 | Build fingerprint | Build Fingerprint records `CONTRACT_SYNTAX_VERSION = 3`; any one-time outer-envelope difference is exact and reviewed | fingerprint Golden; `test-contract-descriptor` PASS | task #5, task #9 | PASS |
+| C10 | Codegen model | Pipeline is `ValidatedContract → ContractDescriptor → BindingModel → generated Rust`; no backend semantic redecision | `cargo xtask test-contract-codegen` PASS | task #5 | PASS |
+| C11 | Binding behavior | Host/Nexa direction, `handle`, `Token<T>`, `Snapshot<T>`, async policies, Fuel, and capabilities remain in Descriptor/fingerprint and generated behavior | structured-codegen and real Host consumer gates; `test-contract-codegen` PASS | task #5, task #9 | PASS |
+| C12 | Binding determinism | Equivalent migration preserves Host/Nexa binding shapes apart from required provenance renames; generated file names the new source; repeated generation is byte-identical | generated binding Goldens; `test-contract-codegen` PASS | task #5, task #9 | PASS |
+| C13 | CLI surface | `nexa contract check/generate` are the only direct commands; generic project commands accept the selected Contract; JSON/NDJSON exposes only Contract-named fields | `cargo xtask test-contract-cli` PASS | task #6 | PASS |
+| C14 | Discovery safety | Resolver checks existence, suffix, project root, symlink/`..` escape, and one current Host Contract | CLI/project discovery fixtures | task #6 | PASS |
+| C15 | Migration diagnostic | An old file receives one actionable suffix/Header diagnostic without invoking a compatibility parser | CLI and parser diagnostic snapshots | task #6 | PASS |
+| C16 | Product migration | Snake, Combat, Language Scale, Hello Runtime, Standalone, REPL, CLI/editor fixtures, diagnostic corpus, and codegen fixtures use Contract v3 | `contract-migration-check` PASS; product corpus | task #6, task #9 | PASS |
+| C17 | Editor registration | VS Code and Zed register `*.contract.nexa` as **Nexa Contract** and remove the old association | extension manifest checks; `contract-migration-check` PASS | task #7, task #9 | PASS |
+| C18 | Editor parsing | Tree-sitter/TextMate support flat Header and Contract keywords | grammar/highlighting fixtures; `test-contract-lsp` PASS | task #7, task #9 | PASS |
+| C19 | LSP semantics | URI/config selects Contract profile; diagnostics include syntax, naming, type, attribute/direction, Stable-ID, and generated-Rust-name collisions | `cargo xtask test-contract-lsp` PASS (42 tests) | task #7, task #9 | PASS |
+| C20 | Outline | Outline contains Contract, Struct, Enum, Handle, Host Function, and Nexa Function symbols | LSP snapshot fixtures; `test-contract-lsp` PASS | task #7, task #9 | PASS |
+| C21 | Documentation | Contract Language, Descriptor, Codegen, Host Binding, CLI/development loop, editor support, migration guide, Roadmap, and Baseline Index agree on v3 boundaries | link check; terminology scan | task #8 | PASS |
 | C22 | Split gates | All seven Contract commands exist, fail closed, and write reproducible evidence | `contract-v3-gates-receipt.json` (7/7 PASS) | task #9 | PASS |
-| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan | task #9 | PASS |
-| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | full gate receipt; workspace `cargo test --workspace --all-targets` PASS | task #9 | PASS |
+| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan; scanner unit tests (7 tests) | task #9 | PASS |
+| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | workspace receipt: `cargo test --workspace --all-targets` PASS + `--doc --workspace` PASS; aggregate PASS | task #9 | PASS |
 | C25 | Independent audit | Architecture, traversal security, Stable IDs, Descriptor determinism, public surface, and release evidence accepted independently | task #10 audit report | task #10 | PENDING |
 
 ## Required gate set
@@ -113,7 +113,7 @@ here and changes both this matrix and the Baseline Index milestone status to
 **COMPLETE**.
 
 ```text
-Candidate commit: 907d34f (Phase 4 final), branch codex/contract-v3-gates, clean worktree
+Candidate commit: 42c0812 (Phase 4 final), branch codex/contract-v3-gates, clean worktree (receipt SHA matches)
 Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt with one known M5 baseline exception
 Independent audit: PENDING
 Final decision: PENDING
