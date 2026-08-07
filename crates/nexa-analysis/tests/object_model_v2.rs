@@ -150,7 +150,7 @@ pub fn run(buffer: Buffer<i32>) -> i32 {
     table["counter"] = values[0];
     const frozen_buffer = buffer;
     frozen_buffer[0] = table["counter"];
-    const references = References { counter: counter, values: values };
+    const references = References { counter, values };
     references.counter.value = frozen_buffer[0];
     references.values[0] = references.counter.value;
     let choice = Choice::Stored(cell);

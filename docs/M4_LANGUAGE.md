@@ -134,6 +134,15 @@ let enemy = Enemy {
 enemy.health = 80;
 ```
 
+Both kinds support field initializer shorthand. `Type { name }` is exactly
+equivalent to `Type { name: name }`, including when followed by an update:
+
+```nexa
+let name = "asp";
+let enemy = Enemy { name, health: 100 };
+let moved = Enemy { name, ..enemy };
+```
+
 Copying a Class value copies its reference. Class equality compares identity;
 Struct equality is structural when every field is comparable. An absent Class
 reference is represented with `Option<Enemy>`.

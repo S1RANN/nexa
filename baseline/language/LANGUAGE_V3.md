@@ -37,6 +37,21 @@ unchanged by Language v3. Equality between these values is neither required nor
 implied. Active products reject every other source, Contract, Descriptor, or
 Bytecode version instead of selecting a compatibility parser or decoder.
 
+### 1.1 Aggregate initializer shorthand
+
+Struct and Class values use the same `Type { fields }` initializer. A field
+whose value is a same-named binding MAY omit the colon and value:
+
+```nexa
+let x = 1;
+let point = Point { x, y: 2 };
+let object = Boxed { value };
+```
+
+`Type { field }` is exactly equivalent to `Type { field: field }`. Shorthand
+fields MAY precede `..base`; duplicate, unknown, missing, and type-mismatched
+fields are checked exactly as explicit field initializers.
+
 ## 2. `Set<T>`
 
 A `Set<T>` is a non-null GC reference type holding distinct elements of one

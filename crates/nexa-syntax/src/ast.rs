@@ -2027,8 +2027,17 @@ impl<'a> Parser<'a> {
             }
             let start = self.current_range();
             let name = self.identifier();
-            self.expect(TokenKind::Colon, "expected `:` after field name");
-            let value = self.expression(0);
+            let value = if self.take(TokenKind::Colon).is_some() {
+                self.expression(0)
+            } else {
+                Expression {
+                    kind: ExpressionKind::Name(QualifiedName {
+                        segments: vec![name.clone()],
+                        range: name.range,
+                    }),
+                    range: name.range,
+                }
+            };
             let end = self.take(TokenKind::Comma).unwrap_or(value.range);
             fields.push(FieldInitializer {
                 name,
