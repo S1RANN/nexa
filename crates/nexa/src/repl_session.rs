@@ -26,13 +26,15 @@ use nexa_runtime::{
 use crate::{CompiledReplCellArtifact, HostContractInput, PackageBuildError, PackageBuildSession};
 
 /// Built-in Host contract used by standalone scripts and REPL sessions.
-pub const CONSOLE_HOST_CONTRACT: &str = "contract Console;\n\
-    host {\n\
-        fn write(value: string);\n\
-        fn write_line(value: string);\n\
-        fn write_error(value: string);\n\
-        fn write_error_line(value: string);\n\
-    }\n";
+pub const CONSOLE_HOST_CONTRACT: &str = r#"
+contract Console;
+host {
+    fn write(value: string);
+    fn write_line(value: string);
+    fn write_error(value: string);
+    fn write_error_line(value: string);
+}
+"#;
 
 /// Reader-facing identity of the built-in Console contract.
 pub const CONSOLE_HOST_SOURCE_IDENTITY: &str = "contract://builtin/console.contract.nexa";
