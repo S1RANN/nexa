@@ -517,14 +517,10 @@ fn is_scalar(ty: &IrType) -> bool {
     )
 }
 
-/// Recursively formattable interpolation set: scalars plus `Array<T>` whose
-/// elements are themselves formattable.
-///
-/// Tuple, Option, Result, Map, Struct, Class, Buffer, and Host values are
-/// deliberately excluded for now. Keeping the first aggregate surface to
-/// arrays makes formatting deterministic without exposing nominal layouts or
-/// introducing recursive object traversal.
-fn is_interpolatable(ty: &IrType) -> bool {
+/// Runtime-formattable values handled by the generic collection formatter.
+/// Nominal values use a compiler-emitted field plan so their declared names
+/// remain available without adding reflection metadata to Bytecode v8.
+fn is_runtime_interpolatable(ty: &IrType) -> bool {
     match ty {
         IrType::Bool
         | IrType::I32
@@ -533,9 +529,53 @@ fn is_interpolatable(ty: &IrType) -> bool {
         | IrType::F64
         | IrType::String
         | IrType::Rune => true,
-        IrType::Array(inner) => is_interpolatable(inner),
+        IrType::Array(inner) => is_runtime_interpolatable(inner),
         _ => false,
     }
+}
+
+/// Recursively formattable interpolation set: scalars, scalar Arrays, and
+/// acyclic Struct/Class field graphs. Nominal cycles and fields whose values
+/// lack deterministic formatting remain compile-time errors.
+fn is_interpolatable(
+    ty: &IrType,
+    definitions: &[Definition],
+    type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+) -> bool {
+    fn visit(
+        ty: &IrType,
+        definitions: &[Definition],
+        type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> bool {
+        if is_runtime_interpolatable(ty) {
+            return true;
+        }
+        let IrType::Named(definition) = ty else {
+            return false;
+        };
+        let Some(declaration) = definitions.get(definition.0 as usize) else {
+            return false;
+        };
+        if !matches!(
+            declaration.kind,
+            DefinitionKind::Struct | DefinitionKind::Class
+        ) || !visiting.insert(*definition)
+        {
+            return false;
+        }
+        let formattable = type_metadata.get(definition).is_some_and(|metadata| {
+            metadata.field_order.iter().all(|field| {
+                definitions.get(field.0 as usize).is_some_and(|field| {
+                    visit(&field.ty, definitions, type_metadata, visiting)
+                })
+            })
+        });
+        visiting.remove(definition);
+        formattable
+    }
+
+    visit(ty, definitions, type_metadata, &mut BTreeSet::new())
 }
 
 fn max_effect(left: IrEffect, right: IrEffect) -> IrEffect {

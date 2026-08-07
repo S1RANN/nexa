@@ -1003,13 +1003,23 @@ fn standalone_compound_assignment_interpolation_and_receiver_methods_execute() {
     let source = fixture.root.join("language-features.nexa");
     fs::write(
         &source,
-        r#"fn next_index(counter: Array<i32>) -> i32 {
+        r#"struct Point {
+    x: i32,
+    y: i32,
+}
+
+class Enemy {
+    name: string,
+    health: i32,
+}
+
+fn next_index(counter: Array<i32>) -> i32 {
     counter[0] += 1;
     return 1;
 }
 
 fn main(args: Array<string>) -> i32 {
-    let mut number = 20;
+    let number = 20;
     number += 2;
     number -= 3;
     number *= 4;
@@ -1033,6 +1043,10 @@ fn main(args: Array<string>) -> i32 {
     host::write_line("${parts}");
     let outcome: Result<i32, string> = Result::Ok(9);
     host::write_line("${outcome.unwrap_or(0)}");
+    let point = Point { x: 3, y: 4 };
+    let enemy = Enemy { name: "asp", health: 100 };
+    host::write_line("${point}");
+    host::write_line(enemy);
     return 0;
 }
 "#,
@@ -1053,6 +1067,8 @@ fn main(args: Array<string>) -> i32 {
             "true\n",
             "[a, b]\n",
             "9\n",
+            "Point { x: 3, y: 4 }\n",
+            "Enemy { name: asp, health: 100 }\n",
         )
     );
     assert!(

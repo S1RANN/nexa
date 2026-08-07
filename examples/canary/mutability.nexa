@@ -29,3 +29,11 @@ pub fn default_mutability() -> i32 {
     references.values[0] += 1;
     return bump(references.object.value + references.values[0]);
 }
+
+pub fn aggregate_interpolation() -> string {
+    let cell = MutableCell { value: 7 };
+    let object = MutableBox { value: 9 };
+    const values = [3, 1, 4];
+    let references = ReferenceHolder { object, values };
+    return "cell=${cell}; object=${object}; references=${references}";
+}

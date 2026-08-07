@@ -8160,7 +8160,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             let value = self.check_expression(expression, None);
                             if is_scalar(&value.ty) {
                                 values.push(value);
-                            } else if is_interpolatable(&value.ty) {
+                            } else if is_interpolatable(
+                                &value.ty,
+                                &self.analyzer.definitions,
+                                &self.analyzer.type_metadata,
+                            ) {
                                 values.push(TypedExpressionIr {
                                     ty: IrType::String,
                                     effect: value.effect,
@@ -8178,8 +8182,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                                 self.type_error(
                                     value.span.clone(),
                                     &format!(
-                                        "interpolation supports scalar values and Array<T> when \
-                                         its elements are formattable; {} is not formattable",
+                                        "interpolation supports scalar values, recursively \
+                                         formattable Array<T>, Struct, and Class values; {} is \
+                                         not formattable",
                                         display_ir_type(&value.ty, &self.analyzer.definitions)
                                     ),
                                 );
@@ -9929,7 +9934,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     if formats_console_value
                         && index == 0
                         && value.ty != IrType::String
-                        && is_interpolatable(&value.ty)
+                        && is_interpolatable(
+                            &value.ty,
+                            &self.analyzer.definitions,
+                            &self.analyzer.type_metadata,
+                        )
                     {
                         return TypedExpressionIr {
                             ty: IrType::String,

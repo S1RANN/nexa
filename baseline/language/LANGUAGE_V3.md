@@ -52,6 +52,24 @@ let object = Boxed { value };
 fields MAY precede `..base`; duplicate, unknown, missing, and type-mismatched
 fields are checked exactly as explicit field initializers.
 
+### 1.2 Struct and Class interpolation
+
+A Struct or Class whose complete field graph is deterministically formattable
+MAY be used in string interpolation and in Host console functions that accept
+formattable values. Its canonical text is:
+
+```text
+TypeName { first_field: value, second_field: value }
+```
+
+Fields MUST appear in declaration order. Scalar and recursively formattable
+Array fields use their existing canonical representations; acyclic nested
+Struct/Class fields use this same rule. Nominal cycles and fields containing
+Map, Tuple, Option, Result, Buffer, Set, Host, or resource-bearing values are
+rejected at analysis time. Formatting evaluates the interpolated expression
+once and MUST NOT expose addresses, GC identities, hash-table order, or
+locale-dependent text.
+
 ## 2. `Set<T>`
 
 A `Set<T>` is a non-null GC reference type holding distinct elements of one

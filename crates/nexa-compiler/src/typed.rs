@@ -876,6 +876,7 @@ fn compile_typed_package_with_profile(
     for expression in constants.values() {
         collect_expression_codegen_inputs(expression, &mut codegen_inputs);
     }
+    collect_aggregate_format_strings(package, &mut codegen_inputs.strings);
     let mut builder = ModuleBuilder::new();
     let string_indices = codegen_inputs
         .strings
@@ -5390,6 +5391,24 @@ impl<'a> FunctionEmitter<'a> {
             return Ok(());
         }
 
+        if operation == BuiltinOperationIr::ValueToString
+            && let [IrType::Named(definition)] = type_arguments
+            && self.layouts.aggregates.contains_key(definition)
+        {
+            let [value] = arguments else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            let source = self.allocate_expression(value)?;
+            self.emit_expression(value, source)?;
+            return self.emit_nominal_to_string(
+                *definition,
+                source,
+                destination,
+                span,
+                &mut BTreeSet::new(),
+            );
+        }
+
         let (args_base, argument_registers, argument_slots) =
             self.reserve_physical_arguments(arguments)?;
         for (argument, register) in arguments.iter().zip(argument_registers.iter().copied()) {
@@ -6973,6 +6992,173 @@ impl<'a> FunctionEmitter<'a> {
             },
             span,
         );
+        Ok(())
+    }
+
+    fn emit_formattable_register(
+        &mut self,
+        ty: &IrType,
+        source: u16,
+        destination: u16,
+        span: SourceSpan,
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> Result<(), CompileError> {
+        if let Ok(conversion) = TypedScalarToString::from_ir_type(ty, span) {
+            self.push(conversion.instruction(destination, source), span);
+            return Ok(());
+        }
+        match ty {
+            IrType::Array(_) => {
+                let value = lower_type(self.package, ty, span)?;
+                let slots = self.layouts.physical_slots(value, span)?;
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic: StandardIntrinsic::ValueToString { value },
+                        args_base: source,
+                        args_count: slots,
+                        dst: destination,
+                    },
+                    span,
+                );
+                Ok(())
+            }
+            IrType::Named(definition) if self.layouts.aggregates.contains_key(definition) => {
+                self.emit_nominal_to_string(*definition, source, destination, span, visiting)
+            }
+            _ => Err(CompileError::type_mismatch(None, None, span)),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_nominal_to_string(
+        &mut self,
+        definition: DefinitionId,
+        source: u16,
+        destination: u16,
+        span: SourceSpan,
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> Result<(), CompileError> {
+        if !visiting.insert(definition) {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        let aggregate = self
+            .layouts
+            .aggregates
+            .get(&definition)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::unknown_type(self.definition_name(definition), self.function_span)
+            })?;
+        let type_name = self
+            .package
+            .definition(definition)
+            .map(|definition| definition.name.clone())
+            .ok_or_else(|| {
+                CompileError::unknown_type(self.definition_name(definition), self.function_span)
+            })?;
+        if aggregate.fields.is_empty() {
+            let text = aggregate_empty_format(&type_name);
+            let string = self.string_indices.get(&text).copied().ok_or_else(|| {
+                CompileError::unknown_name("aggregate format string".into(), span)
+            })?;
+            self.push(
+                Instruction::LoadString {
+                    dst: destination,
+                    string,
+                },
+                span,
+            );
+            visiting.remove(&definition);
+            return Ok(());
+        }
+
+        let part_count = aggregate
+            .fields
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| CompileError::too_many_registers(span))?;
+        let parts_base = self.reserve_types(&vec![ValueType::String; part_count])?;
+        for (index, field) in aggregate.fields.iter().enumerate() {
+            let field_definition = self.package.definition(field.definition).ok_or_else(|| {
+                CompileError::unknown_name(
+                    format!("definition#{}", field.definition.0),
+                    self.function_span,
+                )
+            })?;
+            let prefix = aggregate_field_format(&type_name, &field_definition.name, index == 0);
+            let prefix_register = parts_base
+                .checked_add(
+                    u16::try_from(index.saturating_mul(2))
+                        .map_err(|_| CompileError::too_many_registers(span))?,
+                )
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            let prefix_string = self.string_indices.get(&prefix).copied().ok_or_else(|| {
+                CompileError::unknown_name("aggregate format string".into(), span)
+            })?;
+            self.push(
+                Instruction::LoadString {
+                    dst: prefix_register,
+                    string: prefix_string,
+                },
+                span,
+            );
+
+            let field_register = self.allocate(field.ty)?;
+            self.push(
+                match aggregate.kind {
+                    TypedAggregateKind::Struct => Instruction::StructGet {
+                        source,
+                        field: field.stable_id,
+                        dst: field_register,
+                    },
+                    TypedAggregateKind::Class => Instruction::ClassGet {
+                        source,
+                        field: field.stable_id,
+                        dst: field_register,
+                    },
+                },
+                span,
+            );
+            let value_register = prefix_register
+                .checked_add(1)
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            self.emit_formattable_register(
+                &field_definition.ty,
+                field_register,
+                value_register,
+                span,
+                visiting,
+            )?;
+        }
+        let suffix_register = parts_base
+            .checked_add(
+                u16::try_from(part_count.saturating_sub(1))
+                    .map_err(|_| CompileError::too_many_registers(span))?,
+            )
+            .ok_or_else(|| CompileError::too_many_registers(span))?;
+        let suffix = self
+            .string_indices
+            .get(AGGREGATE_FORMAT_SUFFIX)
+            .copied()
+            .ok_or_else(|| CompileError::unknown_name("aggregate format suffix".into(), span))?;
+        self.push(
+            Instruction::LoadString {
+                dst: suffix_register,
+                string: suffix,
+            },
+            span,
+        );
+        self.push(
+            Instruction::StringBuild {
+                dst: destination,
+                parts_base,
+                parts_count: u16::try_from(part_count)
+                    .map_err(|_| CompileError::too_many_registers(span))?,
+            },
+            span,
+        );
+        visiting.remove(&definition);
         Ok(())
     }
 
@@ -10793,6 +10979,58 @@ fn collect_type_strings(
         || function.return_type == IrType::String;
     if has_string {
         strings.insert(String::new());
+    }
+}
+
+const AGGREGATE_FORMAT_SUFFIX: &str = " }";
+
+fn aggregate_empty_format(type_name: &str) -> String {
+    format!("{type_name} {{}}")
+}
+
+fn aggregate_field_format(type_name: &str, field_name: &str, first: bool) -> String {
+    if first {
+        format!("{type_name} {{ {field_name}: ")
+    } else {
+        format!(", {field_name}: ")
+    }
+}
+
+fn collect_aggregate_format_strings(package: &TypedPackageIr, strings: &mut BTreeSet<String>) {
+    for module in package.modules() {
+        for declaration in module.declarations.iter() {
+            let TypedDeclarationBody::TypeLayout(
+                layout @ (TypedTypeLayoutIr::Struct { .. } | TypedTypeLayoutIr::Class { .. }),
+            ) = &declaration.body
+            else {
+                continue;
+            };
+            let Some(definition) = package.definition(declaration.definition) else {
+                continue;
+            };
+            let fields = match layout {
+                TypedTypeLayoutIr::Struct { fields } | TypedTypeLayoutIr::Class { fields, .. } => {
+                    fields
+                }
+                TypedTypeLayoutIr::Enum { .. } => unreachable!("pattern excludes Enum layouts"),
+            };
+            if fields.is_empty() {
+                strings.insert(aggregate_empty_format(&definition.name));
+                continue;
+            }
+            strings.insert(AGGREGATE_FORMAT_SUFFIX.to_owned());
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_by_key(|field| field.order);
+            for (index, field) in fields.into_iter().enumerate() {
+                if let Some(field) = package.definition(field.definition) {
+                    strings.insert(aggregate_field_format(
+                        &definition.name,
+                        &field.name,
+                        index == 0,
+                    ));
+                }
+            }
+        }
     }
 }
 

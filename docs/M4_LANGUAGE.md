@@ -188,19 +188,24 @@ frame.
 
 ## String interpolation
 
-`${expression}` interpolates a string, integer, float, Boolean, rune, or an
-`Array<T>` whose elements are recursively formattable. Formatting is
-deterministic and locale-free:
+`${expression}` interpolates a string, integer, float, Boolean, rune, a
+recursively formattable `Array<T>`, or a Struct/Class whose complete field
+graph is formattable. Formatting is deterministic, locale-free, and follows
+field declaration order:
 
 ```nexa
 let label: string = "score";
 let values = [3, 1, 4];
 let message: string = "${label}: ${values}"; // score: [3, 1, 4]
+
+let point = Point { x: 3, y: 4 };
+let debug: string = "${point}"; // Point { x: 3, y: 4 }
 ```
 
-Nested arrays use the same representation. Nominal objects, Maps, Tuples,
-Host values, and resource-bearing values are rejected rather than exposing
-object internals or risking recursive object traversal.
+Nested arrays use the same representation. A nominal field graph containing a
+cycle or a Map, Tuple, Option, Result, Buffer, Set, Host value, or
+resource-bearing value is rejected at compile time rather than producing a
+partial string or performing unbounded object traversal.
 
 `\${` produces a literal `${`. Conversion is verified, bounded, fuel-metered,
 and represented in Source Maps and precise Root Maps.

@@ -112,8 +112,9 @@ host::write_line("values = ${values}"); // values = [3, 1, 4]
 
 `Array<T>.get(index)` is bounds checked and returns `Option<T>`; direct
 `values[index]` indexing remains the trapping form. String interpolation
-formats scalars and recursively formattable arrays without requiring a Console
-helper.
+formats scalars, recursively formattable arrays, and formattable Struct/Class
+values without requiring a Console helper. Aggregate output includes the type
+and field names in declaration order.
 
 The compiler lowers those statements, in source order, into a synthetic
 `main(args: Array<string>) -> i32`. The implicit `args` binding contains the
