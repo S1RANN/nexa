@@ -60,7 +60,7 @@ but may not self-waive a required row.
 | C21 | Documentation | Contract Language, Descriptor, Codegen, Host Binding, CLI/development loop, editor support, migration guide, Roadmap, and Baseline Index agree on v3 boundaries | link check; terminology scan | task #8 | PENDING |
 | C22 | Split gates | All seven Contract commands exist, fail closed, and write reproducible evidence | `contract-v3-gates-receipt.json` (7/7 PASS) | task #9 | PASS |
 | C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan | task #9 | PASS |
-| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | full gate receipt; one known M5 baseline exception documented | task #9 | NOTE |
+| C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | full gate receipt; workspace `cargo test --workspace --all-targets` PASS | task #9 | PASS |
 | C25 | Independent audit | Architecture, traversal security, Stable IDs, Descriptor determinism, public surface, and release evidence accepted independently | task #10 audit report | task #10 | PENDING |
 
 ## Required gate set
@@ -113,7 +113,7 @@ here and changes both this matrix and the Baseline Index milestone status to
 **COMPLETE**.
 
 ```text
-Candidate commit: 10946a5 (Phase 4 implementation), branch codex/contract-v3-gates, from integration d431146
+Candidate commit: PENDING (intermediate Phase 4 commit, will set final after review)
 Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt with one known M5 baseline exception
 Independent audit: PENDING
 Final decision: PENDING

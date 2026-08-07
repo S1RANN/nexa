@@ -67,7 +67,7 @@ const contractExamples = [
   "examples/hello-runtime/hello_api.contract.nexa",
   "examples/language-scale/language_scale.contract.nexa",
   "examples/snake-game/snake_api.contract.nexa",
-  "crates/nexa-contract/tests/fixtures/business_host/contract.nidl",
+  "crates/nexa-contract/tests/fixtures/business_host/game.contract.nexa",
 ];
 
 const queryChecks = [
@@ -414,13 +414,13 @@ function validateSyntaxContract() {
     "Contract Tree-sitter grammar must define v2 comments",
   );
   for (const rule of [
-    "nidl_document",
+    "contract_document",
     "handle_declaration",
     "host_block",
     "nexa_block",
     "host_function_declaration",
     "nexa_function_declaration",
-    "nidl_attribute",
+    "contract_attribute",
   ]) {
     assert(
       idlGrammar.rules[rule],

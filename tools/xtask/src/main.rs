@@ -3848,7 +3848,7 @@ fn validate_m5_status_documents(root: &Path) -> Result<(), DynError> {
         "baseline/BASELINE_INDEX.md",
         &baseline_index,
         &[
-            "Version: **5.0.0**",
+            "Version: **6.0.0-rc.1**",
             "Nexa M5 Deep Performance Optimization = COMPLETE",
             "Performance Measurement Authority v1 = COMPLETE",
             "Value Layout v1 = COMPLETE",

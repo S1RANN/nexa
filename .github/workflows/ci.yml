@@ -36,7 +36,7 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets
       - name: Test binding gate
-        run: cargo test -p nexa-idl --test e2e_mutations -- --include-ignored
+        run: cargo test -p nexa-contract --test e2e_mutations -- --include-ignored
       - name: Test public API compile gate
         run: cargo test -p nexa-runtime --test public_api_compile -- --include-ignored
       - name: Test documentation

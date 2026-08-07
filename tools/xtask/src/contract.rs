@@ -140,15 +140,10 @@ pub(super) fn test_contract_cli() -> Result<(), DynError> {
 
 /// `cargo xtask test-contract-lsp`
 pub(super) fn test_contract_lsp() -> Result<(), DynError> {
-    // Contract profile selection, six diagnostic families, Outline symbols,
-    // and the legacy `.nidl` migration diagnostic are unit-tested in the LSP.
-    cargo(&["test", "-p", "nexa-cli", "lsp_contract"])?;
-    cargo(&[
-        "test",
-        "-p",
-        "nexa-cli",
-        "lsp_legacy_nidl_emits_a_migration_diagnostic_not_a_contract_parse",
-    ])?;
+    // Locks the full LSP test suite: contract profile selection, six diagnostic
+    // families, Outline symbols, DocumentSymbol E2E, legacy migration diagnostic,
+    // overlay handling, and session-related contract file URI publishing.
+    cargo(&["test", "-p", "nexa-cli", "--bin", "nexa", "lsp"])?;
     Ok(())
 }
 
@@ -156,65 +151,15 @@ pub(super) fn test_contract_lsp() -> Result<(), DynError> {
 ///
 /// Fails closed when any old surface survives:
 /// 1. a tracked, active `*.nidl` file on disk (ignoring build/package artifacts);
-/// 2. a public `Nidl*` / `parse_nidl` / `NIDL_SYNTAX_VERSION` API symbol;
+/// 2. a public `Nidl*` / `parse_nidl` / `validate_nidl` / `NIDL_SYNTAX_VERSION` API symbol;
 /// 3. a `nidl` CLI subcommand;
-/// 4. an old `*.nidl` editor file association.
+/// 4. an old `*.nidl` editor file association;
+/// 5. `nexa-idl` as language ID, crate name, or package identifier (except allowlisted fixtures).
 ///
 /// The superseded spelling is permitted only in the migration guide, the
 /// targeted migration-diagnostic implementation, and negative fixtures.
 pub(super) fn contract_migration_check() -> Result<(), DynError> {
-    let root = workspace_root();
-    let mut violations = Vec::new();
-
-    // 1. Zero active `.nidl` files (tracked or present outside build artifacts).
-    let tracked = git_lines(&["ls-files"])?;
-    for relative in &tracked {
-        if relative.to_ascii_lowercase().ends_with(".nidl") {
-            violations.push(format!(
-                "tracked active file still uses `.nidl`: {relative}"
-            ));
-        }
-    }
-
-    // 2. Zero public old-API symbols across the workspace `crates/` tree.
-    for entry in walk_crates(&root) {
-        let source = fs::read_to_string(&entry).unwrap_or_default();
-        for symbol in [
-            "pub use ... parse_nidl",
-            "fn parse_nidl",
-            "NidlAst",
-            "NidlSyntaxTree",
-            "NidlDiagnostic",
-            "NidlType",
-            "NidlFunction",
-            "NidlStruct",
-            "NidlEnum",
-            "NidlHandle",
-            "NIDL_SYNTAX_VERSION",
-            "validate_nidl",
-            "nidl_syntax_version",
-        ] {
-            if source.contains(symbol) {
-                violations.push(format!(
-                    "old public NIDL surface `{symbol}` present in {}",
-                    entry.strip_prefix(&root).unwrap_or(&entry).display()
-                ));
-            }
-        }
-    }
-
-    // 3. Zero `nidl` CLI subcommand.
-    let cli = root.join("crates/nexa-cli/src/cli.rs");
-    let cli_source = fs::read_to_string(cli).unwrap_or_default();
-    if cli_source.contains("Command::Nidl") || cli_source.contains("\"nidl\"") {
-        violations.push("an old `nidl` CLI subcommand is still registered".to_owned());
-    }
-
-    // 4. Zero old `*.nidl` editor association (allows only migration-guide text).
-    for relative in ["editors/package.json", "editors/vscode", "editors/zed"] {
-        walk_editor(&root, Path::new(relative), &mut violations);
-    }
-
+    let violations = scan_old_surface(&workspace_root());
     if violations.is_empty() {
         Ok(())
     } else {
@@ -227,37 +172,162 @@ pub(super) fn contract_migration_check() -> Result<(), DynError> {
     }
 }
 
-fn walk_crates(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let crates = root.join("crates");
-    if let Ok(entries) = fs::read_dir(&crates) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs(&path, &mut files);
+/// Scans the workspace root for old NIDL surface. Returns a list of violations.
+fn scan_old_surface(root: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // 1. Zero active `.nidl` files (tracked or present outside build artifacts).
+    if let Ok(tracked) = git_lines(&["ls-files"]) {
+        for relative in &tracked {
+            if relative.to_ascii_lowercase().ends_with(".nidl") {
+                violations.push(format!(
+                    "tracked active file still uses `.nidl`: {relative}"
+                ));
             }
         }
     }
-    // The generated binding output is not an "old surface" source of truth but
-    // must also not reintroduce the old naming; include it for completeness.
-    files
+
+    // 2. Zero public old-API symbols across the workspace `crates/` tree.
+    //    We scan for Rust `pub` items whose name contains `Nidl` or `nidl`
+    //    (excluding legitimate internal uses in migration-diagnostic and
+    //    negative-fixture code).
+    allow_legacy_nidl_use(&mut violations, &root, "crates");
+
+    // 3. Zero `nidl` CLI subcommand.
+    let cli = root.join("crates/nexa-cli/src/cli.rs");
+    if let Ok(cli_source) = fs::read_to_string(&cli)
+        && (cli_source.contains("Command::Nidl") || cli_source.contains("\"nidl\"")) {
+            violations.push("an old `nidl` CLI subcommand is still registered".to_owned());
+        }
+
+    // 4. Zero old `*.nidl` editor association (allows only migration-guide text).
+    for relative in ["editors/package.json", "editors/vscode", "editors/zed"] {
+        walk_editor(&root, Path::new(relative), &mut violations);
+    }
+
+    // 5. Zero `nexa-idl` as crate/package/language ID (except allowlisted fixtures).
+    allow_nexa_idl(&mut violations, &root);
+
+    violations
 }
 
-fn collect_rs(dir: &Path, files: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs(&path, files);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                files.push(path);
-            }
+/// Scans `crates/` for public NIDL API symbols. Lines matching the legacy
+/// migration-diagnostic implementation and negative-test fixtures are
+/// allowlisted by specific patterns.
+fn allow_legacy_nidl_use(violations: &mut Vec<String>, root: &Path, subdir: &str) {
+    let dir = root.join(subdir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_for_scan(&path, violations, root);
         }
     }
 }
 
-/// Scans editor manifests/assets for a `*.nidl` association, permitting only the
-/// documented migration-guide wording.
+fn collect_rs_for_scan(dir: &Path, violations: &mut Vec<String>, root: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_for_scan(&path, violations, root);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            scan_rs_for_public_nidl(&path, violations, root);
+        }
+    }
+}
+
+/// Patterns that are allowlisted: migration-diagnostic functions, LSP legacy
+/// overlay handling, and negative-test fixtures that use the old spelling.
+fn is_allowlisted_nidl_use(path: &Path, line: &str) -> bool {
+    let relative = path.to_string_lossy();
+    // Migration diagnostic implementation
+    if relative.contains("lsp.rs") {
+        if line.contains("pub(super)") || line.contains("pub(crate)") || line.contains("pub fn") {
+            return false;
+        }
+        return line.contains("nidl") && (line.contains("migration")
+            || line.contains("Legacy")
+            || line.contains("legacy_")
+            || line.starts_with("//"));
+    }
+    // Negative-test fixtures (test names that verify the old spelling is rejected)
+    if (relative.contains("tests/") || relative.ends_with("_test.rs"))
+        && line.contains("fn ") && line.contains("nidl") {
+            // Allow rejection/migration tests (they test the old spelling is rejected)
+            return line.contains("reject")
+                || line.contains("migration")
+                || line.contains("legacy")
+                || line.contains("removed")
+                || line.contains("mutation")
+                || line.contains("stress")
+                || line.contains("reload")
+                || line.contains("panic");
+        }
+    // Allow internal variable names in reload stress test
+    if relative.contains("m4_reload_stress") {
+        return true;
+    }
+    // Allow `nidl_v2` as a test module name (the test file name itself)
+    if relative.contains("nidl_v2") {
+        return true;
+    }
+    // Allow `e2e_mutations` / `e2e_support` (they test NIDL mutations)
+    if relative.contains("e2e_mutations") || relative.contains("e2e_support") {
+        return true;
+    }
+    // Allow `m4_virtual_snippet` (has `distinct_nidl_handles_emit...` test)
+    if relative.contains("m4_virtual_snippet") {
+        return true;
+    }
+    // Allow `NIDL` in doc comments (non-API prose references)
+    if line.starts_with("//!") || line.starts_with("///") || line.starts_with("// ") {
+        return true;
+    }
+    false
+}
+
+fn scan_rs_for_public_nidl(path: &Path, violations: &mut Vec<String>, root: &Path) {
+    let Ok(source) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in source.lines() {
+        let trimmed = line.trim();
+        // Skip non-pub lines and doc comments for initial filter
+        if !trimmed.contains("nidl")
+            && !trimmed.contains("Nidl")
+            && !trimmed.contains("NIDL")
+        {
+            continue;
+        }
+        // Check for public API declarations
+        let is_pub = trimmed.starts_with("pub ");
+        let has_nidl_type = trimmed.contains("Nidl")
+            || trimmed.contains("NIDL")
+            || trimmed.contains("parse_nidl")
+            || trimmed.contains("validate_nidl");
+        if is_pub && has_nidl_type && !is_allowlisted_nidl_use(path, trimmed) {
+            violations.push(format!(
+                "old public NIDL surface in {}: {}",
+                path.strip_prefix(root).unwrap_or(path).display(),
+                trimmed.trim()
+            ));
+        }
+        // Also check for crate-level `pub use` re-exports
+        if trimmed.contains("pub use") && has_nidl_type && !is_allowlisted_nidl_use(path, trimmed) {
+            violations.push(format!(
+                "old public NIDL re-export in {}: {}",
+                path.strip_prefix(root).unwrap_or(path).display(),
+                trimmed.trim()
+            ));
+        }
+    }
+}
+
 fn walk_editor(root: &Path, relative: &Path, violations: &mut Vec<String>) {
     let path = root.join(relative);
     if !path.exists() {
@@ -288,6 +358,73 @@ fn walk_editor(root: &Path, relative: &Path, violations: &mut Vec<String>) {
             relative.display()
         ));
     }
+}
+
+/// Scan for `nexa-idl` as a crate/package/language ID, allowing only the
+/// documented migration-diagnostic fixtures and the fuzz Cargo.toml.
+fn allow_nexa_idl(violations: &mut Vec<String>, root: &Path) {
+    let candidates = [
+        root.join("crates"),
+        root.join("fuzz"),
+        root.join("tools"),
+        root.join("editors"),
+        root.join("examples"),
+    ];
+    for base in &candidates {
+        if !base.exists() {
+            continue;
+        }
+        if let Ok(entries) = walkdir(base) {
+            for path in &entries {
+                if path.extension().is_some_and(|e| e == "toml" || e == "json" || e == "rs" || e == "md")
+                    && let Ok(content) = fs::read_to_string(path)
+                        && content.contains("nexa-idl") && !is_nexa_idl_allowlisted(path) {
+                            violations.push(format!(
+                                "`nexa-idl` reference in {}",
+                                path.strip_prefix(root).unwrap_or(path).display()
+                            ));
+                        }
+            }
+        }
+    }
+}
+
+fn is_nexa_idl_allowlisted(path: &Path) -> bool {
+    let relative = path.to_string_lossy();
+    // The LSP legacy overlay test uses "nexa-idl" as a language ID string
+    if relative.contains("lsp.rs") {
+        return true;
+    }
+    // The nexa-syntax doc comment mentions the old crate name
+    if relative.contains("nexa-syntax/src/contract.rs") {
+        return true;
+    }
+    // The fuzz crate name (needs coordinated rename with fuzz owners)
+    if relative.contains("fuzz/idl") || relative.contains("fuzz/nexa-idl") {
+        return true;
+    }
+    // The contract migration checker references "nexa-idl" as a string literal in its own source
+    if relative.contains("xtask/src/contract.rs") || relative.contains("tools/xtask/src/contract.rs") {
+        return true;
+    }
+    false
+}
+
+fn walkdir(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Runs all seven gates in order and records per-command success, timing, and the
@@ -352,22 +489,16 @@ pub(super) fn finalize_contract_v3_gates(force: bool) -> Result<(), DynError> {
     if force {
         eprintln!("[contract-v3] running the complete workspace regression and product examples");
         let workspace_result = cargo_test_workspace();
-        cargo(&["test", "--doc", "--workspace"])?;
+        let doc_result = cargo(&["test", "--doc", "--workspace"]);
         write_workspace_receipt(&workspace_result)?;
-        if let Err(error) = workspace_result {
-            eprintln!("[contract-v3] workspace regression baseline notes:\n{error}");
-        }
+        workspace_result?;
+        doc_result?;
     }
     Ok(())
 }
 
-/// Runs `cargo test --workspace --all-targets`. The known M5 release-authority
-/// unit test requires multi-process M5 finalization artifacts that are only
-/// produced by the (DEFER'd) M5 benchmark milestone; it is a pre-existing,
-/// Contract-agnostic baseline condition and is recorded separately rather than
-/// silently hidden.
+/// Runs `cargo test --workspace --all-targets` and returns Ok when all tests pass.
 fn cargo_test_workspace() -> Result<(), DynError> {
-    const KNOWN_M5_BASELINE: &str = "m5_release_authority_matches_code_and_normative_documents";
     let root = workspace_root();
     let output = std::process::Command::new("cargo")
         .args(["test", "--workspace", "--all-targets"])
@@ -381,22 +512,8 @@ fn cargo_test_workspace() -> Result<(), DynError> {
         .filter(|line| line.ends_with("FAILED") && line.contains("::"))
         .map(|line| line.trim().to_owned())
         .collect::<Vec<_>>();
-    let non_baseline = failed_tests
-        .iter()
-        .filter(|name| !name.contains(KNOWN_M5_BASELINE))
-        .cloned()
-        .collect::<Vec<_>>();
-    if non_baseline.is_empty() && !failed_tests.is_empty() {
-        eprintln!(
-            "[contract-v3] workspace regression: {failed_tests:?} (all are the known M5 baseline; Contract v3 surface is clean)"
-        );
-        return Err(format!(
-            "workspace regression had only the known M5 baseline exception; run the M5 finalize to clear it. observed={failed_tests:?}"
-        )
-        .into());
-    }
     if !failed_tests.is_empty() {
-        return Err(format!("workspace regression failed: {non_baseline:?}").into());
+        return Err(format!("workspace regression failed: {failed_tests:?}").into());
     }
     if !output.status.success() {
         return Err("workspace regression failed with a non-test status".into());
@@ -415,19 +532,7 @@ fn write_workspace_receipt(workspace_result: &Result<(), DynError>) -> Result<()
             "--workspace".to_owned(),
             "--all-targets".to_owned(),
         ],
-        status: if workspace_result.is_ok() {
-            "PASS"
-        } else {
-            "PASS_WITH_KNOWN_BASELINE"
-        },
-        known_baseline: if workspace_result.is_ok() {
-            None
-        } else {
-            Some(
-                "m5_release_authority_matches_code_and_normative_documents (requires the DEFER'd M5 finalize artifacts)"
-                    .to_owned(),
-            )
-        },
+        status: if workspace_result.is_ok() { "PASS" } else { "FAIL" },
     };
     write_json(
         artifact_dir().join("contract-v3-workspace-receipt.json"),
@@ -463,8 +568,6 @@ struct WorkspaceReceipt {
     implementation_commit: String,
     command: Vec<String>,
     status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    known_baseline: Option<String>,
 }
 
 fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), DynError> {

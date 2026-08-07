@@ -19,18 +19,18 @@ module.exports = grammar({
     $.block_comment,
   ],
 
-  word: ($) => $.nidl_identifier,
+  word: ($) => $.contract_identifier,
 
-  supertypes: ($) => [$.contract_member, $.nidl_type],
+  supertypes: ($) => [$.contract_member, $.contract_type],
 
   rules: {
-    source_file: ($) => $.nidl_document,
+    source_file: ($) => $.contract_document,
 
     doc_comment: (_) => token(prec(2, /\/\/\/[^\n\r]*/)),
     line_comment: (_) => token(prec(1, /\/\/[^\n\r]*/)),
     block_comment: (_) => token(seq("/*", /[^*]*\*+([^/*][^*]*\*+)*/, "/")),
 
-    nidl_document: ($) =>
+    contract_document: ($) =>
       seq(
         field("header", $.contract_header),
         repeat($.contract_member),
@@ -41,17 +41,17 @@ module.exports = grammar({
     // attributes (e.g. `@stable("...")`) and doc comments attach to this header.
     contract_header: ($) =>
       seq(
-        repeat($.nidl_attribute),
+        repeat($.contract_attribute),
         field("keyword", $.contract_keyword),
-        field("name", $.nidl_type_identifier),
+        field("name", $.contract_type_identifier),
         ";",
       ),
 
     contract_member: ($) =>
       choice(
         $.handle_declaration,
-        $.nidl_struct_declaration,
-        $.nidl_enum_declaration,
+        $.contract_struct_declaration,
+        $.contract_enum_declaration,
         $.host_block,
         $.nexa_block,
       ),
@@ -59,51 +59,51 @@ module.exports = grammar({
     handle_declaration: ($) =>
       seq(
         field("keyword", $.handle_keyword),
-        field("name", $.nidl_type_identifier),
+        field("name", $.contract_type_identifier),
         ";",
       ),
 
-    nidl_struct_declaration: ($) =>
+    contract_struct_declaration: ($) =>
       seq(
-        field("keyword", $.nidl_struct_keyword),
-        field("name", $.nidl_type_identifier),
+        field("keyword", $.contract_struct_keyword),
+        field("name", $.contract_type_identifier),
         "{",
-        optional(commaSep1($.nidl_field_declaration)),
+        optional(commaSep1($.contract_field_declaration)),
         optional(","),
         "}",
       ),
 
-    nidl_field_declaration: ($) =>
+    contract_field_declaration: ($) =>
       seq(
-        field("name", $.nidl_identifier),
+        field("name", $.contract_identifier),
         ":",
-        field("type", $.nidl_type),
+        field("type", $.contract_type),
       ),
 
-    nidl_enum_declaration: ($) =>
+    contract_enum_declaration: ($) =>
       seq(
-        field("keyword", $.nidl_enum_keyword),
-        field("name", $.nidl_type_identifier),
+        field("keyword", $.contract_enum_keyword),
+        field("name", $.contract_type_identifier),
         "{",
-        optional(commaSep1($.nidl_enum_variant)),
+        optional(commaSep1($.contract_enum_variant)),
         optional(","),
         "}",
       ),
 
-    nidl_enum_variant: ($) =>
+    contract_enum_variant: ($) =>
       seq(
-        field("name", $.nidl_type_identifier),
+        field("name", $.contract_type_identifier),
         optional(
           choice(
             seq(
               "(",
-              optional(commaSep1($.nidl_type)),
+              optional(commaSep1($.contract_type)),
               optional(","),
               ")",
             ),
             seq(
               "{",
-              optional(commaSep1($.nidl_field_declaration)),
+              optional(commaSep1($.contract_field_declaration)),
               optional(","),
               "}",
             ),
@@ -129,15 +129,15 @@ module.exports = grammar({
 
     host_function_declaration: ($) =>
       seq(
-        repeat($.nidl_attribute),
+        repeat($.contract_attribute),
         optional(field("effect", $.async_keyword)),
-        field("keyword", $.nidl_function_keyword),
-        field("name", $.nidl_identifier),
-        field("parameters", $.nidl_parameter_list),
+        field("keyword", $.contract_function_keyword),
+        field("name", $.contract_identifier),
+        field("parameters", $.contract_parameter_list),
         optional(
           seq(
             field("arrow", $.return_arrow_operator),
-            field("return_type", $.nidl_type),
+            field("return_type", $.contract_type),
           ),
         ),
         ";",
@@ -145,92 +145,92 @@ module.exports = grammar({
 
     nexa_function_declaration: ($) =>
       seq(
-        repeat($.nidl_attribute),
+        repeat($.contract_attribute),
         optional(field("effect", $.async_keyword)),
-        field("keyword", $.nidl_function_keyword),
-        field("name", $.nidl_identifier),
-        field("parameters", $.nidl_parameter_list),
+        field("keyword", $.contract_function_keyword),
+        field("name", $.contract_identifier),
+        field("parameters", $.contract_parameter_list),
         optional(
           seq(
             field("arrow", $.return_arrow_operator),
-            field("return_type", $.nidl_type),
+            field("return_type", $.contract_type),
           ),
         ),
         ";",
       ),
 
-    nidl_attribute: ($) =>
+    contract_attribute: ($) =>
       seq(
         "@",
-        field("name", $.nidl_attribute_name),
+        field("name", $.contract_attribute_name),
         optional(
           seq(
             "(",
-            optional(commaSep1($.nidl_attribute_argument)),
+            optional(commaSep1($.contract_attribute_argument)),
             optional(","),
             ")",
           ),
         ),
       ),
 
-    nidl_attribute_argument: ($) =>
+    contract_attribute_argument: ($) =>
       choice(
         seq(
-          field("name", $.nidl_identifier),
+          field("name", $.contract_identifier),
           "=",
-          field("value", $.nidl_attribute_value),
+          field("value", $.contract_attribute_value),
         ),
-        field("value", $.nidl_attribute_value),
+        field("value", $.contract_attribute_value),
       ),
 
-    nidl_attribute_value: ($) =>
+    contract_attribute_value: ($) =>
       choice(
         $.string_literal,
         $.integer_literal,
         $.policy_value,
-        $.nidl_identifier,
+        $.contract_identifier,
       ),
 
-    nidl_parameter_list: ($) =>
-      seq("(", optional(commaSep1($.nidl_parameter)), optional(","), ")"),
+    contract_parameter_list: ($) =>
+      seq("(", optional(commaSep1($.contract_parameter)), optional(","), ")"),
 
-    nidl_parameter: ($) =>
+    contract_parameter: ($) =>
       seq(
-        field("name", $.nidl_identifier),
+        field("name", $.contract_identifier),
         ":",
-        field("type", $.nidl_type),
+        field("type", $.contract_type),
       ),
 
-    nidl_type: ($) =>
+    contract_type: ($) =>
       choice(
-        $.nidl_generic_type,
-        $.nidl_builtin_type,
-        $.nidl_type_identifier,
+        $.contract_generic_type,
+        $.contract_builtin_type,
+        $.contract_type_identifier,
       ),
 
-    nidl_generic_type: ($) =>
+    contract_generic_type: ($) =>
       seq(
-        field("name", choice($.nidl_builtin_type, $.nidl_type_identifier)),
-        field("arguments", $.nidl_type_argument_list),
+        field("name", choice($.contract_builtin_type, $.contract_type_identifier)),
+        field("arguments", $.contract_type_argument_list),
       ),
 
-    nidl_type_argument_list: ($) =>
-      seq("<", commaSep1($.nidl_type), optional(","), ">"),
-    nidl_type_identifier: ($) => $.nidl_identifier,
-    nidl_identifier: (_) => /[A-Za-z_][A-Za-z0-9_]*/,
+    contract_type_argument_list: ($) =>
+      seq("<", commaSep1($.contract_type), optional(","), ">"),
+    contract_type_identifier: ($) => $.contract_identifier,
+    contract_identifier: (_) => /[A-Za-z_][A-Za-z0-9_]*/,
 
     contract_keyword: (_) => keywords.contract,
     handle_keyword: (_) => keywords.handle,
-    nidl_struct_keyword: (_) => keywords.struct,
-    nidl_enum_keyword: (_) => keywords.enum,
+    contract_struct_keyword: (_) => keywords.struct,
+    contract_enum_keyword: (_) => keywords.enum,
     host_keyword: (_) => keywords.host,
     nexa_keyword: (_) => keywords.nexa,
     async_keyword: (_) => keywords.async,
-    nidl_function_keyword: (_) => keywords.fn,
-    nidl_attribute_name: ($) =>
-      choice(...syntax.contract.attributeKeywords, $.nidl_identifier),
+    contract_function_keyword: (_) => keywords.fn,
+    contract_attribute_name: ($) =>
+      choice(...syntax.contract.attributeKeywords, $.contract_identifier),
     policy_value: (_) => choice(...syntax.contract.policyKeywords),
-    nidl_builtin_type: (_) => choice(...syntax.contract.builtinTypes),
+    contract_builtin_type: (_) => choice(...syntax.contract.builtinTypes),
 
     string_literal: ($) =>
       seq('"', repeat(choice($.string_content, $.escape_sequence)), '"'),

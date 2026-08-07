@@ -6,15 +6,15 @@
   keyword: (_) @context
   name: (_) @name) @item
 
-(nidl_struct_declaration
+(contract_struct_declaration
   keyword: (_) @context
   name: (_) @name) @item
 
-(nidl_enum_declaration
+(contract_enum_declaration
   keyword: (_) @context
   name: (_) @name) @item
 
-(nidl_enum_variant
+(contract_enum_variant
   name: (_) @name) @item
 
 (host_block

@@ -1,6 +1,6 @@
 //! Owned, structured NIDL v2 AST built directly from the lossless syntax tree.
 //!
-//! This is the only NIDL grammar parser. `nexa-idl` consumes these nodes and
+//! This is the only NIDL grammar parser. `nexa-contract` consumes these nodes and
 //! performs semantic validation; it must not tokenize or parse source again.
 
 use crate::{SourceText, SyntaxLanguage, SyntaxTree, TextRange, Token, TokenKind, ast::Identifier};

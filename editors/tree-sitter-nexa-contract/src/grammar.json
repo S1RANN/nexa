@@ -1,11 +1,11 @@
 {
   "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
   "name": "nexa_contract",
-  "word": "nidl_identifier",
+  "word": "contract_identifier",
   "rules": {
     "source_file": {
       "type": "SYMBOL",
-      "name": "nidl_document"
+      "name": "contract_document"
     },
     "doc_comment": {
       "type": "TOKEN",
@@ -49,7 +49,7 @@
         ]
       }
     },
-    "nidl_document": {
+    "contract_document": {
       "type": "SEQ",
       "members": [
         {
@@ -76,7 +76,7 @@
           "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_attribute"
+            "name": "contract_attribute"
           }
         },
         {
@@ -92,7 +92,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_identifier"
+            "name": "contract_type_identifier"
           }
         },
         {
@@ -110,11 +110,11 @@
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_struct_declaration"
+          "name": "contract_struct_declaration"
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_enum_declaration"
+          "name": "contract_enum_declaration"
         },
         {
           "type": "SYMBOL",
@@ -142,7 +142,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_identifier"
+            "name": "contract_type_identifier"
           }
         },
         {
@@ -151,7 +151,7 @@
         }
       ]
     },
-    "nidl_struct_declaration": {
+    "contract_struct_declaration": {
       "type": "SEQ",
       "members": [
         {
@@ -159,7 +159,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_struct_keyword"
+            "name": "contract_struct_keyword"
           }
         },
         {
@@ -167,7 +167,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_identifier"
+            "name": "contract_type_identifier"
           }
         },
         {
@@ -182,7 +182,7 @@
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "nidl_field_declaration"
+                  "name": "contract_field_declaration"
                 },
                 {
                   "type": "REPEAT",
@@ -195,7 +195,7 @@
                       },
                       {
                         "type": "SYMBOL",
-                        "name": "nidl_field_declaration"
+                        "name": "contract_field_declaration"
                       }
                     ]
                   }
@@ -225,7 +225,7 @@
         }
       ]
     },
-    "nidl_field_declaration": {
+    "contract_field_declaration": {
       "type": "SEQ",
       "members": [
         {
@@ -233,7 +233,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_identifier"
+            "name": "contract_identifier"
           }
         },
         {
@@ -245,12 +245,12 @@
           "name": "type",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type"
+            "name": "contract_type"
           }
         }
       ]
     },
-    "nidl_enum_declaration": {
+    "contract_enum_declaration": {
       "type": "SEQ",
       "members": [
         {
@@ -258,7 +258,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_enum_keyword"
+            "name": "contract_enum_keyword"
           }
         },
         {
@@ -266,7 +266,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_identifier"
+            "name": "contract_type_identifier"
           }
         },
         {
@@ -281,7 +281,7 @@
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "nidl_enum_variant"
+                  "name": "contract_enum_variant"
                 },
                 {
                   "type": "REPEAT",
@@ -294,7 +294,7 @@
                       },
                       {
                         "type": "SYMBOL",
-                        "name": "nidl_enum_variant"
+                        "name": "contract_enum_variant"
                       }
                     ]
                   }
@@ -324,7 +324,7 @@
         }
       ]
     },
-    "nidl_enum_variant": {
+    "contract_enum_variant": {
       "type": "SEQ",
       "members": [
         {
@@ -332,7 +332,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_identifier"
+            "name": "contract_type_identifier"
           }
         },
         {
@@ -356,7 +356,7 @@
                           "members": [
                             {
                               "type": "SYMBOL",
-                              "name": "nidl_type"
+                              "name": "contract_type"
                             },
                             {
                               "type": "REPEAT",
@@ -369,7 +369,7 @@
                                   },
                                   {
                                     "type": "SYMBOL",
-                                    "name": "nidl_type"
+                                    "name": "contract_type"
                                   }
                                 ]
                               }
@@ -414,7 +414,7 @@
                           "members": [
                             {
                               "type": "SYMBOL",
-                              "name": "nidl_field_declaration"
+                              "name": "contract_field_declaration"
                             },
                             {
                               "type": "REPEAT",
@@ -427,7 +427,7 @@
                                   },
                                   {
                                     "type": "SYMBOL",
-                                    "name": "nidl_field_declaration"
+                                    "name": "contract_field_declaration"
                                   }
                                 ]
                               }
@@ -529,7 +529,7 @@
           "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_attribute"
+            "name": "contract_attribute"
           }
         },
         {
@@ -553,7 +553,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_function_keyword"
+            "name": "contract_function_keyword"
           }
         },
         {
@@ -561,7 +561,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_identifier"
+            "name": "contract_identifier"
           }
         },
         {
@@ -569,7 +569,7 @@
           "name": "parameters",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_parameter_list"
+            "name": "contract_parameter_list"
           }
         },
         {
@@ -591,7 +591,7 @@
                   "name": "return_type",
                   "content": {
                     "type": "SYMBOL",
-                    "name": "nidl_type"
+                    "name": "contract_type"
                   }
                 }
               ]
@@ -614,7 +614,7 @@
           "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_attribute"
+            "name": "contract_attribute"
           }
         },
         {
@@ -638,7 +638,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_function_keyword"
+            "name": "contract_function_keyword"
           }
         },
         {
@@ -646,7 +646,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_identifier"
+            "name": "contract_identifier"
           }
         },
         {
@@ -654,7 +654,7 @@
           "name": "parameters",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_parameter_list"
+            "name": "contract_parameter_list"
           }
         },
         {
@@ -676,7 +676,7 @@
                   "name": "return_type",
                   "content": {
                     "type": "SYMBOL",
-                    "name": "nidl_type"
+                    "name": "contract_type"
                   }
                 }
               ]
@@ -692,7 +692,7 @@
         }
       ]
     },
-    "nidl_attribute": {
+    "contract_attribute": {
       "type": "SEQ",
       "members": [
         {
@@ -704,7 +704,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_attribute_name"
+            "name": "contract_attribute_name"
           }
         },
         {
@@ -725,7 +725,7 @@
                       "members": [
                         {
                           "type": "SYMBOL",
-                          "name": "nidl_attribute_argument"
+                          "name": "contract_attribute_argument"
                         },
                         {
                           "type": "REPEAT",
@@ -738,7 +738,7 @@
                               },
                               {
                                 "type": "SYMBOL",
-                                "name": "nidl_attribute_argument"
+                                "name": "contract_attribute_argument"
                               }
                             ]
                           }
@@ -775,7 +775,7 @@
         }
       ]
     },
-    "nidl_attribute_argument": {
+    "contract_attribute_argument": {
       "type": "CHOICE",
       "members": [
         {
@@ -786,7 +786,7 @@
               "name": "name",
               "content": {
                 "type": "SYMBOL",
-                "name": "nidl_identifier"
+                "name": "contract_identifier"
               }
             },
             {
@@ -798,7 +798,7 @@
               "name": "value",
               "content": {
                 "type": "SYMBOL",
-                "name": "nidl_attribute_value"
+                "name": "contract_attribute_value"
               }
             }
           ]
@@ -808,12 +808,12 @@
           "name": "value",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_attribute_value"
+            "name": "contract_attribute_value"
           }
         }
       ]
     },
-    "nidl_attribute_value": {
+    "contract_attribute_value": {
       "type": "CHOICE",
       "members": [
         {
@@ -830,11 +830,11 @@
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_identifier"
+          "name": "contract_identifier"
         }
       ]
     },
-    "nidl_parameter_list": {
+    "contract_parameter_list": {
       "type": "SEQ",
       "members": [
         {
@@ -849,7 +849,7 @@
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "nidl_parameter"
+                  "name": "contract_parameter"
                 },
                 {
                   "type": "REPEAT",
@@ -862,7 +862,7 @@
                       },
                       {
                         "type": "SYMBOL",
-                        "name": "nidl_parameter"
+                        "name": "contract_parameter"
                       }
                     ]
                   }
@@ -892,7 +892,7 @@
         }
       ]
     },
-    "nidl_parameter": {
+    "contract_parameter": {
       "type": "SEQ",
       "members": [
         {
@@ -900,7 +900,7 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_identifier"
+            "name": "contract_identifier"
           }
         },
         {
@@ -912,29 +912,29 @@
           "name": "type",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type"
+            "name": "contract_type"
           }
         }
       ]
     },
-    "nidl_type": {
+    "contract_type": {
       "type": "CHOICE",
       "members": [
         {
           "type": "SYMBOL",
-          "name": "nidl_generic_type"
+          "name": "contract_generic_type"
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_builtin_type"
+          "name": "contract_builtin_type"
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_type_identifier"
+          "name": "contract_type_identifier"
         }
       ]
     },
-    "nidl_generic_type": {
+    "contract_generic_type": {
       "type": "SEQ",
       "members": [
         {
@@ -945,11 +945,11 @@
             "members": [
               {
                 "type": "SYMBOL",
-                "name": "nidl_builtin_type"
+                "name": "contract_builtin_type"
               },
               {
                 "type": "SYMBOL",
-                "name": "nidl_type_identifier"
+                "name": "contract_type_identifier"
               }
             ]
           }
@@ -959,12 +959,12 @@
           "name": "arguments",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_type_argument_list"
+            "name": "contract_type_argument_list"
           }
         }
       ]
     },
-    "nidl_type_argument_list": {
+    "contract_type_argument_list": {
       "type": "SEQ",
       "members": [
         {
@@ -976,7 +976,7 @@
           "members": [
             {
               "type": "SYMBOL",
-              "name": "nidl_type"
+              "name": "contract_type"
             },
             {
               "type": "REPEAT",
@@ -989,7 +989,7 @@
                   },
                   {
                     "type": "SYMBOL",
-                    "name": "nidl_type"
+                    "name": "contract_type"
                   }
                 ]
               }
@@ -1014,11 +1014,11 @@
         }
       ]
     },
-    "nidl_type_identifier": {
+    "contract_type_identifier": {
       "type": "SYMBOL",
-      "name": "nidl_identifier"
+      "name": "contract_identifier"
     },
-    "nidl_identifier": {
+    "contract_identifier": {
       "type": "PATTERN",
       "value": "[A-Za-z_][A-Za-z0-9_]*"
     },
@@ -1030,11 +1030,11 @@
       "type": "STRING",
       "value": "handle"
     },
-    "nidl_struct_keyword": {
+    "contract_struct_keyword": {
       "type": "STRING",
       "value": "struct"
     },
-    "nidl_enum_keyword": {
+    "contract_enum_keyword": {
       "type": "STRING",
       "value": "enum"
     },
@@ -1050,11 +1050,11 @@
       "type": "STRING",
       "value": "async"
     },
-    "nidl_function_keyword": {
+    "contract_function_keyword": {
       "type": "STRING",
       "value": "fn"
     },
-    "nidl_attribute_name": {
+    "contract_attribute_name": {
       "type": "CHOICE",
       "members": [
         {
@@ -1079,7 +1079,7 @@
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_identifier"
+          "name": "contract_identifier"
         }
       ]
     },
@@ -1100,7 +1100,7 @@
         }
       ]
     },
-    "nidl_builtin_type": {
+    "contract_builtin_type": {
       "type": "CHOICE",
       "members": [
         {
@@ -1237,7 +1237,7 @@
   "inline": [],
   "supertypes": [
     "contract_member",
-    "nidl_type"
+    "contract_type"
   ],
   "reserved": {}
 }
