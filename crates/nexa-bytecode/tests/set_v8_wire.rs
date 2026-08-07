@@ -84,7 +84,9 @@ fn function_with_set_code() -> Function {
                 slot: 6,
                 epoch: 7,
             },
-            dst: 8,
+            has_value_dst: 8,
+            first_dst: 9,
+            second_dst: None,
         })
         .emit(Instruction::IterNext {
             kind: CollectionIteratorKind::Map {
@@ -97,7 +99,9 @@ fn function_with_set_code() -> Function {
                 slot: 6,
                 epoch: 7,
             },
-            dst: 8,
+            has_value_dst: 8,
+            first_dst: 9,
+            second_dst: Some(10),
         })
         .emit(Instruction::IterNext {
             kind: CollectionIteratorKind::Range,
@@ -107,7 +111,9 @@ fn function_with_set_code() -> Function {
                 slot: 6,
                 epoch: 7,
             },
-            dst: 8,
+            has_value_dst: 8,
+            first_dst: 9,
+            second_dst: None,
         })
         .emit(Instruction::ReturnVoid);
     builder.finish().expect("fixture function builds")

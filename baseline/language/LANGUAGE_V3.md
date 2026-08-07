@@ -126,8 +126,9 @@ epoch register       mutation epoch observed at IterNew
 ```
 
 No iterator object is allocated. `IterNew` initializes the cursor and snapshots
-the epoch; each `IterNext` advances the cursor and yields one `Option<T>`
-element (for Map: one `Option<(K, V)>` pair).
+the epoch; each `IterNext` sets `has_value` to true (element yielded) or false
+(iteration exhausted), writes the element into `first_dst`, and for Map
+iteration writes the value into `second_dst`.
 
 ### 4.3 Mutation-epoch trap
 
@@ -159,7 +160,9 @@ Bytecode v8 carries the Language v3 surface:
   `BufferIsEmpty`/`BufferFill` (wire tags 47-55; 56 reserved variants total).
 - `CollectionIteratorKind` instantiates Range/Array/Buffer/Map/Set iteration
   with concrete element types; `IteratorStateRegisters` encodes the four
-  hidden scalar registers of section 4.2.
+  hidden scalar registers of section 4.2. `IterNext` carries explicit
+  `has_value_dst`, `first_dst`, and optional `second_dst` registers (set for
+  Map, `None` for other shapes) instead of a fabricated Tuple result.
 
 The v8 decoder rejects every other wire version. There is no v7 compatibility
 decoder. `BYTECODE_VERSION` and `OPCODE_COST_TABLE_VERSION` are frozen at 8;

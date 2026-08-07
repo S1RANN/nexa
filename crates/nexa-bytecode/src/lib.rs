@@ -1709,15 +1709,18 @@ pub enum Instruction {
         kind: CollectionIteratorKind,
         state: IteratorStateRegisters,
     },
-    /// Advances the iterator by one element. `dst` is the base of a
-    /// caller-owned result range receiving `Option<T>`, where `T` is the
-    /// element type for Array/Buffer/Set, the scalar type for Range, and the
-    /// `(key, value)` pair for Map. Traps when the live collection epoch
-    /// differs from `state.epoch`.
+    /// Advances the iterator by one element. `has_value_dst` receives a bool
+    /// (true = element yielded, false = iteration exhausted). `first_dst`
+    /// receives the yielded scalar/ref value; `second_dst` receives the value
+    /// for Map iteration and is `None` for Range/Array/Buffer/Set. The
+    /// verifier validates that `second_dst` is `Some` iff `kind` is `Map`.
+    /// Traps when the live collection epoch differs from `state.epoch`.
     IterNext {
         kind: CollectionIteratorKind,
         state: IteratorStateRegisters,
-        dst: u16,
+        has_value_dst: u16,
+        first_dst: u16,
+        second_dst: Option<u16>,
     },
     StateFinish,
     StateOldFieldGet {
@@ -4129,11 +4132,19 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             encode_iterator_kind(output, kind);
             encode_iterator_state(output, state);
         }
-        Instruction::IterNext { kind, state, dst } => {
+        Instruction::IterNext { kind, state, has_value_dst, first_dst, second_dst } => {
             output.push(118);
             encode_iterator_kind(output, kind);
             encode_iterator_state(output, state);
-            put_u16(output, dst);
+            put_u16(output, has_value_dst);
+            put_u16(output, first_dst);
+            match second_dst {
+                Some(dst) => {
+                    output.push(1);
+                    put_u16(output, dst);
+                }
+                None => output.push(0),
+            }
         }
         Instruction::Jump { target } => {
             output.push(7);
@@ -4801,7 +4812,13 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         118 => Instruction::IterNext {
             kind: decode_iterator_kind(reader)?,
             state: decode_iterator_state(reader)?,
-            dst: reader.u16()?,
+            has_value_dst: reader.u16()?,
+            first_dst: reader.u16()?,
+            second_dst: match reader.u8()? {
+                0 => None,
+                1 => Some(reader.u16()?),
+                _ => return Err(DecodeError::InvalidBoolean(0)),
+            },
         },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })

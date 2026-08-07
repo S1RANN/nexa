@@ -154,6 +154,9 @@ v8 instructions operate on physical ranges:
   is heap-allocation-free: four hidden scalar registers hold the collection
   reference, the phase/slot cursor, and the mutation epoch snapshot. Every
   `IterNext` revalidates the epoch; mutation during iteration traps.
+  `IterNext` uses explicit `has_value_dst`, `first_dst`, and optional
+  `second_dst` registers (Map uses `second_dst`; the verifier enforces
+  correctness).
 - `StandardIntrinsic` encodes the fully instantiated logical types of generic
   standard-library operations; runtime name or generic resolution is
   forbidden.
