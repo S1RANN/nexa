@@ -354,11 +354,12 @@ fn render_human_source_line(
     }
 }
 
-/// Expands tabs to four-column stops. Returns the expanded line and the display column after each
-/// original character (plus one trailing entry for the end of line).
+/// Expands tabs to four-column stops. Returns the expanded line and the display column at every
+/// source boundary: zero before the first character, then one entry after each character.
 fn expand_tabs(line: &str) -> (String, Vec<usize>) {
     let mut expanded = String::new();
     let mut columns = Vec::with_capacity(line.len() + 1);
+    columns.push(0);
     for character in line.chars() {
         if character == '\t' {
             let pad = 4 - expanded.chars().count() % 4;
@@ -368,7 +369,6 @@ fn expand_tabs(line: &str) -> (String, Vec<usize>) {
         }
         columns.push(expanded.chars().count());
     }
-    columns.push(expanded.chars().count());
     (expanded, columns)
 }
 
@@ -990,13 +990,13 @@ mod tests {
             "  |\n",
             "1 | fn main() -> i32 {\n",
             "2 |     let value = 1 + \"x\";\n",
-            "  |                  ^ this expression is not a number\n",
+            "  |                 ^ this expression is not a number\n",
             "3 |     return value;\n",
             "  --> root.app:src/main.nexa:2:21\n",
             "  |\n",
             "1 | fn main() -> i32 {\n",
             "2 |     let value = 1 + \"x\";\n",
-            "  |                      --- string literal has type `string`\n",
+            "  |                     --- string literal has type `string`\n",
             "3 |     return value;\n",
             "   = note: expected `i32`, found `string`\n",
             "   = help: write `value` as an integer\n",
@@ -1006,7 +1006,7 @@ mod tests {
             "  |\n",
             "2 |     let value = 1 + \"x\";\n",
             "3 |     return value;\n",
-            "  |      ^^^^^^ invalid Nexa syntax\n",
+            "  |     ^^^^^^ invalid Nexa syntax\n",
             "4 | }\n",
             "error: 2 errors emitted; 1 downstream error suppressed (caused by unknown type `u32`)\n",
         );
@@ -1073,8 +1073,8 @@ mod tests {
         let human = DiagnosticRenderer::human(&batch);
         // Line 1 has no preceding context line; line 3 has no following one (the trailing
         // newline's empty phantom line is not rendered as context).
-        assert!(human.contains("\n  |\n1 | first\n  |  ^ first line\n2 | middle\n"));
-        assert!(human.contains("\n  |\n2 | middle\n3 | last\n  |  --- last line\n"));
+        assert!(human.contains("\n  |\n1 | first\n  | ^ first line\n2 | middle\n"));
+        assert!(human.contains("\n  |\n2 | middle\n3 | last\n  | ---- last line\n"));
         assert!(!human.contains("0 |"));
         assert!(!human.contains("4 |"));
     }
