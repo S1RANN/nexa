@@ -2,7 +2,7 @@
 
 Version: **1.0.0**
 
-Milestone status: **IN PROGRESS**
+Milestone status: **COMPLETE**
 
 This matrix is the release contract for the `.contract.nexa` migration. It
 does not mark implementation complete. The milestone becomes **COMPLETE** only
@@ -59,9 +59,9 @@ but may not self-waive a required row.
 | C20 | Outline | Outline contains Contract, Struct, Enum, Handle, Host Function, and Nexa Function symbols | LSP snapshot fixtures; `test-contract-lsp` PASS | task #7, task #9 | PASS |
 | C21 | Documentation | Contract Language, Descriptor, Codegen, Host Binding, CLI/development loop, editor support, migration guide, Roadmap, and Baseline Index agree on v3 boundaries | link check; terminology scan | task #8 | PASS |
 | C22 | Split gates | All seven Contract commands exist, fail closed, and write reproducible evidence | `contract-v3-gates-receipt.json` (7/7 PASS) | task #9 | PASS |
-| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan; scanner unit tests (7 tests) | task #9 | PASS |
+| C23 | Zero old surface | No active old-extension file, public old-name API, old CLI command, or old editor association remains | `cargo xtask contract-migration-check` PASS; repo scan; scanner unit tests (14 tests) | task #9 | PASS |
 | C24 | Workspace regression | Complete workspace regression and all product examples pass on the candidate commit | workspace receipt: `cargo test --workspace --all-targets` PASS + `--doc --workspace` PASS; aggregate PASS | task #9 | PASS |
-| C25 | Independent audit | Architecture, traversal security, Stable IDs, Descriptor determinism, public surface, and release evidence accepted independently | task #10 audit report | task #10 | PENDING |
+| C25 | Independent audit | Architecture, traversal security, Stable IDs, Descriptor determinism, public surface, and release evidence accepted independently | task #10 audit report; candidate `c9c73b7` | task #10 | PASS |
 
 ## Required gate set
 
@@ -113,8 +113,8 @@ here and changes both this matrix and the Baseline Index milestone status to
 **COMPLETE**.
 
 ```text
-Candidate commit: receipts implementation_commit (task #9 final), branch codex/contract-v3-gates, clean worktree
+Candidate commit: c9c73b7b7ad85b6e0a938a103a28754725661857, branch codex/contract-syntax-v3, clean worktree
 Gate evidence: target/nexa-artifacts/contract-v3-gates/contract-v3-gates-receipt.json (7/7 PASS); workspace receipt: workspace PASS, doc-test PASS, aggregate PASS
-Independent audit: PENDING
-Final decision: PENDING
+Independent audit: PASS — task #10 accepted the exact candidate after architecture, path-security, Stable ID, Descriptor, public-surface, and release-evidence review
+Final decision: ACCEPT
 ```

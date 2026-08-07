@@ -42,7 +42,7 @@ Incremental GC v1 = COMPLETE
 Runtime Fast Paths v1 = COMPLETE
 M6 LLVM JIT = DEFER
 Nexa Language v2 = COMPLETE
-Contract Syntax v3 = IN PROGRESS
+Contract Syntax v3 = COMPLETE
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -104,11 +104,11 @@ JIT decision is **DEFER**: M5 met every frozen performance target, but neither
 per-workload CPU sampling nor a bounded LLVM compilation-cost prototype proves
 the remaining JIT GO conditions.
 
-Contract Syntax v3 is the active migration milestone. It introduces one flat
+Contract Syntax v3 is the completed migration milestone. It introduces one flat
 `*.contract.nexa` source profile with `contract Name;`, Contract-named public
 crate/API/CLI/editor surfaces, and dedicated migration gates. It does not
-change Host schema v2, Descriptor v2 framing, or Bytecode v7. Completion is
-tracked by the
+change Host schema v2, Descriptor v2 framing, or Bytecode v7. Final evidence
+and independent acceptance are recorded in the
 [Contract v3 acceptance matrix](baseline/abi/CONTRACT_V3_ACCEPTANCE.md).
 
 See [Source Modules](docs/MODULES.md),

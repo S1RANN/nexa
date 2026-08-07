@@ -1,6 +1,6 @@
 # Nexa editor support
 
-Status: Contract Syntax v3 migration IN PROGRESS
+Status: Contract Syntax v3 migration COMPLETE
 
 Nexa provides local syntax support for executable `.nexa` files and
 `.contract.nexa` files in VS Code and Zed. The Contract file type is displayed

@@ -12,7 +12,7 @@ owned host resources, typed `@state`, and Restart Reload.
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa Language v2 = COMPLETE
-Contract Syntax v3 = IN PROGRESS
+Contract Syntax v3 = COMPLETE
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE

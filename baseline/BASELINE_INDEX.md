@@ -29,7 +29,7 @@ Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa Language v2 = COMPLETE
-Contract Syntax v3 = IN PROGRESS
+Contract Syntax v3 = COMPLETE
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -76,9 +76,10 @@ completion commit and is marked by the annotated
 
 M4R1 is the completed breaking reset of the executable source language,
 generated Rust bindings, Standalone entry model, and REPL. Contract Syntax v3
-is a later, independently gated source-container migration. It replaces the
-Contract file/profile/public naming surface without changing Host schema v2 or
-Descriptor v2 framing. The acceptance state is tracked in
+is the completed, independently gated source-container migration. Candidate
+`c9c73b7b7ad85b6e0a938a103a28754725661857` replaces the Contract
+file/profile/public naming surface without changing Host schema v2 or
+Descriptor v2 framing. Its final evidence and independent acceptance are tracked in
 [`abi/CONTRACT_V3_ACCEPTANCE.md`](abi/CONTRACT_V3_ACCEPTANCE.md).
 
 ## Frozen active versions

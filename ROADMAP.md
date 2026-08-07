@@ -28,7 +28,7 @@ Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
 Nexa M5 Deep Performance Optimization = COMPLETE
 Nexa Language v2 = COMPLETE
-Contract Syntax v3 = IN PROGRESS
+Contract Syntax v3 = COMPLETE
 Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
@@ -171,9 +171,9 @@ Last Known Good artifact.
 The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M3R3 adds no
 language, Runtime, Package, LSP, editor, or optimization capability.
 
-## Current milestone
+## Completed Contract Syntax v3 milestone
 
-Contract Syntax v3 is the active post-M5 migration milestone. It replaces the
+Contract Syntax v3 is the completed post-M5 migration milestone. It replaces the
 old Contract file suffix and enclosing container with one flat
 `*.contract.nexa` source headed by `contract Name;`. It also unifies
 `SourceProfile::Contract`, renames the public crate/API/CLI/editor surface to
@@ -187,9 +187,9 @@ migration preserves Stable IDs and normalized Descriptor bytes; required
 syntax-version metadata renames are provenance only. The Build Fingerprint
 records `CONTRACT_SYNTAX_VERSION = 3`.
 
-The milestone remains **IN PROGRESS** until every row in
-`baseline/abi/CONTRACT_V3_ACCEPTANCE.md` passes on one audited candidate commit.
-M6 remains deferred; M7 and M8 do not start as part of this work.
+Every row in `baseline/abi/CONTRACT_V3_ACCEPTANCE.md` passes on audited
+candidate `c9c73b7b7ad85b6e0a938a103a28754725661857`. M6 remains deferred;
+M7 and M8 did not start as part of this work.
 
 ## Completed M4/M4R1 foundation
 
