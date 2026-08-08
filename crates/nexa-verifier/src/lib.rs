@@ -1566,6 +1566,10 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
                         .display_types
                         .iter()
                         .any(|display| display.type_id == id)
+                    || module.enum_types.iter().any(|enumeration| {
+                        enumeration.type_id == id
+                            && nexa_bytecode::is_builtin_display_enum(enumeration)
+                    })
             }
             ValueType::Ref => false,
         },

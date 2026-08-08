@@ -279,9 +279,9 @@ frame.
 ## String interpolation
 
 `${expression}` interpolates a string, integer, float, Boolean, rune, a
-recursively formattable `Array<T>`, or a Struct/Class whose complete field
-graph is formattable. Formatting is deterministic, locale-free, and follows
-field declaration order:
+recursively formattable `Array<T>`, `Option<T>`, or `Result<T, E>`, or a
+Struct/Class whose complete field graph is formattable. Formatting is
+deterministic, locale-free, and follows field declaration order:
 
 ```nexa
 let label: string = "score";
@@ -290,17 +290,21 @@ let message: string = "${label}: ${values}"; // score: [3, 1, 4]
 
 let point = Point { x: 3, y: 4 };
 let debug: string = "${point}"; // Point { x: 3, y: 4 }
+
+let result: Result<i32, string> = Ok(4);
+let outcome: string = "${result}"; // Ok(4)
 ```
 
-Nested arrays use the same representation. Class formatting tracks GC object
-identity within one interpolation operation. The first occurrence is labeled
-`ClassName#N`; an active back-edge renders as `<cycle #N>`, while a later
-shared reference renders as `<ref #N>`. Traversal depth and the number of
-tracked objects are deterministically bounded, producing `<depth-limit>` or
-`<object-limit>` instead of recursing indefinitely. Struct value-layout cycles
-remain invalid. Map, Tuple, Option, Result, Buffer, Set, Host values, and
-resource-bearing values are rejected at compile time rather than producing an
-unstable representation.
+Nested arrays use the same representation. `Option` renders as `None` or
+`Some(value)`; `Result` renders as `Ok(value)` or `Err(error)`. Class formatting
+tracks GC object identity within one interpolation operation. The first
+occurrence is labeled `ClassName#N`; an active back-edge renders as
+`<cycle #N>`, while a later shared reference renders as `<ref #N>`. Traversal
+depth and the number of tracked objects are deterministically bounded,
+producing `<depth-limit>` or `<object-limit>` instead of recursing indefinitely.
+Struct value-layout cycles remain invalid. Map, Tuple, user Enum, Buffer, Set,
+Host values, and resource-bearing values are rejected at compile time rather
+than producing an unstable representation.
 
 `\${` produces a literal `${`. Conversion is verified, bounded, fuel-metered,
 and represented in Source Maps and precise Root Maps.

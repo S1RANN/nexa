@@ -112,11 +112,12 @@ host::write_line("values = ${values}"); // values = [3, 1, 4]
 
 `Array<T>.get(index)` is bounds checked and returns `Option<T>`; direct
 `values[index]` indexing remains the trapping form. String interpolation
-formats scalars, recursively formattable arrays, and formattable Struct/Class
-values without requiring a Console helper. Aggregate output includes the type
-and field names in declaration order. Class graphs are cycle-safe: each object
-gets a traversal-local ID, repeated references render as `<ref #N>`, and an
-active back-edge renders as `<cycle #N>`.
+formats scalars, recursively formattable arrays, `Option`/`Result`, and
+formattable Struct/Class values without requiring a Console helper. `Option`
+uses `None`/`Some(value)` and `Result` uses `Ok(value)`/`Err(error)`. Aggregate
+output includes the type and field names in declaration order. Class graphs are
+cycle-safe: each object gets a traversal-local ID, repeated references render
+as `<ref #N>`, and an active back-edge renders as `<cycle #N>`.
 
 The compiler lowers those statements, in source order, into a synthetic
 `main(args: Array<string>) -> i32`. The implicit `args` binding contains the

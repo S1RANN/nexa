@@ -886,6 +886,44 @@ pub struct DisplayType {
     pub field_names: Vec<u32>,
 }
 
+/// Source-facing name of a compiler-provided `Option` or `Result` variant.
+///
+/// Keeping this mapping beside the canonical variant identities lets the
+/// verifier and runtime agree on which structural Enums have deterministic
+/// display semantics without adding names to every user Enum in the wire
+/// format.
+#[must_use]
+pub fn builtin_variant_display_name(variant: StableId) -> Option<&'static str> {
+    [
+        (StableId::from_parts(&["Option", "::None"]), "None"),
+        (StableId::from_parts(&["Option", "::Some"]), "Some"),
+        (StableId::from_parts(&["Result", "::Ok"]), "Ok"),
+        (StableId::from_parts(&["Result", "::Err"]), "Err"),
+    ]
+    .into_iter()
+    .find_map(|(candidate, name)| (candidate == variant).then_some(name))
+}
+
+/// Whether an Enum is exactly one of the canonical built-in structural
+/// display shapes. Exact reconstruction validates its type ID, tags, variant
+/// identities, and payload types together.
+#[must_use]
+pub fn is_builtin_display_enum(enumeration: &EnumType) -> bool {
+    match enumeration.variants.as_slice() {
+        [none, some] if none.payload_type.is_none() && some.payload_type.is_some() => {
+            enumeration == &option_type(some.payload_type.expect("guarded payload"))
+        }
+        [ok, error] if ok.payload_type.is_some() && error.payload_type.is_some() => {
+            enumeration
+                == &result_type(
+                    ok.payload_type.expect("guarded payload"),
+                    error.payload_type.expect("guarded payload"),
+                )
+        }
+        _ => false,
+    }
+}
+
 #[must_use]
 pub fn option_type(payload: ValueType) -> EnumType {
     let type_id = parameterized_type_id("Option", &[payload]);

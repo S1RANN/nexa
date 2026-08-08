@@ -6457,13 +6457,18 @@ fn standard_intrinsic_attempt_fuel(
                 map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
             }
         }
-        StandardIntrinsicFuelModel::ValueToString => formattable_attempt_fuel(
-            metadata.module,
-            metadata.layouts,
-            intrinsic,
-            arguments[0],
-            heap_required()?,
-        )?,
+        StandardIntrinsicFuelModel::ValueToString => {
+            let source = abi.argument_base(args_base, 0)?;
+            let values =
+                crate::trusted::read_register_window(arena, source, abi.argument_slots[0])?;
+            formattable_attempt_fuel(
+                metadata.module,
+                metadata.layouts,
+                intrinsic,
+                FormatSlots::Frame(values),
+                heap_required()?,
+            )?
+        }
     };
     let logical_slots = intrinsic.argument_count().saturating_add(1);
     let physical_slots = args_count
@@ -6663,14 +6668,16 @@ fn run_physical_standard_intrinsic(
             Ok(PhysicalStandardIntrinsicOutcome::Returned)
         }
         Intrinsic::ValueToString { value: ty } => {
-            if abi.argument_slots[0] != 1 || abi.result_slots != 1 {
+            if abi.result_slots != 1 {
                 return Err(InterpreterError::TypeMismatch);
             }
-            let source = argument(arena, 0)?;
+            let source = argument_base(0)?;
+            let values =
+                crate::trusted::read_register_window(arena, source, abi.argument_slots[0])?;
             let heap = heap
                 .as_deref_mut()
                 .ok_or(InterpreterError::HeapUnavailable)?;
-            let shape = measure_formattable(module, layouts, heap, FormatSlots::one(source), ty)?;
+            let shape = measure_formattable(module, layouts, heap, FormatSlots::Frame(values), ty)?;
             let capacity =
                 usize::try_from(shape.bytes).map_err(|_| InterpreterError::StringLengthOverflow)?;
             heap.validate_string_length(capacity)?;
@@ -6680,7 +6687,7 @@ fn run_physical_standard_intrinsic(
                 module,
                 layouts,
                 heap,
-                FormatSlots::one(source),
+                FormatSlots::Frame(values),
                 ty,
             )?;
             if text.len() != capacity {
@@ -7354,13 +7361,13 @@ fn formattable_attempt_fuel(
     module: &nexa_bytecode::Module,
     layouts: &nexa_bytecode::layout::LayoutTable,
     intrinsic: StandardIntrinsic,
-    value: RuntimeValue,
+    values: FormatSlots<'_>,
     heap: &Heap,
 ) -> Result<u64, InterpreterError> {
     let StandardIntrinsic::ValueToString { value: ty } = intrinsic else {
         return Err(InterpreterError::TypeMismatch);
     };
-    let shape = measure_formattable(module, layouts, heap, FormatSlots::one(value), ty)?;
+    let shape = measure_formattable(module, layouts, heap, values, ty)?;
     let cells = shape
         .cells
         .checked_mul(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
@@ -7619,6 +7626,13 @@ fn format_value(
             output,
         );
     }
+    if module.enum_types.iter().any(|enumeration| {
+        enumeration.type_id == type_id && nexa_bytecode::is_builtin_display_enum(enumeration)
+    }) {
+        return format_builtin_enum(
+            module, layouts, heap, values, type_id, depth, context, output,
+        );
+    }
     let display = module
         .display_types
         .iter()
@@ -7641,6 +7655,58 @@ fn format_value(
     format_struct(
         module, layouts, heap, values, structure, display, depth, context, output,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_builtin_enum(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    type_id: StableId,
+    depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    let layout = layouts
+        .named_layout(type_id)
+        .and_then(|layout| layout.enum_layout.as_ref())
+        .ok_or(InterpreterError::TypeMismatch)?;
+    let RuntimeValue::I32(tag) = values
+        .get(usize::from(layout.tag_offset))
+        .ok_or(InterpreterError::TypeMismatch)?
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    let tag = u32::try_from(tag).map_err(|_| InterpreterError::TypeMismatch)?;
+    let variant = layout
+        .variants
+        .iter()
+        .find(|variant| variant.tag == tag)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    let name = nexa_bytecode::builtin_variant_display_name(variant.stable_id)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    output.push_str(name)?;
+    let Some(payload_type) = variant.payload_type else {
+        return Ok(());
+    };
+    output.push_str("(")?;
+    format_value(
+        module,
+        layouts,
+        heap,
+        values
+            .slice(
+                usize::from(layout.payload_offset),
+                usize::from(variant.payload_slots),
+            )
+            .ok_or(InterpreterError::TypeMismatch)?,
+        payload_type,
+        depth.saturating_add(1),
+        context,
+        output,
+    )?;
+    output.push_str(")")
 }
 
 fn format_scalar(

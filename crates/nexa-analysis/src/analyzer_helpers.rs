@@ -537,6 +537,13 @@ fn is_interpolatable(
         if let IrType::Array(element) = ty {
             return visit(element, definitions, type_metadata, visiting);
         }
+        if let IrType::Option(payload) = ty {
+            return visit(payload, definitions, type_metadata, visiting);
+        }
+        if let IrType::Result(success, error) = ty {
+            return visit(success, definitions, type_metadata, visiting)
+                && visit(error, definitions, type_metadata, visiting);
+        }
         let IrType::Named(definition) = ty else { return false };
         let Some(declaration) = definitions.get(definition.0 as usize) else {
             return false;

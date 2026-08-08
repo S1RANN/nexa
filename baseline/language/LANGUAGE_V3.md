@@ -52,23 +52,29 @@ let object = Boxed { value };
 fields MAY precede `..base`; duplicate, unknown, missing, and type-mismatched
 fields are checked exactly as explicit field initializers.
 
-### 1.2 Struct and Class interpolation
+### 1.2 Structural interpolation
 
-A Struct or Class whose complete field graph is deterministically formattable
+A recursively formattable Array, `Option<T>`, `Result<T, E>`, Struct, or Class
 MAY be used in string interpolation and in Host console functions that accept
-formattable values. Its canonical text is:
+formattable values. Struct canonical text is:
 
 ```text
 TypeName { first_field: value, second_field: value }
 ```
 
+Class canonical text is `TypeName#N { ... }`, where `N` is a traversal-local
+identity starting at one. An active back-edge MUST render as `<cycle #N>` and a
+later shared reference as `<ref #N>`. `Option` MUST render as `None` or
+`Some(value)`; `Result` MUST render as `Ok(value)` or `Err(error)`.
+
 Fields MUST appear in declaration order. Scalar and recursively formattable
-Array fields use their existing canonical representations; acyclic nested
-Struct/Class fields use this same rule. Nominal cycles and fields containing
-Map, Tuple, Option, Result, Buffer, Set, Host, or resource-bearing values are
-rejected at analysis time. Formatting evaluates the interpolated expression
-once and MUST NOT expose addresses, GC identities, hash-table order, or
-locale-dependent text.
+Array, Option, Result, Struct, and Class fields use these same rules. Traversal
+MUST be bounded and MUST render its deterministic limit markers instead of
+recursing or allocating without bound. Fields containing Map, Tuple, user
+Enum, Buffer, Set, Host, or resource-bearing values are rejected at analysis
+time. Formatting evaluates the interpolated expression once and MUST NOT
+expose addresses, raw GC identities, hash-table order, or locale-dependent
+text.
 
 ## 2. `Set<T>`
 

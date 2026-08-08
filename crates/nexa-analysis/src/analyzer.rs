@@ -9768,9 +9768,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                                 self.type_error(
                                     value.span.clone(),
                                     &format!(
-                                        "interpolation supports scalar values, recursively \
-                                         formattable Array<T>, Struct, and Class values; {} is \
-                                         not formattable",
+                                        "interpolation supports scalar values and recursively \
+                                         formattable Array<T>, Option<T>, Result<T, E>, Struct, \
+                                         and Class values; {} is not formattable",
                                         display_ir_type(&value.ty, &self.analyzer.definitions)
                                     ),
                                 );
