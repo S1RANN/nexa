@@ -673,6 +673,15 @@ fn run_session_with_analyzer(
                         &documents,
                     );
                 }
+                if references.is_empty() {
+                    references = namespace_alias_reference_locations(
+                        &path,
+                        &source,
+                        offset,
+                        include_declaration,
+                        &documents,
+                    );
+                }
                 respond(writer, id, &Value::Array(references))?;
             }
             Some("textDocument/rename") => {
@@ -687,6 +696,9 @@ fn run_session_with_analyzer(
                     })
                     .or_else(|| {
                         generic_parameter_rename_edit(&path, &source, offset, new_name, &documents)
+                    })
+                    .or_else(|| {
+                        namespace_alias_rename_edit(&path, &source, offset, new_name, &documents)
                     });
                 respond(writer, id, edit.as_ref().unwrap_or(&Value::Null))?;
             }
@@ -2980,7 +2992,141 @@ fn generic_parameter_rename_edit(
             })
         })
         .collect::<Vec<_>>();
-    Some(json!({"changes": {uri: edits}}))
+    let mut changes = serde_json::Map::new();
+    changes.insert(uri, Value::Array(edits));
+    Some(json!({"changes": changes}))
+}
+
+fn namespace_alias_reference_locations(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    include_declaration: bool,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Vec<Value> {
+    let Some((declaration, ranges, _)) = namespace_alias_ranges_at(source, offset) else {
+        return Vec::new();
+    };
+    let uri = documents
+        .values()
+        .find(|document| same_file_path(&document.path, path))
+        .map(|document| document.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok());
+    let Some(uri) = uri else {
+        return Vec::new();
+    };
+    ranges
+        .into_iter()
+        .filter(|range| include_declaration || *range != declaration)
+        .map(|range| {
+            let start = byte_offset_to_lsp_position(source, range.start.get() as usize);
+            let end = byte_offset_to_lsp_position(source, range.end.get() as usize);
+            json!({
+                "uri": uri,
+                "range": {
+                    "start": {"line": start.line, "character": start.character},
+                    "end": {"line": end.line, "character": end.character}
+                }
+            })
+        })
+        .collect()
+}
+
+fn namespace_alias_rename_edit(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    new_name: &str,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Option<Value> {
+    if !valid_nexa_identifier(new_name)
+        || !new_name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (_, ranges, explicit) = namespace_alias_ranges_at(source, offset)?;
+    if !explicit {
+        return None;
+    }
+    let tree = nexa_syntax::parse_nexa(source).ok()?;
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    if ast.uses.iter().any(|usage| {
+        usage
+            .alias
+            .as_ref()
+            .or_else(|| usage.segments.last())
+            .is_some_and(|candidate| candidate.text == new_name)
+    }) {
+        return None;
+    }
+    let uri = documents
+        .values()
+        .find(|document| same_file_path(&document.path, path))
+        .map(|document| document.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok())?;
+    let edits = ranges
+        .into_iter()
+        .map(|range| {
+            let start = byte_offset_to_lsp_position(source, range.start.get() as usize);
+            let end = byte_offset_to_lsp_position(source, range.end.get() as usize);
+            json!({
+                "range": {
+                    "start": {"line": start.line, "character": start.character},
+                    "end": {"line": end.line, "character": end.character}
+                },
+                "newText": new_name
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut changes = serde_json::Map::new();
+    changes.insert(uri, Value::Array(edits));
+    Some(json!({"changes": changes}))
+}
+
+fn namespace_alias_ranges_at(
+    source: &str,
+    offset: usize,
+) -> Option<(nexa_syntax::TextRange, Vec<nexa_syntax::TextRange>, bool)> {
+    use nexa_syntax::TokenKind;
+    let tree = nexa_syntax::parse_nexa(source).ok()?;
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let lexed = nexa_syntax::lex_nexa(source).ok()?;
+    let offset = u32::try_from(offset).ok()?;
+    let current = lexed.tokens.iter().find(|token| {
+        token.kind == TokenKind::Identifier
+            && token.range.start.get() <= offset
+            && offset <= token.range.end.get()
+    })?;
+    let name = source.get(current.range.start.get() as usize..current.range.end.get() as usize)?;
+    let usage = ast.uses.iter().find(|usage| {
+        usage
+            .alias
+            .as_ref()
+            .or_else(|| usage.segments.last())
+            .is_some_and(|candidate| candidate.text == name)
+    })?;
+    let local = usage.alias.as_ref().or_else(|| usage.segments.last())?;
+    let significant = lexed
+        .tokens
+        .iter()
+        .filter(|token| !token.kind.is_trivia())
+        .collect::<Vec<_>>();
+    let mut ranges = significant
+        .windows(2)
+        .filter(|pair| {
+            pair[0].kind == TokenKind::Identifier
+                && pair[1].kind == TokenKind::ColonColon
+                && source.get(pair[0].range.start.get() as usize..pair[0].range.end.get() as usize)
+                    == Some(name)
+        })
+        .map(|pair| pair[0].range)
+        .collect::<Vec<_>>();
+    ranges.push(local.range);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    Some((local.range, ranges, usage.alias.is_some()))
 }
 
 fn generic_parameter_ranges_at(
