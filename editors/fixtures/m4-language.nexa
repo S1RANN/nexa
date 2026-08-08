@@ -18,7 +18,7 @@ pub class Box<T> {
 
 fn choose<T>(left: T, right: T) -> T
 where
-    T: Copy + PartialOrd,
+    T: PartialOrd,
 {
     if left < right {
         return left;

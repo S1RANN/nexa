@@ -76,6 +76,16 @@ time. Formatting evaluates the interpolated expression once and MUST NOT
 expose addresses, raw GC identities, hash-table order, or locale-dependent
 text.
 
+### 1.3 Value copying and resource aliases
+
+Nexa has no user-visible `Copy` bound and no move checker. Every ordinary value
+MAY be read or passed multiple times. Struct and Enum values copy their value
+slots; Class and collection values copy references; Snapshot and StateHandle
+values copy handles. Copying `Token<T>` creates an alias of the same resource
+handle, not a second resource. Releasing or invalidating that resource MUST
+make all aliases stale, and the runtime MUST NOT release the underlying
+resource more than once.
+
 ## 2. `Set<T>`
 
 A `Set<T>` is a non-null GC reference type holding distinct elements of one

@@ -277,7 +277,7 @@ fn main() -> i32 {
 fn generics_allow_same_instance_recursion_and_reject_polymorphic_recursion() {
     let recursive = analyze_main(
         r"
-fn countdown<T: Copy>(value: T, remaining: i32) -> T {
+fn countdown<T>(value: T, remaining: i32) -> T {
     if remaining <= 0 {
         return value;
     }
@@ -455,7 +455,7 @@ fn equal<T: PartialEq>(left: T, right: T) -> bool {
 
 fn smaller<T>(left: T, right: T) -> T
 where
-    T: Copy + PartialOrd,
+    T: PartialOrd,
 {
     if left < right {
         return left;
@@ -907,7 +907,7 @@ pub struct Pair<T, U> {
     second: U,
 }
 
-pub fn identity<T: Copy>(value: T) -> T {
+pub fn identity<T>(value: T) -> T {
     return value;
 }
 ",
@@ -919,7 +919,7 @@ pub struct Pair<First, Second> {
     second: Second,
 }
 
-pub fn identity<Value: Copy>(value: Value) -> Value {
+pub fn identity<Value>(value: Value) -> Value {
     return value;
 }
 ",
@@ -933,7 +933,7 @@ pub fn identity<Value: Copy>(value: Value) -> Value {
 
     let changed_bound = analyze_main(
         r"
-pub struct Pair<T: Copy, U> {
+pub struct Pair<T: Eq, U> {
     first: T,
     second: U,
 }

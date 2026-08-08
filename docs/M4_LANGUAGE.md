@@ -52,7 +52,7 @@ fn identity<T>(value: T) -> T {
 
 fn smaller<T>(left: T, right: T) -> T
 where
-    T: Copy + PartialOrd,
+    T: PartialOrd,
 {
     if left < right {
         return left;
@@ -100,10 +100,17 @@ the Runtime. A generic declaration's stable identity and canonical concrete
 argument identities determine each instance identity; type parameter spelling
 does not.
 
-The closed bounds are `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
-`Display`, and `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg` with `Output = T`. These
-names do not form a user-extensible trait system. `Map<K, V>` requires
-`K: Eq + Hash`.
+The closed bounds are `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Display`,
+and `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg` with `Output = T`. These names do not
+form a user-extensible trait system. `Map<K, V>` requires `K: Eq + Hash`.
+
+Nexa has no public `Copy` bound or move checker. Every ordinary value can be
+read more than once and passed more than once. Struct and Enum values copy
+their value slots; Class and collection values copy a reference; Snapshot and
+StateHandle values copy a handle. A `Token<T>` copy is another alias of the
+same runtime resource handle, not ownership of a second resource. Releasing or
+invalidating the resource makes every alias stale, and the runtime prevents a
+second release of the underlying resource.
 
 Generic `@state` Classes are rejected. A non-generic state Class may contain
 fully concrete generic instances. Migration, lifecycle, test, Contract, and

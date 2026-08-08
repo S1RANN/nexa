@@ -27,7 +27,7 @@ fn function_generics_preserve_declared_type_parameters() {
 #[test]
 fn function_generics_parse_inline_and_where_bounds() {
     let tree = parse_nexa(
-        "fn smaller<T: Copy>(left: T, right: T) -> T where T: PartialOrd + Display, { return left; }\n",
+        "fn smaller<T: Eq>(left: T, right: T) -> T where T: PartialOrd + Display, { return left; }\n",
     )
     .expect("valid bounded generic function source");
     assert!(tree.errors.is_empty(), "{:?}", tree.errors);
@@ -36,7 +36,7 @@ fn function_generics_parse_inline_and_where_bounds() {
     let DeclarationKind::Function(function) = &ast.declarations[0].kind else {
         panic!("expected a function declaration");
     };
-    assert_eq!(function.type_parameters[0].bounds[0].name.text, "Copy");
+    assert_eq!(function.type_parameters[0].bounds[0].name.text, "Eq");
     assert_eq!(
         function.where_constraints[0]
             .bounds

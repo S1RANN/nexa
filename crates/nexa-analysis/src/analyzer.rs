@@ -477,7 +477,6 @@ struct FunctionSignature {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum BuiltinBound {
-    Copy,
     PartialEq,
     Eq,
     PartialOrd,
@@ -5139,7 +5138,6 @@ impl<'a> Analyzer<'a> {
             };
             for bound in bounds {
                 let builtin = match bound.name.text.as_str() {
-                    "Copy" => Some(BuiltinBound::Copy),
                     "PartialEq" => Some(BuiltinBound::PartialEq),
                     "Eq" => Some(BuiltinBound::Eq),
                     "PartialOrd" => Some(BuiltinBound::PartialOrd),
@@ -5205,7 +5203,7 @@ impl<'a> Analyzer<'a> {
                         &module.source,
                         byte_range(bound.range),
                         format!("unsupported generic bound `{}`", bound.name.text),
-                        "supported bounds are Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, Add, Sub, Mul, Div, Rem, and Neg",
+                        "supported bounds are PartialEq, Eq, PartialOrd, Ord, Hash, Display, Add, Sub, Mul, Div, Rem, and Neg",
                     );
                 }
             }
@@ -15621,7 +15619,6 @@ fn ir_type_contains_type_parameter(ty: &IrType) -> bool {
 
 const fn builtin_bound_name(bound: BuiltinBound) -> &'static str {
     match bound {
-        BuiltinBound::Copy => "Copy",
         BuiltinBound::PartialEq => "PartialEq",
         BuiltinBound::Eq => "Eq",
         BuiltinBound::PartialOrd => "PartialOrd",
@@ -15644,8 +15641,7 @@ fn bound_set_satisfies(bounds: &BTreeSet<BuiltinBound>, required: BuiltinBound) 
                 bounds.contains(&BuiltinBound::Eq) || bounds.contains(&BuiltinBound::Ord)
             }
             BuiltinBound::Eq | BuiltinBound::PartialOrd => bounds.contains(&BuiltinBound::Ord),
-            BuiltinBound::Copy
-            | BuiltinBound::Ord
+            BuiltinBound::Ord
             | BuiltinBound::Hash
             | BuiltinBound::Display
             | BuiltinBound::Add
@@ -15712,7 +15708,11 @@ fn type_satisfies_bound(
             | IrType::Array(_)
             | IrType::Set(_)
             | IrType::Snapshot(_)
-            | IrType::Buffer(_) => bound == BuiltinBound::Copy,
+            | IrType::Buffer(_)
+            | IrType::ResourceToken(_)
+            | IrType::HostRequest(_)
+            | IrType::TypeParameter(_)
+            | IrType::Error => false,
             IrType::Option(inner) => recursive(
                 inner,
                 bound,
@@ -15753,10 +15753,7 @@ fn type_satisfies_bound(
                     return false;
                 };
                 if declaration.kind == DefinitionKind::Class {
-                    return matches!(
-                        bound,
-                        BuiltinBound::Copy | BuiltinBound::Eq | BuiltinBound::Hash
-                    );
+                    return matches!(bound, BuiltinBound::Eq | BuiltinBound::Hash);
                 }
                 if !visiting.insert(*definition) {
                     return true;
@@ -15799,14 +15796,7 @@ fn type_satisfies_bound(
                 visiting.remove(definition);
                 satisfied
             }
-            IrType::StateHandle(_) => matches!(
-                bound,
-                BuiltinBound::Copy | BuiltinBound::Eq | BuiltinBound::Hash
-            ),
-            IrType::ResourceToken(_)
-            | IrType::HostRequest(_)
-            | IrType::TypeParameter(_)
-            | IrType::Error => false,
+            IrType::StateHandle(_) => matches!(bound, BuiltinBound::Eq | BuiltinBound::Hash),
         }
     }
 
@@ -15820,7 +15810,7 @@ fn type_satisfies_bound(
         | BuiltinBound::Div
         | BuiltinBound::Rem
         | BuiltinBound::Neg => is_numeric(ty),
-        BuiltinBound::Eq | BuiltinBound::Copy | BuiltinBound::Hash => recursive(
+        BuiltinBound::Eq | BuiltinBound::Hash => recursive(
             ty,
             bound,
             definitions,

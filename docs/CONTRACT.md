@@ -139,7 +139,9 @@ Generic builtin names are case-sensitive. User-defined generics, `void`,
 nullable references, pointers, and source-visible request or future types are
 not supported. `Token<Entity>` is tied to the declared `Entity` Handle's
 Stable ID and cannot be used as another Handle's token. `Snapshot<State>` is
-similarly tied to a declared Struct.
+similarly tied to a declared Struct. Copying a Token copies its typed handle;
+all copies alias one runtime resource, and invalidating it makes every alias
+stale without releasing the underlying resource more than once.
 
 ## Host functions and attributes
 
