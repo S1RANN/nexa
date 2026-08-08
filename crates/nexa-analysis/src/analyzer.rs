@@ -14707,36 +14707,25 @@ fn unknown_symbol_fix(
             "Nexa has no unsigned integer types; use `i8`, `i16`, `i32`, or `i64`",
         ));
     }
-    let is_type_kind = |kind: DefinitionKind| {
-        matches!(
-            kind,
-            DefinitionKind::Struct
-                | DefinitionKind::Enum
-                | DefinitionKind::Class
-                | DefinitionKind::HostContract
-        )
-    };
-    let is_value_kind = |kind: DefinitionKind| {
-        matches!(
-            kind,
-            DefinitionKind::Function
-                | DefinitionKind::Task
-                | DefinitionKind::Const
-                | DefinitionKind::Field
-                | DefinitionKind::Variant
-                | DefinitionKind::Parameter
-                | DefinitionKind::Local
-                | DefinitionKind::HostFunction
-        )
-    };
+    let exact_name_exists = definitions.iter().any(|definition| {
+        definition.package_id == module.package
+            && definition.module == module.module
+            && definition.name == name
+            && suggestion_kind_matches(usage, definition.kind)
+    });
+    if exact_name_exists {
+        // The spelling is already exact. The definition is unavailable because of scope or
+        // declaration order, so proposing a different near-name would be misleading as well.
+        return None;
+    }
     let mut best: Option<(u8, usize, usize, &str)> = None;
     for definition in definitions {
+        if definition.name == name {
+            continue;
+        }
         let in_module =
             definition.package_id == module.package && definition.module == module.module;
-        let relevant = match usage {
-            SymbolUse::Type => is_type_kind(definition.kind),
-            SymbolUse::Value | SymbolUse::Callable => is_value_kind(definition.kind),
-        };
+        let relevant = suggestion_kind_matches(usage, definition.kind);
         if relevant {
             let layer = if in_module { 0 } else { 2 };
             let distance = edit_distance(name, &definition.name, 2);
@@ -14778,6 +14767,29 @@ fn unknown_symbol_fix(
         range,
         candidate,
     ))
+}
+
+const fn suggestion_kind_matches(usage: SymbolUse, kind: DefinitionKind) -> bool {
+    match usage {
+        SymbolUse::Type => matches!(
+            kind,
+            DefinitionKind::Struct
+                | DefinitionKind::Enum
+                | DefinitionKind::Class
+                | DefinitionKind::HostContract
+        ),
+        SymbolUse::Value | SymbolUse::Callable => matches!(
+            kind,
+            DefinitionKind::Function
+                | DefinitionKind::Task
+                | DefinitionKind::Const
+                | DefinitionKind::Field
+                | DefinitionKind::Variant
+                | DefinitionKind::Parameter
+                | DefinitionKind::Local
+                | DefinitionKind::HostFunction
+        ),
+    }
 }
 
 /// Length of the shared character prefix of two names, used to break did-you-mean ties.

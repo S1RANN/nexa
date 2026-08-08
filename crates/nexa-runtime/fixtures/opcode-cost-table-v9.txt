@@ -1,4 +1,4 @@
-bytecode_version=8
+bytecode_version=9
 opcode_cost_table_version=8
 entries=119
 index	name	table_base	effective_base	dynamic_work

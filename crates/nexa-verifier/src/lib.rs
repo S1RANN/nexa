@@ -792,6 +792,42 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
             });
         }
     }
+    let mut display_ids = BTreeSet::new();
+    for display in &module.display_types {
+        let nominal_fields = module
+            .struct_types
+            .iter()
+            .find(|ty| ty.type_id == display.type_id)
+            .map(|ty| ty.fields.len())
+            .or_else(|| {
+                module
+                    .class_types
+                    .iter()
+                    .find(|ty| ty.type_id == display.type_id)
+                    .map(|ty| ty.fields.len())
+            });
+        let name_valid = usize::try_from(display.name)
+            .ok()
+            .and_then(|index| module.strings.get(index))
+            .is_some_and(|name| !name.is_empty());
+        let fields_valid = display.field_names.iter().all(|name| {
+            usize::try_from(*name)
+                .ok()
+                .and_then(|index| module.strings.get(index))
+                .is_some_and(|name| !name.is_empty())
+        });
+        if !display_ids.insert(display.type_id)
+            || nominal_fields != Some(display.field_names.len())
+            || !name_valid
+            || !fields_valid
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidClassMetadata,
+            });
+        }
+    }
     let mut state_ids = BTreeSet::new();
     for state_type in &module.state_schema.types {
         let mut field_ids = BTreeSet::new();
@@ -1524,7 +1560,13 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
             | ValueType::Bool
             | ValueType::Rune
             | ValueType::String => true,
-            ValueType::Named(id) => module.array_types.iter().any(|ty| ty.type_id == id),
+            ValueType::Named(id) => {
+                module.array_types.iter().any(|ty| ty.type_id == id)
+                    || module
+                        .display_types
+                        .iter()
+                        .any(|display| display.type_id == id)
+            }
             ValueType::Ref => false,
         },
         _ => true,

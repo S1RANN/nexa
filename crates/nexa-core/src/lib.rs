@@ -12,7 +12,7 @@ use std::fmt;
 /// version as independent identities.
 pub const NEXA_COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Current bytecode wire-format version included in every build fingerprint and module header.
-pub const BYTECODE_VERSION: u16 = 8;
+pub const BYTECODE_VERSION: u16 = 9;
 /// Version of observable VM execution semantics included in every build fingerprint.
 pub const RUNTIME_SEMANTICS_VERSION: u16 = 1;
 /// Version of the fixed instruction fuel schedule included in every build fingerprint.

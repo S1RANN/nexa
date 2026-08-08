@@ -1,10 +1,10 @@
-# Nexa Internal Language Bytecode 8
+# Nexa Internal Language Bytecode 9
 
-Version: **8.0.0**
+Version: **9.0.0**
 
 Status: **COMPLETE**
 
-Bytecode v8 is Nexa's only portable execution artifact. It is a
+Bytecode v9 is Nexa's only portable execution artifact. It is a
 little-endian, sectioned, typed-register format whose logical values are
 lowered through the physical ABI defined by
 [`VALUE_LAYOUT_V1.md`](../performance/VALUE_LAYOUT_V1.md). Runtime execution
@@ -14,12 +14,12 @@ executed directly.
 ## Frozen versions
 
 ```text
-BYTECODE_VERSION = 8
+BYTECODE_VERSION = 9
 OPCODE_COST_TABLE_VERSION = 8
-MANDATORY_SECTION_COUNT = 16
+MANDATORY_SECTION_COUNT = 17
 ```
 
-The decoder rejects every wire version other than 8 from the envelope before
+The decoder rejects every wire version other than 9 from the envelope before
 section payload decoding. There is no v5/v6/v7 compatibility decoder, feature
 negotiation, or product fallback path. The opcode cost-table version is
 validated when an `ExecutableModule` is built and is part of deterministic
@@ -32,7 +32,7 @@ Every integer is encoded little-endian. The envelope is:
 ```text
 offset  width  field
 0       4      magic = "NXBC"
-4       2      bytecode version = 8
+4       2      bytecode version = 9
 6       2      section-directory entry count
 8       20*N   section-directory entries
 ...            contiguous section payloads
@@ -57,7 +57,7 @@ consume the artifact exactly. Unknown mandatory sections fail closed.
 
 ## Mandatory sections
 
-The v8 encoder emits, and the decoder requires, these 16 sections:
+The v9 encoder emits, and the decoder requires, these 17 sections:
 
 | Kind | Name | Authority |
 | ---: | --- | --- |
@@ -77,6 +77,7 @@ The v8 encoder emits, and the decoder requires, these 16 sections:
 | 14 | LoopBounds | Immediate-function back edges and static iteration bounds |
 | 15 | SourceMap | Function/PC ranges mapped to exact source spans |
 | 16 | ReloadMetadata | Contract/schema fingerprints, migration/activation entries, and minimum migration limits |
+| 17 | DisplayTypes | Source-facing nominal type and field-name string indices for deterministic structural interpolation |
 
 `Code`, `RootMaps`, `Safepoints`, and `LoopBounds` duplicate the canonical
 copies carried with function metadata. The decoder requires byte-for-byte

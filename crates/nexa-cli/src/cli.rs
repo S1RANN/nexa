@@ -60,7 +60,7 @@ pub(crate) enum Command {
     )]
     Check(CheckArgs),
 
-    /// Compile an Application to Bytecode v7.
+    /// Compile an Application to Bytecode v9.
     #[command(
         after_help = "Examples:\n  nexa build game.nexa -o game.nxb\n  nexa build --project nexa.dev.toml"
     )]
@@ -86,7 +86,7 @@ pub(crate) enum Command {
     #[command(after_help = "Examples:\n  nexa repl\n  nexa repl --history 512 --no-prompt")]
     Repl(ReplArgs),
 
-    /// Execute a verified Bytecode v7 module.
+    /// Execute a verified Bytecode v9 module.
     #[command(after_help = "Examples:\n  nexa exec game.nxb\n  nexa exec game.nxb --trace")]
     Exec(ExecArgs),
 
@@ -98,7 +98,7 @@ pub(crate) enum Command {
     #[command(after_help = "Examples:\n  nexa compile game.nexa")]
     Compile { file: PathBuf },
 
-    /// Inspect a Bytecode v7 module.
+    /// Inspect a Bytecode v9 module.
     #[command(after_help = "Examples:\n  nexa dump game.nxb --section Code")]
     Dump(DumpArgs),
 

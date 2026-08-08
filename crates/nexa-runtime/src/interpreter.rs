@@ -3004,7 +3004,10 @@ impl CheckedInterpreter {
                         &continuation.arena,
                         heap.as_deref(),
                         DynamicFuelPlan {
-                            module: module.module(),
+                            metadata: RuntimeTypeMetadata {
+                                module: module.module(),
+                                layouts: module.layout_table(),
+                            },
                             nominal_shape: module.nominal_index_shape(),
                             costs,
                             resolved: resolved_nominal,
@@ -3026,7 +3029,10 @@ impl CheckedInterpreter {
                         &continuation.arena,
                         heap.as_deref(),
                         DynamicFuelPlan {
-                            module: module.module(),
+                            metadata: RuntimeTypeMetadata {
+                                module: module.module(),
+                                layouts: module.layout_table(),
+                            },
                             nominal_shape: module.nominal_index_shape(),
                             costs,
                             resolved: resolved_nominal,
@@ -3042,7 +3048,10 @@ impl CheckedInterpreter {
                     .resolved_operand(frame.function as usize, frame.pc as usize)
                     .into();
                 instruction_cost = instruction_attempt_fuel(
-                    module.module(),
+                    RuntimeTypeMetadata {
+                        module: module.module(),
+                        layouts: module.layout_table(),
+                    },
                     module.nominal_index_shape(),
                     instruction,
                     &continuation.arena,
@@ -5649,7 +5658,7 @@ pub(crate) fn static_instruction_fuel(
 }
 
 fn instruction_attempt_fuel(
-    module: &nexa_bytecode::Module,
+    metadata: RuntimeTypeMetadata<'_>,
     nominal_shape: nexa_verifier::NominalIndexShape,
     instruction: Instruction,
     arena: &FrameArena,
@@ -5660,7 +5669,9 @@ fn instruction_attempt_fuel(
     // F1 single source of truth: instructions whose whole attempt fuel is
     // known at module load time settle here; only operand-dependent
     // surcharges fall through to the dynamic arms below.
-    if let Some(static_fuel) = static_instruction_fuel(module, nominal_shape, instruction, costs)? {
+    if let Some(static_fuel) =
+        static_instruction_fuel(metadata.module, nominal_shape, instruction, costs)?
+    {
         return Ok(static_fuel);
     }
     dynamic_instruction_fuel(
@@ -5668,7 +5679,7 @@ fn instruction_attempt_fuel(
         arena,
         heap,
         DynamicFuelPlan {
-            module,
+            metadata,
             nominal_shape,
             costs,
             resolved,
@@ -5772,8 +5783,14 @@ pub(crate) fn physical_instruction_work_fuel(
 }
 
 #[derive(Clone, Copy)]
-struct DynamicFuelPlan<'a> {
+struct RuntimeTypeMetadata<'a> {
     module: &'a nexa_bytecode::Module,
+    layouts: &'a nexa_bytecode::layout::LayoutTable,
+}
+
+#[derive(Clone, Copy)]
+struct DynamicFuelPlan<'a> {
+    metadata: RuntimeTypeMetadata<'a>,
     nominal_shape: nexa_verifier::NominalIndexShape,
     costs: &'a OpcodeCostTable,
     resolved: ExecutableNominalOperand,
@@ -5788,12 +5805,13 @@ fn dynamic_instruction_fuel(
     plan: DynamicFuelPlan<'_>,
 ) -> Result<u64, InterpreterError> {
     let DynamicFuelPlan {
-        module,
+        metadata,
         nominal_shape,
         costs,
         resolved,
         predecoded_base,
     } = plan;
+    let module = metadata.module;
     let heap_required = || heap.ok_or(InterpreterError::HeapUnavailable);
     let base = predecoded_base.unwrap_or_else(|| costs.cost(instruction));
     let physical_work =
@@ -5806,7 +5824,7 @@ fn dynamic_instruction_fuel(
             ..
         } => {
             return standard_intrinsic_attempt_fuel(
-                module, intrinsic, args_base, args_count, arena, heap, resolved,
+                metadata, intrinsic, args_base, args_count, arena, heap, resolved,
             );
         }
         Instruction::StringLen { source, .. } | Instruction::StringRuneAt { source, .. } => {
@@ -6335,7 +6353,7 @@ fn standard_intrinsic_arguments(
 
 #[allow(clippy::too_many_lines)]
 fn standard_intrinsic_attempt_fuel(
-    module: &nexa_bytecode::Module,
+    metadata: RuntimeTypeMetadata<'_>,
     intrinsic: StandardIntrinsic,
     args_base: u16,
     args_count: u16,
@@ -6439,9 +6457,13 @@ fn standard_intrinsic_attempt_fuel(
                 map_insert_attempt_fuel(heap_required()?, arguments[0], arguments[1])?
             }
         }
-        StandardIntrinsicFuelModel::ValueToString => {
-            formattable_attempt_fuel(module, intrinsic, arguments[0], heap_required()?)?
-        }
+        StandardIntrinsicFuelModel::ValueToString => formattable_attempt_fuel(
+            metadata.module,
+            metadata.layouts,
+            intrinsic,
+            arguments[0],
+            heap_required()?,
+        )?,
     };
     let logical_slots = intrinsic.argument_count().saturating_add(1);
     let physical_slots = args_count
@@ -6648,12 +6670,19 @@ fn run_physical_standard_intrinsic(
             let heap = heap
                 .as_deref_mut()
                 .ok_or(InterpreterError::HeapUnavailable)?;
-            let shape = formattable_shape(module, heap, source, ty, 0)?;
+            let shape = measure_formattable(module, layouts, heap, FormatSlots::one(source), ty)?;
             let capacity =
                 usize::try_from(shape.bytes).map_err(|_| InterpreterError::StringLengthOverflow)?;
             heap.validate_string_length(capacity)?;
             let mut text = String::with_capacity(capacity);
-            write_formattable_value(&mut text, module, heap, source, ty, 0)?;
+            write_formattable(
+                &mut text,
+                module,
+                layouts,
+                heap,
+                FormatSlots::one(source),
+                ty,
+            )?;
             if text.len() != capacity {
                 return Err(InterpreterError::TypeMismatch);
             }
@@ -7323,6 +7352,7 @@ fn run_standard_intrinsic(
 
 fn formattable_attempt_fuel(
     module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
     intrinsic: StandardIntrinsic,
     value: RuntimeValue,
     heap: &Heap,
@@ -7330,7 +7360,7 @@ fn formattable_attempt_fuel(
     let StandardIntrinsic::ValueToString { value: ty } = intrinsic else {
         return Err(InterpreterError::TypeMismatch);
     };
-    let shape = formattable_shape(module, heap, value, ty, 0)?;
+    let shape = measure_formattable(module, layouts, heap, FormatSlots::one(value), ty)?;
     let cells = shape
         .cells
         .checked_mul(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
@@ -7344,6 +7374,7 @@ fn formattable_attempt_fuel(
 }
 
 const MAX_FORMATTABLE_DEPTH: u8 = 64;
+const MAX_FORMATTABLE_OBJECTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FormattableShape {
@@ -7352,18 +7383,6 @@ struct FormattableShape {
 }
 
 impl FormattableShape {
-    fn add(&mut self, other: Self) -> Result<(), InterpreterError> {
-        self.cells = self
-            .cells
-            .checked_add(other.cells)
-            .ok_or(InterpreterError::FuelCostOverflow)?;
-        self.bytes = self
-            .bytes
-            .checked_add(other.bytes)
-            .ok_or(InterpreterError::StringLengthOverflow)?;
-        Ok(())
-    }
-
     fn add_bytes(&mut self, bytes: usize) -> Result<(), InterpreterError> {
         self.bytes = self
             .bytes
@@ -7373,137 +7392,510 @@ impl FormattableShape {
     }
 }
 
-fn formattable_array_element(
-    module: &nexa_bytecode::Module,
-    ty: ValueType,
-) -> Result<ValueType, InterpreterError> {
-    let ValueType::Named(type_id) = ty else {
-        return Err(InterpreterError::TypeMismatch);
-    };
-    module
-        .array_types
-        .iter()
-        .find(|array| array.type_id == type_id)
-        .map(|array| array.element)
-        .ok_or(InterpreterError::TypeMismatch)
+#[derive(Clone, Copy)]
+enum FormatSlots<'a> {
+    One(RuntimeValue),
+    Frame(&'a [RuntimeValue]),
+    Heap {
+        values: crate::CollectionView<'a>,
+        start: usize,
+        length: usize,
+    },
 }
 
-fn scalar_shape(
-    heap: &Heap,
-    value: RuntimeValue,
-    ty: ValueType,
-) -> Result<FormattableShape, InterpreterError> {
-    let bytes = match (ty, value) {
-        (ValueType::String, RuntimeValue::String { reference, .. }) => {
-            heap.string(reference)?.len()
+impl FormatSlots<'_> {
+    const fn one(value: RuntimeValue) -> Self {
+        Self::One(value)
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Frame(values) => values.len(),
+            Self::Heap { length, .. } => length,
         }
-        (ValueType::I32, RuntimeValue::I32(_))
-        | (ValueType::I64, RuntimeValue::I64(_))
-        | (ValueType::F32, RuntimeValue::F32(_))
-        | (ValueType::F64, RuntimeValue::F64(_))
-        | (ValueType::Bool, RuntimeValue::Bool(_))
-        | (ValueType::Rune, RuntimeValue::Rune(_)) => {
-            let mut text = ScalarText::new();
-            write_scalar_text(value, &mut text)?;
-            text.as_str().len()
+    }
+
+    fn get(self, index: usize) -> Option<RuntimeValue> {
+        match self {
+            Self::One(value) => (index == 0).then_some(value),
+            Self::Frame(values) => values.get(index).copied(),
+            Self::Heap {
+                values,
+                start,
+                length,
+            } => (index < length)
+                .then(|| values.get(start + index))
+                .flatten(),
         }
-        _ => return Err(InterpreterError::TypeMismatch),
-    };
-    Ok(FormattableShape {
-        cells: 1,
-        bytes: fuel_usize(bytes)?,
-    })
+    }
+
+    fn slice(self, start: usize, length: usize) -> Option<Self> {
+        let end = start.checked_add(length)?;
+        if end > self.len() {
+            return None;
+        }
+        match self {
+            Self::One(value) => (start == 0 && length == 1).then_some(Self::One(value)),
+            Self::Frame(values) => values.get(start..end).map(Self::Frame),
+            Self::Heap {
+                values,
+                start: base,
+                ..
+            } => Some(Self::Heap {
+                values,
+                start: base.checked_add(start)?,
+                length,
+            }),
+        }
+    }
 }
 
-fn formattable_shape(
-    module: &nexa_bytecode::Module,
-    heap: &Heap,
-    value: RuntimeValue,
-    ty: ValueType,
-    depth: u8,
-) -> Result<FormattableShape, InterpreterError> {
-    if depth >= MAX_FORMATTABLE_DEPTH {
-        return Err(InterpreterError::TypeMismatch);
-    }
-    if !matches!(ty, ValueType::Named(_)) {
-        return scalar_shape(heap, value, ty);
+enum FormatOutput<'a> {
+    Measure(&'a mut FormattableShape),
+    Write(&'a mut String),
+}
+
+impl FormatOutput<'_> {
+    fn visit_cell(&mut self) -> Result<(), InterpreterError> {
+        if let Self::Measure(shape) = self {
+            shape.cells = shape
+                .cells
+                .checked_add(1)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+        }
+        Ok(())
     }
 
-    let element = formattable_array_element(module, ty)?;
-    let values = heap.array_values(value)?;
-    let mut shape = FormattableShape { cells: 1, bytes: 2 };
-    if values.len() > 1 {
-        shape.add_bytes(
-            values
-                .len()
-                .saturating_sub(1)
-                .checked_mul(2)
-                .ok_or(InterpreterError::StringLengthOverflow)?,
-        )?;
+    fn push_str(&mut self, value: &str) -> Result<(), InterpreterError> {
+        match self {
+            Self::Measure(shape) => shape.add_bytes(value.len()),
+            Self::Write(output) => {
+                output.push_str(value);
+                Ok(())
+            }
+        }
     }
-    for item in values.iter() {
-        shape.add(formattable_shape(
-            module,
-            heap,
-            item,
-            element,
-            depth.saturating_add(1),
-        )?)?;
+}
+
+#[derive(Clone, Copy)]
+struct SeenFormatObject {
+    reference: GcRef,
+    id: u32,
+    active: bool,
+}
+
+struct FormatContext {
+    seen: [Option<SeenFormatObject>; MAX_FORMATTABLE_OBJECTS],
+    length: usize,
+}
+
+enum FormatObjectEncounter {
+    First(u32),
+    Cycle(u32),
+    Reference(u32),
+    Limit,
+}
+
+impl FormatContext {
+    const fn new() -> Self {
+        Self {
+            seen: [None; MAX_FORMATTABLE_OBJECTS],
+            length: 0,
+        }
     }
+
+    fn enter(&mut self, reference: GcRef) -> FormatObjectEncounter {
+        if let Some(entry) = self.seen[..self.length]
+            .iter()
+            .flatten()
+            .find(|entry| entry.reference == reference)
+        {
+            return if entry.active {
+                FormatObjectEncounter::Cycle(entry.id)
+            } else {
+                FormatObjectEncounter::Reference(entry.id)
+            };
+        }
+        if self.length == self.seen.len() {
+            return FormatObjectEncounter::Limit;
+        }
+        let id = u32::try_from(self.length + 1).expect("format object bound fits u32");
+        self.seen[self.length] = Some(SeenFormatObject {
+            reference,
+            id,
+            active: true,
+        });
+        self.length += 1;
+        FormatObjectEncounter::First(id)
+    }
+
+    fn leave(&mut self, reference: GcRef) {
+        if let Some(entry) = self.seen[..self.length]
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.reference == reference)
+        {
+            entry.active = false;
+        }
+    }
+}
+
+fn measure_formattable(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    ty: ValueType,
+) -> Result<FormattableShape, InterpreterError> {
+    let mut shape = FormattableShape::default();
+    format_value(
+        module,
+        layouts,
+        heap,
+        values,
+        ty,
+        0,
+        &mut FormatContext::new(),
+        &mut FormatOutput::Measure(&mut shape),
+    )?;
     Ok(shape)
 }
 
-fn write_formattable_value(
+fn write_formattable(
     output: &mut String,
     module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
     heap: &Heap,
-    value: RuntimeValue,
+    values: FormatSlots<'_>,
+    ty: ValueType,
+) -> Result<(), InterpreterError> {
+    format_value(
+        module,
+        layouts,
+        heap,
+        values,
+        ty,
+        0,
+        &mut FormatContext::new(),
+        &mut FormatOutput::Write(output),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_value(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
     ty: ValueType,
     depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
 ) -> Result<(), InterpreterError> {
+    output.visit_cell()?;
     if depth >= MAX_FORMATTABLE_DEPTH {
+        return output.push_str("<depth-limit>");
+    }
+    if !matches!(ty, ValueType::Named(_)) {
+        return format_scalar(heap, values, ty, output);
+    }
+    let ValueType::Named(type_id) = ty else {
+        unreachable!()
+    };
+    if let Some(array) = module
+        .array_types
+        .iter()
+        .find(|array| array.type_id == type_id)
+    {
+        return format_array(
+            module,
+            layouts,
+            heap,
+            values,
+            array.element,
+            depth,
+            context,
+            output,
+        );
+    }
+    let display = module
+        .display_types
+        .iter()
+        .find(|display| display.type_id == type_id)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    if let Some(class) = module
+        .class_types
+        .iter()
+        .find(|class| class.type_id == type_id)
+    {
+        return format_class(
+            module, layouts, heap, values, class, display, depth, context, output,
+        );
+    }
+    let structure = module
+        .struct_types
+        .iter()
+        .find(|structure| structure.type_id == type_id)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    format_struct(
+        module, layouts, heap, values, structure, display, depth, context, output,
+    )
+}
+
+fn format_scalar(
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    ty: ValueType,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    if values.len() != 1 {
         return Err(InterpreterError::TypeMismatch);
     }
-    match (ty, value) {
-        (ValueType::String, RuntimeValue::String { reference, .. }) => {
-            output.push_str(heap.string(reference)?);
-            Ok(())
-        }
-        (
-            ValueType::I32
-            | ValueType::I64
-            | ValueType::F32
-            | ValueType::F64
-            | ValueType::Bool
-            | ValueType::Rune,
-            value,
-        ) => {
-            let mut text = ScalarText::new();
-            write_scalar_text(value, &mut text)?;
-            output.push_str(text.as_str());
-            Ok(())
-        }
-        (ty @ ValueType::Named(_), value) => {
-            let element = formattable_array_element(module, ty)?;
-            let values = heap.array_values(value)?;
-            output.push('[');
-            for (index, item) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push_str(", ");
-                }
-                write_formattable_value(
-                    output,
-                    module,
-                    heap,
-                    item,
-                    element,
-                    depth.saturating_add(1),
-                )?;
+    let value = values.get(0).ok_or(InterpreterError::TypeMismatch)?;
+    if let (ValueType::String, RuntimeValue::String { reference, .. }) = (ty, value) {
+        return output.push_str(heap.string(reference)?);
+    }
+    if !matches!(
+        (ty, value),
+        (ValueType::I32, RuntimeValue::I32(_))
+            | (ValueType::I64, RuntimeValue::I64(_))
+            | (ValueType::F32, RuntimeValue::F32(_))
+            | (ValueType::F64, RuntimeValue::F64(_))
+            | (ValueType::Bool, RuntimeValue::Bool(_))
+            | (ValueType::Rune, RuntimeValue::Rune(_))
+    ) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let mut text = ScalarText::new();
+    write_scalar_text(value, &mut text)?;
+    output.push_str(text.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_array(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    element: ValueType,
+    depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    if values.len() != 1 {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let array = values.get(0).ok_or(InterpreterError::TypeMismatch)?;
+    output.push_str("[")?;
+    if let Some(rows) = heap.array_rows(array)? {
+        let count = rows.cells.len() / rows.stride;
+        for index in 0..count {
+            if index != 0 {
+                output.push_str(", ")?;
             }
-            output.push(']');
-            Ok(())
+            let start = index
+                .checked_mul(rows.stride)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let row = rows
+                .cells
+                .get(start..start + rows.stride)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            format_value(
+                module,
+                layouts,
+                heap,
+                FormatSlots::Frame(row),
+                element,
+                depth.saturating_add(1),
+                context,
+                output,
+            )?;
         }
-        _ => Err(InterpreterError::TypeMismatch),
+    } else {
+        let elements = heap.array_values(array)?;
+        for index in 0..elements.len() {
+            if index != 0 {
+                output.push_str(", ")?;
+            }
+            format_value(
+                module,
+                layouts,
+                heap,
+                FormatSlots::one(elements.get(index).ok_or(InterpreterError::TypeMismatch)?),
+                element,
+                depth.saturating_add(1),
+                context,
+                output,
+            )?;
+        }
+    }
+    output.push_str("]")
+}
+
+fn display_string(module: &nexa_bytecode::Module, index: u32) -> Result<&str, InterpreterError> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| module.strings.get(index))
+        .map(String::as_str)
+        .ok_or(InterpreterError::TypeMismatch)
+}
+
+fn push_object_marker(
+    output: &mut FormatOutput<'_>,
+    kind: &str,
+    id: u32,
+) -> Result<(), InterpreterError> {
+    let mut text = ScalarText::new();
+    write!(&mut text, "<{kind} #{id}>").map_err(|_| InterpreterError::StringLengthOverflow)?;
+    output.push_str(text.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_class(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    class: &nexa_bytecode::ClassType,
+    display: &nexa_bytecode::DisplayType,
+    depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    if values.len() != 1 {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let value = values.get(0).ok_or(InterpreterError::TypeMismatch)?;
+    let RuntimeValue::NamedRef { reference, type_id } = value else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    if type_id != class.type_id {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let id = match context.enter(reference) {
+        FormatObjectEncounter::Cycle(id) => return push_object_marker(output, "cycle", id),
+        FormatObjectEncounter::Reference(id) => return push_object_marker(output, "ref", id),
+        FormatObjectEncounter::Limit => return output.push_str("<object-limit>"),
+        FormatObjectEncounter::First(id) => id,
+    };
+    output.push_str(display_string(module, display.name)?)?;
+    output.push_str("#")?;
+    let mut id_text = ScalarText::new();
+    write!(&mut id_text, "{id}").map_err(|_| InterpreterError::StringLengthOverflow)?;
+    output.push_str(id_text.as_str())?;
+    format_nominal_fields(
+        module,
+        layouts,
+        heap,
+        heap.class_fields(value)?.into(),
+        &class.fields,
+        display,
+        depth,
+        context,
+        output,
+    )?;
+    context.leave(reference);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_struct(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    structure: &nexa_bytecode::StructType,
+    display: &nexa_bytecode::DisplayType,
+    depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    output.push_str(display_string(module, display.name)?)?;
+    if structure.fields.is_empty() {
+        let valid_empty_value = values.len() == 0
+            || (values.len() == 1
+                && matches!(
+                    values.get(0),
+                    Some(RuntimeValue::Struct { type_id, .. }) if type_id == structure.type_id
+                ));
+        if !valid_empty_value {
+            return Err(InterpreterError::TypeMismatch);
+        }
+        return output.push_str(" {}");
+    }
+    format_nominal_fields(
+        module,
+        layouts,
+        heap,
+        values,
+        &structure.fields,
+        display,
+        depth,
+        context,
+        output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_nominal_fields(
+    module: &nexa_bytecode::Module,
+    layouts: &nexa_bytecode::layout::LayoutTable,
+    heap: &Heap,
+    values: FormatSlots<'_>,
+    fields: &[nexa_bytecode::StructField],
+    display: &nexa_bytecode::DisplayType,
+    depth: u8,
+    context: &mut FormatContext,
+    output: &mut FormatOutput<'_>,
+) -> Result<(), InterpreterError> {
+    if fields.len() != display.field_names.len() {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    output.push_str(" {")?;
+    let mut offset = 0_usize;
+    for (index, (field, name)) in fields.iter().zip(&display.field_names).enumerate() {
+        let slots = usize::from(
+            layouts
+                .physical_slots(field.ty)
+                .map_err(|_| InterpreterError::TypeMismatch)?,
+        );
+        if index == 0 {
+            output.push_str(" ")?;
+        } else {
+            output.push_str(", ")?;
+        }
+        output.push_str(display_string(module, *name)?)?;
+        output.push_str(": ")?;
+        format_value(
+            module,
+            layouts,
+            heap,
+            values
+                .slice(offset, slots)
+                .ok_or(InterpreterError::TypeMismatch)?,
+            field.ty,
+            depth.saturating_add(1),
+            context,
+            output,
+        )?;
+        offset = offset
+            .checked_add(slots)
+            .ok_or(InterpreterError::TypeMismatch)?;
+    }
+    if offset != values.len() {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    output.push_str(if fields.is_empty() { "}" } else { " }" })
+}
+
+impl<'a> From<crate::CollectionView<'a>> for FormatSlots<'a> {
+    fn from(values: crate::CollectionView<'a>) -> Self {
+        Self::Heap {
+            start: 0,
+            length: values.len(),
+            values,
+        }
     }
 }
 
@@ -8681,9 +9073,9 @@ mod tests {
     use super::{
         CheckedInterpreter, DynamicFuelPlan, FuelState, InterpreterError, InterpreterHost,
         InterpreterHostArguments, InterpreterHostOutcome, InterpreterMigration, InterpreterOutcome,
-        OPCODE_COST_SCHEDULE, StandardIntrinsicOutcome, SuspendReason, TrapKind,
-        allocate_runtime_string, dynamic_instruction_fuel, ensure_host_call_available, fuel_add,
-        fuel_blocks, run_standard_intrinsic,
+        OPCODE_COST_SCHEDULE, RuntimeTypeMetadata, StandardIntrinsicOutcome, SuspendReason,
+        TrapKind, allocate_runtime_string, dynamic_instruction_fuel, ensure_host_call_available,
+        fuel_add, fuel_blocks, run_standard_intrinsic,
     };
     use crate::{
         ContinuationReservation, ExecutableModule, FrameArena, FrameError, FrameLimits, GcRoots,
@@ -9409,8 +9801,8 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
-    fn bytecode_v8_opcode_cost_schedule_matches_the_frozen_fixture() {
-        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 8);
+    fn bytecode_v9_opcode_cost_schedule_matches_the_frozen_fixture() {
+        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 9);
         assert_eq!(OPCODE_COST_SCHEDULE.len(), 119);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
@@ -9455,7 +9847,7 @@ fn work(x: i32) -> i32 {
         .unwrap();
         assert_eq!(
             rendered,
-            include_str!("../fixtures/opcode-cost-table-v8.txt")
+            include_str!("../fixtures/opcode-cost-table-v9.txt")
         );
 
         let mut mismatched = table;
@@ -12248,7 +12640,7 @@ pub fn run(start: i32, end: i32) -> i32 {
     #[test]
     fn v3_set_source_iteration_exhausts_without_iterator_allocation() {
         let (module, executable, run) = v3_source(V3_SET_SUM);
-        // The source fixture must lower to the v8 wire, not a fabricated
+        // The source fixture must lower to the v9 wire, not a fabricated
         // tuple path.
         assert!(v3_module_contains(&module, |i| matches!(
             i,
@@ -12406,7 +12798,10 @@ pub fn run(start: i32, end: i32) -> i32 {
             &arena,
             None,
             DynamicFuelPlan {
-                module: module.module(),
+                metadata: RuntimeTypeMetadata {
+                    module: module.module(),
+                    layouts: module.layout_table(),
+                },
                 nominal_shape: module.nominal_index_shape(),
                 costs: OpcodeCostTable::canonical(),
                 resolved: ExecutableNominalOperand::None,

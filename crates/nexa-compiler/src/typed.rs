@@ -22,10 +22,10 @@ use nexa_analysis::{
 use nexa_bytecode::layout::LayoutTable;
 use nexa_bytecode::{
     AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType,
-    CollectionIteratorKind, EnumType, EnumVariant, Function, FunctionEffect, HostCallMode,
-    HostImport, Instruction, IteratorStateRegisters, LoopBound, MapType, Module, ModuleBuilder,
-    ResourceTokenType, RootMap, ScriptExport, SetType, Signature, SnapshotType, SourceMapEntry,
-    StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
+    CollectionIteratorKind, DisplayType, EnumType, EnumVariant, Function, FunctionEffect,
+    HostCallMode, HostImport, Instruction, IteratorStateRegisters, LoopBound, MapType, Module,
+    ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, SetType, Signature, SnapshotType,
+    SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
     StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type, map_type,
     option_type, parameterized_type_id, resource_token_type, result_type, set_type, snapshot_type,
     state_handle_type,
@@ -890,6 +890,7 @@ fn compile_typed_package_with_profile(
     let state_schema = typed_state_schema(package, &files)?;
     builder.state_schema(state_schema.clone());
     let layouts = emit_typed_type_metadata(package, &modules, &files, &state_schema, &mut builder)?;
+    emit_display_type_metadata(package, &layouts, &string_indices, &mut builder)?;
     let (host_imports, host_contract_id) =
         emit_typed_host_imports(package, &codegen_inputs.host_functions, &mut builder)?;
     let standard_functions = typed_standard_functions(package, &files)?;
@@ -5393,7 +5394,11 @@ impl<'a> FunctionEmitter<'a> {
 
         if operation == BuiltinOperationIr::ValueToString
             && let [IrType::Named(definition)] = type_arguments
-            && self.layouts.aggregates.contains_key(definition)
+            && self
+                .layouts
+                .aggregates
+                .get(definition)
+                .is_some_and(|aggregate| aggregate.kind == TypedAggregateKind::Struct)
         {
             let [value] = arguments else {
                 return Err(CompileError::type_mismatch(None, None, span));
@@ -11008,6 +11013,7 @@ fn collect_aggregate_format_strings(package: &TypedPackageIr, strings: &mut BTre
             let Some(definition) = package.definition(declaration.definition) else {
                 continue;
             };
+            strings.insert(definition.name.clone());
             let fields = match layout {
                 TypedTypeLayoutIr::Struct { fields } | TypedTypeLayoutIr::Class { fields, .. } => {
                     fields
@@ -11023,6 +11029,7 @@ fn collect_aggregate_format_strings(package: &TypedPackageIr, strings: &mut BTre
             fields.sort_by_key(|field| field.order);
             for (index, field) in fields.into_iter().enumerate() {
                 if let Some(field) = package.definition(field.definition) {
+                    strings.insert(field.name.clone());
                     strings.insert(aggregate_field_format(
                         &definition.name,
                         &field.name,
@@ -11032,6 +11039,49 @@ fn collect_aggregate_format_strings(package: &TypedPackageIr, strings: &mut BTre
             }
         }
     }
+}
+
+fn emit_display_type_metadata(
+    package: &TypedPackageIr,
+    layouts: &TypedLayoutContext,
+    string_indices: &BTreeMap<String, u32>,
+    builder: &mut ModuleBuilder,
+) -> Result<(), CompileError> {
+    for (definition_id, aggregate) in &layouts.aggregates {
+        let definition = package.definition(*definition_id).ok_or_else(|| {
+            CompileError::unknown_type(
+                format!("definition#{}", definition_id.0),
+                SourceSpan::default(),
+            )
+        })?;
+        let name = *string_indices.get(&definition.name).ok_or_else(|| {
+            CompileError::unknown_name("aggregate display name".into(), SourceSpan::default())
+        })?;
+        let field_names = aggregate
+            .fields
+            .iter()
+            .map(|field| {
+                let field = package.definition(field.definition).ok_or_else(|| {
+                    CompileError::unknown_name(
+                        format!("definition#{}", field.definition.0),
+                        SourceSpan::default(),
+                    )
+                })?;
+                string_indices.get(&field.name).copied().ok_or_else(|| {
+                    CompileError::unknown_name(
+                        "aggregate display field name".into(),
+                        SourceSpan::default(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder.display_type(DisplayType {
+            type_id: aggregate.type_id,
+            name,
+            field_names,
+        });
+    }
+    Ok(())
 }
 
 fn collect_block_codegen_inputs(block: &TypedBlockIr, inputs: &mut CodegenInputs) {

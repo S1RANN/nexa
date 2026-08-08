@@ -3217,7 +3217,7 @@ mod tests {
             full,
             render_module_dump(&bytes, &module, None, false).unwrap()
         );
-        assert!(full.contains("header magic=NXBC version=8 sections=16"));
+        assert!(full.contains("header magic=NXBC version=9 sections=17"));
         assert!(full.contains("000000 LoadI32"));
         assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(full.contains("struct "));

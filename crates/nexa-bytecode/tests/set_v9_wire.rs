@@ -1,4 +1,4 @@
-//! Bytecode v8 focused wire tests: Set type metadata, Set/iteration
+//! Bytecode v9 focused wire tests: Set type metadata, Set/iteration
 //! instruction and intrinsic roundtrips, and strict version rejection.
 
 use nexa_bytecode::{
@@ -134,7 +134,7 @@ fn set_type_identity_is_canonical() {
 }
 
 #[test]
-fn set_and_iteration_instructions_roundtrip_bytecode_v8() {
+fn set_and_iteration_instructions_roundtrip_bytecode_v9() {
     let mut builder = builder_with_set();
     builder.function(function_with_set_code());
     let module = builder.finish();

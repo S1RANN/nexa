@@ -143,7 +143,7 @@ impl LayoutTable {
     /// Derives the table for every layoutable named type in the module.
     ///
     /// Recursive value types, dangling named types, and slot overflows are
-    /// hard errors. Bytecode v7 carries the complete nominal closure,
+    /// hard errors. Bytecode v9 carries the complete nominal closure,
     /// including explicit Host opaque scalar identities.
     pub fn for_module(module: &Module) -> Result<Self, LayoutError> {
         let mut table = Self::default();

@@ -272,10 +272,15 @@ let point = Point { x: 3, y: 4 };
 let debug: string = "${point}"; // Point { x: 3, y: 4 }
 ```
 
-Nested arrays use the same representation. A nominal field graph containing a
-cycle or a Map, Tuple, Option, Result, Buffer, Set, Host value, or
-resource-bearing value is rejected at compile time rather than producing a
-partial string or performing unbounded object traversal.
+Nested arrays use the same representation. Class formatting tracks GC object
+identity within one interpolation operation. The first occurrence is labeled
+`ClassName#N`; an active back-edge renders as `<cycle #N>`, while a later
+shared reference renders as `<ref #N>`. Traversal depth and the number of
+tracked objects are deterministically bounded, producing `<depth-limit>` or
+`<object-limit>` instead of recursing indefinitely. Struct value-layout cycles
+remain invalid. Map, Tuple, Option, Result, Buffer, Set, Host values, and
+resource-bearing values are rejected at compile time rather than producing an
+unstable representation.
 
 `\${` produces a literal `${`. Conversion is verified, bounded, fuel-metered,
 and represented in Source Maps and precise Root Maps.

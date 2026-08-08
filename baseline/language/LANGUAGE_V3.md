@@ -28,7 +28,7 @@ NEXA_LANGUAGE_VERSION = 3
 CONTRACT_SYNTAX_VERSION = 3      (unchanged)
 HOST_CONTRACT_SCHEMA_VERSION = 2 (unchanged)
 ABI_DESCRIPTOR_VERSION = 2       (unchanged)
-BYTECODE_VERSION = 8
+BYTECODE_VERSION = 9
 OPCODE_COST_TABLE_VERSION = 8
 ```
 
@@ -216,9 +216,9 @@ Array and Buffer iteration may use any mechanism whose bumps exactly match
 the rules above (for example a monotonically counted epoch or a content
 fingerprint); the observable contract is the same trap.
 
-## 5. Wire surface (bytecode v8)
+## 5. Wire surface (bytecode v9)
 
-Bytecode v8 carries the Language v3 surface:
+Bytecode v9 carries the Language v3 surface:
 
 - Types section kind `8` = `Set` nominal type metadata (`type_id`, `element`).
 - Instructions: `SetNew`, `SetLen`, `SetContains`, `SetInsert` (returns
@@ -235,10 +235,10 @@ Bytecode v8 carries the Language v3 surface:
   `has_value_dst`, `first_dst`, and optional `second_dst` registers (set for
   Map, `None` for other shapes) instead of a fabricated Tuple result.
 
-The v8 decoder rejects every other wire version. There is no v7 compatibility
-decoder. `BYTECODE_VERSION` and `OPCODE_COST_TABLE_VERSION` are frozen at 8;
-the new Set/iteration opcodes and intrinsics receive deterministic base costs
-in the v8 cost table.
+The v9 decoder rejects every other wire version. There is no compatibility
+decoder. `BYTECODE_VERSION` is 9 and `OPCODE_COST_TABLE_VERSION` remains 8;
+the Set/iteration opcodes and intrinsics retain deterministic base costs in
+opcode cost-table version 8.
 
 ## 6. Exclusions carried from v2
 
@@ -255,13 +255,13 @@ one candidate commit. Status values are `PENDING`, `PASS`, or `FAIL`.
 
 | ID | Surface | Acceptance | Evidence / gate | Status |
 | --- | --- | --- | --- | --- |
-| L01 | Version constants | `NEXA_LANGUAGE_VERSION = 3`, `BYTECODE_VERSION = 8`, `OPCODE_COST_TABLE_VERSION = 8` in every authoritative code constant and baseline doc | baseline docs; `nexa-core` constants; `nexa-analysis` constant | PASS |
+| L01 | Version constants | `NEXA_LANGUAGE_VERSION = 3`, `BYTECODE_VERSION = 9`, `OPCODE_COST_TABLE_VERSION = 8` in every authoritative code constant and baseline doc | baseline docs; `nexa-core` constants; `nexa-analysis` constant | PASS |
 | L02 | Canonical Set identity | `Set<T>` derives its ABI type ID from `canonical_set_type_id("Set", [T])` and equals `SetType::new(T).type_id` | nexa-core unit test; nexa-bytecode wire test | PASS |
 | L03 | Set module metadata | Types section kind 8 round-trips `SetType` (type_id + element) through encode/decode | wire roundtrip test | PASS |
-| L04 | Set instructions | `SetNew`/`SetLen`/`SetContains`/`SetInsert`/`SetRemove`/`SetClear` encode/decode as v8 opcodes 111-116 | wire roundtrip test | PASS |
+| L04 | Set instructions | `SetNew`/`SetLen`/`SetContains`/`SetInsert`/`SetRemove`/`SetClear` encode/decode as v9 opcodes 111-116 | wire roundtrip test | PASS |
 | L05 | Set + collection intrinsics | `SetLen`/`SetContains`/`SetInsert`/`SetRemove` (tags 43-46) and `ArrayFirst`/`ArrayLast`/`ArraySwap`/`ArrayReverse`, `MapIsEmpty`/`MapGetOr`/`MapInsertIfAbsent`, `BufferIsEmpty`/`BufferFill` (tags 47-55) with correct canonical names, arity, argument/result types, mutation flags, and fuel models | intrinsic metadata + roundtrip tests | PASS |
 | L06 | Iteration wire | `IterNew`/`IterNext` (117/118) carry `CollectionIteratorKind` and heap-free `IteratorStateRegisters` (collection/phase/slot/epoch) | wire roundtrip test | PASS |
-| L07 | Version rejection | Decoder rejects every wire version other than 8 with `UnsupportedVersion`, no compatibility decoder | version rejection test | PASS |
+| L07 | Version rejection | Decoder rejects every wire version other than 9 with `UnsupportedVersion`, no compatibility decoder | version rejection test | PASS |
 | L08 | Frozen ABI | Contract Syntax v3, Host schema 2, Descriptor 2, and Contract/Host ABI unchanged | no baseline ABI doc changes; untouched code paths | PASS |
 | L09 | No surface creep | No new integers, StringBuilder, fixed arrays, sorted Map/Set, or extra collection APIs | baseline doc freeze; repo scan | PASS |
 | L10 | Compiler/runtime | Compiler lowers `Set<T>` and dynamic iteration to the v8 wire; verifier validates the new metadata/instructions; runtime implements epoch-trapped iteration | downstream tasks | PENDING |

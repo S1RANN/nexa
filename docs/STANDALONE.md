@@ -3,7 +3,7 @@
 Status: Language v3 Standalone Profile IN PROGRESS
 
 The Standalone profile runs a Nexa program as a command-line application. It
-uses the same syntax, analysis, Typed IR, Bytecode v8, verifier, and runtime as
+uses the same syntax, analysis, Typed IR, Bytecode v9, verifier, and runtime as
 an embedded package. `nexa run` selects a source program and calls its typed
 `main`; it never asks users for a bytecode function index.
 
@@ -114,7 +114,9 @@ host::write_line("values = ${values}"); // values = [3, 1, 4]
 `values[index]` indexing remains the trapping form. String interpolation
 formats scalars, recursively formattable arrays, and formattable Struct/Class
 values without requiring a Console helper. Aggregate output includes the type
-and field names in declaration order.
+and field names in declaration order. Class graphs are cycle-safe: each object
+gets a traversal-local ID, repeated references render as `<ref #N>`, and an
+active back-edge renders as `<cycle #N>`.
 
 The compiler lowers those statements, in source order, into a synthetic
 `main(args: Array<string>) -> i32`. The implicit `args` binding contains the
@@ -157,7 +159,7 @@ remapping reserved values; an operating system may expose only a
 platform-sized portion. Diagnostics still distinguish a returned value from a
 tool failure.
 
-Every program passes Syntax, Analysis, Typed IR, Bytecode v7, and Verifier stages
+Every program passes Syntax, Analysis, Typed IR, Bytecode v9, and Verifier stages
 before user code or a Console call can run. Standalone execution resolves
 finite limits for fuel, cumulative budget, heap, frames, call depth, tasks,
 Host resources, cleanup, and output. Capacity is charged before an operation

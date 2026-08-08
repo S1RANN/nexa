@@ -11,8 +11,8 @@ use nexa_core::{
 pub const MAGIC: [u8; 4] = *b"NXBC";
 /// Current wire-format version.
 ///
-/// Version 7 adds physical ValueLayout/ABI metadata and explicit Host opaque
-/// scalar identities. The decoder intentionally accepts only the current version:
+/// Version 9 adds nominal formatting metadata used by cycle-safe structural
+/// interpolation. The decoder intentionally accepts only the current version:
 /// bytecode is an internal package artifact and has no cross-version decoding
 /// compatibility promise.
 pub use nexa_core::BYTECODE_VERSION;
@@ -50,6 +50,7 @@ pub enum SectionKind {
     LoopBounds = 14,
     SourceMap = 15,
     ReloadMetadata = 16,
+    DisplayTypes = 17,
 }
 
 pub const SECTION_FLAG_MANDATORY: u16 = 1;
@@ -65,7 +66,7 @@ pub struct SectionEntry {
 }
 
 impl SectionKind {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Strings,
         Self::Types,
         Self::Constants,
@@ -82,6 +83,7 @@ impl SectionKind {
         Self::LoopBounds,
         Self::SourceMap,
         Self::ReloadMetadata,
+        Self::DisplayTypes,
     ];
 
     #[must_use]
@@ -103,6 +105,7 @@ impl SectionKind {
             Self::LoopBounds => "loop-bounds",
             Self::SourceMap => "source-map",
             Self::ReloadMetadata => "reload-metadata",
+            Self::DisplayTypes => "display-types",
         }
     }
 
@@ -338,7 +341,7 @@ pub const STANDARD_STRING_FUEL_BLOCK_BYTES: u64 = 32;
 pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
 
 impl StandardIntrinsic {
-    /// Number of `StandardIntrinsic` tags reserved by the bytecode v8 wire codec.
+    /// Number of `StandardIntrinsic` tags reserved by the bytecode v9 wire codec.
     pub const WIRE_VARIANT_COUNT: usize = 56;
 
     #[must_use]
@@ -669,7 +672,7 @@ impl StandardIntrinsic {
         )
     }
 
-    /// Bytecode v8 opcode-cost-table deterministic base fuel cost.
+    /// Bytecode v9 opcode-cost-table deterministic base fuel cost.
     ///
     /// Variable work declared by [`Self::fuel_model`] is charged separately
     /// from read-only register and heap metadata before any mutation.
@@ -871,6 +874,16 @@ pub struct StructType {
 pub struct ClassType {
     pub type_id: StableId,
     pub fields: Vec<StructField>,
+}
+
+/// Source-facing names for one nominal type's deterministic structural display.
+/// String indices refer to [`Module::strings`]; field names are aligned with the
+/// authoritative Struct/Class field order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayType {
+    pub type_id: StableId,
+    pub name: u32,
+    pub field_names: Vec<u32>,
 }
 
 #[must_use]
@@ -1823,6 +1836,7 @@ pub struct Module {
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
+    pub display_types: Vec<DisplayType>,
     pub host_imports: Vec<HostImport>,
     pub exports: Vec<ScriptExport>,
     pub state_schema: StateSchema,
@@ -2219,6 +2233,25 @@ impl Module {
         let mut output = Vec::new();
         put_u32(
             &mut output,
+            u32::try_from(self.display_types.len())
+                .expect("display type count exceeds wire format"),
+        );
+        for display_type in &self.display_types {
+            put_u64(&mut output, display_type.type_id.0);
+            put_u32(&mut output, display_type.name);
+            put_u16(
+                &mut output,
+                u16::try_from(display_type.field_names.len())
+                    .expect("display field count exceeds wire format"),
+            );
+            for field_name in &display_type.field_names {
+                put_u32(&mut output, *field_name);
+            }
+        }
+        let display_types = output;
+        let mut output = Vec::new();
+        put_u32(
+            &mut output,
             u32::try_from(self.state_schema.types.len())
                 .expect("state type count exceeds wire format"),
         );
@@ -2493,6 +2526,7 @@ impl Module {
             (SectionKind::LoopBounds, loop_bounds),
             (SectionKind::SourceMap, source_map),
             (SectionKind::ReloadMetadata, reload_metadata),
+            (SectionKind::DisplayTypes, display_types),
         ])
     }
 
@@ -2531,6 +2565,12 @@ impl Module {
             SectionKind::Structs,
             limits.max_structs,
             "structs",
+        )?;
+        enforce_section_limit(
+            &sections,
+            SectionKind::DisplayTypes,
+            limits.max_types,
+            "display types",
         )?;
         enforce_section_limit(
             &sections,
@@ -2631,6 +2671,7 @@ impl Module {
         metadata.extend_from_slice(required_section(&sections, SectionKind::Enums)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Structs)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Classes)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::DisplayTypes)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::StateSchemas)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Exports)?);
         let function_bytes = required_section(&sections, SectionKind::Functions)?;
@@ -2816,6 +2857,29 @@ impl Module {
                 });
             }
             class_types.push(ClassType { type_id, fields });
+        }
+        let display_type_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        enforce_limit(display_type_count, limits.max_types, "display types")?;
+        let mut display_types = Vec::with_capacity(display_type_count);
+        let mut total_display_fields = 0_usize;
+        for _ in 0..display_type_count {
+            let type_id = StableId(reader.u64()?);
+            let name = reader.u32()?;
+            let field_count = usize::from(reader.u16()?);
+            total_display_fields = total_display_fields
+                .checked_add(field_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_display_fields, limits.max_fields, "display fields")?;
+            let mut field_names = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                field_names.push(reader.u32()?);
+            }
+            display_types.push(DisplayType {
+                type_id,
+                name,
+                field_names,
+            });
         }
         let state_type_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
@@ -3069,6 +3133,7 @@ impl Module {
             enum_types,
             struct_types,
             class_types,
+            display_types,
             host_imports,
             exports,
             state_schema: StateSchema { types: state_types },
@@ -5010,6 +5075,7 @@ pub struct ModuleBuilder {
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
+    display_types: Vec<DisplayType>,
     host_imports: Vec<HostImport>,
     exports: Vec<ScriptExport>,
     state_schema: StateSchema,
@@ -5036,6 +5102,7 @@ impl ModuleBuilder {
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
+            display_types: Vec::new(),
             host_imports: Vec::new(),
             exports: Vec::new(),
             state_schema: StateSchema { types: Vec::new() },
@@ -5103,6 +5170,11 @@ impl ModuleBuilder {
 
     pub fn class_type(&mut self, class_type: ClassType) -> &mut Self {
         self.class_types.push(class_type);
+        self
+    }
+
+    pub fn display_type(&mut self, display_type: DisplayType) -> &mut Self {
+        self.display_types.push(display_type);
         self
     }
 
@@ -5193,6 +5265,7 @@ impl ModuleBuilder {
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
+            display_types: self.display_types,
             host_imports: self.host_imports,
             exports: self.exports,
             state_schema: self.state_schema,
@@ -5478,9 +5551,12 @@ mod tests {
         }]);
         let module = builder.finish();
         let encoded = module.encode();
-        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 16);
         assert_eq!(
-            (0..16)
+            usize::from(u16::from_le_bytes([encoded[6], encoded[7]])),
+            SectionKind::ALL.len()
+        );
+        assert_eq!(
+            (0..SectionKind::ALL.len())
                 .map(|index| {
                     u16::from_le_bytes([encoded[8 + index * 20], encoded[8 + index * 20 + 1]])
                 })
@@ -5505,7 +5581,7 @@ mod tests {
         assert_eq!(
             Module::decode(&corrupt),
             Err(DecodeError::ChecksumMismatch(
-                SectionKind::ReloadMetadata as u16
+                SectionKind::DisplayTypes as u16
             ))
         );
     }

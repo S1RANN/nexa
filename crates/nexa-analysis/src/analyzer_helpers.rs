@@ -517,26 +517,9 @@ fn is_scalar(ty: &IrType) -> bool {
     )
 }
 
-/// Runtime-formattable values handled by the generic collection formatter.
-/// Nominal values use a compiler-emitted field plan so their declared names
-/// remain available without adding reflection metadata to Bytecode v8.
-fn is_runtime_interpolatable(ty: &IrType) -> bool {
-    match ty {
-        IrType::Bool
-        | IrType::I32
-        | IrType::I64
-        | IrType::F32
-        | IrType::F64
-        | IrType::String
-        | IrType::Rune => true,
-        IrType::Array(inner) => is_runtime_interpolatable(inner),
-        _ => false,
-    }
-}
-
-/// Recursively formattable interpolation set: scalars, scalar Arrays, and
-/// acyclic Struct/Class field graphs. Nominal cycles and fields whose values
-/// lack deterministic formatting remain compile-time errors.
+/// Recursively formattable interpolation set. Struct recursion remains invalid
+/// because it has no finite value layout; Class recursion is accepted because
+/// the VM formatter tracks object identity and terminates cycles at runtime.
 fn is_interpolatable(
     ty: &IrType,
     definitions: &[Definition],
@@ -548,21 +531,21 @@ fn is_interpolatable(
         type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
         visiting: &mut BTreeSet<DefinitionId>,
     ) -> bool {
-        if is_runtime_interpolatable(ty) {
+        if is_scalar(ty) {
             return true;
         }
-        let IrType::Named(definition) = ty else {
-            return false;
-        };
+        if let IrType::Array(element) = ty {
+            return visit(element, definitions, type_metadata, visiting);
+        }
+        let IrType::Named(definition) = ty else { return false };
         let Some(declaration) = definitions.get(definition.0 as usize) else {
             return false;
         };
-        if !matches!(
-            declaration.kind,
-            DefinitionKind::Struct | DefinitionKind::Class
-        ) || !visiting.insert(*definition)
-        {
+        if !matches!(declaration.kind, DefinitionKind::Struct | DefinitionKind::Class) {
             return false;
+        }
+        if !visiting.insert(*definition) {
+            return declaration.kind == DefinitionKind::Class;
         }
         let formattable = type_metadata.get(definition).is_some_and(|metadata| {
             metadata.field_order.iter().all(|field| {

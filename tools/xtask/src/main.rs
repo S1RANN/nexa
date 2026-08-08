@@ -6978,7 +6978,7 @@ mod audit_tests {
     #[test]
     fn m5_release_authority_rejects_a_later_active_bytecode_version() {
         let Err(error) = super::validate_m5_release_authority(&super::workspace_root()) else {
-            panic!("Bytecode v8 main must not reproduce the frozen M5 v7 receipt");
+            panic!("Bytecode v9 main must not reproduce the frozen M5 v7 receipt");
         };
         let message = error.to_string();
         assert!(message.contains("M5 requires BYTECODE_VERSION=7"));
