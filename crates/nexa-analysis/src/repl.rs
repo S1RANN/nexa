@@ -1276,6 +1276,8 @@ pub fn repl_seed_typed_ir() -> Arc<TypedPackageIr> {
         standard_functions: Arc::from([]),
         inherent_methods: Arc::from([]),
         generic_nominal_instances: Arc::from([]),
+        definition_names: Arc::from([]),
+        lexical_scopes: Arc::from([]),
         generic_function_instances: 0,
         generic_nominal_type_instances: 0,
         public_api_fingerprint: public_api_fingerprint([]),

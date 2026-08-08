@@ -3,6 +3,16 @@ pub struct Pair<T, U> {
     second: U,
 }
 
+impl<T, U> Pair<T, U> {
+    pub fn first_value(self) -> T {
+        return self.first;
+    }
+
+    pub fn swap(self) -> Pair<U, T> {
+        return Pair { first: self.second, second: self.first };
+    }
+}
+
 pub struct Holder<T> {
     value: T,
 }

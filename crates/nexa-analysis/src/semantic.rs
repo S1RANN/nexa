@@ -3,6 +3,15 @@ use crate::{
     SourceKey, SourceRange, TypedBlockIr, TypedDeclarationBody, TypedExpressionIr,
     TypedExpressionKind, TypedPackageIr, TypedPlaceIr, TypedStatementIr,
 };
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisibleSymbol {
+    pub definition: DefinitionId,
+    pub name: String,
+    pub kind: DefinitionKind,
+    pub ty: IrType,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstantiatedParameter {
@@ -50,12 +59,12 @@ pub fn definition_at(
         return Some(reference.target);
     }
     analysis
-        .definitions()
+        .metadata()
+        .definition_names
         .iter()
-        .filter(|definition| &definition.span.source == source)
-        .filter(|definition| contains_offset(&definition.span, offset))
-        .min_by_key(|definition| definition.span.end.saturating_sub(definition.span.start))
-        .map(|definition| definition.id)
+        .filter(|name| &name.span.source == source && contains_offset(&name.span, offset))
+        .min_by_key(|name| name.span.end.saturating_sub(name.span.start))
+        .map(|name| name.definition)
 }
 
 /// Smallest source-visible reference/declaration span containing `offset`.
@@ -77,13 +86,152 @@ pub fn semantic_span_at(
         })
         .chain(
             analysis
-                .definitions()
+                .metadata()
+                .definition_names
                 .iter()
-                .map(|definition| &definition.span),
+                .map(|name| &name.span),
         )
         .filter(|span| &span.source == source && contains_offset(span, offset))
         .min_by_key(|span| span.end.saturating_sub(span.start))
         .cloned()
+}
+
+#[must_use]
+pub fn definition_name_span(
+    analysis: &TypedPackageIr,
+    definition: DefinitionId,
+) -> Option<SourceRange> {
+    analysis
+        .metadata()
+        .definition_names
+        .iter()
+        .find(|name| name.definition == definition)
+        .map(|name| name.span.clone())
+}
+
+/// Symbols that can be named without adding another namespace segment at `offset`.
+#[must_use]
+pub fn visible_symbols_at(
+    analysis: &TypedPackageIr,
+    source: &SourceKey,
+    offset: u32,
+) -> Vec<VisibleSymbol> {
+    let Some(module) = analysis
+        .modules()
+        .iter()
+        .find(|module| &module.source == source)
+    else {
+        return Vec::new();
+    };
+    let mut visible = BTreeMap::<String, DefinitionId>::new();
+    for definition in analysis.definitions().iter().filter(|definition| {
+        definition.package_id == module.package_id
+            && definition.module == module.module
+            && !definition.name.contains("$instance$")
+            && !definition.name.contains("::")
+            && matches!(
+                definition.kind,
+                DefinitionKind::Function
+                    | DefinitionKind::Task
+                    | DefinitionKind::Struct
+                    | DefinitionKind::Enum
+                    | DefinitionKind::Class
+                    | DefinitionKind::Const
+            )
+    }) {
+        visible.insert(definition.name.clone(), definition.id);
+    }
+
+    let mut scopes = analysis
+        .metadata()
+        .lexical_scopes
+        .iter()
+        .filter(|scope| &scope.span.source == source && contains_offset(&scope.span, offset))
+        .collect::<Vec<_>>();
+    scopes.sort_by_key(|scope| std::cmp::Reverse(scope.span.end.saturating_sub(scope.span.start)));
+    for scope in scopes {
+        for definition in &scope.definitions {
+            let Some(definition) = analysis.definition(*definition) else {
+                continue;
+            };
+            let declaration_start = definition_name_span(analysis, definition.id)
+                .map_or(definition.span.start, |span| span.start);
+            if matches!(definition.kind, DefinitionKind::Parameter) || declaration_start <= offset {
+                visible.insert(definition.name.clone(), definition.id);
+            }
+        }
+    }
+    visible
+        .into_values()
+        .filter_map(|definition| analysis.definition(definition))
+        .map(|definition| VisibleSymbol {
+            definition: definition.id,
+            name: definition.name.clone(),
+            kind: definition.kind,
+            ty: definition.ty.clone(),
+        })
+        .collect()
+}
+
+/// All source references resolved to a source declaration.
+#[must_use]
+pub fn references_of(analysis: &TypedPackageIr, definition: DefinitionId) -> Vec<SourceRange> {
+    let mut references = analysis
+        .modules()
+        .iter()
+        .flat_map(|module| module.resolved_references.iter())
+        .filter(|reference| reference.target == definition)
+        .map(|reference| reference.span.clone())
+        .collect::<Vec<_>>();
+    references.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.start.cmp(&right.start))
+            .then(left.end.cmp(&right.end))
+    });
+    references.dedup();
+    references
+}
+
+/// Enum variants available through `Type::` for a concrete nominal type.
+#[must_use]
+pub fn variants_for_type(analysis: &TypedPackageIr, ty: &IrType) -> Vec<VisibleSymbol> {
+    let IrType::Named(named) = ty else {
+        return Vec::new();
+    };
+    let declaration = analysis
+        .metadata()
+        .generic_nominal_instances
+        .iter()
+        .find(|instance| instance.instance == *named)
+        .map_or(*named, |instance| instance.declaration);
+    analysis
+        .modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .find_map(|typed| {
+            if typed.definition != declaration {
+                return None;
+            }
+            let TypedDeclarationBody::TypeLayout(crate::TypedTypeLayoutIr::Enum { variants }) =
+                &typed.body
+            else {
+                return None;
+            };
+            Some(
+                variants
+                    .iter()
+                    .filter_map(|variant| analysis.definition(variant.definition))
+                    .map(|definition| VisibleSymbol {
+                        definition: definition.id,
+                        name: definition.name.clone(),
+                        kind: definition.kind,
+                        ty: definition.ty.clone(),
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
 }
 
 #[must_use]

@@ -234,6 +234,10 @@ trait WorkspaceAnalyzer {
     fn semantic_for_path(&self, _path: &Path) -> Option<SemanticDocument> {
         None
     }
+
+    fn semantic_for_completion_path(&self, path: &Path) -> Option<SemanticDocument> {
+        self.semantic_for_path(path)
+    }
 }
 
 #[derive(Default)]
@@ -249,6 +253,7 @@ struct PackageAnalysisSession {
     generation: u64,
     build: nexa::PackageBuildSession,
     semantic: Option<SemanticSnapshot>,
+    last_good_semantic: Option<SemanticSnapshot>,
 }
 
 #[derive(Clone)]
@@ -309,6 +314,7 @@ impl PackageAnalysisSession {
                 generation: 0,
                 build: nexa::PackageBuildSession::new(),
                 semantic: None,
+                last_good_semantic: None,
             };
         }
         if self.build_fingerprint != Some(build.build_fingerprint) {
@@ -394,6 +400,11 @@ fn run_session_with_analyzer(
                             },
                             "hoverProvider": true,
                             "definitionProvider": true,
+                            "referencesProvider": true,
+                            "renameProvider": {"prepareProvider": false},
+                            "signatureHelpProvider": {
+                                "triggerCharacters": ["(", ","]
+                            },
                             "semanticTokensProvider": {
                                 "legend": {
                                     "tokenTypes": [
@@ -576,7 +587,7 @@ fn run_session_with_analyzer(
                 {
                     contract_document_symbols(&source)
                 } else {
-                    Vec::new()
+                    executable_document_symbols(&source)
                 };
                 respond(writer, id, &Value::Array(symbols))?;
             }
@@ -588,7 +599,7 @@ fn run_session_with_analyzer(
                 {
                     let offset = request_byte_offset(&source, &message["params"]["position"])?;
                     analyzer
-                        .semantic_for_path(&path)
+                        .semantic_for_completion_path(&path)
                         .and_then(|document| semantic_completion_items(&document, &source, offset))
                         .unwrap_or_else(|| language_v3_completion_items(&source, offset))
                 } else {
@@ -626,6 +637,67 @@ fn run_session_with_analyzer(
                     None
                 };
                 respond(writer, id, definition.as_ref().unwrap_or(&Value::Null))?;
+            }
+            Some("textDocument/references") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                let include_declaration = message["params"]["context"]["includeDeclaration"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let mut references = analyzer.semantic_for_path(&path).map_or_else(
+                    || {
+                        generic_parameter_reference_locations(
+                            &path,
+                            &source,
+                            offset,
+                            include_declaration,
+                            &documents,
+                        )
+                    },
+                    |document| {
+                        semantic_reference_locations(
+                            &document,
+                            offset,
+                            include_declaration,
+                            &documents,
+                        )
+                    },
+                );
+                if references.is_empty() {
+                    references = generic_parameter_reference_locations(
+                        &path,
+                        &source,
+                        offset,
+                        include_declaration,
+                        &documents,
+                    );
+                }
+                respond(writer, id, &Value::Array(references))?;
+            }
+            Some("textDocument/rename") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                let new_name = required_str(&message["params"], "newName")?;
+                let edit = analyzer
+                    .semantic_for_path(&path)
+                    .and_then(|document| {
+                        semantic_rename_edit(&document, offset, new_name, &documents)
+                    })
+                    .or_else(|| {
+                        generic_parameter_rename_edit(&path, &source, offset, new_name, &documents)
+                    });
+                respond(writer, id, edit.as_ref().unwrap_or(&Value::Null))?;
+            }
+            Some("textDocument/signatureHelp") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                let help = analyzer
+                    .semantic_for_path(&path)
+                    .and_then(|document| semantic_signature_help(&document, &source, offset));
+                respond(writer, id, help.as_ref().unwrap_or(&Value::Null))?;
             }
             Some("textDocument/semanticTokens/full") => {
                 let (path, source) =
@@ -1065,6 +1137,19 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
             .chain(self.standalone_sessions.values())
             .find_map(|session| session.semantic.as_ref()?.document(path))
     }
+
+    fn semantic_for_completion_path(&self, path: &Path) -> Option<SemanticDocument> {
+        self.package_sessions
+            .values()
+            .chain(self.standalone_sessions.values())
+            .find_map(|session| {
+                session
+                    .semantic
+                    .as_ref()
+                    .or(session.last_good_semantic.as_ref())?
+                    .document(path)
+            })
+    }
 }
 
 fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path) -> Option<String> {
@@ -1372,10 +1457,9 @@ fn analyze_package_snapshot(
             )]);
         }
     };
-    session.semantic = Some(SemanticSnapshot::from_build(
-        &build,
-        Arc::clone(&check.semantic_ir),
-    ));
+    let semantic = SemanticSnapshot::from_build(&build, Arc::clone(&check.semantic_ir));
+    session.last_good_semantic = Some(semantic.clone());
+    session.semantic = Some(semantic);
     match build.compile_with_contract_session(
         &mut session.build,
         generation,
@@ -1898,6 +1982,155 @@ fn contract_document_symbols(source: &str) -> Vec<serde_json::Value> {
     symbols
 }
 
+#[allow(clippy::too_many_lines)]
+fn executable_document_symbols(source: &str) -> Vec<Value> {
+    use nexa_syntax::ast::{DeclarationKind, TypeDeclarationKind};
+    let Ok(tree) = nexa_syntax::parse_nexa(source) else {
+        return Vec::new();
+    };
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let mut symbols = Vec::new();
+    let mut impls = BTreeMap::<String, Vec<&nexa_syntax::ast::FunctionDeclaration>>::new();
+    for declaration in &ast.declarations {
+        match &declaration.kind {
+            DeclarationKind::Function(function) if function.impl_target.is_some() => {
+                let target = function.impl_target.as_ref().expect("impl target exists");
+                let start = target.range.start.get() as usize;
+                let end = target.range.end.get() as usize;
+                let name = source.get(start..end).unwrap_or("impl target").to_owned();
+                impls.entry(name).or_default().push(function);
+            }
+            DeclarationKind::Function(function) => symbols.push(executable_symbol(
+                source,
+                &function.name.text,
+                12,
+                function.range,
+                function.name.range,
+                &[],
+            )),
+            DeclarationKind::Type(ty) => {
+                let kind = match ty.kind {
+                    TypeDeclarationKind::Struct => 23,
+                    TypeDeclarationKind::Enum => 10,
+                    TypeDeclarationKind::Class => 5,
+                };
+                let mut children = ty
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        executable_symbol(
+                            source,
+                            &field.name.text,
+                            8,
+                            field.range,
+                            field.name.range,
+                            &[],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                children.extend(ty.variants.iter().map(|variant| {
+                    executable_symbol(
+                        source,
+                        &variant.name.text,
+                        22,
+                        variant.range,
+                        variant.name.range,
+                        &[],
+                    )
+                }));
+                symbols.push(executable_symbol(
+                    source,
+                    &ty.name.text,
+                    kind,
+                    ty.range,
+                    ty.name.range,
+                    &children,
+                ));
+            }
+            DeclarationKind::Const(constant) => symbols.push(executable_symbol(
+                source,
+                &constant.name.text,
+                14,
+                constant.range,
+                constant.name.range,
+                &[],
+            )),
+            DeclarationKind::Error => {}
+        }
+    }
+    for (target, methods) in impls {
+        let Some(first) = methods.first() else {
+            continue;
+        };
+        let Some(last) = methods.last() else {
+            continue;
+        };
+        let type_parameters = first
+            .type_parameters
+            .iter()
+            .take(first.impl_type_parameter_count)
+            .map(|parameter| parameter.name.text.as_str())
+            .collect::<Vec<_>>();
+        let label = if type_parameters.is_empty() {
+            format!("impl {target}")
+        } else {
+            format!("impl<{}> {target}", type_parameters.join(", "))
+        };
+        let range = nexa_syntax::TextRange::new(first.range.start, last.range.end);
+        let selection = first
+            .impl_target
+            .as_ref()
+            .map_or(first.name.range, |target| target.range);
+        let children = methods
+            .iter()
+            .map(|method| {
+                executable_symbol(
+                    source,
+                    &method.name.text,
+                    6,
+                    method.range,
+                    method.name.range,
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+        symbols.push(executable_symbol(
+            source, &label, 3, range, selection, &children,
+        ));
+    }
+    symbols.sort_by_key(|symbol| {
+        symbol["range"]["start"]["line"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+    });
+    symbols
+}
+
+fn executable_symbol(
+    source: &str,
+    name: &str,
+    kind: u32,
+    range: nexa_syntax::TextRange,
+    selection: nexa_syntax::TextRange,
+    children: &[Value],
+) -> Value {
+    let lsp_range = |range: nexa_syntax::TextRange| {
+        let start = byte_offset_to_lsp_position(source, range.start.get() as usize);
+        let end = byte_offset_to_lsp_position(source, range.end.get() as usize);
+        json!({
+            "start": {"line": start.line, "character": start.character},
+            "end": {"line": end.line, "character": end.character}
+        })
+    };
+    json!({
+        "name": name,
+        "kind": kind,
+        "range": lsp_range(range),
+        "selectionRange": lsp_range(selection),
+        "children": children
+    })
+}
+
 fn request_document_source(
     documents: &BTreeMap<String, OpenDocument>,
     text_document: &Value,
@@ -2025,17 +2258,81 @@ fn hover_value(source: &str, span: &nexa_analysis::SourceRange, value: &str) -> 
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn semantic_completion_items(
     document: &SemanticDocument,
     source: &str,
     offset: usize,
 ) -> Option<Vec<Value>> {
-    let (receiver_start, _, is_static) = language_v3_completion_receiver_range(source, offset)?;
+    let Some((receiver_start, _, is_static)) =
+        language_v3_completion_receiver_range(source, offset)
+    else {
+        let symbols = nexa_analysis::visible_symbols_at(
+            &document.ir,
+            &document.source,
+            u32::try_from(offset).ok()?,
+        );
+        let mut items = symbols
+            .into_iter()
+            .map(|symbol| {
+                let kind = match symbol.kind {
+                    nexa_analysis::DefinitionKind::Function
+                    | nexa_analysis::DefinitionKind::Task
+                    | nexa_analysis::DefinitionKind::HostFunction
+                    | nexa_analysis::DefinitionKind::StandardLibrary => 3,
+                    nexa_analysis::DefinitionKind::Struct
+                    | nexa_analysis::DefinitionKind::Class => 22,
+                    nexa_analysis::DefinitionKind::Enum => 13,
+                    nexa_analysis::DefinitionKind::Const => 21,
+                    nexa_analysis::DefinitionKind::Parameter
+                    | nexa_analysis::DefinitionKind::Local => 6,
+                    nexa_analysis::DefinitionKind::Field => 5,
+                    nexa_analysis::DefinitionKind::Variant => 20,
+                    nexa_analysis::DefinitionKind::HostContract => 8,
+                };
+                json!({
+                    "label": symbol.name,
+                    "kind": kind,
+                    "detail": format!(
+                        "{}: {}",
+                        definition_kind_name(symbol.kind),
+                        nexa_analysis::display_type(&symbol.ty, &document.ir)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        items.extend(
+            generic_parameters_at(source, offset)
+                .into_iter()
+                .map(|name| {
+                    json!({
+                        "label": name,
+                        "kind": 25,
+                        "detail": "type parameter"
+                    })
+                }),
+        );
+        items.extend(namespace_aliases(source).into_iter().map(|name| {
+            json!({
+                "label": name,
+                "kind": 9,
+                "detail": "imported namespace"
+            })
+        }));
+        return Some(items);
+    };
     let ty = nexa_analysis::type_at(
         &document.ir,
         &document.source,
         u32::try_from(receiver_start).ok()?,
-    )?;
+    );
+    let Some(ty) = ty else {
+        if is_static {
+            let items = semantic_namespace_completion_items(document, source, offset);
+            return (!items.is_empty()).then_some(items);
+        }
+        return None;
+    };
     let methods = if is_static {
         nexa_analysis::associated_functions_for_type(&document.ir, &document.source, &ty)
     } else {
@@ -2079,6 +2376,17 @@ fn semantic_completion_items(
         })
         .collect::<Vec<_>>();
     if is_static {
+        items.extend(
+            nexa_analysis::variants_for_type(&document.ir, &ty)
+                .into_iter()
+                .map(|variant| {
+                    json!({
+                        "label": variant.name,
+                        "kind": 20,
+                        "detail": "enum variant"
+                    })
+                }),
+        );
         return Some(items);
     }
     let owner = match &ty {
@@ -2093,6 +2401,248 @@ fn semantic_completion_items(
         return Some(items);
     }
     (!items.is_empty() || matches!(ty, nexa_analysis::IrType::Named(_))).then_some(items)
+}
+
+#[allow(clippy::too_many_lines)]
+fn semantic_namespace_completion_items(
+    document: &SemanticDocument,
+    source: &str,
+    offset: usize,
+) -> Vec<Value> {
+    let Some(segments) = qualified_completion_segments(source, offset) else {
+        return Vec::new();
+    };
+    let Some(current) = document
+        .ir
+        .modules()
+        .iter()
+        .find(|module| module.source == document.source)
+    else {
+        return Vec::new();
+    };
+    let (package, module_prefix) = match segments.as_slice() {
+        [root, rest @ ..] if root == "package" => {
+            (Some(current.package_id.clone()), rest.join("."))
+        }
+        [root, rest @ ..] if root == "self" => {
+            let prefix = current
+                .module
+                .as_str()
+                .rsplit_once('.')
+                .map_or("", |(parent, _)| parent);
+            let suffix = rest.join(".");
+            (
+                Some(current.package_id.clone()),
+                [prefix, suffix.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        }
+        [root] if root == "host" => (Some(current.package_id.clone()), "host".to_owned()),
+        [root, rest @ ..] if root == "std" => {
+            let suffix = rest.join(".");
+            (
+                None,
+                ["std", suffix.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        }
+        [alias, rest @ ..] => {
+            let Some((target_package, target_module)) =
+                imported_namespace_target(document, source, alias)
+            else {
+                return Vec::new();
+            };
+            let suffix = rest.join(".");
+            (
+                target_package,
+                [target_module.as_str(), suffix.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        }
+        [] => return Vec::new(),
+    };
+    let mut items = BTreeMap::<String, Value>::new();
+    for module in document.ir.modules().iter().filter(|module| {
+        package
+            .as_ref()
+            .is_none_or(|package| &module.package_id == package)
+    }) {
+        let candidate = module.module.as_str();
+        if let Some(remainder) = candidate
+            .strip_prefix(&module_prefix)
+            .and_then(|rest| rest.strip_prefix('.'))
+            && let Some(next) = remainder.split('.').next()
+        {
+            items
+                .entry(next.to_owned())
+                .or_insert_with(|| json!({"label": next, "kind": 9, "detail": "module"}));
+        }
+        if candidate != module_prefix {
+            continue;
+        }
+        for definition in document.ir.definitions().iter().filter(|definition| {
+            definition.package_id == module.package_id
+                && definition.module == module.module
+                && !definition.name.contains("::")
+                && !definition.name.contains("$instance$")
+                && (definition.package_id == current.package_id
+                    || definition.visibility == nexa_analysis::DeclarationVisibility::Public)
+                && matches!(
+                    definition.kind,
+                    nexa_analysis::DefinitionKind::Function
+                        | nexa_analysis::DefinitionKind::Task
+                        | nexa_analysis::DefinitionKind::Struct
+                        | nexa_analysis::DefinitionKind::Enum
+                        | nexa_analysis::DefinitionKind::Class
+                        | nexa_analysis::DefinitionKind::Const
+                )
+        }) {
+            items.insert(
+                definition.name.clone(),
+                json!({
+                    "label": definition.name,
+                    "kind": match definition.kind {
+                        nexa_analysis::DefinitionKind::Struct
+                        | nexa_analysis::DefinitionKind::Class => 22,
+                        nexa_analysis::DefinitionKind::Enum => 13,
+                        nexa_analysis::DefinitionKind::Const => 21,
+                        _ => 3,
+                    },
+                    "detail": definition_kind_name(definition.kind)
+                }),
+            );
+        }
+    }
+    items.into_values().collect()
+}
+
+fn qualified_completion_segments(source: &str, offset: usize) -> Option<Vec<String>> {
+    let prefix = source.get(..offset)?;
+    let mut cursor = prefix.len();
+    while cursor > 0
+        && prefix
+            .as_bytes()
+            .get(cursor - 1)
+            .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        cursor -= 1;
+    }
+    let before = prefix.get(..cursor)?.trim_end().strip_suffix("::")?;
+    let start = before
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            (!(character == '_' || character == ':' || character.is_ascii_alphanumeric()))
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let segments = before
+        .get(start..)?
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn imported_namespace_target(
+    document: &SemanticDocument,
+    source: &str,
+    alias: &str,
+) -> Option<(Option<nexa_analysis::PackageId>, String)> {
+    let tree = nexa_syntax::parse_nexa(source).ok()?;
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let usage = ast.uses.iter().find(|usage| {
+        usage
+            .alias
+            .as_ref()
+            .or_else(|| usage.segments.last())
+            .is_some_and(|candidate| candidate.text == alias)
+    })?;
+    let module = usage
+        .segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let package = match usage.root.kind {
+        nexa_syntax::ast::UsePathRootKind::Package
+        | nexa_syntax::ast::UsePathRootKind::Self_
+        | nexa_syntax::ast::UsePathRootKind::Super
+        | nexa_syntax::ast::UsePathRootKind::Host => document
+            .ir
+            .modules()
+            .iter()
+            .find(|module| module.source == document.source)
+            .map(|module| module.package_id.clone()),
+        nexa_syntax::ast::UsePathRootKind::Std | nexa_syntax::ast::UsePathRootKind::Dependency => {
+            None
+        }
+    };
+    Some((package, module))
+}
+
+fn namespace_aliases(source: &str) -> Vec<String> {
+    let Ok(tree) = nexa_syntax::parse_nexa(source) else {
+        return Vec::new();
+    };
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let mut aliases = ast
+        .uses
+        .iter()
+        .filter_map(|usage| {
+            usage
+                .alias
+                .as_ref()
+                .or_else(|| usage.segments.last())
+                .map(|name| name.text.clone())
+        })
+        .collect::<Vec<_>>();
+    aliases.extend(["host".to_owned(), "std".to_owned()]);
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn generic_parameters_at(source: &str, offset: usize) -> Vec<String> {
+    use nexa_syntax::ast::DeclarationKind;
+    let Ok(tree) = nexa_syntax::parse_nexa(source) else {
+        return Vec::new();
+    };
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let offset = u32::try_from(offset).unwrap_or(u32::MAX);
+    let mut names = ast
+        .declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.range.start.get() <= offset && offset <= declaration.range.end.get()
+        })
+        .flat_map(|declaration| match &declaration.kind {
+            DeclarationKind::Function(function) => function
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.text.clone())
+                .collect::<Vec<_>>(),
+            DeclarationKind::Type(ty) => ty
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.text.clone())
+                .collect(),
+            DeclarationKind::Const(_) | DeclarationKind::Error => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn semantic_definition_location(
@@ -2128,6 +2678,494 @@ fn semantic_definition_location(
             "end": {"line": end.line, "character": end.character}
         }
     }))
+}
+
+fn semantic_reference_locations(
+    document: &SemanticDocument,
+    offset: usize,
+    include_declaration: bool,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Vec<Value> {
+    let Some(target) = nexa_analysis::definition_at(
+        &document.ir,
+        &document.source,
+        u32::try_from(offset).ok().unwrap_or(u32::MAX),
+    ) else {
+        return Vec::new();
+    };
+    let mut spans = nexa_analysis::references_of(&document.ir, target);
+    if include_declaration
+        && let Some(span) = nexa_analysis::definition_name_span(&document.ir, target)
+    {
+        spans.push(span);
+    }
+    spans.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.start.cmp(&right.start))
+            .then(left.end.cmp(&right.end))
+    });
+    spans.dedup();
+    spans
+        .iter()
+        .filter_map(|span| semantic_location_for_span(document, span, documents))
+        .collect()
+}
+
+fn semantic_rename_edit(
+    document: &SemanticDocument,
+    offset: usize,
+    new_name: &str,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Option<Value> {
+    if !valid_nexa_identifier(new_name) {
+        return None;
+    }
+    let target =
+        nexa_analysis::definition_at(&document.ir, &document.source, u32::try_from(offset).ok()?)?;
+    let definition = document.ir.definition(target)?;
+    if !valid_rename_for_kind(definition.kind, new_name) {
+        return None;
+    }
+    if rename_conflicts(document, definition, new_name) {
+        return None;
+    }
+    let mut spans = nexa_analysis::references_of(&document.ir, target);
+    spans.push(nexa_analysis::definition_name_span(&document.ir, target)?);
+    spans.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.start.cmp(&right.start))
+            .then(left.end.cmp(&right.end))
+    });
+    spans.dedup();
+    let mut changes = serde_json::Map::new();
+    for span in spans {
+        let path = document.paths_by_source.get(&span.source)?;
+        let open = documents
+            .values()
+            .find(|candidate| same_file_path(&candidate.path, path));
+        let source = open
+            .map(|candidate| candidate.text.clone())
+            .or_else(|| std::fs::read_to_string(path).ok())?;
+        let uri = open
+            .map(|candidate| candidate.uri.clone())
+            .or_else(|| path_to_file_uri(path).ok())?;
+        let start = byte_offset_to_lsp_position(&source, span.start as usize);
+        let end = byte_offset_to_lsp_position(&source, span.end as usize);
+        changes
+            .entry(uri)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()?
+            .push(json!({
+                "range": {
+                    "start": {"line": start.line, "character": start.character},
+                    "end": {"line": end.line, "character": end.character}
+                },
+                "newText": new_name
+            }));
+    }
+    Some(json!({"changes": changes}))
+}
+
+fn rename_conflicts(
+    document: &SemanticDocument,
+    target: &nexa_analysis::Definition,
+    new_name: &str,
+) -> bool {
+    if target.name == new_name {
+        return false;
+    }
+    if matches!(
+        target.kind,
+        nexa_analysis::DefinitionKind::Local | nexa_analysis::DefinitionKind::Parameter
+    ) {
+        return nexa_analysis::visible_symbols_at(
+            &document.ir,
+            &target.span.source,
+            target.span.start,
+        )
+        .iter()
+        .any(|symbol| symbol.definition != target.id && symbol.name == new_name);
+    }
+    if let Some(method) = document
+        .ir
+        .metadata()
+        .inherent_methods
+        .iter()
+        .find(|method| method.definition == target.id)
+    {
+        return document
+            .ir
+            .metadata()
+            .inherent_methods
+            .iter()
+            .any(|candidate| {
+                candidate.definition != target.id
+                    && candidate.owner == method.owner
+                    && candidate.name == new_name
+            });
+    }
+    if matches!(
+        target.kind,
+        nexa_analysis::DefinitionKind::Field | nexa_analysis::DefinitionKind::Variant
+    ) && let Some(owner) = nominal_member_owner(&document.ir, target.id)
+    {
+        return document.ir.definitions().iter().any(|candidate| {
+            candidate.id != target.id
+                && candidate.name == new_name
+                && nominal_member_owner(&document.ir, candidate.id) == Some(owner)
+        });
+    }
+    document.ir.definitions().iter().any(|candidate| {
+        candidate.id != target.id
+            && candidate.package_id == target.package_id
+            && candidate.module == target.module
+            && candidate.name == new_name
+            && candidate.kind == target.kind
+    })
+}
+
+fn nominal_member_owner(
+    ir: &nexa_analysis::TypedPackageIr,
+    member: nexa_analysis::DefinitionId,
+) -> Option<nexa_analysis::DefinitionId> {
+    ir.modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .find_map(|declaration| match &declaration.body {
+            nexa_analysis::TypedDeclarationBody::TypeLayout(
+                nexa_analysis::TypedTypeLayoutIr::Struct { fields }
+                | nexa_analysis::TypedTypeLayoutIr::Class { fields, .. },
+            ) if fields.iter().any(|field| field.definition == member) => {
+                Some(declaration.definition)
+            }
+            nexa_analysis::TypedDeclarationBody::TypeLayout(
+                nexa_analysis::TypedTypeLayoutIr::Enum { variants },
+            ) if variants.iter().any(|variant| variant.definition == member) => {
+                Some(declaration.definition)
+            }
+            nexa_analysis::TypedDeclarationBody::Function(_)
+            | nexa_analysis::TypedDeclarationBody::Const(_)
+            | nexa_analysis::TypedDeclarationBody::TypeLayout(_)
+            | nexa_analysis::TypedDeclarationBody::External => None,
+        })
+}
+
+fn valid_nexa_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        && !matches!(
+            name,
+            "fn" | "async"
+                | "struct"
+                | "enum"
+                | "class"
+                | "impl"
+                | "const"
+                | "let"
+                | "self"
+                | "Self"
+                | "return"
+                | "if"
+                | "else"
+                | "while"
+                | "for"
+                | "match"
+                | "use"
+                | "pub"
+                | "package"
+                | "where"
+                | "true"
+                | "false"
+        )
+}
+
+fn valid_rename_for_kind(kind: nexa_analysis::DefinitionKind, name: &str) -> bool {
+    match kind {
+        nexa_analysis::DefinitionKind::Struct
+        | nexa_analysis::DefinitionKind::Enum
+        | nexa_analysis::DefinitionKind::Class
+        | nexa_analysis::DefinitionKind::Variant => name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase()),
+        nexa_analysis::DefinitionKind::Const => name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        nexa_analysis::DefinitionKind::Function
+        | nexa_analysis::DefinitionKind::Task
+        | nexa_analysis::DefinitionKind::Field
+        | nexa_analysis::DefinitionKind::Parameter
+        | nexa_analysis::DefinitionKind::Local => name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+        nexa_analysis::DefinitionKind::HostContract
+        | nexa_analysis::DefinitionKind::HostFunction
+        | nexa_analysis::DefinitionKind::StandardLibrary => false,
+    }
+}
+
+fn generic_parameter_reference_locations(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    include_declaration: bool,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Vec<Value> {
+    let Some((declaration, ranges)) = generic_parameter_ranges_at(source, offset) else {
+        return Vec::new();
+    };
+    let uri = documents
+        .values()
+        .find(|document| same_file_path(&document.path, path))
+        .map(|document| document.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok());
+    let Some(uri) = uri else {
+        return Vec::new();
+    };
+    ranges
+        .into_iter()
+        .filter(|range| include_declaration || *range != declaration)
+        .map(|range| {
+            let start = byte_offset_to_lsp_position(source, range.start.get() as usize);
+            let end = byte_offset_to_lsp_position(source, range.end.get() as usize);
+            json!({
+                "uri": uri,
+                "range": {
+                    "start": {"line": start.line, "character": start.character},
+                    "end": {"line": end.line, "character": end.character}
+                }
+            })
+        })
+        .collect()
+}
+
+fn generic_parameter_rename_edit(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    new_name: &str,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Option<Value> {
+    if !valid_nexa_identifier(new_name)
+        || !new_name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let (_, ranges) = generic_parameter_ranges_at(source, offset)?;
+    let uri = documents
+        .values()
+        .find(|document| same_file_path(&document.path, path))
+        .map(|document| document.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok())?;
+    let edits = ranges
+        .into_iter()
+        .map(|range| {
+            let start = byte_offset_to_lsp_position(source, range.start.get() as usize);
+            let end = byte_offset_to_lsp_position(source, range.end.get() as usize);
+            json!({
+                "range": {
+                    "start": {"line": start.line, "character": start.character},
+                    "end": {"line": end.line, "character": end.character}
+                },
+                "newText": new_name
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({"changes": {uri: edits}}))
+}
+
+fn generic_parameter_ranges_at(
+    source: &str,
+    offset: usize,
+) -> Option<(nexa_syntax::TextRange, Vec<nexa_syntax::TextRange>)> {
+    use nexa_syntax::TokenKind;
+    use nexa_syntax::ast::DeclarationKind;
+    let tree = nexa_syntax::parse_nexa(source).ok()?;
+    let ast = nexa_syntax::ast::parse_nexa_ast(&tree);
+    let lexed = nexa_syntax::lex_nexa(source).ok()?;
+    let offset = u32::try_from(offset).ok()?;
+    let current = lexed.tokens.iter().find(|token| {
+        token.kind == TokenKind::Identifier
+            && token.range.start.get() <= offset
+            && offset <= token.range.end.get()
+    })?;
+    let name = source.get(current.range.start.get() as usize..current.range.end.get() as usize)?;
+    let mut declaration = None;
+    let mut scopes = Vec::new();
+    for item in &ast.declarations {
+        let parameters = match &item.kind {
+            DeclarationKind::Function(function) => &function.type_parameters,
+            DeclarationKind::Type(ty) => &ty.type_parameters,
+            DeclarationKind::Const(_) | DeclarationKind::Error => continue,
+        };
+        if let Some(parameter) = parameters
+            .iter()
+            .find(|parameter| parameter.name.text == name)
+            && item.range.start.get() <= offset
+            && offset <= item.range.end.get()
+        {
+            declaration = Some(parameter.name.range);
+            scopes.push(item.range);
+            for sibling in &ast.declarations {
+                let sibling_parameters = match &sibling.kind {
+                    DeclarationKind::Function(function) => &function.type_parameters,
+                    DeclarationKind::Type(ty) => &ty.type_parameters,
+                    DeclarationKind::Const(_) | DeclarationKind::Error => continue,
+                };
+                if sibling_parameters.iter().any(|candidate| {
+                    candidate.name.text == name && candidate.name.range == parameter.name.range
+                }) {
+                    scopes.push(sibling.range);
+                }
+            }
+            break;
+        }
+    }
+    let declaration = declaration?;
+    scopes.sort_by_key(|range| (range.start, range.end));
+    scopes.dedup();
+    let mut ranges = lexed
+        .tokens
+        .iter()
+        .filter(|token| token.kind == TokenKind::Identifier)
+        .filter(|token| {
+            scopes
+                .iter()
+                .any(|scope| scope.start <= token.range.start && token.range.end <= scope.end)
+        })
+        .filter(|token| {
+            source.get(token.range.start.get() as usize..token.range.end.get() as usize)
+                == Some(name)
+        })
+        .map(|token| token.range)
+        .collect::<Vec<_>>();
+    ranges.push(declaration);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    Some((declaration, ranges))
+}
+
+fn semantic_location_for_span(
+    document: &SemanticDocument,
+    span: &nexa_analysis::SourceRange,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Option<Value> {
+    let path = document.paths_by_source.get(&span.source)?;
+    let open = documents
+        .values()
+        .find(|candidate| same_file_path(&candidate.path, path));
+    let source = open
+        .map(|candidate| candidate.text.clone())
+        .or_else(|| std::fs::read_to_string(path).ok())?;
+    let uri = open
+        .map(|candidate| candidate.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok())?;
+    let start = byte_offset_to_lsp_position(&source, span.start as usize);
+    let end = byte_offset_to_lsp_position(&source, span.end as usize);
+    Some(json!({
+        "uri": uri,
+        "range": {
+            "start": {"line": start.line, "character": start.character},
+            "end": {"line": end.line, "character": end.character}
+        }
+    }))
+}
+
+fn semantic_signature_help(
+    document: &SemanticDocument,
+    source: &str,
+    offset: usize,
+) -> Option<Value> {
+    let signature = nexa_analysis::call_signature_at(
+        &document.ir,
+        &document.source,
+        u32::try_from(offset).ok()?,
+    )?;
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}: {}",
+                parameter.name,
+                nexa_analysis::display_type(&parameter.ty, &document.ir)
+            )
+        })
+        .collect::<Vec<_>>();
+    let effect = if signature.effect == nexa_analysis::IrEffect::Task {
+        "async "
+    } else {
+        ""
+    };
+    let label = format!(
+        "{effect}fn {}({}) -> {}",
+        signature.name,
+        parameters.join(", "),
+        nexa_analysis::display_type(&signature.result, &document.ir)
+    );
+    let active_parameter = active_call_parameter(
+        source,
+        signature.span.start as usize,
+        offset,
+        parameters.len(),
+    );
+    Some(json!({
+        "signatures": [{
+            "label": label,
+            "parameters": parameters.into_iter().map(|label| json!({"label": label})).collect::<Vec<_>>()
+        }],
+        "activeSignature": 0,
+        "activeParameter": active_parameter
+    }))
+}
+
+fn active_call_parameter(
+    source: &str,
+    start: usize,
+    offset: usize,
+    parameter_count: usize,
+) -> usize {
+    let end = offset.min(source.len());
+    let Some(text) = source.get(start.min(end)..end) else {
+        return 0;
+    };
+    let mut depth = 0usize;
+    let mut commas = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut saw_open = false;
+    for byte in text.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'(' | b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                saw_open = true;
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if saw_open && depth == 1 => commas = commas.saturating_add(1),
+            _ => {}
+        }
+    }
+    commas.min(parameter_count.saturating_sub(1))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2195,6 +3233,7 @@ fn diagnostics_for_nexa_source(
             .insert(path.clone(), origin.source_key.clone());
         Arc::make_mut(&mut semantic.paths_by_source).insert(origin.source_key.clone(), path);
     }
+    session.last_good_semantic = Some(semantic.clone());
     session.semantic = Some(semantic);
     match build.compile_standalone_with_session_and_limits(
         &mut session.build,

@@ -36,14 +36,15 @@ use crate::query::{
 use crate::{
     ArtifactFileId, ArtifactFileTable, BinaryOperator, BuiltinOperationIr, BuiltinVariantIr,
     CompilationLimits, CompilationProfile, DeclarationVisibility, Definition, DefinitionId,
-    DefinitionKind, ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr,
-    FieldLayoutIr, GenericNominalInstanceIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr,
-    HostFunctionBindingIr, HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr,
-    HostVariantBindingIr, InherentMethodIr, IrAbandonPolicy, IrCancelPolicy, IrEffect,
-    IrHostFunctionMode, IrLiteral, IrType, LifecycleBindingsIr, ModuleGraph, ModuleGraphError,
-    ModuleKey, ModulePath, NormalizedPackagePath, PackageId, PackageKind, PackageSemanticMetadata,
-    PackageSourceSet, PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey,
-    ReplCellInput, ReplSessionSnapshot, ResolvedBuildInput, ResolvedReference, ResolvedTestInput,
+    DefinitionKind, DefinitionNameIr, ExportBindingIr, ExternalSourceRangeIr,
+    ExternalSourceSnapshotIr, FieldLayoutIr, GenericNominalInstanceIr, HostAsyncResultIr,
+    HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr, HostNamespaceBindingIr,
+    HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr, InherentMethodIr, IrAbandonPolicy,
+    IrCancelPolicy, IrEffect, IrHostFunctionMode, IrLiteral, IrType, LexicalScopeIr,
+    LifecycleBindingsIr, ModuleGraph, ModuleGraphError, ModuleKey, ModulePath,
+    NormalizedPackagePath, PackageId, PackageKind, PackageSemanticMetadata, PackageSourceSet,
+    PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey, ReplCellInput,
+    ReplSessionSnapshot, ResolvedBuildInput, ResolvedReference, ResolvedTestInput,
     SemanticFingerprintRecord, SourceKey, SourceRange, SourceRole, SourceSetFingerprint,
     StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr, StateMetadataIr,
     StateSchemaFingerprint, StateTypeIr, TestDefinitionIr, TypedBlockIr, TypedDeclarationBody,
@@ -611,6 +612,7 @@ struct Analyzer<'a> {
     type_metadata: BTreeMap<DefinitionId, TypeMetadata>,
     variant_payloads: BTreeMap<DefinitionId, Vec<IrType>>,
     resolved_references: BTreeMap<usize, Vec<ResolvedReference>>,
+    lexical_scopes: Vec<LexicalScopeIr>,
     typed_declarations: BTreeMap<usize, Vec<TypedDeclarationIr>>,
     stable_registry: StableSymbolRegistry,
     stable_ids: BTreeMap<DefinitionId, StableSymbolId>,
@@ -839,6 +841,7 @@ impl<'a> Analyzer<'a> {
             type_metadata: BTreeMap::new(),
             variant_payloads: BTreeMap::new(),
             resolved_references: BTreeMap::new(),
+            lexical_scopes: Vec::new(),
             typed_declarations: BTreeMap::new(),
             stable_registry: StableSymbolRegistry::new(),
             stable_ids: BTreeMap::new(),
@@ -1884,6 +1887,14 @@ impl<'a> Analyzer<'a> {
             })
             .collect::<Vec<_>>();
         generic_nominal_instances.sort_by_key(|instance| instance.instance);
+        let definition_names = self
+            .definitions
+            .iter()
+            .map(|definition| DefinitionNameIr {
+                definition: definition.id,
+                span: self.definition_name_span(definition.id),
+            })
+            .collect::<Vec<_>>();
         PackageSemanticMetadata {
             entry_module: self.input.root_manifest.entry().cloned(),
             state_types: state_types.into(),
@@ -1896,6 +1907,8 @@ impl<'a> Analyzer<'a> {
             standard_functions: standard_functions.into(),
             inherent_methods: inherent_methods.into(),
             generic_nominal_instances: generic_nominal_instances.into(),
+            definition_names: definition_names.into(),
+            lexical_scopes: self.lexical_scopes.clone().into(),
             generic_function_instances: self
                 .generic_instances
                 .keys()
@@ -6708,6 +6721,16 @@ impl<'a> Analyzer<'a> {
                 };
                 return source_range(&module.source, range);
             }
+            if let DeclarationKind::Function(function) = &record.declaration.kind
+                && let Some(signature) = self.function_signatures.get(&record.definition)
+                && let Some((parameter, _)) = function
+                    .parameters
+                    .iter()
+                    .zip(signature.parameters.iter())
+                    .find(|(_, definition)| **definition == target)
+            {
+                return source_range(&module.source, parameter.name.range);
+            }
             if let DeclarationKind::Type(ty) = &record.declaration.kind
                 && let Some(metadata) = self.type_metadata.get(&record.definition)
             {
@@ -8865,6 +8888,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     }
 
     fn check_block(&mut self, block: &ast::Block) -> TypedBlockIr {
+        let is_function_body = self.scopes.len() == 1;
         self.scopes.push(BTreeMap::new());
         let statements = block
             .statements
@@ -8874,8 +8898,35 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         let tail = block.tail.as_ref().map(|expression| {
             Box::new(self.check_expression(expression, Some(&self.return_type.clone())))
         });
+        self.record_scope(block.range, self.scopes.len().saturating_sub(1));
+        if is_function_body {
+            self.record_scope(block.range, 0);
+        }
         self.scopes.pop();
         TypedBlockIr { statements, tail }
+    }
+
+    fn record_scope(&mut self, range: TextRange, scope_index: usize) {
+        if self.current_function.is_some_and(|function| {
+            self.analyzer
+                .generic_instance_origins
+                .contains_key(&function)
+        }) {
+            return;
+        }
+        let Some(scope) = self.scopes.get(scope_index) else {
+            return;
+        };
+        let mut definitions = scope.values().copied().collect::<Vec<_>>();
+        definitions.sort_unstable();
+        definitions.dedup();
+        if definitions.is_empty() {
+            return;
+        }
+        self.analyzer.lexical_scopes.push(LexicalScopeIr {
+            span: source_range(&self.module.source, range),
+            definitions,
+        });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8914,6 +8965,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     .insert(binding.text.clone(), definition);
                 self.readonly_loop_bindings.insert(definition);
                 self.loop_depth += 1;
+                self.record_scope(body.range, self.scopes.len().saturating_sub(1));
                 let body = self.check_block(body);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 self.readonly_loop_bindings.remove(&definition);
@@ -9081,6 +9133,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             self.iterated_collections.insert(guarded);
         }
         self.loop_depth += 1;
+        self.record_scope(body.range, self.scopes.len().saturating_sub(1));
         let body = self.check_block(body);
         self.loop_depth = self.loop_depth.saturating_sub(1);
         if let Some(guarded) = guarded {
@@ -9117,6 +9170,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             .tail
             .as_ref()
             .map(|expression| Box::new(self.check_expression(expression, None)));
+        self.record_scope(block.range, self.scopes.len().saturating_sub(1));
         self.scopes.pop();
         TypedBlockIr { statements, tail }
     }
@@ -14282,6 +14336,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         for arm in arms {
             self.scopes.push(BTreeMap::new());
             let pattern = self.check_pattern(&arm.pattern, &value.ty);
+            self.record_scope(arm.value.range, self.scopes.len().saturating_sub(1));
             let arm_value = self.check_expression(&arm.value, result.as_ref());
             if let Some(result) = &result {
                 self.expect_type(&arm_value.ty, result, &arm_value.span);

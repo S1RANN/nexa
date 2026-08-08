@@ -470,6 +470,21 @@ pub struct GenericNominalInstanceIr {
     pub arguments: Vec<IrType>,
 }
 
+/// Exact source spelling of a semantic definition. Declaration ranges intentionally remain
+/// available on [`Definition`]; this narrower range is used by navigation and rename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefinitionNameIr {
+    pub definition: DefinitionId,
+    pub span: SourceRange,
+}
+
+/// One lexical scope retained for source-position semantic queries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LexicalScopeIr {
+    pub span: SourceRange,
+    pub definitions: Vec<DefinitionId>,
+}
+
 /// Authoritative entrypoint for one cumulative REPL cell.
 ///
 /// The compiler uses this metadata instead of guessing a function by name. A synchronous source
@@ -496,6 +511,8 @@ pub struct PackageSemanticMetadata {
     pub standard_functions: Arc<[StandardFunctionBindingIr]>,
     pub inherent_methods: Arc<[InherentMethodIr]>,
     pub generic_nominal_instances: Arc<[GenericNominalInstanceIr]>,
+    pub definition_names: Arc<[DefinitionNameIr]>,
+    pub lexical_scopes: Arc<[LexicalScopeIr]>,
     pub generic_function_instances: usize,
     pub generic_nominal_type_instances: usize,
     pub public_api_fingerprint: PublicApiFingerprint,
@@ -1196,6 +1213,14 @@ fn validate_metadata<'a>(
         validate_id(instance.declaration, limit)?;
         for argument in &instance.arguments {
             validate_type(argument, limit)?;
+        }
+    }
+    for name in metadata.definition_names.iter() {
+        validate_id(name.definition, limit)?;
+    }
+    for scope in metadata.lexical_scopes.iter() {
+        for definition in &scope.definitions {
+            validate_id(*definition, limit)?;
         }
     }
     let mut standard_functions = BTreeMap::new();

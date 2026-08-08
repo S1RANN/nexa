@@ -12761,6 +12761,8 @@ mod tests {
                 standard_functions: std::sync::Arc::new([]),
                 inherent_methods: std::sync::Arc::new([]),
                 generic_nominal_instances: std::sync::Arc::new([]),
+                definition_names: std::sync::Arc::new([]),
+                lexical_scopes: std::sync::Arc::new([]),
                 generic_function_instances: 0,
                 generic_nominal_type_instances: 0,
                 public_api_fingerprint: PublicApiFingerprint::default(),

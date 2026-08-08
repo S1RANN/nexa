@@ -1,6 +1,6 @@
 # Nexa editor support
 
-Status: Language v3 support IN PROGRESS — generics, inherent methods, semantic navigation
+Status: Language v3 support IN PROGRESS — package-aware semantic editing
 
 Nexa provides local syntax support for executable `.nexa` files and
 `.contract.nexa` files in VS Code and Zed. The Contract file type is displayed
@@ -8,10 +8,13 @@ as **Nexa Contract**. Version `0.1.2` provides syntax highlighting, bracket hand
 indentation, outlines, and live compiler diagnostics through `nexa lsp`.
 It provides line/block comment configuration and documentation-comment
 highlighting. On a fresh semantic package snapshot the LSP provides concrete
-type Hover, receiver/associated method Completion, and Go to Definition,
-including monomorphized generic calls and user `impl` methods. It does not yet
-provide semantic token classification, references, rename, formatting,
-snippets, code actions, DAP, or debugging.
+type Hover, lexical and receiver/associated Completion, Go to Definition,
+Find References, checked Rename, Signature Help, and executable-file Outline,
+including monomorphized generic calls, generic parameters, Enum variants, and
+user `impl` methods. Completion alone may use the last successful snapshot
+while a document contains an incomplete edit; navigation and edits require a
+fresh snapshot. It does not yet provide true semantic token classification,
+formatting, snippets, code actions, DAP, or debugging.
 
 The editor tooling is isolated under `editors/`. It is not part of the Rust
 Workspace and does not change Runtime gates.

@@ -17,14 +17,39 @@ struct CombatStats {
     label: string,
 }
 
+impl CombatStats {
+    fn total(self, bonus: i64) -> i64 {
+        return self.damage + bonus;
+    }
+
+    fn with_damage(self, damage: i64) -> Self {
+        return CombatStats { damage: damage, label: self.label };
+    }
+}
+
 enum CombatEvent {
     Idle,
     Damage(CombatStats),
 }
 
+impl CombatEvent {
+    fn damage(self) -> i64 {
+        return match self {
+            CombatEvent::Idle => 0,
+            CombatEvent::Damage(stats) => stats.total(0),
+        };
+    }
+}
+
 class CombatFrame {
     hits: i32,
     next: Option<CombatFrame>,
+}
+
+impl CombatFrame {
+    fn record_hit(self) {
+        self.hits += 1;
+    }
 }
 
 fn option_value(value: i32) -> i32 {
@@ -60,15 +85,12 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
     let ratio: f32 = 7.5 / 2.5;
     let glyph: rune = '界';
     let label: string = "combat" + "-runtime";
-    let stats: CombatStats = CombatStats { damage: wide, label: label };
+    let stats: CombatStats = CombatStats { damage: 0, label: label }.with_damage(wide);
     let event: CombatEvent = CombatEvent::Damage(stats);
-    let decoded: i64 = match event {
-        CombatEvent::Idle => 0,
-        CombatEvent::Damage(payload) => payload.damage,
-    };
+    let decoded: i64 = event.damage();
 
     let frame: CombatFrame = CombatFrame { hits: 1, next: Option::None };
-    frame.hits = frame.hits + 1;
+    frame.record_hit();
 
     let values: Array<i32> = Array::new();
     values.push(frame.hits);
