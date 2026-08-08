@@ -2074,6 +2074,7 @@ fn semantic_completion_items(
                     method.name,
                     nexa_analysis::display_type(&method.result, &document.ir)
                 ),
+                "documentation": method.documentation,
             })
         })
         .collect::<Vec<_>>();
@@ -2091,44 +2092,7 @@ fn semantic_completion_items(
         items.extend(language_v3_completion_items_for_owner(owner, false));
         return Some(items);
     }
-    if let Some(numeric) = numeric_completion_items(&ty) {
-        items.extend(numeric);
-    }
     (!items.is_empty() || matches!(ty, nexa_analysis::IrType::Named(_))).then_some(items)
-}
-
-fn numeric_completion_items(ty: &nexa_analysis::IrType) -> Option<Vec<Value>> {
-    let owner = match ty {
-        nexa_analysis::IrType::I32 => "i32",
-        nexa_analysis::IrType::I64 => "i64",
-        nexa_analysis::IrType::F32 => "f32",
-        nexa_analysis::IrType::F64 => "f64",
-        _ => return None,
-    };
-    Some(
-        nexa_stdlib::standard_library()
-            .methods()
-            .filter(|method| method.receiver == owner)
-            .map(|method| {
-                let parameters = method
-                    .parameters
-                    .iter()
-                    .map(|parameter| format!("{}: {}", parameter.name, parameter.ty))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                json!({
-                    "label": method.name,
-                    "kind": 2,
-                    "detail": format!(
-                        "{owner} · fn {}({parameters}) -> {}",
-                        method.name,
-                        method.result
-                    ),
-                    "documentation": method.contract,
-                })
-            })
-            .collect(),
-    )
 }
 
 fn semantic_definition_location(

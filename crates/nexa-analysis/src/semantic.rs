@@ -25,6 +25,7 @@ pub struct InstantiatedSignature {
 pub struct MethodCandidate {
     pub declaration: DefinitionId,
     pub name: String,
+    pub documentation: Option<String>,
     pub type_parameters: Vec<String>,
     pub parameters: Vec<InstantiatedParameter>,
     pub result: IrType,
@@ -204,7 +205,49 @@ pub fn methods_for_type(
     source: &SourceKey,
     ty: &IrType,
 ) -> Vec<MethodCandidate> {
-    method_candidates_for_type(analysis, source, ty, true)
+    let mut methods = method_candidates_for_type(analysis, source, ty, true);
+    let receiver = match ty {
+        IrType::I32 => Some("i32"),
+        IrType::I64 => Some("i64"),
+        IrType::F32 => Some("f32"),
+        IrType::F64 => Some("f64"),
+        _ => None,
+    };
+    if let Some(receiver) = receiver {
+        methods.extend(
+            nexa_stdlib::standard_library()
+                .methods()
+                .filter(|method| method.receiver == receiver)
+                .filter_map(|method| {
+                    let definition = analysis.definitions().iter().find(|definition| {
+                        definition.package_id.as_str() == nexa_stdlib::PACKAGE_ID
+                            && definition.module.as_str()
+                                == format!("std.{}", method.implementation_module)
+                            && definition.name == method.implementation
+                    })?;
+                    Some(MethodCandidate {
+                        declaration: definition.id,
+                        name: method.name.to_owned(),
+                        documentation: Some(method.contract.to_owned()),
+                        type_parameters: Vec::new(),
+                        parameters: method
+                            .parameters
+                            .iter()
+                            .filter_map(|parameter| {
+                                semantic_scalar_type(parameter.ty).map(|ty| InstantiatedParameter {
+                                    name: parameter.name.to_owned(),
+                                    ty,
+                                })
+                            })
+                            .collect(),
+                        result: semantic_scalar_type(method.result)?,
+                        effect: definition.effect,
+                        span: definition.span.clone(),
+                    })
+                }),
+        );
+    }
+    methods
 }
 
 /// Source-level associated functions available through a concrete type namespace.
@@ -259,6 +302,7 @@ fn method_candidates_for_type(
             Some(MethodCandidate {
                 declaration: method.definition,
                 name: method.name.clone(),
+                documentation: method.documentation.clone(),
                 type_parameters: method
                     .type_parameters
                     .iter()
@@ -280,6 +324,17 @@ fn method_candidates_for_type(
             })
         })
         .collect()
+}
+
+fn semantic_scalar_type(name: &str) -> Option<IrType> {
+    match name {
+        "i32" => Some(IrType::I32),
+        "i64" => Some(IrType::I64),
+        "f32" => Some(IrType::F32),
+        "f64" => Some(IrType::F64),
+        "string" => Some(IrType::String),
+        _ => None,
+    }
 }
 
 fn substitute_semantic_type(ty: &IrType, arguments: &[IrType]) -> IrType {

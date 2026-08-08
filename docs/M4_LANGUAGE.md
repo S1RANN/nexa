@@ -147,7 +147,10 @@ remain absent from Bytecode and Runtime type metadata.
 Numeric values expose `abs`, `min`, `max`, `clamp`, and `to_string`. `f32` and
 `f64` also expose `floor`, `ceil`, `round`, `sqrt`, `sin`, and `cos`. The old
 public type-suffixed functions such as `math::abs_i32` and `core::max_f64` are
-not part of the language surface.
+not part of the language surface. Compiler-provided numeric methods and user
+inherent methods feed the same semantic method query used by Hover,
+Completion, and Go to Definition; their lowering remains separate only where
+an intrinsic implementation requires it.
 
 ## Comments and documentation
 

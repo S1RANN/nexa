@@ -453,6 +453,7 @@ pub struct InherentMethodIr {
     pub definition: DefinitionId,
     pub owner: DefinitionId,
     pub name: String,
+    pub documentation: Option<String>,
     pub has_receiver: bool,
     pub impl_type_parameter_count: usize,
     pub type_parameters: Vec<String>,

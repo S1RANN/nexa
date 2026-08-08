@@ -1846,6 +1846,15 @@ impl<'a> Analyzer<'a> {
                     definition: *definition,
                     owner: *owner,
                     name: function.name.text.clone(),
+                    documentation: (!record.declaration.docs.is_empty()).then(|| {
+                        record
+                            .declaration
+                            .docs
+                            .iter()
+                            .map(|doc| doc.text.trim().to_owned())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }),
                     has_receiver: function.has_receiver,
                     impl_type_parameter_count: function.impl_type_parameter_count,
                     type_parameters: signature.type_parameters.clone(),
