@@ -1,15 +1,17 @@
 # Nexa editor support
 
-Status: Language v3 support IN PROGRESS — Set type, collection iteration, pair binding
+Status: Language v3 support IN PROGRESS — generics, inherent methods, semantic navigation
 
 Nexa provides local syntax support for executable `.nexa` files and
 `.contract.nexa` files in VS Code and Zed. The Contract file type is displayed
 as **Nexa Contract**. Version `0.1.2` provides syntax highlighting, bracket handling,
 indentation, outlines, and live compiler diagnostics through `nexa lsp`.
 It provides line/block comment configuration and documentation-comment
-highlighting. It does not provide semantic highlighting, completion, hover,
-definition, references, rename, formatting, snippets, code actions, DAP, or
-debugging.
+highlighting. On a fresh semantic package snapshot the LSP provides concrete
+type Hover, receiver/associated method Completion, and Go to Definition,
+including monomorphized generic calls and user `impl` methods. It does not yet
+provide semantic token classification, references, rename, formatting,
+snippets, code actions, DAP, or debugging.
 
 The editor tooling is isolated under `editors/`. It is not part of the Rust
 Workspace and does not change Runtime gates.
@@ -128,6 +130,8 @@ Nexa support follows the current compiler Lexer and Parser:
   `Operator<Output = T>` bounds; no user traits, runtime generics, or turbofish
 - numeric receiver methods such as `value.abs()`, `value.clamp(...)`, and
   `value.floor()`
+- inherent `impl` blocks, ordinary `self` parameters, `Self`, and generic impl
+  targets such as `impl<T> Box<T>`
 - namespace and associated-item `::`, member `.`, Range and update `..`
 - `Set<T>` built-in generic type with `Set::new`, `insert`, `contains`, `remove`, `clear`, `len`
 - single-binding collection `for` iteration over `Array`, `Buffer`, and `Set`
@@ -167,8 +171,10 @@ TextMate JSON files by hand.
 
 - Parsing is intended for editor structure and highlighting; compiler
   type-checking and semantic validation remain authoritative.
-- The diagnostics-only LSP publishes compiler Problems for unsaved overlays,
-  converts byte spans to UTF-16 positions, and clears diagnostics after fixes.
+- The LSP publishes compiler Problems for unsaved overlays, converts byte spans
+  to UTF-16 positions, and clears diagnostics after fixes. Semantic queries use
+  only the latest successful package snapshot; invalid edits fall back to the
+  lightweight lexical helpers until analysis succeeds again.
 - Incomplete expressions or blocks may temporarily produce recovery nodes,
   but the extension remains usable.
 - VS Code does not register `<` and `>` as global bracket pairs. This prevents

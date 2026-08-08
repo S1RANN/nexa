@@ -11039,6 +11039,34 @@ fn collect_aggregate_format_strings(package: &TypedPackageIr, strings: &mut BTre
             }
         }
     }
+    for host in package.metadata().host_bindings.iter() {
+        for ty in &host.types {
+            let nexa_analysis::HostTypeLayoutIr::Struct { fields } = &ty.layout else {
+                continue;
+            };
+            let Some(definition) = package.definition(ty.definition) else {
+                continue;
+            };
+            strings.insert(definition.name.clone());
+            if fields.is_empty() {
+                strings.insert(aggregate_empty_format(&definition.name));
+                continue;
+            }
+            strings.insert(AGGREGATE_FORMAT_SUFFIX.to_owned());
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_by_key(|field| field.order);
+            for (index, field) in fields.into_iter().enumerate() {
+                if let Some(field) = package.definition(field.definition) {
+                    strings.insert(field.name.clone());
+                    strings.insert(aggregate_field_format(
+                        &definition.name,
+                        &field.name,
+                        index == 0,
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn emit_display_type_metadata(
@@ -11055,7 +11083,10 @@ fn emit_display_type_metadata(
             )
         })?;
         let name = *string_indices.get(&definition.name).ok_or_else(|| {
-            CompileError::unknown_name("aggregate display name".into(), SourceSpan::default())
+            CompileError::unknown_name(
+                format!("aggregate display name `{}`", definition.name),
+                SourceSpan::default(),
+            )
         })?;
         let field_names = aggregate
             .fields
@@ -12728,6 +12759,8 @@ mod tests {
                 lifecycle: LifecycleBindingsIr::default(),
                 repl_entry: None,
                 standard_functions: std::sync::Arc::new([]),
+                inherent_methods: std::sync::Arc::new([]),
+                generic_nominal_instances: std::sync::Arc::new([]),
                 generic_function_instances: 0,
                 generic_nominal_type_instances: 0,
                 public_api_fingerprint: PublicApiFingerprint::default(),

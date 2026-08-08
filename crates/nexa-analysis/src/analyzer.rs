@@ -37,13 +37,13 @@ use crate::{
     ArtifactFileId, ArtifactFileTable, BinaryOperator, BuiltinOperationIr, BuiltinVariantIr,
     CompilationLimits, CompilationProfile, DeclarationVisibility, Definition, DefinitionId,
     DefinitionKind, ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr,
-    FieldLayoutIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
-    HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr,
-    IrAbandonPolicy, IrCancelPolicy, IrEffect, IrHostFunctionMode, IrLiteral, IrType,
-    LifecycleBindingsIr, ModuleGraph, ModuleGraphError, ModuleKey, ModulePath,
-    NormalizedPackagePath, PackageId, PackageKind, PackageSemanticMetadata, PackageSourceSet,
-    PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey, ReplCellInput,
-    ReplSessionSnapshot, ResolvedBuildInput, ResolvedReference, ResolvedTestInput,
+    FieldLayoutIr, GenericNominalInstanceIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr,
+    HostFunctionBindingIr, HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr,
+    HostVariantBindingIr, InherentMethodIr, IrAbandonPolicy, IrCancelPolicy, IrEffect,
+    IrHostFunctionMode, IrLiteral, IrType, LifecycleBindingsIr, ModuleGraph, ModuleGraphError,
+    ModuleKey, ModulePath, NormalizedPackagePath, PackageId, PackageKind, PackageSemanticMetadata,
+    PackageSourceSet, PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey,
+    ReplCellInput, ReplSessionSnapshot, ResolvedBuildInput, ResolvedReference, ResolvedTestInput,
     SemanticFingerprintRecord, SourceKey, SourceRange, SourceRole, SourceSetFingerprint,
     StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr, StateMetadataIr,
     StateSchemaFingerprint, StateTypeIr, TestDefinitionIr, TypedBlockIr, TypedDeclarationBody,
@@ -591,6 +591,8 @@ struct Analyzer<'a> {
     symbols: BTreeMap<(PackageId, ModulePath, String), DefinitionId>,
     builtin_types: BTreeMap<String, DefinitionId>,
     members: BTreeMap<(DefinitionId, String), DefinitionId>,
+    inherent_method_owners: BTreeMap<DefinitionId, DefinitionId>,
+    inherent_method_receivers: BTreeSet<DefinitionId>,
     declaration_records: Vec<DeclRecord>,
     function_signatures: BTreeMap<DefinitionId, FunctionSignature>,
     generic_instances: BTreeMap<GenericInstanceKey, DefinitionId>,
@@ -817,6 +819,8 @@ impl<'a> Analyzer<'a> {
             symbols: BTreeMap::new(),
             builtin_types: BTreeMap::new(),
             members: BTreeMap::new(),
+            inherent_method_owners: BTreeMap::new(),
+            inherent_method_receivers: BTreeSet::new(),
             declaration_records: Vec::new(),
             function_signatures: BTreeMap::new(),
             generic_instances: BTreeMap::new(),
@@ -1826,6 +1830,51 @@ impl<'a> Analyzer<'a> {
             })
             .collect::<Vec<_>>();
         standard_functions.sort_by_key(|binding| binding.definition);
+        let mut inherent_methods = self
+            .inherent_method_owners
+            .iter()
+            .filter_map(|(definition, owner)| {
+                let signature = self.function_signatures.get(definition)?;
+                let record = self
+                    .declaration_records
+                    .iter()
+                    .find(|record| record.definition == *definition)?;
+                let DeclarationKind::Function(function) = &record.declaration.kind else {
+                    return None;
+                };
+                Some(InherentMethodIr {
+                    definition: *definition,
+                    owner: *owner,
+                    name: function.name.text.clone(),
+                    has_receiver: function.has_receiver,
+                    impl_type_parameter_count: function.impl_type_parameter_count,
+                    type_parameters: signature.type_parameters.clone(),
+                    parameters: signature
+                        .parameters
+                        .iter()
+                        .zip(signature.parameter_types.iter())
+                        .filter_map(|(parameter, ty)| {
+                            self.definitions
+                                .get(parameter.0 as usize)
+                                .map(|definition| (definition.name.clone(), ty.clone()))
+                        })
+                        .collect(),
+                    result: signature.result.clone(),
+                    effect: signature.effect,
+                })
+            })
+            .collect::<Vec<_>>();
+        inherent_methods.sort_by_key(|method| method.definition);
+        let mut generic_nominal_instances = self
+            .generic_type_instance_origins
+            .iter()
+            .map(|(instance, origin)| GenericNominalInstanceIr {
+                instance: *instance,
+                declaration: origin.definition,
+                arguments: origin.arguments.clone(),
+            })
+            .collect::<Vec<_>>();
+        generic_nominal_instances.sort_by_key(|instance| instance.instance);
         PackageSemanticMetadata {
             entry_module: self.input.root_manifest.entry().cloned(),
             state_types: state_types.into(),
@@ -1836,6 +1885,8 @@ impl<'a> Analyzer<'a> {
             lifecycle: self.lifecycle_bindings(),
             repl_entry: self.repl_entry.clone(),
             standard_functions: standard_functions.into(),
+            inherent_methods: inherent_methods.into(),
+            generic_nominal_instances: generic_nominal_instances.into(),
             generic_function_instances: self
                 .generic_instances
                 .keys()
@@ -2112,6 +2163,9 @@ impl<'a> Analyzer<'a> {
                         name: identifier(&generated_name),
                         type_parameters: Vec::new(),
                         where_constraints: Vec::new(),
+                        impl_target: None,
+                        impl_type_parameter_count: 0,
+                        has_receiver: false,
                         parameters: Vec::new(),
                         result: None,
                         body: ast::Block {
@@ -2172,6 +2226,9 @@ impl<'a> Analyzer<'a> {
                     name: identifier("main"),
                     type_parameters: Vec::new(),
                     where_constraints: Vec::new(),
+                    impl_target: None,
+                    impl_type_parameter_count: 0,
+                    has_receiver: false,
                     parameters: vec![ast::Parameter {
                         mutable: false,
                         name: identifier("args"),
@@ -2423,9 +2480,32 @@ impl<'a> Analyzer<'a> {
             if prior_has_compiler_module && module.compiler_provided {
                 continue;
             }
-            for (declaration_index, declaration) in
-                module.ast.declarations.clone().into_iter().enumerate()
-            {
+            let declarations = module
+                .ast
+                .declarations
+                .clone()
+                .into_iter()
+                .enumerate()
+                .collect::<Vec<_>>();
+            // Nominal types and ordinary declarations establish the module namespace before
+            // inherent methods are attached, so an impl remains declaration-order independent.
+            let ordered_declarations = declarations
+                .iter()
+                .filter(|(_, declaration)| {
+                    !matches!(
+                        &declaration.kind,
+                        DeclarationKind::Function(function) if function.impl_target.is_some()
+                    )
+                })
+                .chain(declarations.iter().filter(|(_, declaration)| {
+                    matches!(
+                        &declaration.kind,
+                        DeclarationKind::Function(function) if function.impl_target.is_some()
+                    )
+                }));
+            for (declaration_index, declaration) in ordered_declarations {
+                let declaration_index = *declaration_index;
+                let declaration = declaration.clone();
                 let Some((name, kind, mut symbol_kind, mut effect)) =
                     declaration_surface(&declaration)
                 else {
@@ -2449,12 +2529,27 @@ impl<'a> Analyzer<'a> {
                     // production `fn` remains Ordinary.
                     effect = IrEffect::Immediate;
                 }
+                let impl_owner = match &declaration.kind {
+                    DeclarationKind::Function(function) => function
+                        .impl_target
+                        .as_ref()
+                        .and_then(|target| self.resolve_impl_owner(&module, function, target)),
+                    _ => None,
+                };
+                let is_inherent_method = matches!(
+                    &declaration.kind,
+                    DeclarationKind::Function(function) if function.impl_target.is_some()
+                );
                 let visibility = declaration_visibility(declaration.visibility);
+                let identity_name = impl_owner.map_or_else(
+                    || name.clone(),
+                    |owner| format!("{}::{name}", self.definitions[owner.0 as usize].name),
+                );
                 let canonical_identity = self.canonical_identity(
                     &module,
                     &declaration,
                     symbol_kind,
-                    &name,
+                    &identity_name,
                     declaration.range,
                     true,
                     declaration_index,
@@ -2462,7 +2557,7 @@ impl<'a> Analyzer<'a> {
                 let definition = self.allocate_definition(
                     module.key.package.clone(),
                     module.key.module.clone(),
-                    name.clone(),
+                    identity_name.clone(),
                     kind,
                     visibility,
                     IrType::Unit,
@@ -2473,12 +2568,17 @@ impl<'a> Analyzer<'a> {
                 if is_repl_entry {
                     self.repl_entry_definition = Some(definition);
                 }
-                let key = (
-                    module.key.package.clone(),
-                    module.key.module.clone(),
-                    name.clone(),
-                );
-                if let Some(prior) = self.symbols.insert(key, definition) {
+                let prior_symbol = if is_inherent_method {
+                    None
+                } else {
+                    let key = (
+                        module.key.package.clone(),
+                        module.key.module.clone(),
+                        name.clone(),
+                    );
+                    self.symbols.insert(key, definition)
+                };
+                if let Some(prior) = prior_symbol {
                     let prior_definition = self.definitions[prior.0 as usize].clone();
                     let is_repl_shadow = self.mode == AnalysisMode::ReplCell
                         && prior_definition.span.source != module.source
@@ -2524,6 +2624,38 @@ impl<'a> Analyzer<'a> {
 
                 match &declaration.kind {
                     DeclarationKind::Function(function) => {
+                        if let Some(owner) = impl_owner {
+                            let member_key = (owner, name.clone());
+                            if let Some(prior) = self.members.insert(member_key, definition) {
+                                let prior = self.definitions[prior.0 as usize].clone();
+                                self.diagnostics.push(
+                                    Diagnostic::new(
+                                        ErrorCode::NX2704,
+                                        Severity::Error,
+                                        format!(
+                                            "duplicate inherent member `{}` on `{}`",
+                                            name, self.definitions[owner.0 as usize].name
+                                        ),
+                                    )
+                                    .with_label(Label::primary(
+                                        source_identity(&module.source),
+                                        byte_range(function.name.range),
+                                        "member is declared more than once",
+                                    ))
+                                    .with_related(
+                                        RelatedLocation::new(
+                                            source_identity(&prior.span.source),
+                                            range_from_source(&prior.span),
+                                            "first member declaration",
+                                        ),
+                                    ),
+                                );
+                            }
+                            self.inherent_method_owners.insert(definition, owner);
+                            if function.has_receiver {
+                                self.inherent_method_receivers.insert(definition);
+                            }
+                        }
                         let mut parameters = Vec::new();
                         for parameter in &function.parameters {
                             let id = self.allocate_definition(
@@ -2744,6 +2876,100 @@ impl<'a> Analyzer<'a> {
                 });
             }
         }
+    }
+
+    fn resolve_impl_owner(
+        &mut self,
+        module: &ParsedModule,
+        function: &ast::FunctionDeclaration,
+        target: &TypeRef,
+    ) -> Option<DefinitionId> {
+        let (TypeKind::Named(path) | TypeKind::Generic { base: path, .. }) = &target.kind else {
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(target.range),
+                "inherent impl target must be a named Struct, Enum, or Class",
+                "collection, tuple, and other structural types cannot declare inherent methods",
+            );
+            return None;
+        };
+        let Some(owner) = self.lookup_symbol_path(module, path) else {
+            self.push_source_error(
+                ErrorCode::NX2002,
+                &module.source,
+                byte_range(target.range),
+                format!("unknown impl target `{}`", path.text()),
+                "the target type must be declared in this package",
+            );
+            return None;
+        };
+        let definition = &self.definitions[owner.0 as usize];
+        if !matches!(
+            definition.kind,
+            DefinitionKind::Struct | DefinitionKind::Enum | DefinitionKind::Class
+        ) {
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(target.range),
+                "inherent impl target must be a Struct, Enum, or Class",
+                "only user nominal types have an inherent method namespace",
+            );
+            return None;
+        }
+        if definition.package_id != module.key.package {
+            self.push_source_error(
+                ErrorCode::NX2706,
+                &module.source,
+                byte_range(target.range),
+                "cannot add inherent methods to a type from another package",
+                "declare the impl in the package that owns the type",
+            );
+            return None;
+        }
+        let impl_parameters = &function.type_parameters[..function
+            .impl_type_parameter_count
+            .min(function.type_parameters.len())];
+        match &target.kind {
+            TypeKind::Named(_) if !impl_parameters.is_empty() => {
+                self.push_source_error(
+                    ErrorCode::NX2101,
+                    &module.source,
+                    byte_range(target.range),
+                    "non-generic impl target cannot declare type parameters",
+                    "remove the impl type parameters or apply them directly to a generic target",
+                );
+                return None;
+            }
+            TypeKind::Generic { arguments, .. } => {
+                let valid = arguments.len() == impl_parameters.len()
+                    && arguments
+                        .iter()
+                        .zip(impl_parameters)
+                        .all(|(argument, parameter)| {
+                            matches!(
+                                &argument.kind,
+                                TypeKind::Named(path)
+                                    if path.segments.len() == 1
+                                        && path.segments[0].text == parameter.name.text
+                            )
+                        });
+                if !valid {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(target.range),
+                        "generic impl target must apply its type parameters once, in declaration order",
+                        "use a general form such as `impl<T, U> Pair<T, U>`; specialization is not supported",
+                    );
+                    return None;
+                }
+            }
+            TypeKind::Named(_) | TypeKind::Error => {}
+            _ => unreachable!("structural impl targets were rejected above"),
+        }
+        Some(owner)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9567,6 +9793,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 arguments,
                 expected,
                 awaited,
+                None,
             ),
             ExpressionKind::Construct {
                 ty,
@@ -11514,7 +11741,69 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn inherent_method_for_type(&self, ty: &IrType, name: &str) -> Option<DefinitionId> {
+        let IrType::Named(owner) = ty else {
+            return None;
+        };
+        let template = self
+            .analyzer
+            .generic_type_instance_origins
+            .get(owner)
+            .map_or(*owner, |origin| origin.definition);
+        self.analyzer
+            .members
+            .get(&(template, name.to_owned()))
+            .copied()
+            .filter(|method| self.analyzer.inherent_method_receivers.contains(method))
+    }
+
+    fn current_impl_type_definition(&mut self) -> Option<DefinitionId> {
+        let current = self.current_function?;
+        let method = self
+            .analyzer
+            .generic_instance_origins
+            .get(&current)
+            .map_or(current, |origin| origin.function);
+        let owner = self.analyzer.inherent_method_owners.get(&method).copied()?;
+        let Some((_record, declaration)) = self.analyzer.generic_type_declaration(owner) else {
+            return Some(owner);
+        };
+        let argument_count = declaration.type_parameters.len();
+        let Some(origin) = self.analyzer.generic_instance_origins.get(&current) else {
+            return Some(owner);
+        };
+        let arguments = origin
+            .arguments
+            .iter()
+            .take(argument_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        if arguments.len() != argument_count {
+            return None;
+        }
+        let instance = self
+            .analyzer
+            .request_generic_type_instance(GenericTypeInstanceKey {
+                definition: owner,
+                arguments,
+            });
+        self.analyzer.populate_pending_generic_type_instances();
+        instance
+    }
+
+    fn inherent_member_for_owner(&self, owner: DefinitionId, name: &str) -> Option<DefinitionId> {
+        let template = self
+            .analyzer
+            .generic_type_instance_origins
+            .get(&owner)
+            .map_or(owner, |origin| origin.definition);
+        self.analyzer
+            .members
+            .get(&(template, name.to_owned()))
+            .copied()
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn check_call(
         &mut self,
         whole: &Expression,
@@ -11523,9 +11812,24 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         arguments: &[Expression],
         expected: Option<&IrType>,
         awaited: bool,
+        pre_resolved: Option<DefinitionId>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
-        if let ExpressionKind::Name(path) = &callee.kind {
+        let mut pre_resolved = pre_resolved;
+        if pre_resolved.is_none()
+            && let ExpressionKind::Name(path) = &callee.kind
+            && let [root, member] = path.segments.as_slice()
+            && root.text == "Self"
+            && let Some(owner) = self.current_impl_type_definition()
+            && let Some(method) = self.inherent_member_for_owner(owner, &member.text)
+        {
+            self.analyzer
+                .record_reference(&self.module, path.range, method);
+            pre_resolved = Some(method);
+        }
+        if pre_resolved.is_none()
+            && let ExpressionKind::Name(path) = &callee.kind
+        {
             let name = path.text();
             if let Some(intrinsic) =
                 self.check_migration_intrinsic(whole, &name, type_arguments, arguments, expected)
@@ -11533,7 +11837,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 return intrinsic;
             }
         }
-        if let ExpressionKind::Member { receiver, member } = &callee.kind {
+        if pre_resolved.is_none()
+            && let ExpressionKind::Member { receiver, member } = &callee.kind
+        {
             if let ExpressionKind::Name(path) = &receiver.kind
                 && let [root] = path.segments.as_slice()
                 && matches!(root.text.as_str(), "old" | "new")
@@ -11549,7 +11855,75 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     return intrinsic;
                 }
             }
+            if let Some(receiver_type) = self.infer_expression_type(receiver, true)
+                && let Some(method) = self.inherent_method_for_type(&receiver_type, &member.text)
+            {
+                let method_definition = self.analyzer.definitions[method.0 as usize].clone();
+                if !Analyzer::visible_from(&method_definition, &self.module.key) {
+                    let declaration_span = self.analyzer.definition_name_span(method);
+                    self.analyzer.diagnostics.push(
+                        Diagnostic::new(
+                            ErrorCode::NX2705,
+                            Severity::Error,
+                            format!(
+                                "`{}` is not visible from {}",
+                                member.text, self.module.key.module
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            source_identity(&self.module.source),
+                            byte_range(member.range),
+                            "inaccessible method",
+                        ))
+                        .with_related(RelatedLocation::new(
+                            source_identity(&declaration_span.source),
+                            range_from_source(&declaration_span),
+                            format!(
+                                "declared using {} visibility",
+                                visibility_name(method_definition.visibility)
+                            ),
+                        )),
+                    );
+                }
+                let mut method_arguments = Vec::with_capacity(arguments.len() + 1);
+                method_arguments.push((**receiver).clone());
+                method_arguments.extend_from_slice(arguments);
+                self.analyzer
+                    .record_reference(&self.module, member.range, method);
+                return self.check_call(
+                    whole,
+                    callee,
+                    type_arguments,
+                    &method_arguments,
+                    expected,
+                    awaited,
+                    Some(method),
+                );
+            }
             let receiver = self.check_expression(receiver, None);
+            if let Some(method) = self.inherent_method_for_type(&receiver.ty, &member.text) {
+                let ExpressionKind::Member {
+                    receiver: source_receiver,
+                    ..
+                } = &callee.kind
+                else {
+                    unreachable!("member call branch")
+                };
+                let mut method_arguments = Vec::with_capacity(arguments.len() + 1);
+                method_arguments.push((**source_receiver).clone());
+                method_arguments.extend_from_slice(arguments);
+                self.analyzer
+                    .record_reference(&self.module, member.range, method);
+                return self.check_call(
+                    whole,
+                    callee,
+                    type_arguments,
+                    &method_arguments,
+                    expected,
+                    awaited,
+                    Some(method),
+                );
+            }
             return self
                 .check_builtin_method_call(whole, receiver, member, type_arguments, arguments)
                 .unwrap_or_else(|| {
@@ -11560,35 +11934,46 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     self.error_expression(span.clone())
                 });
         }
-        let ExpressionKind::Name(path) = &callee.kind else {
-            self.type_error(
-                span.clone(),
-                "callee must resolve to a named function or method",
-            );
-            return self.error_expression(span);
+        let path = match &callee.kind {
+            ExpressionKind::Name(path) => Some(path),
+            _ if pre_resolved.is_some() => None,
+            _ => {
+                self.type_error(
+                    span.clone(),
+                    "callee must resolve to a named function or method",
+                );
+                return self.error_expression(span);
+            }
         };
-        if let Some(expression) =
-            self.check_builtin_constructor_call(whole, path, type_arguments, arguments, expected)
-        {
-            return expression;
+        if let Some(path) = path {
+            if let Some(expression) = self.check_builtin_constructor_call(
+                whole,
+                path,
+                type_arguments,
+                arguments,
+                expected,
+            ) {
+                return expression;
+            }
+            if let Some(expression) =
+                self.check_builtin_variant_call(whole, path, type_arguments, arguments, expected)
+            {
+                return expression;
+            }
+            if let Some((receiver, method)) = self.check_receiver_method_path(path) {
+                return self
+                    .check_builtin_method_call(whole, receiver, method, type_arguments, arguments)
+                    .unwrap_or_else(|| {
+                        self.type_error(
+                            span.clone(),
+                            &format!("unknown method `{}` for receiver type", method.text),
+                        );
+                        self.error_expression(span.clone())
+                    });
+            }
         }
-        if let Some(expression) =
-            self.check_builtin_variant_call(whole, path, type_arguments, arguments, expected)
-        {
-            return expression;
-        }
-        if let Some((receiver, method)) = self.check_receiver_method_path(path) {
-            return self
-                .check_builtin_method_call(whole, receiver, method, type_arguments, arguments)
-                .unwrap_or_else(|| {
-                    self.type_error(
-                        span.clone(),
-                        &format!("unknown method `{}` for receiver type", method.text),
-                    );
-                    self.error_expression(span.clone())
-                });
-        }
-        if let Some(definition) = self.analyzer.lookup_symbol_path(&self.module, path)
+        if let Some(path) = path
+            && let Some(definition) = self.analyzer.lookup_symbol_path(&self.module, path)
             && self.analyzer.definitions[definition.0 as usize].kind == DefinitionKind::Variant
         {
             let generic_owner = self
@@ -11730,11 +12115,19 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             };
             return self.check_enum_variant_call(whole, definition, arguments, None);
         }
-        let Some(mut definition) =
-            self.analyzer
-                .resolve_symbol_path(&self.module, path, SymbolUse::Callable)
-        else {
-            return self.error_expression(span);
+        let mut definition = if let Some(definition) = pre_resolved {
+            definition
+        } else {
+            let Some(path) = path else {
+                return self.error_expression(span);
+            };
+            let Some(definition) =
+                self.analyzer
+                    .resolve_symbol_path(&self.module, path, SymbolUse::Callable)
+            else {
+                return self.error_expression(span);
+            };
+            definition
         };
         let resolved_callable = &self.analyzer.definitions[definition.0 as usize];
         if !self.module.compiler_provided
@@ -13341,7 +13734,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         expected: Option<&IrType>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
-        let resolved_construct = self.analyzer.lookup_symbol_path(&self.module, ty);
+        let resolved_construct = if ty.text() == "Self" {
+            self.current_impl_type_definition()
+        } else {
+            self.analyzer.lookup_symbol_path(&self.module, ty)
+        };
         let generic_variant_template = resolved_construct
             .filter(|definition| {
                 self.analyzer.definitions[definition.0 as usize].kind == DefinitionKind::Variant
@@ -13568,6 +13965,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             };
         }
         let definition = if let Some(definition) = generic_definition {
+            definition
+        } else if let Some(definition) = resolved_construct {
+            if !type_arguments.is_empty() {
+                self.type_error(
+                    span.clone(),
+                    "non-generic type does not accept explicit type arguments",
+                );
+            }
             definition
         } else {
             if !type_arguments.is_empty() {

@@ -150,6 +150,7 @@ pub enum Keyword {
     Struct,
     Enum,
     Class,
+    Impl,
     Use,
     As,
     In,

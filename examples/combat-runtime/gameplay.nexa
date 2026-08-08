@@ -96,7 +96,7 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
         Result::Err(error) => 0,
     };
     let sample = common::Holder { value: common::identity(amount) };
-    return sample.value + mapped_length + values.len();
+    return sample.get() + mapped_length + values.len();
 }
 
 fn state_probe(handle: StateHandle<EnemyBrain>) -> i32 {

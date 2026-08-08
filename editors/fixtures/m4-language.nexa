@@ -16,6 +16,16 @@ pub class Box<T> {
     value: T,
 }
 
+impl<T> Box<T> {
+    pub fn get(self) -> T {
+        return self.value;
+    }
+
+    fn replace<U>(self, value: U) -> Box<U> {
+        return Box { value };
+    }
+}
+
 fn choose<T>(left: T, right: T) -> T
 where
     T: PartialOrd,

@@ -262,9 +262,9 @@ Language v3 = IN PROGRESS
 ```
 
 Language v3 adds `Set<T>`, collection iteration, monomorphized generic
-functions and nominal Struct/Enum/Class types, closed
-`Copy`/`PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash`/`Display` and arithmetic
-operator bounds, and numeric receiver methods. `for item in collection` iterates over
+functions and nominal Struct/Enum/Class types, inherent `impl` methods with an
+ordinary `self` parameter, closed `PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash`/`Display`
+and arithmetic operator bounds, and numeric receiver methods. `for item in collection` iterates over
 `Array`, `Buffer`, and `Set`; `for (key, value) in map` iterates over
 `Map<K, V>` with key-value pair bindings. The existing range-based `for i in
 start..end` remains unchanged.

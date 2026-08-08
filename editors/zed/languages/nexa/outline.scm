@@ -16,6 +16,11 @@
 (enum_variant
   name: (_) @name) @item
 
+(impl_declaration
+  keyword: (_) @context
+  target: (_) @name
+  body: (_)) @item
+
 (function_declaration
   keyword: (_) @context
   name: (_) @name

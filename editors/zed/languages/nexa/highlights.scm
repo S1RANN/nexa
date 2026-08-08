@@ -8,6 +8,7 @@
 (struct_keyword) @keyword
 (enum_keyword) @keyword
 (class_keyword) @keyword
+(impl_keyword) @keyword
 (const_keyword) @keyword
 (where_keyword) @keyword
 (pub_keyword) @keyword
@@ -54,6 +55,11 @@
 
 (enum_declaration
   name: (type_identifier) @type)
+
+(impl_declaration
+  target: (_) @type)
+
+(self_parameter) @variable.parameter.builtin
 
 (function_declaration
   name: (identifier) @function)

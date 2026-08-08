@@ -53,15 +53,16 @@ pub use identity::{
 pub use ir::{
     BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, CollectionIterationKindIr, Definition,
     DefinitionId, DefinitionKind, ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr,
-    FieldLayoutIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
-    HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr,
-    IrAbandonPolicy, IrCancelPolicy, IrCompilationKind, IrEffect, IrHostFunctionMode, IrLiteral,
-    IrType, LifecycleBindingsIr, MigrationIntrinsicIr, PackageSemanticMetadata, ReplEntrypointIr,
-    ResolvedReference, SourceRange, StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr,
-    StateMetadataIr, StateTypeIr, TestDefinitionIr, TypedBlockIr, TypedDeclarationBody,
-    TypedDeclarationIr, TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedIrError,
-    TypedMatchArmIr, TypedModuleIr, TypedPackageIr, TypedPatternIr, TypedPatternKind, TypedPlaceIr,
-    TypedStatementIr, TypedTypeLayoutIr, UnaryOperator, VariantLayoutIr,
+    FieldLayoutIr, GenericNominalInstanceIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr,
+    HostFunctionBindingIr, HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr,
+    HostVariantBindingIr, InherentMethodIr, IrAbandonPolicy, IrCancelPolicy, IrCompilationKind,
+    IrEffect, IrHostFunctionMode, IrLiteral, IrType, LifecycleBindingsIr, MigrationIntrinsicIr,
+    PackageSemanticMetadata, ReplEntrypointIr, ResolvedReference, SourceRange,
+    StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr, StateMetadataIr, StateTypeIr,
+    TestDefinitionIr, TypedBlockIr, TypedDeclarationBody, TypedDeclarationIr, TypedExpressionIr,
+    TypedExpressionKind, TypedFunctionIr, TypedIrError, TypedMatchArmIr, TypedModuleIr,
+    TypedPackageIr, TypedPatternIr, TypedPatternKind, TypedPlaceIr, TypedStatementIr,
+    TypedTypeLayoutIr, UnaryOperator, VariantLayoutIr,
 };
 pub use loader::{
     LoadedPackageDirectory, PackageLoadError, load_package_directory,
@@ -84,8 +85,8 @@ pub use query::{
 };
 pub use repl::*;
 pub use semantic::{
-    InstantiatedParameter, InstantiatedSignature, call_signature_at, definition_at, display_type,
-    semantic_span_at, type_at,
+    InstantiatedParameter, InstantiatedSignature, MethodCandidate, associated_functions_for_type,
+    call_signature_at, definition_at, display_type, methods_for_type, semantic_span_at, type_at,
 };
 pub use snippet::{
     DEFAULT_SNIPPET_MODULE, SnippetModuleInferenceError, SnippetModuleInferenceErrorKind,

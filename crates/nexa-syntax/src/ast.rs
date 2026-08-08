@@ -159,6 +159,12 @@ pub struct FunctionDeclaration {
     pub name: Identifier,
     pub type_parameters: Vec<GenericParameter>,
     pub where_constraints: Vec<GenericConstraint>,
+    /// The nominal target of an inherent method. `None` for an ordinary function.
+    pub impl_target: Option<TypeRef>,
+    /// Number of leading type parameters declared by the enclosing impl.
+    pub impl_type_parameter_count: usize,
+    /// Whether this method declares the ordinary `self` receiver.
+    pub has_receiver: bool,
     pub parameters: Vec<Parameter>,
     pub result: Option<TypeRef>,
     pub body: Block,
@@ -587,7 +593,9 @@ impl<'a> Parser<'a> {
             }
             self.reject_legacy_top_level_syntax();
             let before = self.cursor;
-            if self.declaration_starts_here() {
+            if self.at_keyword(Keyword::Impl) {
+                declarations.extend(self.impl_declarations());
+            } else if self.declaration_starts_here() {
                 declarations.push(self.parse_declaration());
             } else {
                 match self.statement(true) {
@@ -741,6 +749,7 @@ impl<'a> Parser<'a> {
                             | Keyword::Struct
                             | Keyword::Enum
                             | Keyword::Class
+                            | Keyword::Impl
                     )
             )
         ) || (self.at_keyword(Keyword::Const)
@@ -757,7 +766,7 @@ impl<'a> Parser<'a> {
         let attributes = self.attributes();
         let visibility = self.visibility();
         let kind = if self.function_starts_here() {
-            DeclarationKind::Function(self.function())
+            DeclarationKind::Function(self.function(None, Vec::new(), Vec::new()))
         } else if self.at_keyword(Keyword::Struct) {
             DeclarationKind::Type(self.type_declaration(TypeDeclarationKind::Struct))
         } else if self.at_keyword(Keyword::Enum) {
@@ -1012,7 +1021,12 @@ impl<'a> Parser<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn function(&mut self) -> FunctionDeclaration {
+    fn function(
+        &mut self,
+        impl_target: Option<TypeRef>,
+        mut impl_type_parameters: Vec<GenericParameter>,
+        mut impl_where_constraints: Vec<GenericConstraint>,
+    ) -> FunctionDeclaration {
         let start = self.current_range();
         let is_async = self.take_keyword(Keyword::Async).is_some();
         self.expect_keyword(Keyword::Fn, "expected `fn`");
@@ -1033,12 +1047,16 @@ impl<'a> Parser<'a> {
             self.identifier()
         };
         self.require_snake_case(&name, "function");
-        let type_parameters = if missing_name {
+        let impl_type_parameter_count = impl_type_parameters.len();
+        let method_type_parameters = if missing_name {
             Vec::new()
         } else {
             self.function_type_parameters()
         };
+        impl_type_parameters.extend(method_type_parameters);
+        let type_parameters = impl_type_parameters;
         let mut parameters = Vec::new();
+        let mut has_receiver = false;
         let mut parameter_error = false;
         let mut header_broken = missing_name;
         if !missing_name {
@@ -1056,6 +1074,24 @@ impl<'a> Parser<'a> {
                 }
                 let parameter_name = self.identifier();
                 self.require_snake_case(&parameter_name, "parameter");
+                if parameters.is_empty()
+                    && parameter_name.text == "self"
+                    && impl_target.is_some()
+                    && !self.at(TokenKind::Colon)
+                {
+                    let ty = impl_target.clone().expect("inherent method target exists");
+                    parameters.push(Parameter {
+                        mutable: true,
+                        range: parameter_name.range,
+                        name: parameter_name,
+                        ty,
+                    });
+                    has_receiver = true;
+                    if self.take(TokenKind::Comma).is_none() {
+                        break;
+                    }
+                    continue;
+                }
                 if self.take(TokenKind::Colon).is_none() {
                     if !parameter_error {
                         self.error(self.current_range(), "expected `:` after parameter name");
@@ -1092,16 +1128,26 @@ impl<'a> Parser<'a> {
                 self.error(self.current_range(), "expected `)` after parameters");
             }
         }
-        let result = if missing_name {
+        let mut result = if missing_name {
             None
         } else {
             self.take(TokenKind::Arrow).map(|_| self.ty())
         };
-        let where_constraints = if missing_name {
+        if let Some(target) = impl_target.as_ref() {
+            for parameter in &mut parameters {
+                replace_self_type(&mut parameter.ty, target);
+            }
+            if let Some(result) = &mut result {
+                replace_self_type(result, target);
+            }
+        }
+        let method_where_constraints = if missing_name {
             Vec::new()
         } else {
             self.function_where_constraints()
         };
+        impl_where_constraints.extend(method_where_constraints);
+        let where_constraints = impl_where_constraints;
         let body = if self.at(TokenKind::LBrace) {
             self.block()
         } else if header_broken {
@@ -1120,11 +1166,58 @@ impl<'a> Parser<'a> {
             name,
             type_parameters,
             where_constraints,
+            impl_target,
+            impl_type_parameter_count,
+            has_receiver,
             parameters,
             result,
             range: cover(start, body.range),
             body,
         }
+    }
+
+    fn impl_declarations(&mut self) -> Vec<Declaration> {
+        let impl_start = self.bump_range();
+        let type_parameters = self.function_type_parameters();
+        let target = self.ty();
+        let where_constraints = self.function_where_constraints();
+        self.expect(TokenKind::LBrace, "expected `{` after impl target");
+        let mut declarations = Vec::new();
+        while !self.at_end() && !self.at(TokenKind::RBrace) {
+            let first = self.current_original_index();
+            let docs = self.leading_docs(first);
+            let start = docs
+                .first()
+                .map_or_else(|| self.current_range(), |doc| doc.range);
+            let attributes = self.attributes();
+            let visibility = self.visibility();
+            if !self.function_starts_here() {
+                self.error_current("an impl block may contain only function declarations");
+                while !self.at_end() && !self.function_starts_here() && !self.at(TokenKind::RBrace)
+                {
+                    self.bump();
+                }
+                continue;
+            }
+            let function = self.function(
+                Some(target.clone()),
+                type_parameters.clone(),
+                where_constraints.clone(),
+            );
+            let end = function.range;
+            declarations.push(Declaration {
+                docs,
+                attributes,
+                visibility,
+                kind: DeclarationKind::Function(function),
+                range: cover(start, end),
+            });
+        }
+        self.expect(TokenKind::RBrace, "expected `}` after impl block");
+        if declarations.is_empty() {
+            self.error(impl_start, "an impl block must declare at least one method");
+        }
+        declarations
     }
 
     fn type_declaration(&mut self, kind: TypeDeclarationKind) -> TypeDeclaration {
@@ -2767,6 +2860,31 @@ impl<'a> Parser<'a> {
 enum ParsedStatement {
     Statement(Statement),
     Tail(Expression),
+}
+
+fn replace_self_type(ty: &mut TypeRef, target: &TypeRef) {
+    match &mut ty.kind {
+        TypeKind::Named(path) if path.text() == "Self" => {
+            ty.kind = target.kind.clone();
+        }
+        TypeKind::Generic { arguments, .. } | TypeKind::Tuple(arguments) => {
+            for argument in arguments {
+                replace_self_type(argument, target);
+            }
+        }
+        TypeKind::Array(inner) | TypeKind::Set(inner) | TypeKind::Option(inner) => {
+            replace_self_type(inner, target);
+        }
+        TypeKind::Map { key, value } => {
+            replace_self_type(key, target);
+            replace_self_type(value, target);
+        }
+        TypeKind::Result { ok, error } => {
+            replace_self_type(ok, target);
+            replace_self_type(error, target);
+        }
+        TypeKind::Named(_) | TypeKind::Error => {}
+    }
 }
 
 fn declaration_range(kind: &DeclarationKind) -> Option<TextRange> {

@@ -1,7 +1,7 @@
 use crate::{
-    DefinitionId, DefinitionKind, IrEffect, IrType, MigrationIntrinsicIr, SourceKey, SourceRange,
-    TypedBlockIr, TypedDeclarationBody, TypedExpressionIr, TypedExpressionKind, TypedPackageIr,
-    TypedPlaceIr, TypedStatementIr,
+    DeclarationVisibility, DefinitionId, DefinitionKind, IrEffect, IrType, MigrationIntrinsicIr,
+    SourceKey, SourceRange, TypedBlockIr, TypedDeclarationBody, TypedExpressionIr,
+    TypedExpressionKind, TypedPackageIr, TypedPlaceIr, TypedStatementIr,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +15,17 @@ pub struct InstantiatedSignature {
     pub declaration: DefinitionId,
     pub instance: DefinitionId,
     pub name: String,
+    pub parameters: Vec<InstantiatedParameter>,
+    pub result: IrType,
+    pub effect: IrEffect,
+    pub span: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MethodCandidate {
+    pub declaration: DefinitionId,
+    pub name: String,
+    pub type_parameters: Vec<String>,
     pub parameters: Vec<InstantiatedParameter>,
     pub result: IrType,
     pub effect: IrEffect,
@@ -160,9 +171,15 @@ pub fn call_signature_at(
                 )
         })
         .map_or(instance, |candidate| candidate.id);
+    let has_receiver = analysis
+        .metadata()
+        .inherent_methods
+        .iter()
+        .any(|method| method.definition == declaration && method.has_receiver);
     let parameters = function
         .parameters
         .iter()
+        .skip(usize::from(has_receiver))
         .filter_map(|parameter| analysis.definition(*parameter))
         .map(|parameter| InstantiatedParameter {
             name: parameter.name.clone(),
@@ -180,6 +197,154 @@ pub fn call_signature_at(
     })
 }
 
+/// Source-level inherent methods available on a concrete receiver type.
+#[must_use]
+pub fn methods_for_type(
+    analysis: &TypedPackageIr,
+    source: &SourceKey,
+    ty: &IrType,
+) -> Vec<MethodCandidate> {
+    method_candidates_for_type(analysis, source, ty, true)
+}
+
+/// Source-level associated functions available through a concrete type namespace.
+#[must_use]
+pub fn associated_functions_for_type(
+    analysis: &TypedPackageIr,
+    source: &SourceKey,
+    ty: &IrType,
+) -> Vec<MethodCandidate> {
+    method_candidates_for_type(analysis, source, ty, false)
+}
+
+fn method_candidates_for_type(
+    analysis: &TypedPackageIr,
+    source: &SourceKey,
+    ty: &IrType,
+    has_receiver: bool,
+) -> Vec<MethodCandidate> {
+    let IrType::Named(owner) = ty else {
+        return Vec::new();
+    };
+    let origin = analysis
+        .metadata()
+        .generic_nominal_instances
+        .iter()
+        .find(|instance| instance.instance == *owner);
+    let declaration = origin.map_or(*owner, |instance| instance.declaration);
+    let arguments = origin.map_or(&[][..], |instance| instance.arguments.as_slice());
+    analysis
+        .metadata()
+        .inherent_methods
+        .iter()
+        .filter(|method| method.owner == declaration && method.has_receiver == has_receiver)
+        .filter_map(|method| {
+            let definition = analysis.definition(method.definition)?;
+            let current = analysis
+                .modules()
+                .iter()
+                .find(|module| &module.source == source)?;
+            let visible = if definition.package_id == current.package_id
+                && definition.module == current.module
+            {
+                true
+            } else if definition.package_id == current.package_id {
+                definition.visibility != DeclarationVisibility::Private
+            } else {
+                definition.visibility == DeclarationVisibility::Public
+            };
+            if !visible {
+                return None;
+            }
+            Some(MethodCandidate {
+                declaration: method.definition,
+                name: method.name.clone(),
+                type_parameters: method
+                    .type_parameters
+                    .iter()
+                    .skip(method.impl_type_parameter_count)
+                    .cloned()
+                    .collect(),
+                parameters: method
+                    .parameters
+                    .iter()
+                    .skip(usize::from(has_receiver))
+                    .map(|(name, ty)| InstantiatedParameter {
+                        name: name.clone(),
+                        ty: substitute_semantic_type(ty, arguments),
+                    })
+                    .collect(),
+                result: substitute_semantic_type(&method.result, arguments),
+                effect: method.effect,
+                span: definition.span.clone(),
+            })
+        })
+        .collect()
+}
+
+fn substitute_semantic_type(ty: &IrType, arguments: &[IrType]) -> IrType {
+    match ty {
+        IrType::TypeParameter(index) => {
+            arguments
+                .get(usize::from(*index))
+                .cloned()
+                .unwrap_or_else(|| {
+                    IrType::TypeParameter(
+                        index.saturating_sub(u16::try_from(arguments.len()).unwrap_or(u16::MAX)),
+                    )
+                })
+        }
+        IrType::Option(inner) => {
+            IrType::Option(Box::new(substitute_semantic_type(inner, arguments)))
+        }
+        IrType::Result(ok, error) => IrType::Result(
+            Box::new(substitute_semantic_type(ok, arguments)),
+            Box::new(substitute_semantic_type(error, arguments)),
+        ),
+        IrType::Array(inner) => IrType::Array(Box::new(substitute_semantic_type(inner, arguments))),
+        IrType::Map(key, value) => IrType::Map(
+            Box::new(substitute_semantic_type(key, arguments)),
+            Box::new(substitute_semantic_type(value, arguments)),
+        ),
+        IrType::Set(inner) => IrType::Set(Box::new(substitute_semantic_type(inner, arguments))),
+        IrType::Tuple(items) => IrType::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_semantic_type(item, arguments))
+                .collect(),
+        ),
+        IrType::HostRequest(inner) => IrType::HostRequest(
+            inner
+                .as_ref()
+                .map(|inner| Box::new(substitute_semantic_type(inner, arguments))),
+        ),
+        IrType::ResourceToken(inner) => IrType::ResourceToken(
+            inner
+                .as_ref()
+                .map(|inner| Box::new(substitute_semantic_type(inner, arguments))),
+        ),
+        IrType::Snapshot(inner) => {
+            IrType::Snapshot(Box::new(substitute_semantic_type(inner, arguments)))
+        }
+        IrType::Buffer(inner) => {
+            IrType::Buffer(Box::new(substitute_semantic_type(inner, arguments)))
+        }
+        IrType::StateHandle(inner) => {
+            IrType::StateHandle(Box::new(substitute_semantic_type(inner, arguments)))
+        }
+        IrType::Error
+        | IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_) => ty.clone(),
+    }
+}
+
 #[must_use]
 pub fn display_type(ty: &IrType, analysis: &TypedPackageIr) -> String {
     match ty {
@@ -192,10 +357,33 @@ pub fn display_type(ty: &IrType, analysis: &TypedPackageIr) -> String {
         IrType::F64 => "f64".into(),
         IrType::String => "string".into(),
         IrType::Rune => "rune".into(),
-        IrType::Named(definition) => analysis.definition(*definition).map_or_else(
-            || format!("type#{}", definition.0),
-            |definition| definition.name.clone(),
-        ),
+        IrType::Named(definition) => analysis
+            .metadata()
+            .generic_nominal_instances
+            .iter()
+            .find(|instance| instance.instance == *definition)
+            .and_then(|instance| {
+                analysis
+                    .definition(instance.declaration)
+                    .map(|declaration| {
+                        format!(
+                            "{}<{}>",
+                            declaration.name,
+                            instance
+                                .arguments
+                                .iter()
+                                .map(|argument| display_type(argument, analysis))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+            })
+            .or_else(|| {
+                analysis
+                    .definition(*definition)
+                    .map(|definition| definition.name.clone())
+            })
+            .unwrap_or_else(|| format!("type#{}", definition.0)),
         IrType::Option(inner) => format!("Option<{}>", display_type(inner, analysis)),
         IrType::Result(ok, error) => format!(
             "Result<{}, {}>",

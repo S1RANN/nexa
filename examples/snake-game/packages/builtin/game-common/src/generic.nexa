@@ -7,6 +7,12 @@ pub struct Holder<T> {
     value: T,
 }
 
+impl<T> Holder<T> {
+    pub fn get(self) -> T {
+        return self.value;
+    }
+}
+
 pub enum Change<T> {
     Unchanged,
     Updated(T),

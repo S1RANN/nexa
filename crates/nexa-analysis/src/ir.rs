@@ -446,6 +446,29 @@ pub struct StandardFunctionBindingIr {
     pub result: IrType,
 }
 
+/// Source-level inherent method metadata retained for semantic tooling.
+/// Methods still lower to ordinary functions; this registry is not runtime metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InherentMethodIr {
+    pub definition: DefinitionId,
+    pub owner: DefinitionId,
+    pub name: String,
+    pub has_receiver: bool,
+    pub impl_type_parameter_count: usize,
+    pub type_parameters: Vec<String>,
+    pub parameters: Vec<(String, IrType)>,
+    pub result: IrType,
+    pub effect: IrEffect,
+}
+
+/// Links one monomorphized nominal type back to its generic source declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenericNominalInstanceIr {
+    pub instance: DefinitionId,
+    pub declaration: DefinitionId,
+    pub arguments: Vec<IrType>,
+}
+
 /// Authoritative entrypoint for one cumulative REPL cell.
 ///
 /// The compiler uses this metadata instead of guessing a function by name. A synchronous source
@@ -470,6 +493,8 @@ pub struct PackageSemanticMetadata {
     pub lifecycle: LifecycleBindingsIr,
     pub repl_entry: Option<ReplEntrypointIr>,
     pub standard_functions: Arc<[StandardFunctionBindingIr]>,
+    pub inherent_methods: Arc<[InherentMethodIr]>,
+    pub generic_nominal_instances: Arc<[GenericNominalInstanceIr]>,
     pub generic_function_instances: usize,
     pub generic_nominal_type_instances: usize,
     pub public_api_fingerprint: PublicApiFingerprint,
@@ -1155,6 +1180,21 @@ fn validate_metadata<'a>(
         validate_concrete_type(&entry.result, limit)?;
         if !matches!(entry.effect, IrEffect::Ordinary | IrEffect::Task) {
             return Err(TypedIrError::InvalidReplEntrypoint(entry.function));
+        }
+    }
+    for method in metadata.inherent_methods.iter() {
+        validate_id(method.definition, limit)?;
+        validate_id(method.owner, limit)?;
+        for (_, parameter) in &method.parameters {
+            validate_type(parameter, limit)?;
+        }
+        validate_type(&method.result, limit)?;
+    }
+    for instance in metadata.generic_nominal_instances.iter() {
+        validate_id(instance.instance, limit)?;
+        validate_id(instance.declaration, limit)?;
+        for argument in &instance.arguments {
+            validate_type(argument, limit)?;
         }
     }
     let mut standard_functions = BTreeMap::new();

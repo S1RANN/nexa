@@ -1274,6 +1274,8 @@ pub fn repl_seed_typed_ir() -> Arc<TypedPackageIr> {
         lifecycle: LifecycleBindingsIr::default(),
         repl_entry: None,
         standard_functions: Arc::from([]),
+        inherent_methods: Arc::from([]),
+        generic_nominal_instances: Arc::from([]),
         generic_function_instances: 0,
         generic_nominal_type_instances: 0,
         public_api_fingerprint: public_api_fingerprint([]),

@@ -2031,14 +2031,55 @@ fn semantic_completion_items(
     offset: usize,
 ) -> Option<Vec<Value>> {
     let (receiver_start, _, is_static) = language_v3_completion_receiver_range(source, offset)?;
-    if is_static {
-        return None;
-    }
     let ty = nexa_analysis::type_at(
         &document.ir,
         &document.source,
         u32::try_from(receiver_start).ok()?,
     )?;
+    let methods = if is_static {
+        nexa_analysis::associated_functions_for_type(&document.ir, &document.source, &ty)
+    } else {
+        nexa_analysis::methods_for_type(&document.ir, &document.source, &ty)
+    };
+    let mut items = methods
+        .into_iter()
+        .map(|method| {
+            let type_parameters = if method.type_parameters.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", method.type_parameters.join(", "))
+            };
+            let parameters = method
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    format!(
+                        "{}: {}",
+                        parameter.name,
+                        nexa_analysis::display_type(&parameter.ty, &document.ir)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let effect = if method.effect == nexa_analysis::IrEffect::Task {
+                "async "
+            } else {
+                ""
+            };
+            json!({
+                "label": method.name,
+                "kind": 2,
+                "detail": format!(
+                    "{effect}fn {}{type_parameters}({parameters}) -> {}",
+                    method.name,
+                    nexa_analysis::display_type(&method.result, &document.ir)
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    if is_static {
+        return Some(items);
+    }
     let owner = match &ty {
         nexa_analysis::IrType::Array(_) => Some("Array"),
         nexa_analysis::IrType::Map(_, _) => Some("Map"),
@@ -2047,9 +2088,13 @@ fn semantic_completion_items(
         _ => None,
     };
     if let Some(owner) = owner {
-        return Some(language_v3_completion_items_for_owner(owner, false));
+        items.extend(language_v3_completion_items_for_owner(owner, false));
+        return Some(items);
     }
-    numeric_completion_items(&ty)
+    if let Some(numeric) = numeric_completion_items(&ty) {
+        items.extend(numeric);
+    }
+    (!items.is_empty() || matches!(ty, nexa_analysis::IrType::Named(_))).then_some(items)
 }
 
 fn numeric_completion_items(ty: &nexa_analysis::IrType) -> Option<Vec<Value>> {

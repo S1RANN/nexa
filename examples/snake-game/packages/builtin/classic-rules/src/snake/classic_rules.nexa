@@ -6,7 +6,8 @@ fn empty() -> Array<host::SnakeCommand> {
 }
 
 fn singleton<T>(value: T) -> Array<T> {
-    return [common::identity(value)];
+    let holder = common::Holder { value: common::identity(value) };
+    return [holder.get()];
 }
 
 fn ready() -> Array<host::SnakeCommand> {

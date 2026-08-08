@@ -79,6 +79,7 @@ module.exports = grammar({
         $.struct_declaration,
         $.enum_declaration,
         $.class_declaration,
+        $.impl_declaration,
         $.function_declaration,
         $.const_declaration,
       ),
@@ -154,6 +155,17 @@ module.exports = grammar({
         optional(field("where_clause", $.where_clause)),
         field("body", $.enum_variant_block),
       ),
+
+    impl_declaration: ($) =>
+      seq(
+        field("keyword", $.impl_keyword),
+        optional(field("type_parameters", $.generic_parameter_list)),
+        field("target", $.type),
+        optional(field("where_clause", $.where_clause)),
+        field("body", $.impl_declaration_block),
+      ),
+
+    impl_declaration_block: ($) => seq("{", repeat($.function_declaration), "}"),
 
     const_declaration: ($) =>
       prec(
@@ -254,7 +266,14 @@ module.exports = grammar({
       ),
 
     parameter_list: ($) =>
-      seq("(", optional(commaSep1($.parameter)), optional(","), ")"),
+      seq(
+        "(",
+        optional(commaSep1(choice($.self_parameter, $.parameter))),
+        optional(","),
+        ")",
+      ),
+
+    self_parameter: (_) => "self",
 
     parameter: ($) =>
       seq(
@@ -631,6 +650,7 @@ module.exports = grammar({
     struct_keyword: (_) => keywords.struct,
     enum_keyword: (_) => keywords.enum,
     class_keyword: (_) => keywords.class,
+    impl_keyword: (_) => keywords.impl,
     const_keyword: (_) => keywords.const,
     where_keyword: (_) => keywords.where,
     pub_keyword: (_) => keywords.pub,

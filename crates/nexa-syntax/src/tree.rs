@@ -58,6 +58,7 @@ pub enum NodeKind {
     StructDeclaration,
     EnumDeclaration,
     ClassDeclaration,
+    ImplDeclaration,
     ConstDeclaration,
     TopLevelStatement,
     ContractDeclaration,
@@ -268,6 +269,7 @@ impl Parser<'_> {
                 TokenKind::Keyword(Keyword::Struct) => NodeKind::StructDeclaration,
                 TokenKind::Keyword(Keyword::Enum) => NodeKind::EnumDeclaration,
                 TokenKind::Keyword(Keyword::Class) => NodeKind::ClassDeclaration,
+                TokenKind::Keyword(Keyword::Impl) => NodeKind::ImplDeclaration,
                 TokenKind::Keyword(Keyword::Const)
                     if self.kind_at(cursor + 1) == Some(TokenKind::Identifier)
                         && self.kind_at(cursor + 2) == Some(TokenKind::Colon) =>
@@ -670,6 +672,7 @@ fn is_top_level_start(kind: TokenKind) -> bool {
                     | Keyword::Struct
                     | Keyword::Enum
                     | Keyword::Class
+                    | Keyword::Impl
                     | Keyword::Const
             )
     )
@@ -705,6 +708,7 @@ impl<'a> AstRoot<'a> {
                         | NodeKind::StructDeclaration
                         | NodeKind::EnumDeclaration
                         | NodeKind::ClassDeclaration
+                        | NodeKind::ImplDeclaration
                         | NodeKind::ConstDeclaration
                 )
             })
@@ -764,6 +768,7 @@ pub enum DeclarationKind {
     Struct,
     Enum,
     Class,
+    Impl,
     Const,
 }
 
@@ -780,6 +785,7 @@ impl<'a> Declaration<'a> {
             DeclarationKind::Struct => Keyword::Struct,
             DeclarationKind::Enum => Keyword::Enum,
             DeclarationKind::Class => Keyword::Class,
+            DeclarationKind::Impl => Keyword::Impl,
             DeclarationKind::Const => Keyword::Const,
         }
     }
@@ -791,6 +797,7 @@ impl<'a> Declaration<'a> {
             NodeKind::StructDeclaration => DeclarationKind::Struct,
             NodeKind::EnumDeclaration => DeclarationKind::Enum,
             NodeKind::ClassDeclaration => DeclarationKind::Class,
+            NodeKind::ImplDeclaration => DeclarationKind::Impl,
             NodeKind::ConstDeclaration => DeclarationKind::Const,
             _ => unreachable!("Declaration wraps declaration nodes"),
         }

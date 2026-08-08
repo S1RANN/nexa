@@ -118,6 +118,32 @@ Host boundaries must remain fully concrete. Inline recursive Struct and Enum
 layouts and non-converging recursive generic instances are rejected; Class
 recursion that preserves its concrete arguments is allowed.
 
+Struct, Enum, and Class declarations may define inherent methods in one or
+more `impl` blocks:
+
+```nexa
+impl Point {
+    fn translated(self, dx: f32, dy: f32) -> Self {
+        self.x += dx;
+        self.y += dy;
+        return self;
+    }
+
+    fn zero() -> Self {
+        return Self { x: 0.0, y: 0.0 };
+    }
+}
+```
+
+`self` is an ordinary mutable parameter. For Struct and Enum it receives a
+value copy; for Class it receives a copy of the object reference, so field
+updates affect the shared object. A method without `self` is called through
+the type namespace, such as `Point::zero()`. Generic targets use the general
+form `impl<T> Box<T>` and may also declare method type parameters. Concrete
+specialization impls, overloads, external-package impls, traits, and dynamic
+dispatch are not supported. Methods are lowered to ordinary functions and
+remain absent from Bytecode and Runtime type metadata.
+
 Numeric values expose `abs`, `min`, `max`, `clamp`, and `to_string`. `f32` and
 `f64` also expose `floor`, `ceil`, `round`, `sqrt`, `sin`, and `cos`. The old
 public type-suffixed functions such as `math::abs_i32` and `core::max_f64` are

@@ -490,6 +490,7 @@ fn nexa_keyword(text: &str) -> Option<Keyword> {
         "struct" => Keyword::Struct,
         "enum" => Keyword::Enum,
         "class" => Keyword::Class,
+        "impl" => Keyword::Impl,
         "use" => Keyword::Use,
         "as" => Keyword::As,
         "in" => Keyword::In,
