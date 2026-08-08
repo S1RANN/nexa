@@ -6432,6 +6432,27 @@ impl<'a> Analyzer<'a> {
         Some(definition)
     }
 
+    fn short_path_shadows_builtin_variant(
+        &self,
+        module: &ParsedModule,
+        path: &ast::QualifiedName,
+    ) -> bool {
+        let [name] = path.segments.as_slice() else {
+            return false;
+        };
+        self.lookup_symbol_path(module, path).is_some()
+            || self
+                .imports
+                .get(&module.key)
+                .is_some_and(|scope| scope.aliases.contains_key(&name.text))
+            || self
+                .repl_snapshot_symbol(module, path, SymbolUse::Value)
+                .is_some()
+            || self
+                .repl_snapshot_symbol(module, path, SymbolUse::Callable)
+                .is_some()
+    }
+
     fn visible_from(definition: &Definition, module: &SourceModuleKey) -> bool {
         if definition.package_id == module.package && definition.module == module.module {
             return true;
@@ -6836,11 +6857,10 @@ impl<'a> Analyzer<'a> {
                 }
             },
             ExpressionKind::Name(path) => {
-                if matches!(
-                    path.segments.as_slice(),
-                    [namespace, variant]
-                        if namespace.text == "Option" && variant.text == "None"
-                ) {
+                let short_unshadowed = !self.short_path_shadows_builtin_variant(module, path);
+                if builtin_variant_syntax(path, short_unshadowed)
+                    == Some(BuiltinVariantIr::OptionNone)
+                {
                     if !matches!(expected, Some(IrType::Option(_))) {
                         self.invalid_const(
                             module,
@@ -7027,20 +7047,16 @@ impl<'a> Analyzer<'a> {
                     );
                     return None;
                 };
-                let builtin = match (path.segments.as_slice(), expected) {
-                    ([namespace, variant], Some(IrType::Option(inner)))
-                        if namespace.text == "Option" && variant.text == "Some" =>
-                    {
+                let short_unshadowed = !self.short_path_shadows_builtin_variant(module, path);
+                let builtin_variant = builtin_variant_syntax(path, short_unshadowed);
+                let builtin = match (builtin_variant, expected) {
+                    (Some(BuiltinVariantIr::OptionSome), Some(IrType::Option(inner))) => {
                         Some((BuiltinVariantIr::OptionSome, inner.as_ref()))
                     }
-                    ([namespace, variant], Some(IrType::Result(ok, _)))
-                        if namespace.text == "Result" && variant.text == "Ok" =>
-                    {
+                    (Some(BuiltinVariantIr::ResultOk), Some(IrType::Result(ok, _))) => {
                         Some((BuiltinVariantIr::ResultOk, ok.as_ref()))
                     }
-                    ([namespace, variant], Some(IrType::Result(_, error)))
-                        if namespace.text == "Result" && variant.text == "Err" =>
-                    {
+                    (Some(BuiltinVariantIr::ResultErr), Some(IrType::Result(_, error))) => {
                         Some((BuiltinVariantIr::ResultErr, error.as_ref()))
                     }
                     _ => None,
@@ -7067,11 +7083,12 @@ impl<'a> Analyzer<'a> {
                     });
                 }
                 if matches!(
-                    path.segments.as_slice(),
-                    [namespace, variant]
-                        if (namespace.text == "Option" && variant.text == "Some")
-                            || (namespace.text == "Result"
-                                && matches!(variant.text.as_str(), "Ok" | "Err"))
+                    builtin_variant,
+                    Some(
+                        BuiltinVariantIr::OptionSome
+                            | BuiltinVariantIr::ResultOk
+                            | BuiltinVariantIr::ResultErr
+                    )
                 ) {
                     self.invalid_const(
                         module,
@@ -9285,11 +9302,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 if let Some(value) = self.check_receiver_name(path) {
                     return value;
                 }
-                if path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.text.as_str())
-                    .eq(["Option", "None"])
+                if self.builtin_variant(path) == Some(BuiltinVariantIr::OptionNone)
                     && let Some(value) = self.check_empty_builtin_variant(
                         BuiltinVariantIr::OptionNone,
                         expected,
@@ -9332,12 +9345,16 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     IrType::Array(inner) => Some(inner.as_ref()),
                     _ => None,
                 });
+                let inferred_element = expected_element.cloned().or_else(|| {
+                    values
+                        .iter()
+                        .find_map(|value| self.infer_expression_type(value, true))
+                });
                 let values = values
                     .iter()
-                    .map(|value| self.check_expression(value, expected_element))
+                    .map(|value| self.check_expression(value, inferred_element.as_ref()))
                     .collect::<Vec<_>>();
-                let element = expected_element
-                    .cloned()
+                let element = inferred_element
                     .or_else(|| values.first().map(|value| value.ty.clone()))
                     .unwrap_or_else(|| {
                         if expected.is_some_and(contains_ir_error) {
@@ -10034,8 +10051,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ErrorCode::NX2210,
                     &self.module.source,
                     byte_range(range),
-                    "`None` requires an expected Option<T> type",
-                    "constructor type cannot be inferred here",
+                    "cannot infer the payload type of `None`",
+                    "add an expected `Option<T>` type",
                 );
                 IrType::Option(Box::new(IrType::Unit))
             }
@@ -10050,6 +10067,46 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 payload: None,
             },
         })
+    }
+
+    fn builtin_variant(&self, path: &ast::QualifiedName) -> Option<BuiltinVariantIr> {
+        let short_unshadowed = path.segments.len() != 1
+            || (self.local(&path.segments[0].text).is_none()
+                && !self
+                    .analyzer
+                    .short_path_shadows_builtin_variant(&self.module, path));
+        builtin_variant_syntax(path, short_unshadowed)
+    }
+
+    fn is_builtin_none_expression(&self, expression: &Expression) -> bool {
+        matches!(
+            &expression.kind,
+            ExpressionKind::Name(path)
+                if self.builtin_variant(path) == Some(BuiltinVariantIr::OptionNone)
+        )
+    }
+
+    fn builtin_variant_call<'b>(
+        &self,
+        expression: &'b Expression,
+    ) -> Option<(BuiltinVariantIr, &'b Vec<TypeRef>, &'b Vec<Expression>)> {
+        let ExpressionKind::Call {
+            callee,
+            type_arguments,
+            arguments,
+        } = &expression.kind
+        else {
+            return None;
+        };
+        let ExpressionKind::Name(path) = &callee.kind else {
+            return None;
+        };
+        let variant = self.builtin_variant(path)?;
+        matches!(
+            variant,
+            BuiltinVariantIr::OptionSome | BuiltinVariantIr::ResultOk | BuiltinVariantIr::ResultErr
+        )
+        .then_some((variant, type_arguments, arguments))
     }
 
     fn check_field_access(
@@ -11055,10 +11112,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             SurfaceType::Option(inner) => {
-                if is_none_expression(expression) {
+                if self.is_builtin_none_expression(expression) {
                     return;
                 }
-                if let Some(("Some", explicit, arguments)) = builtin_variant_call(expression) {
+                if let Some((BuiltinVariantIr::OptionSome, explicit, arguments)) =
+                    self.builtin_variant_call(expression)
+                {
                     if let [explicit] = explicit.as_slice()
                         && let Some(actual) = self.infer_type_ref(explicit)
                     {
@@ -11080,8 +11139,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             SurfaceType::Result(success, error) => {
-                if let Some((variant @ ("Ok" | "Err"), explicit, arguments)) =
-                    builtin_variant_call(expression)
+                if let Some((
+                    variant @ (BuiltinVariantIr::ResultOk | BuiltinVariantIr::ResultErr),
+                    explicit,
+                    arguments,
+                )) = self.builtin_variant_call(expression)
                 {
                     if let [explicit_success, explicit_error] = explicit.as_slice()
                         && let (Some(actual_success), Some(actual_error)) = (
@@ -11094,7 +11156,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     }
                     if let Some(payload) = arguments.first() {
                         self.infer_standard_argument_constraints(
-                            if variant == "Ok" { success } else { error },
+                            if variant == BuiltinVariantIr::ResultOk {
+                                success
+                            } else {
+                                error
+                            },
                             payload,
                             bindings,
                             allow_numeric_literals,
@@ -11182,7 +11248,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 typed_literal(literal, None).ok().map(|(ty, _)| ty)
             }
             ExpressionKind::Name(path) => {
-                if is_none_expression(expression) {
+                if self.is_builtin_none_expression(expression) {
                     return None;
                 }
                 let definition = if path.segments.len() == 1 {
@@ -11240,11 +11306,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 type_arguments,
                 arguments,
             } => {
-                if let ExpressionKind::Name(path) = &callee.kind
-                    && let [namespace, name] = path.segments.as_slice()
-                {
-                    match (namespace.text.as_str(), name.text.as_str()) {
-                        ("Option", "Some") => {
+                if let ExpressionKind::Name(path) = &callee.kind {
+                    match self.builtin_variant(path) {
+                        Some(BuiltinVariantIr::OptionSome) => {
                             let inner = type_arguments
                                 .first()
                                 .and_then(|ty| self.infer_type_ref(ty))
@@ -11255,13 +11319,17 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                                 })?;
                             return Some(IrType::Option(Box::new(inner)));
                         }
-                        ("Result", "Ok" | "Err") if type_arguments.len() == 2 => {
+                        Some(BuiltinVariantIr::ResultOk | BuiltinVariantIr::ResultErr)
+                            if type_arguments.len() == 2 =>
+                        {
                             return Some(IrType::Result(
                                 Box::new(self.infer_type_ref(&type_arguments[0])?),
                                 Box::new(self.infer_type_ref(&type_arguments[1])?),
                             ));
                         }
-                        ("Result", "Ok" | "Err") => return None,
+                        Some(BuiltinVariantIr::ResultOk | BuiltinVariantIr::ResultErr) => {
+                            return None;
+                        }
                         _ => {}
                     }
                 }
@@ -13077,18 +13145,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         arguments: &[Expression],
         expected: Option<&IrType>,
     ) -> Option<TypedExpressionIr> {
-        let (name, variant) = match path.segments.as_slice() {
-            [namespace, name] if namespace.text == "Option" && name.text == "Some" => {
-                (name, BuiltinVariantIr::OptionSome)
-            }
-            [namespace, name] if namespace.text == "Result" && name.text == "Ok" => {
-                (name, BuiltinVariantIr::ResultOk)
-            }
-            [namespace, name] if namespace.text == "Result" && name.text == "Err" => {
-                (name, BuiltinVariantIr::ResultErr)
-            }
-            _ => return None,
-        };
+        let variant = self.builtin_variant(path)?;
+        if variant == BuiltinVariantIr::OptionNone {
+            return None;
+        }
+        let name = path.segments.last()?;
         let span = source_range(&self.module.source, whole.range);
         if arguments.len() != 1 {
             self.type_error(
@@ -13165,9 +13226,17 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     if expected.is_some_and(contains_ir_error) {
                         (IrType::Error, IrType::Error)
                     } else {
-                        self.type_error(
-                            span.clone(),
-                            "`Ok`/`Err` requires an expected Result<T, E> or two type arguments",
+                        let missing = if variant == BuiltinVariantIr::ResultOk {
+                            "error"
+                        } else {
+                            "success"
+                        };
+                        self.analyzer.push_source_error(
+                            ErrorCode::NX2210,
+                            &self.module.source,
+                            byte_range(whole.range),
+                            format!("cannot infer the {missing} type of `{}`", name.text),
+                            "add an expected `Result<T, E>` type or two explicit type arguments",
                         );
                         if variant == BuiltinVariantIr::ResultOk {
                             (payload_ty.clone(), IrType::Unit)
@@ -14087,50 +14156,34 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         payload: &[Pattern],
         expected: &IrType,
     ) -> Option<TypedPatternKind> {
-        let [namespace, name] = path.segments.as_slice() else {
-            return None;
-        };
-        let family = namespace.text.as_str();
-        let (variant, payload_type) = match (family, name.text.as_str(), expected) {
-            ("Option", "Some", IrType::Option(inner)) => {
+        let variant = self.builtin_variant(path)?;
+        let (variant, payload_type) = match (variant, expected) {
+            (BuiltinVariantIr::OptionSome, IrType::Option(inner)) => {
                 (BuiltinVariantIr::OptionSome, Some(inner.as_ref().clone()))
             }
-            ("Option", "None", IrType::Option(_)) => (BuiltinVariantIr::OptionNone, None),
-            ("Result", "Ok", IrType::Result(ok, _)) => {
+            (BuiltinVariantIr::OptionNone, IrType::Option(_)) => {
+                (BuiltinVariantIr::OptionNone, None)
+            }
+            (BuiltinVariantIr::ResultOk, IrType::Result(ok, _)) => {
                 (BuiltinVariantIr::ResultOk, Some(ok.as_ref().clone()))
             }
-            ("Result", "Err", IrType::Result(_, error)) => {
+            (BuiltinVariantIr::ResultErr, IrType::Result(_, error)) => {
                 (BuiltinVariantIr::ResultErr, Some(error.as_ref().clone()))
             }
-            ("Option", "Some" | "None", _) => {
+            (variant @ (BuiltinVariantIr::OptionSome | BuiltinVariantIr::OptionNone), _) => {
                 self.type_error(
                     source_range(&self.module.source, path.range),
                     "Option pattern requires an Option<T> scrutinee",
                 );
-                (
-                    if name.text == "Some" {
-                        BuiltinVariantIr::OptionSome
-                    } else {
-                        BuiltinVariantIr::OptionNone
-                    },
-                    None,
-                )
+                (variant, None)
             }
-            ("Result", "Ok" | "Err", _) => {
+            (variant @ (BuiltinVariantIr::ResultOk | BuiltinVariantIr::ResultErr), _) => {
                 self.type_error(
                     source_range(&self.module.source, path.range),
                     "Result pattern requires a Result<T, E> scrutinee",
                 );
-                (
-                    if name.text == "Ok" {
-                        BuiltinVariantIr::ResultOk
-                    } else {
-                        BuiltinVariantIr::ResultErr
-                    },
-                    None,
-                )
+                (variant, None)
             }
-            _ => return None,
         };
         let expected_arity = usize::from(payload_type.is_some());
         if payload.len() != expected_arity {
@@ -15354,40 +15407,29 @@ fn split_descriptor_arguments(text: &str) -> Result<Vec<&str>, String> {
     Ok(values)
 }
 
-fn is_none_expression(expression: &Expression) -> bool {
-    matches!(
-        &expression.kind,
-        ExpressionKind::Name(path)
-            if matches!(
-                path.segments.as_slice(),
-                [namespace, variant]
-                    if namespace.text == "Option" && variant.text == "None"
-            )
-    )
-}
-
-fn builtin_variant_call(
-    expression: &Expression,
-) -> Option<(&str, &Vec<TypeRef>, &Vec<Expression>)> {
-    let ExpressionKind::Call {
-        callee,
-        type_arguments,
-        arguments,
-    } = &expression.kind
-    else {
-        return None;
-    };
-    let ExpressionKind::Name(path) = &callee.kind else {
-        return None;
-    };
-    let [namespace, name] = path.segments.as_slice() else {
-        return None;
-    };
-    matches!(
-        (namespace.text.as_str(), name.text.as_str()),
-        ("Option", "Some") | ("Result", "Ok" | "Err")
-    )
-    .then_some((name.text.as_str(), type_arguments, arguments))
+fn builtin_variant_syntax(
+    path: &ast::QualifiedName,
+    allow_short: bool,
+) -> Option<BuiltinVariantIr> {
+    match path.segments.as_slice() {
+        [namespace, name] if namespace.text == "Option" && name.text == "Some" => {
+            Some(BuiltinVariantIr::OptionSome)
+        }
+        [namespace, name] if namespace.text == "Option" && name.text == "None" => {
+            Some(BuiltinVariantIr::OptionNone)
+        }
+        [namespace, name] if namespace.text == "Result" && name.text == "Ok" => {
+            Some(BuiltinVariantIr::ResultOk)
+        }
+        [namespace, name] if namespace.text == "Result" && name.text == "Err" => {
+            Some(BuiltinVariantIr::ResultErr)
+        }
+        [name] if allow_short && name.text == "Some" => Some(BuiltinVariantIr::OptionSome),
+        [name] if allow_short && name.text == "None" => Some(BuiltinVariantIr::OptionNone),
+        [name] if allow_short && name.text == "Ok" => Some(BuiltinVariantIr::ResultOk),
+        [name] if allow_short && name.text == "Err" => Some(BuiltinVariantIr::ResultErr),
+        _ => None,
+    }
 }
 
 fn merge_surface_constraint(

@@ -40,6 +40,11 @@ let value = result.unwrap_or(0);
 - `Option<T>`: `is_some()`, `is_none()`, `unwrap_or(fallback)`
 - `Result<T, E>`: `is_ok()`, `is_err()`, `unwrap_or(fallback)`
 
+Their variants are available through both fully qualified names and
+low-priority Prelude aliases: `Option::Some`/`Some`, `Option::None`/`None`,
+`Result::Ok`/`Ok`, and `Result::Err`/`Err`. User-declared or imported symbols
+with the same name take precedence.
+
 ### Array and Map
 
 ```nexa

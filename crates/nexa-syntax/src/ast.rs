@@ -1774,7 +1774,20 @@ impl<'a> Parser<'a> {
                         },
                     };
                 }
-                if self.at(TokenKind::LBrace)
+                if !type_arguments.is_empty() && self.at(TokenKind::LParen) {
+                    let arguments = self.call_arguments();
+                    Expression {
+                        range: cover(start, self.previous_range()),
+                        kind: ExpressionKind::Call {
+                            callee: Box::new(Expression {
+                                range: name.range,
+                                kind: ExpressionKind::Name(name),
+                            }),
+                            type_arguments,
+                            arguments,
+                        },
+                    }
+                } else if self.at(TokenKind::LBrace)
                     && name.last().is_some_and(|last| starts_uppercase(&last.text))
                 {
                     let (fields, update) = self.field_initializers();

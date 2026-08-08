@@ -74,6 +74,26 @@ let empty: Maybe<i32> = Maybe::None;
 let also_present = Maybe<i32>::Some(20);
 ```
 
+The built-in `Option` and `Result` variants are also available as low-priority
+Prelude names:
+
+```nexa
+let present = Some(10);
+let empty: Option<i32> = None;
+let success: Result<i32, string> = Ok(20);
+
+let value = match present {
+    Some(payload) => payload,
+    None => 0,
+};
+```
+
+`Option::Some`, `Option::None`, `Result::Ok`, and `Result::Err` remain valid.
+A lexical, Module, or imported symbol with the same name takes precedence over
+the Prelude name. Bare `None` needs an expected `Option<T>` type. Bare `Ok` and
+`Err` need an expected `Result<T, E>` type unless both type arguments are
+written explicitly, for example `Ok<i32, string>(20)`.
+
 The compiler monomorphizes each distinct concrete function and type argument
 list and reuses identical instances. Type parameters never enter Bytecode or
 the Runtime. A generic declaration's stable identity and canonical concrete
