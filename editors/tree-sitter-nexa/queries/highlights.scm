@@ -9,6 +9,7 @@
 (enum_keyword) @keyword
 (class_keyword) @keyword
 (const_keyword) @keyword
+(where_keyword) @keyword
 (pub_keyword) @keyword
 (package_keyword) @keyword
 (async_keyword) @keyword
@@ -18,7 +19,6 @@
 (else_keyword) @keyword
 (while_keyword) @keyword
 (match_keyword) @keyword
-(new_keyword) @keyword
 (await_keyword) @keyword
 (yield_keyword) @keyword
 (defer_keyword) @keyword
@@ -58,12 +58,24 @@
 (function_declaration
   name: (identifier) @function)
 
+(generic_parameter
+  name: (type_identifier) @type.parameter)
+
+(generic_bound
+  name: (type_path) @type)
+
+(associated_output_binding
+  name: (identifier) @property)
+
 (const_declaration
   name: (identifier) @constant)
 
 (postfix_expression
   operand: (_) @function.call
   operation: (call_suffix))
+
+(generic_call_expression
+  callee: (path_expression) @function.call)
 
 (parameter
   name: (identifier) @variable.parameter)

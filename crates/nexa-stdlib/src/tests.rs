@@ -284,15 +284,20 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(string::byte_len(unit_probe), 7);
     assert_eq!(string::substring(unit_probe, 1, 1).as_deref(), Ok("😀"));
 
-    assert_eq!(library.descriptor_schema, 1);
+    assert_eq!(library.descriptor_schema, 2);
     assert_eq!(library.package_id, "nexa.stdlib");
-    assert_eq!(library.canonical_package_id, "nexa.stdlib@2.0.0");
-    assert_eq!(library.version.to_string(), "2.0.0");
+    assert_eq!(library.canonical_package_id, "nexa.stdlib@3.0.0");
+    assert_eq!(library.version.to_string(), "3.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0xd2b7_e40c_28bf_3ddf);
+    assert_eq!(library.descriptor_hash().0, 0x326d_d3b4_4a73_aa90);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.symbols().count(), 96);
+    assert_eq!(library.symbols().count(), 128);
+    assert_eq!(library.methods().count(), 32);
+    let abs = library.method("i32", "abs").expect("i32.abs method");
+    assert_eq!(abs.implementation_module, "math");
+    assert_eq!(abs.implementation, "abs_i32");
+    assert_eq!(abs.canonical_declaration(), "pub method i32::abs()->i32");
 
     let canonical_lower = canonical.to_ascii_lowercase();
     for forbidden in [
@@ -317,7 +322,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0xd2b7_e40c_28bf_3ddf);
+    assert_eq!(library.descriptor_hash().0, 0x326d_d3b4_4a73_aa90);
 
     let symbols = library
         .symbols()
@@ -325,8 +330,10 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
         .collect::<Vec<_>>();
     assert_eq!(symbols.len(), symbols.iter().collect::<BTreeSet<_>>().len());
     assert!(symbols.iter().all(|symbol| {
-        symbol.starts_with("nexa.stdlib@2.0.0::std.")
-            && (symbol.contains("::function::") || symbol.contains("::type::"))
+        symbol.starts_with("nexa.stdlib@3.0.0::")
+            && (symbol.contains("::function::")
+                || symbol.contains("::type::")
+                || symbol.contains("::method::"))
     }));
 
     let (module, function) = library
@@ -345,8 +352,50 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
 }
 
 #[test]
+fn receiver_methods_match_their_internal_lowering_targets() {
+    let library = standard_library();
+    for method in library.methods() {
+        let module = library
+            .module(method.implementation_module)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing method module for {}::{}",
+                    method.receiver, method.name
+                )
+            });
+        let function = module.function(method.implementation).unwrap_or_else(|| {
+            panic!(
+                "missing method target {}::{} for {}::{}",
+                method.implementation_module, method.implementation, method.receiver, method.name
+            )
+        });
+        assert_eq!(function.lowering, method.lowering);
+        assert_eq!(function.behavior, method.behavior);
+        assert_eq!(function.result, method.result);
+        let Some((receiver, parameters)) = function.parameters.split_first() else {
+            panic!(
+                "method target {} has no receiver parameter",
+                method.implementation
+            );
+        };
+        assert_eq!(receiver.ty, method.receiver);
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|parameter| parameter.ty)
+                .collect::<Vec<_>>(),
+            method
+                .parameters
+                .iter()
+                .map(|parameter| parameter.ty)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn descriptor_identity_has_one_exact_length_framed_authority() {
-    const PREFIX: &[u8] = b"nexa.stdlib.descriptor.v1\0";
+    const PREFIX: &[u8] = b"nexa.stdlib.descriptor.v2\0";
     let library = standard_library();
     let manifest = library.canonical_manifest();
     let identity = canonical_descriptor_identity();

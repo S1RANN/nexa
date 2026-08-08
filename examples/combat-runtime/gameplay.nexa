@@ -1,4 +1,6 @@
 
+use game_common::generic as common;
+
 @state(version = 1)
 class EnemyBrain {
     phase: i32,
@@ -23,14 +25,6 @@ enum CombatEvent {
 class CombatFrame {
     hits: i32,
     next: Option<CombatFrame>,
-}
-
-struct Sample<T> {
-    value: T,
-}
-
-fn identity<T>(value: T) -> T {
-    return value;
 }
 
 fn option_value(value: i32) -> i32 {
@@ -101,7 +95,7 @@ pub fn feature_probe(input: Buffer<i32>) -> i32 {
         Result::Ok(value) => value,
         Result::Err(error) => 0,
     };
-    let sample = Sample { value: identity(amount) };
+    let sample = common::Holder { value: common::identity(amount) };
     return sample.value + mapped_length + values.len();
 }
 

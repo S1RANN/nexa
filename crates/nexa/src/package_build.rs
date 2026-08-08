@@ -511,7 +511,7 @@ pub(crate) fn linked_state_fingerprint(
     dependency_closure: &ResolvedDependencyGraph,
     dependency_source_fingerprints: &BTreeMap<PackageId, SourceSetFingerprint>,
 ) -> LinkedStateFingerprint {
-    const LINKED_STATE_SCHEMA: u16 = 5;
+    const LINKED_STATE_SCHEMA: u16 = 6;
     let mut builder = FingerprintBuilder::new(LinkedStateFingerprint::DOMAIN, LINKED_STATE_SCHEMA);
     builder.field_bytes("build", build_fingerprint.as_bytes());
     builder.field_bytes("module-v6", &module.encode());
@@ -541,6 +541,14 @@ pub(crate) fn linked_state_fingerprint(
     builder.field_u64(
         "linked-package-count",
         u64::try_from(compilation_evidence.packages).unwrap_or(u64::MAX),
+    );
+    builder.field_u64(
+        "generic-function-instance-count",
+        u64::try_from(compilation_evidence.generic_function_instances).unwrap_or(u64::MAX),
+    );
+    builder.field_u64(
+        "generic-nominal-type-instance-count",
+        u64::try_from(compilation_evidence.generic_nominal_type_instances).unwrap_or(u64::MAX),
     );
     builder.field_bytes("source-set", source_set_fingerprint.as_bytes());
     builder.field_bytes("public-api", public_api_fingerprint.as_bytes());
@@ -788,6 +796,8 @@ pub struct PackageCheckReport {
     pub resolved_dependency_imports: usize,
     /// Exact semantic/closure cardinalities from this analyzer result.
     pub compilation_evidence: PackageCompilationEvidence,
+    /// Fresh concrete semantic graph for editor/navigation queries.
+    pub semantic_ir: Arc<nexa_analysis::TypedPackageIr>,
 }
 
 /// Exact cardinalities observed by canonical analysis and retained by the compiled artifact.
@@ -802,6 +812,8 @@ pub struct PackageCompilationEvidence {
     pub package_symbols: usize,
     pub import_edges: usize,
     pub packages: usize,
+    pub generic_function_instances: usize,
+    pub generic_nominal_type_instances: usize,
 }
 
 /// Cumulative production-side invocation counters for one canonical build session.
@@ -1062,6 +1074,33 @@ impl PackageBuildSession {
         input: &ResolvedBuildInput,
         contract: &HostContractInput<'_>,
     ) -> Result<PackageCheckReport, PackageBuildError> {
+        validate_compilation_profile(input, nexa_analysis::CompilationProfile::Package)?;
+        self.check_with_contract(input, contract, false)
+    }
+
+    /// Performs the same concrete semantic check used by standalone/script compilation without
+    /// lowering Bytecode. This is the authoritative editor query entrypoint for single files.
+    pub fn check_standalone_with_contract(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+    ) -> Result<PackageCheckReport, PackageBuildError> {
+        if !matches!(
+            input.compilation_options.profile,
+            nexa_analysis::CompilationProfile::Standalone
+                | nexa_analysis::CompilationProfile::Script
+        ) {
+            return Err(PackageBuildError::ExecutableProfileRequired);
+        }
+        self.check_with_contract(input, contract, true)
+    }
+
+    fn check_with_contract(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+        executable: bool,
+    ) -> Result<PackageCheckReport, PackageBuildError> {
         input
             .validate_integrity()
             .map_err(PackageBuildError::InvalidResolvedInput)?;
@@ -1074,7 +1113,13 @@ impl PackageBuildSession {
         validate_host_contract(input, contract)?;
         let environment = crate::package_environment::canonical_analysis_environment(contract)?;
         self.pipeline.start_check_analysis();
-        let mut outcome = analyze_package(input, &environment, &mut self.queries);
+        let mut outcome = if executable
+            && input.compilation_options.profile == nexa_analysis::CompilationProfile::Script
+        {
+            nexa_analysis::analyze_script(input, &environment, &mut self.queries)
+        } else {
+            analyze_package(input, &environment, &mut self.queries)
+        };
         let Some(ir) = outcome.ir.take() else {
             self.pipeline.finish_check_analysis(false);
             return Err(PackageBuildError::AnalysisFailed(Box::new(
@@ -1084,6 +1129,7 @@ impl PackageBuildSession {
         self.pipeline.finish_check_analysis(true);
         let compilation_evidence =
             package_compilation_evidence(&ir, &outcome.resolved_import_edges);
+        let semantic_ir = Arc::new(ir);
         let resolved_module_imports = outcome
             .resolved_import_edges
             .iter()
@@ -1114,9 +1160,9 @@ impl PackageBuildSession {
             analysis_revision: outcome.analyzed_revision,
             query_report: outcome.query_report,
             query_stats: self.queries.stats(),
-            modules: ir.modules().len(),
-            symbols: ir.definitions().len(),
-            resolved_references: ir
+            modules: semantic_ir.modules().len(),
+            symbols: semantic_ir.definitions().len(),
+            resolved_references: semantic_ir
                 .modules()
                 .iter()
                 .map(|module| module.resolved_references.len())
@@ -1124,6 +1170,7 @@ impl PackageBuildSession {
             resolved_module_imports,
             resolved_dependency_imports,
             compilation_evidence,
+            semantic_ir,
         })
     }
 
@@ -2224,6 +2271,8 @@ fn package_compilation_evidence(
         package_symbols,
         import_edges,
         packages,
+        generic_function_instances: ir.metadata().generic_function_instances,
+        generic_nominal_type_instances: ir.metadata().generic_nominal_type_instances,
     }
 }
 

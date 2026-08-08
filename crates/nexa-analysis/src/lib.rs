@@ -20,6 +20,7 @@ mod options;
 pub mod passes;
 mod query;
 mod repl;
+mod semantic;
 mod snippet;
 mod source;
 
@@ -82,6 +83,10 @@ pub use query::{
     SourceUpdate, SourceUpdateError,
 };
 pub use repl::*;
+pub use semantic::{
+    InstantiatedParameter, InstantiatedSignature, call_signature_at, definition_at, display_type,
+    semantic_span_at, type_at,
+};
 pub use snippet::{
     DEFAULT_SNIPPET_MODULE, SnippetModuleInferenceError, SnippetModuleInferenceErrorKind,
     infer_snippet_module,

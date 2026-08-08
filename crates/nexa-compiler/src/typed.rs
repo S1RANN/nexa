@@ -12678,6 +12678,8 @@ mod tests {
                 lifecycle: LifecycleBindingsIr::default(),
                 repl_entry: None,
                 standard_functions: std::sync::Arc::new([]),
+                generic_function_instances: 0,
+                generic_nominal_type_instances: 0,
                 public_api_fingerprint: PublicApiFingerprint::default(),
                 state_schema_fingerprint: StateSchemaFingerprint::default(),
             },

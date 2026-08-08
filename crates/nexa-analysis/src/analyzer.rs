@@ -597,6 +597,8 @@ struct Analyzer<'a> {
     generic_instances: BTreeMap<GenericInstanceKey, DefinitionId>,
     pending_generic_instances: Vec<GenericInstanceKey>,
     generic_instance_origins: BTreeMap<DefinitionId, GenericInstanceKey>,
+    generic_instance_parents: BTreeMap<GenericInstanceKey, GenericInstanceKey>,
+    generic_function_instance_stack: Vec<GenericInstanceKey>,
     generic_type_instances: BTreeMap<GenericTypeInstanceKey, DefinitionId>,
     pending_generic_type_instances: Vec<GenericTypeInstanceKey>,
     generic_type_instance_origins: BTreeMap<DefinitionId, GenericTypeInstanceKey>,
@@ -748,6 +750,7 @@ pub(crate) fn analyze_repl_cell_with_session<'a>(
 }
 
 impl<'a> Analyzer<'a> {
+    #[allow(clippy::too_many_lines)]
     fn new(
         input: &'a ResolvedBuildInput,
         test_source_set: Option<&'a PackageSourceSet>,
@@ -820,6 +823,8 @@ impl<'a> Analyzer<'a> {
             generic_instances: BTreeMap::new(),
             pending_generic_instances: Vec::new(),
             generic_instance_origins: BTreeMap::new(),
+            generic_instance_parents: BTreeMap::new(),
+            generic_function_instance_stack: Vec::new(),
             generic_type_instances: BTreeMap::new(),
             pending_generic_type_instances: Vec::new(),
             generic_type_instance_origins: BTreeMap::new(),
@@ -1832,6 +1837,26 @@ impl<'a> Analyzer<'a> {
             lifecycle: self.lifecycle_bindings(),
             repl_entry: self.repl_entry.clone(),
             standard_functions: standard_functions.into(),
+            generic_function_instances: self
+                .generic_instances
+                .keys()
+                .filter(|instance| {
+                    instance
+                        .arguments
+                        .iter()
+                        .all(|argument| !ir_type_contains_type_parameter(argument))
+                })
+                .count(),
+            generic_nominal_type_instances: self
+                .generic_type_instances
+                .keys()
+                .filter(|instance| {
+                    instance
+                        .arguments
+                        .iter()
+                        .all(|argument| !ir_type_contains_type_parameter(argument))
+                })
+                .count(),
             public_api_fingerprint,
             state_schema_fingerprint,
         }
@@ -7125,6 +7150,71 @@ impl<'a> Analyzer<'a> {
             })
     }
 
+    fn generic_instance_count(&self) -> usize {
+        self.generic_instances
+            .len()
+            .saturating_add(self.generic_type_instances.len())
+    }
+
+    fn generic_function_instance_lineage(
+        &self,
+        key: &GenericInstanceKey,
+    ) -> Vec<GenericInstanceKey> {
+        let mut lineage = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursor = Some(key.clone());
+        while let Some(instance) = cursor {
+            if !seen.insert(instance.clone()) {
+                break;
+            }
+            lineage.push(instance.clone());
+            cursor = self.generic_instance_parents.get(&instance).cloned();
+        }
+        lineage.reverse();
+        lineage
+    }
+
+    fn display_generic_function_instance(&self, key: &GenericInstanceKey) -> String {
+        let name = self
+            .definitions
+            .get(key.function.0 as usize)
+            .map_or("<generic function>", |definition| definition.name.as_str());
+        let arguments = key
+            .arguments
+            .iter()
+            .map(|argument| display_ir_type(argument, &self.definitions))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}<{arguments}>")
+    }
+
+    fn display_generic_type_instance(&self, key: &GenericTypeInstanceKey) -> String {
+        let name = self
+            .definitions
+            .get(key.definition.0 as usize)
+            .map_or("<generic type>", |definition| definition.name.as_str());
+        let arguments = key
+            .arguments
+            .iter()
+            .map(|argument| display_ir_type(argument, &self.definitions))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}<{arguments}>")
+    }
+
+    fn active_generic_instance_chain(&self) -> String {
+        self.generic_function_instance_stack
+            .iter()
+            .map(|instance| self.display_generic_function_instance(instance))
+            .chain(
+                self.generic_type_instance_stack
+                    .iter()
+                    .map(|instance| self.display_generic_type_instance(instance)),
+            )
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+
     #[allow(clippy::too_many_lines)]
     fn request_generic_type_instance(
         &mut self,
@@ -7194,19 +7284,45 @@ impl<'a> Analyzer<'a> {
             );
             return self.generic_type_instances.get(&active).copied();
         }
-        let per_declaration = self
-            .generic_type_instances
-            .keys()
-            .filter(|candidate| candidate.definition == key.definition)
-            .count();
-        if per_declaration >= 256 || self.generic_type_instances.len() >= 4096 {
+        let limits = self.input.compilation_options.limits;
+        let next_depth = self
+            .generic_function_instance_stack
+            .len()
+            .saturating_add(self.generic_type_instance_stack.len())
+            .saturating_add(1);
+        if next_depth > limits.max_generic_instantiation_depth {
             let module = self.modules[record.module_index].clone();
+            let instance = self.display_generic_type_instance(&key);
+            let active = self.active_generic_instance_chain();
+            let chain = if active.is_empty() {
+                instance
+            } else {
+                format!("{active} -> {instance}")
+            };
             self.push_source_error(
                 ErrorCode::NX2101,
                 &module.source,
                 byte_range(declaration.name.range),
-                "generic type instance limit exceeded",
-                "reduce the number or nesting depth of concrete generic type arguments",
+                format!(
+                    "generic instantiation depth limit exceeded (maximum {}): {chain}",
+                    limits.max_generic_instantiation_depth
+                ),
+                "reduce recursive generic nesting or raise max_generic_instantiation_depth",
+            );
+            return None;
+        }
+        if self.generic_instance_count() >= limits.max_generic_instances {
+            let module = self.modules[record.module_index].clone();
+            let instance = self.display_generic_type_instance(&key);
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(declaration.name.range),
+                format!(
+                    "generic instance limit exceeded (maximum {}): {instance}",
+                    limits.max_generic_instances
+                ),
+                "reduce the number of concrete generic combinations or raise max_generic_instances",
             );
             return None;
         }
@@ -7487,13 +7603,24 @@ impl<'a> Analyzer<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn request_generic_instance(&mut self, key: GenericInstanceKey) -> Option<DefinitionId> {
+    fn request_generic_instance(
+        &mut self,
+        key: GenericInstanceKey,
+        parent: Option<GenericInstanceKey>,
+    ) -> Option<DefinitionId> {
         if let Some(definition) = self.generic_instances.get(&key) {
             return Some(*definition);
         }
         let template = self.function_signatures.get(&key.function)?.clone();
         if template.type_parameters.len() != key.arguments.len()
             || key.arguments.iter().any(ir_type_contains_type_parameter)
+        {
+            return None;
+        }
+        let limits = self.input.compilation_options.limits;
+        if self.generic_instance_count() >= limits.max_generic_instances
+            || self.generic_function_instance_stack.len().saturating_add(1)
+                > limits.max_generic_instantiation_depth
         {
             return None;
         }
@@ -7509,6 +7636,9 @@ impl<'a> Analyzer<'a> {
             })
             .collect::<Vec<_>>();
         self.populate_pending_generic_type_instances();
+        if self.generic_instance_count() >= limits.max_generic_instances {
+            return None;
+        }
         let display_arguments = key
             .arguments
             .iter()
@@ -7601,6 +7731,11 @@ impl<'a> Analyzer<'a> {
         );
         self.generic_instances.insert(key.clone(), instance);
         self.generic_instance_origins.insert(instance, key.clone());
+        if let Some(parent) = parent
+            && parent != key
+        {
+            self.generic_instance_parents.insert(key.clone(), parent);
+        }
         self.pending_generic_instances.push(key);
         Some(instance)
     }
@@ -7820,11 +7955,17 @@ impl<'a> Analyzer<'a> {
                 .zip(key.arguments.iter().cloned())
                 .map(|(parameter, argument)| (parameter.name.text.clone(), argument))
                 .collect();
-            let mut checker = BodyChecker::new(self, module, Some(instance), &signature)
-                .with_type_bindings(type_bindings);
-            let body = checker.check_block(&function.body);
-            checker.validate_migration_body(&function.body, &body);
-            let locals = checker.locals;
+            let stack_base = self.generic_function_instance_stack.len();
+            let lineage = self.generic_function_instance_lineage(&key);
+            self.generic_function_instance_stack.extend(lineage);
+            let (body, locals) = {
+                let mut checker = BodyChecker::new(self, module, Some(instance), &signature)
+                    .with_type_bindings(type_bindings);
+                let body = checker.check_block(&function.body);
+                checker.validate_migration_body(&function.body, &body);
+                (body, checker.locals)
+            };
+            self.generic_function_instance_stack.truncate(stack_base);
             self.typed_declarations
                 .entry(record.module_index)
                 .or_default()
@@ -10104,43 +10245,27 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         type_arguments: &[TypeRef],
         arguments: &[Expression],
     ) -> Option<TypedExpressionIr> {
-        let (suffix, supported) = match receiver.ty {
-            IrType::I32 => ("i32", &["abs", "min", "max", "clamp"][..]),
-            IrType::I64 => ("i64", &["abs", "min", "max", "clamp"][..]),
-            IrType::F32 => (
-                "f32",
-                &[
-                    "abs", "min", "max", "clamp", "floor", "ceil", "round", "sqrt", "sin", "cos",
-                ][..],
-            ),
-            IrType::F64 => (
-                "f64",
-                &[
-                    "abs", "min", "max", "clamp", "floor", "ceil", "round", "sqrt", "sin", "cos",
-                ][..],
-            ),
+        let receiver_name = match receiver.ty {
+            IrType::I32 => "i32",
+            IrType::I64 => "i64",
+            IrType::F32 => "f32",
+            IrType::F64 => "f64",
             _ => return None,
         };
         let method = member.text.as_str();
+        let descriptor = nexa_stdlib::standard_library().method(receiver_name, method)?;
         let span = source_range(&self.module.source, whole.range);
-        if !supported.contains(&method) {
-            return None;
-        }
         if !type_arguments.is_empty() {
             self.type_error(
                 span.clone(),
                 "numeric receiver methods do not accept explicit type arguments",
             );
         }
-        let function_name = format!("{method}_{suffix}");
+        let function_name = descriptor.implementation.to_owned();
         let package =
             PackageId::new(nexa_stdlib::PACKAGE_ID).expect("standard-library package ID is valid");
-        let module = ModulePath::new(if matches!(method, "min" | "max") {
-            "std.core"
-        } else {
-            "std.math"
-        })
-        .expect("numeric receiver method target module is valid");
+        let module = ModulePath::new(format!("std.{}", descriptor.implementation_module))
+            .expect("numeric receiver method target module is valid");
         let definition = self
             .analyzer
             .symbols
@@ -11769,19 +11894,80 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 function: definition,
                 arguments: concrete_arguments,
             };
-            let recursive = self
-                .current_function
-                .and_then(|current| self.analyzer.generic_instance_origins.get(&current))
-                == Some(&key);
-            if recursive {
-                self.type_error(
-                    span.clone(),
-                    "recursive generic function instantiation is not supported yet",
-                );
-            } else if !self.abstract_generic
-                && let Some(instance) = self.analyzer.request_generic_instance(key)
-            {
-                definition = instance;
+            if !self.abstract_generic {
+                let active_same_declaration = self
+                    .analyzer
+                    .generic_function_instance_stack
+                    .iter()
+                    .find(|active| active.function == key.function)
+                    .cloned();
+                if let Some(active) = active_same_declaration {
+                    if active == key {
+                        if let Some(instance) = self.analyzer.generic_instances.get(&key).copied() {
+                            definition = instance;
+                        }
+                    } else {
+                        let active_chain = self.analyzer.active_generic_instance_chain();
+                        let requested = self.analyzer.display_generic_function_instance(&key);
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "generic function instantiation does not converge: instance chain: {active_chain} -> {requested}"
+                            ),
+                        );
+                    }
+                } else {
+                    let is_new = !self.analyzer.generic_instances.contains_key(&key);
+                    let limits = self.analyzer.input.compilation_options.limits;
+                    let next_depth = self
+                        .analyzer
+                        .generic_function_instance_stack
+                        .len()
+                        .saturating_add(1);
+                    if is_new
+                        && self.analyzer.generic_instance_count() >= limits.max_generic_instances
+                    {
+                        let requested = self.analyzer.display_generic_function_instance(&key);
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "generic instance limit exceeded (maximum {}): {requested}",
+                                limits.max_generic_instances
+                            ),
+                        );
+                    } else if is_new && next_depth > limits.max_generic_instantiation_depth {
+                        let active_chain = self.analyzer.active_generic_instance_chain();
+                        let requested = self.analyzer.display_generic_function_instance(&key);
+                        let chain = if active_chain.is_empty() {
+                            requested
+                        } else {
+                            format!("{active_chain} -> {requested}")
+                        };
+                        self.type_error(
+                            span.clone(),
+                            &format!(
+                                "generic instantiation depth limit exceeded (maximum {}): {chain}",
+                                limits.max_generic_instantiation_depth
+                            ),
+                        );
+                    } else {
+                        let parent = self
+                            .analyzer
+                            .generic_function_instance_stack
+                            .last()
+                            .cloned();
+                        if let Some(instance) =
+                            self.analyzer.request_generic_instance(key.clone(), parent)
+                        {
+                            definition = instance;
+                        } else if is_new {
+                            self.type_error(
+                                span.clone(),
+                                "generic instance limit exceeded while materializing its concrete signature",
+                            );
+                        }
+                    }
+                }
             }
             generic_arguments = Some(values);
         } else if let Some((surface_parameters, surface_result)) = generic {

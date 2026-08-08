@@ -269,8 +269,8 @@ operator bounds, and numeric receiver methods. `for item in collection` iterates
 `Map<K, V>` with key-value pair bindings. The existing range-based `for i in
 start..end` remains unchanged.
 
-Version identifiers: Language3, Bytecode8, OpcodeCost8, stdlib2.0.0.
-Contract/Host/Descriptor versions unchanged.
+Version identifiers: Language3, Bytecode8, OpcodeCost8, stdlib3.0.0.
+The standard-library descriptor schema is 2; Contract and Host schemas are unchanged.
 
 M4R1 does not include user-defined traits or interfaces, closures,
 inheritance, dynamic dispatch, operator overloading, macros, reflection,

@@ -689,6 +689,7 @@ dependencies = [
  "nexa-machine",
  "nexa-migrate",
  "nexa-model",
+ "nexa-stdlib",
  "nexa-syntax",
  "serde",
  "serde_json",

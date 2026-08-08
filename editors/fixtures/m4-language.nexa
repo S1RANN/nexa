@@ -2,6 +2,34 @@
 use package::demo::food;
 use snake_common::score as score;
 
+pub struct Pair<T, U> {
+    first: T,
+    second: U,
+}
+
+pub enum Change<T> {
+    Unchanged,
+    Updated(T),
+}
+
+pub class Box<T> {
+    value: T,
+}
+
+fn choose<T>(left: T, right: T) -> T
+where
+    T: Copy + PartialOrd,
+{
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn add<T: Add<Output = T>>(left: T, right: T) -> T {
+    return left + right;
+}
+
 // Public constants participate in the package API fingerprint.
 pub const MAX_SCORE: i32 = 100;
 

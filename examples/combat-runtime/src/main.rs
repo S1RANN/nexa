@@ -25,6 +25,8 @@ struct EngineHost {
 
 const COMBAT_PACKAGE_ID: &str = "example.combat";
 const COMBAT_HOST_SOURCE: &str = "examples/combat-runtime/combat_api.contract.nexa";
+const GAME_COMMON_SOURCE: &str =
+    include_str!("../../snake-game/packages/builtin/game-common/src/generic.nexa");
 
 fn combat_symbol(kind: SymbolKind, name: &str) -> StableId {
     CanonicalSymbolIdentity::automatic(COMBAT_PACKAGE_ID, "game.combat", kind, name)
@@ -43,15 +45,16 @@ fn compile_combat_candidate(
         trust: TrustLevel::FirstParty,
         capability_ceiling: CapabilitySet::default(),
         allowed_activation: ActivationSet::new([ActivationPolicy::Programmatic]),
-        max_packages: 1,
+        max_packages: 2,
         runtime_limits: PackageRuntimeLimits::default(),
         allow_entitlement: false,
     };
-    let source = MemorySource::new(SourceId::new("combat-runtime")?, policy).package(
-        MemoryPackage::new(
-            "combat",
-            format!(
-                "schema = 2\n\
+    let source = MemorySource::new(SourceId::new("combat-runtime")?, policy)
+        .package(
+            MemoryPackage::new(
+                "combat",
+                format!(
+                    "schema = 2\n\
                  kind = \"application\"\n\
                  id = \"{COMBAT_PACKAGE_ID}\"\n\
                  name = \"Combat Runtime\"\n\
@@ -60,11 +63,41 @@ fn compile_combat_candidate(
                  entry = \"game.combat\"\n\
                  activation = \"programmatic\"\n\
                  capabilities = []\n\
-                 handler_fuel = 20000\n"
+                 handler_fuel = 20000\n\
+                 [dependencies]\n\
+                 game_common = {{ path = \"../game-common\" }}\n"
+                ),
+            )
+            .source("src/game/combat.nexa", source_text)
+            .lock(
+                "schema = 1\n\
+             root = \"example.combat\"\n\
+             [[packages]]\n\
+             id = \"example.combat\"\n\
+             version = \"1.0.0\"\n\
+             path = \"combat\"\n\
+             [[packages]]\n\
+             id = \"example.game-common\"\n\
+             version = \"1.0.0\"\n\
+             path = \"game-common\"\n\
+             [[edges]]\n\
+             from = \"example.combat\"\n\
+             alias = \"game_common\"\n\
+             to = \"example.game-common\"\n",
             ),
         )
-        .source("src/game/combat.nexa", source_text),
-    );
+        .package(
+            MemoryPackage::new(
+                "game-common",
+                "schema = 2\n\
+                 kind = \"library\"\n\
+                 id = \"example.game-common\"\n\
+                 name = \"Game Common\"\n\
+                 version = \"1.0.0\"\n\
+                 source_root = \"src\"\n",
+            )
+            .source("src/generic.nexa", GAME_COMMON_SOURCE),
+        );
     let context = CandidateBuildContext::with_source(
         contract.source().identity().clone(),
         contract.source().text().as_bytes().to_vec(),

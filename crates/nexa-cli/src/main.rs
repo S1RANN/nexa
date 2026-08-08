@@ -639,6 +639,12 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
             format,
         )?;
         let functions = compiled.function_count();
+        let generic_function_instances = compiled
+            .product()
+            .map(|artifact| artifact.compilation_evidence.generic_function_instances);
+        let generic_nominal_type_instances = compiled
+            .product()
+            .map(|artifact| artifact.compilation_evidence.generic_nominal_type_instances);
         print_success(
             format,
             "check",
@@ -648,6 +654,8 @@ fn check_command(arguments: cli::CheckArgs, format: DiagnosticFormat) -> CliResu
                 "contract": contract,
                 "functions": functions,
                 "modules": compiled.module_count,
+                "genericFunctionInstances": generic_function_instances,
+                "genericNominalTypeInstances": generic_nominal_type_instances,
                 "buildFingerprint": compiled.identity.build_fingerprint,
                 "validationLevel": validation_level,
             }),
@@ -1098,6 +1106,8 @@ fn build_command(arguments: cli::BuildArgs, format: DiagnosticFormat) -> CliResu
                 "packageId": build.package_id().as_str(),
                 "output": output,
                 "modules": compiled.module_count,
+                "genericFunctionInstances": artifact.compilation_evidence.generic_function_instances,
+                "genericNominalTypeInstances": artifact.compilation_evidence.generic_nominal_type_instances,
                 "buildFingerprint": compiled.identity.build_fingerprint,
             }),
             &format!(

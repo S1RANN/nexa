@@ -6,10 +6,15 @@ use nexa_analysis::{
     CompilationLimits, CompilationOptions, IrType, NormalizedPackagePath, PackageKind,
     PackageManifest, QueryDatabase, ResolvedBuildInput, ResolvedDependencyGraph, ResolvedPackage,
     SourceId, SourceRole, SourceSetBuilder, TypedDeclarationBody, TypedStatementIr,
-    analyze_package, canonical_compilation_options, source_set_fingerprint,
+    analyze_package, call_signature_at, canonical_compilation_options, definition_at,
+    source_set_fingerprint, type_at,
 };
 
 fn analyze_main(source: &str) -> AnalysisOutcome {
+    analyze_main_with_options(source, CompilationOptions::default())
+}
+
+fn analyze_main_with_options(source: &str, options: CompilationOptions) -> AnalysisOutcome {
     let manifest = Arc::new(
         PackageManifest::parse(
             r#"
@@ -25,9 +30,7 @@ activation = "programmatic"
         )
         .expect("valid language-v3 fixture manifest"),
     );
-    let options = CompilationOptions::default();
-    let mut source_builder =
-        SourceSetBuilder::new(manifest.id.clone(), CompilationLimits::default());
+    let mut source_builder = SourceSetBuilder::new(manifest.id.clone(), options.limits);
     source_builder
         .add(
             NormalizedPackagePath::new("src/main.nexa").expect("normalized fixture path"),
@@ -158,6 +161,53 @@ fn main() -> i32 {
 }
 
 #[test]
+fn semantic_queries_expose_the_generic_declaration_and_concrete_call_signature() {
+    const SOURCE: &str = r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn main() -> i32 {
+    let result = identity(10);
+    return result;
+}
+";
+    let outcome = analyze_main(SOURCE);
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "{:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    let ir = outcome.ir.expect("semantic queries require typed IR");
+    let source = ir
+        .modules()
+        .iter()
+        .find(|module| module.source.path.as_str() == "src/main.nexa")
+        .map(|module| module.source.clone())
+        .expect("main source key");
+    let call_offset = u32::try_from(SOURCE.rfind("identity(10)").expect("call exists") + 2)
+        .expect("fixture offset fits u32");
+
+    let target = definition_at(&ir, &source, call_offset).expect("resolved call target");
+    let target = ir.definition(target).expect("resolved definition exists");
+    assert_eq!(target.name, "identity");
+
+    assert_eq!(type_at(&ir, &source, call_offset), Some(IrType::I32));
+    let signature = call_signature_at(&ir, &source, call_offset).expect("concrete signature");
+    assert_eq!(signature.name, "identity<i32>");
+    assert_eq!(signature.parameters.len(), 1);
+    assert_eq!(signature.parameters[0].name, "value");
+    assert_eq!(signature.parameters[0].ty, IrType::I32);
+    assert_eq!(signature.result, IrType::I32);
+    assert_eq!(
+        ir.definition(signature.declaration)
+            .expect("generic declaration")
+            .name,
+        "identity"
+    );
+}
+
+#[test]
 fn generics_identity_emits_distinct_concrete_instances() {
     let outcome = analyze_main(
         r"
@@ -221,6 +271,135 @@ fn main() -> i32 {
             1
         );
     }
+}
+
+#[test]
+fn generics_allow_same_instance_recursion_and_reject_polymorphic_recursion() {
+    let recursive = analyze_main(
+        r"
+fn countdown<T: Copy>(value: T, remaining: i32) -> T {
+    if remaining <= 0 {
+        return value;
+    }
+    return countdown(value, remaining - 1);
+}
+
+fn main() -> i32 {
+    return countdown(42, 3);
+}
+",
+    );
+    assert!(
+        recursive.diagnostics.is_empty(),
+        "{:?}",
+        recursive.diagnostics.diagnostics()
+    );
+    let ir = recursive.ir.expect("same generic instance may recurse");
+    assert_eq!(
+        ir.definitions()
+            .iter()
+            .filter(|definition| definition.name.starts_with("countdown$instance$"))
+            .count(),
+        1
+    );
+
+    let polymorphic = analyze_main(
+        r"
+fn expand<T>(value: T) -> i32 {
+    return expand<Array<T>>([value]);
+}
+
+fn main() -> i32 {
+    return expand(1);
+}
+",
+    );
+    assert!(
+        polymorphic
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("generic function instantiation does not converge")),
+        "{:?}",
+        polymorphic.diagnostics.diagnostics()
+    );
+}
+
+#[test]
+fn generics_enforce_shared_instance_and_instantiation_depth_limits() {
+    let one_instance = CompilationOptions {
+        limits: CompilationLimits {
+            max_generic_instances: 1,
+            ..CompilationLimits::default()
+        },
+        ..CompilationOptions::default()
+    };
+    let too_many = analyze_main_with_options(
+        r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn main() -> i32 {
+    let integer = identity(1);
+    let wide = identity<i64>(2);
+    return integer;
+}
+",
+        one_instance,
+    );
+    assert!(
+        too_many
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("generic instance limit exceeded")),
+        "{:?}",
+        too_many.diagnostics.diagnostics()
+    );
+
+    let two_levels = CompilationOptions {
+        limits: CompilationLimits {
+            max_generic_instantiation_depth: 2,
+            ..CompilationLimits::default()
+        },
+        ..CompilationOptions::default()
+    };
+    let too_deep = analyze_main_with_options(
+        r"
+fn third<T>(value: T) -> T {
+    return value;
+}
+
+fn second<T>(value: T) -> T {
+    return third(value);
+}
+
+fn first<T>(value: T) -> T {
+    return second(value);
+}
+
+fn main() -> i32 {
+    return first(42);
+}
+",
+        two_levels,
+    );
+    assert!(
+        too_deep
+            .diagnostics
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("generic instantiation depth limit exceeded")),
+        "{:?}",
+        too_deep.diagnostics.diagnostics()
+    );
 }
 
 #[test]

@@ -939,7 +939,7 @@ impl FinalizeLanguageV3Options {
     fn print_plan() {
         println!(
             "finalize-language-v3 --dry-run\n\
-             validates frozen historical tags and Language3/Bytecode8/OpcodeCost8/stdlib2.0.0\n\
+             validates frozen historical tags and Language3/Bytecode8/OpcodeCost8/stdlib3.0.0\n\
              runs editor+canonical canary gates, then workspace fmt/check/clippy/test/doc once\n\
              writes target/nexa-artifacts/language-v3-finalize/final-report.json only on PASS"
         );
@@ -1200,7 +1200,7 @@ fn finalize_language_v3(options: FinalizeLanguageV3Options) -> Result<(), DynErr
         language_version,
         bytecode_version,
         opcode_cost_version,
-        stdlib_version: "2.0.0",
+        stdlib_version: "3.0.0",
         contract_syntax_version,
         host_schema_version,
         descriptor_version,

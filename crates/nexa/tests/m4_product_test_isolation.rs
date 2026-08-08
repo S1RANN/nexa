@@ -8,9 +8,9 @@ use nexa::{
     canonical_package_build_fingerprint_input_with_contract,
 };
 use nexa_analysis::{
-    CompilationLimits, NormalizedPackagePath, PackageManifest, QueryKey, ResolvedBuildInput,
-    ResolvedDependencyGraph, ResolvedPackage, ResolvedTestInput, SourceId, SourceRole,
-    SourceSetBuilder,
+    CompilationLimits, LockFile, NormalizedPackagePath, PackageCatalog, PackageLocation,
+    PackageManifest, QueryKey, ResolvedBuildInput, ResolvedDependencyGraph, ResolvedPackage,
+    ResolvedTestInput, SourceId, SourceRole, SourceSetBuilder,
 };
 
 const EMPTY_HOST_NIDL: &str = "contract Empty;";
@@ -429,6 +429,137 @@ pub(package) fn unwrap<T>(holder: Holder<T>) -> T {
         .compile_package_with_contract(&product, &contract, identity(&product))
         .expect("cross-module generic call is monomorphized before compilation");
     assert!(!artifact.encode_module().is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn generics_from_a_local_library_are_instantiated_by_the_application() {
+    let parsed_contract = nexa_contract::parse_contract(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
+    let root_manifest = Arc::new(
+        PackageManifest::parse(
+            r#"
+schema = 2
+kind = "application"
+id = "generic.consumer"
+name = "Generic Consumer"
+version = "1.0.0"
+source_root = "src"
+entry = "main"
+activation = "programmatic"
+
+[dependencies]
+game_common = { path = "../game-common" }
+"#,
+        )
+        .unwrap(),
+    );
+    let library_manifest = Arc::new(
+        PackageManifest::parse(
+            r#"
+schema = 2
+kind = "library"
+id = "generic.game-common"
+name = "Generic Game Common"
+version = "1.0.0"
+source_root = "src"
+"#,
+        )
+        .unwrap(),
+    );
+    let sources = |manifest: &PackageManifest, path: &str, source: &str| {
+        let mut builder = SourceSetBuilder::new(manifest.id.clone(), CompilationLimits::default());
+        builder
+            .add(
+                NormalizedPackagePath::new(path).unwrap(),
+                source,
+                SourceRole::Production,
+            )
+            .unwrap();
+        Arc::new(builder.build().unwrap())
+    };
+    let root_sources = sources(
+        &root_manifest,
+        "src/main.nexa",
+        r"
+use game_common::common as common;
+
+fn main() -> i32 {
+    let holder = common::Holder { value: 42 };
+    return common::unwrap(holder);
+}
+",
+    );
+    let library_sources = sources(
+        &library_manifest,
+        "src/common.nexa",
+        r"
+pub struct Holder<T> {
+    value: T,
+}
+
+pub fn unwrap<T>(holder: Holder<T>) -> T {
+    return holder.value;
+}
+",
+    );
+    let source_id = SourceId::new("local-generic-library").unwrap();
+    let root_directory = NormalizedPackagePath::new("packages/app").unwrap();
+    let library_directory = NormalizedPackagePath::new("packages/game-common").unwrap();
+    let mut catalog = PackageCatalog::new();
+    for (manifest, directory) in [
+        (Arc::clone(&root_manifest), root_directory.clone()),
+        (Arc::clone(&library_manifest), library_directory),
+    ] {
+        catalog
+            .insert(PackageLocation {
+                source_id: source_id.clone(),
+                directory,
+                manifest,
+            })
+            .unwrap();
+    }
+    let graph = Arc::new(
+        catalog
+            .resolve(&source_id, &root_directory, CompilationLimits::default())
+            .unwrap(),
+    );
+    let dependency_manifests =
+        BTreeMap::from([(library_manifest.id.clone(), Arc::clone(&library_manifest))]);
+    let dependency_source_sets =
+        BTreeMap::from([(library_manifest.id.clone(), Arc::clone(&library_sources))]);
+    let lock = Arc::new(LockFile::from_graph(&graph));
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
+        &root_manifest,
+        &root_sources,
+        &dependency_manifests,
+        &dependency_source_sets,
+        &contract,
+        Some(&lock),
+    );
+    let input = ResolvedBuildInput::new(
+        root_manifest,
+        root_sources,
+        dependency_manifests,
+        dependency_source_sets,
+        graph,
+        Some(lock),
+        Arc::<[u8]>::from(fingerprint_input.host_contract.clone()),
+        canonical_host_contract_source_identity(&contract),
+        fingerprint_input.host_required_entrypoints.clone(),
+        nexa_analysis::CompilationOptions::default(),
+        fingerprint_input,
+    )
+    .unwrap();
+    let artifact = PackageBuildSession::new()
+        .compile_package_with_contract(&input, &contract, identity(&input))
+        .expect("application monomorphizes generic functions and types from its local Library");
+    assert!(!artifact.encode_module().is_empty());
+    assert_eq!(artifact.compilation_evidence.generic_function_instances, 1);
+    assert_eq!(
+        artifact.compilation_evidence.generic_nominal_type_instances,
+        1
+    );
 }
 
 fn query_key_belongs_to_tests(key: &QueryKey) -> bool {

@@ -9,3 +9,6 @@ priority = 400
 activation = "default-enabled"
 handler_fuel = 20000
 capabilities = ["diagnostics.log"]
+
+[dependencies]
+game_common = { path = "../game-common" }

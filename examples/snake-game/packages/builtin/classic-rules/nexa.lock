@@ -1,0 +1,17 @@
+schema = 1
+root = "builtin.classic-rules"
+
+[[packages]]
+id = "builtin.classic-rules"
+version = "1.0.0"
+path = "classic-rules"
+
+[[packages]]
+id = "example.game-common"
+version = "1.0.0"
+path = "game-common"
+
+[[edges]]
+from = "builtin.classic-rules"
+alias = "game_common"
+to = "example.game-common"

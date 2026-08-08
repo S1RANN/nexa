@@ -470,6 +470,8 @@ pub struct PackageSemanticMetadata {
     pub lifecycle: LifecycleBindingsIr,
     pub repl_entry: Option<ReplEntrypointIr>,
     pub standard_functions: Arc<[StandardFunctionBindingIr]>,
+    pub generic_function_instances: usize,
+    pub generic_nominal_type_instances: usize,
     pub public_api_fingerprint: PublicApiFingerprint,
     pub state_schema_fingerprint: StateSchemaFingerprint,
 }

@@ -30,6 +30,7 @@ impl fmt::Display for StandardLibraryVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolKind {
     Function,
+    Method,
     Type,
 }
 
@@ -38,6 +39,7 @@ impl SymbolKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Function => "function",
+            Self::Method => "method",
             Self::Type => "type",
         }
     }
@@ -384,6 +386,50 @@ pub struct FunctionDescriptor {
     pub contract: &'static str,
 }
 
+/// One source-visible inherent method backed by an internal standard-library function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MethodDescriptor {
+    pub receiver: &'static str,
+    pub name: &'static str,
+    /// Internal descriptor module containing the concrete lowering target.
+    pub implementation_module: &'static str,
+    /// Internal descriptor function called after prepending the receiver argument.
+    pub implementation: &'static str,
+    pub parameters: &'static [ParameterDescriptor],
+    pub result: &'static str,
+    pub lowering: Lowering,
+    pub behavior: FunctionBehavior,
+    pub contract: &'static str,
+}
+
+impl MethodDescriptor {
+    #[must_use]
+    pub fn canonical_declaration(&self) -> String {
+        let mut output = format!("pub method {}::{}(", self.receiver, self.name);
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            if index != 0 {
+                output.push(',');
+            }
+            output.push_str(parameter.name);
+            output.push(':');
+            output.push_str(parameter.ty);
+        }
+        output.push_str(")->");
+        output.push_str(self.result);
+        output
+    }
+
+    #[must_use]
+    pub const fn canonical_symbol(&self) -> CanonicalSymbol {
+        CanonicalSymbol {
+            package_id: crate::CANONICAL_PACKAGE_ID,
+            module_path: self.receiver,
+            kind: SymbolKind::Method,
+            name: self.name,
+        }
+    }
+}
+
 impl FunctionDescriptor {
     /// Renders a stable declaration shape. Synthetic generic declarations are
     /// metadata and are not inserted into embedded source.
@@ -507,6 +553,7 @@ pub struct StandardLibrary {
     pub canonical_package_id: &'static str,
     pub version: StandardLibraryVersion,
     modules: &'static [ModuleDescriptor],
+    method_groups: &'static [&'static [MethodDescriptor]],
 }
 
 impl StandardLibrary {
@@ -517,6 +564,7 @@ impl StandardLibrary {
         canonical_package_id: &'static str,
         version: StandardLibraryVersion,
         modules: &'static [ModuleDescriptor],
+        method_groups: &'static [&'static [MethodDescriptor]],
     ) -> Self {
         Self {
             descriptor_schema,
@@ -524,12 +572,23 @@ impl StandardLibrary {
             canonical_package_id,
             version,
             modules,
+            method_groups,
         }
     }
 
     #[must_use]
     pub const fn modules(&self) -> &'static [ModuleDescriptor] {
         self.modules
+    }
+
+    pub fn methods(&self) -> impl Iterator<Item = &'static MethodDescriptor> + '_ {
+        self.method_groups.iter().flat_map(|group| group.iter())
+    }
+
+    #[must_use]
+    pub fn method(&self, receiver: &str, name: &str) -> Option<&'static MethodDescriptor> {
+        self.methods()
+            .find(|method| method.receiver == receiver && method.name == name)
     }
 
     /// Accepts either a short name (`string`) or a source-level reserved path
@@ -573,17 +632,20 @@ impl StandardLibrary {
 
     /// Iterates symbols in the fixed module/declaration order of this schema.
     pub fn symbols(&self) -> impl Iterator<Item = CanonicalSymbol> + '_ {
-        self.modules.iter().flat_map(|module| {
-            let types = module
-                .types
-                .iter()
-                .map(|ty| module.canonical_type_symbol(ty));
-            let functions = module
-                .functions
-                .iter()
-                .map(|function| module.canonical_symbol(function));
-            types.chain(functions)
-        })
+        self.modules
+            .iter()
+            .flat_map(|module| {
+                let types = module
+                    .types
+                    .iter()
+                    .map(|ty| module.canonical_type_symbol(ty));
+                let functions = module
+                    .functions
+                    .iter()
+                    .map(|function| module.canonical_symbol(function));
+                types.chain(functions)
+            })
+            .chain(self.methods().map(MethodDescriptor::canonical_symbol))
     }
 
     /// Length-framed canonical descriptor text for build fingerprints and
@@ -631,6 +693,30 @@ impl StandardLibrary {
                 );
                 push_field(&mut output, "contract", function.contract);
             }
+        }
+        for method in self.methods() {
+            let symbol = method.canonical_symbol();
+            push_field(&mut output, "symbol", &symbol.canonical_name());
+            push_field(&mut output, "declaration", &method.canonical_declaration());
+            push_field(
+                &mut output,
+                "implementation-module",
+                method.implementation_module,
+            );
+            push_field(&mut output, "implementation", method.implementation);
+            push_field(&mut output, "lowering", method.lowering.canonical_name());
+            push_field(&mut output, "effect", method.behavior.effect.as_str());
+            push_field(
+                &mut output,
+                "allocation",
+                method.behavior.allocation.as_str(),
+            );
+            push_field(
+                &mut output,
+                "termination",
+                method.behavior.termination.as_str(),
+            );
+            push_field(&mut output, "contract", method.contract);
         }
         output
     }

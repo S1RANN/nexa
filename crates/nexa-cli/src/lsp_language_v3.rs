@@ -130,12 +130,9 @@ pub(super) fn completion_items(source: &str, offset: usize) -> Vec<Value> {
         } else {
             declared_owner(source, offset, receiver)
         };
-        return owner
-            .into_iter()
-            .flat_map(|owner| APIS.iter().filter(move |api| api.owner == owner))
-            .filter(|api| (is_static && api.label == "new") || (!is_static && api.label != "new"))
-            .map(completion_item)
-            .collect();
+        return owner.map_or_else(Vec::new, |owner| {
+            completion_items_for_owner(owner, is_static)
+        });
     }
 
     TYPES
@@ -152,6 +149,14 @@ pub(super) fn completion_items(source: &str, offset: usize) -> Vec<Value> {
         .collect()
 }
 
+pub(super) fn completion_items_for_owner(owner: &str, is_static: bool) -> Vec<Value> {
+    APIS.iter()
+        .filter(|api| api.owner == owner)
+        .filter(|api| (is_static && api.label == "new") || (!is_static && api.label != "new"))
+        .map(completion_item)
+        .collect()
+}
+
 fn completion_item(api: &Api) -> Value {
     json!({
         "label": api.label,
@@ -162,6 +167,14 @@ fn completion_item(api: &Api) -> Value {
 }
 
 fn completion_receiver(source: &str, offset: usize) -> Option<(&str, bool)> {
+    let (start, end, is_static) = completion_receiver_range(source, offset)?;
+    Some((source.get(start..end)?, is_static))
+}
+
+pub(super) fn completion_receiver_range(
+    source: &str,
+    offset: usize,
+) -> Option<(usize, usize, bool)> {
     let prefix = source.get(..offset)?;
     let mut cursor = prefix.len();
     while cursor > 0 {
@@ -178,7 +191,10 @@ fn completion_receiver(source: &str, offset: usize) -> Option<(&str, bool)> {
     } else {
         (before_partial.strip_suffix('.')?, false)
     };
-    final_word(before_receiver).map(|receiver| (receiver, is_static))
+    let receiver = final_word(before_receiver)?;
+    let end = before_receiver.len();
+    let start = end.checked_sub(receiver.len())?;
+    Some((start, end, is_static))
 }
 
 fn final_word(source: &str) -> Option<&str> {

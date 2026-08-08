@@ -5,6 +5,7 @@
 //! Source-backed functions are linked with the application package; compiler
 //! intrinsics are resolved from the same canonical symbol records.
 
+mod methods;
 mod model;
 
 pub mod buffer;
@@ -17,25 +18,26 @@ pub mod string;
 
 pub use model::{
     Allocation, CanonicalSymbol, DescriptorHash, Effect, FieldDescriptor, FunctionBehavior,
-    FunctionDescriptor, Intrinsic, Lowering, ModuleDescriptor, ParameterDescriptor,
-    StandardLibrary, StandardLibraryVersion, SymbolKind, Termination, TypeDescriptor, TypeKind,
+    FunctionDescriptor, Intrinsic, Lowering, MethodDescriptor, ModuleDescriptor,
+    ParameterDescriptor, StandardLibrary, StandardLibraryVersion, SymbolKind, Termination,
+    TypeDescriptor, TypeKind,
 };
 
 /// Schema of the canonical descriptor manifest.
-pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
+pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 2;
 
 /// Logical package identity used by source resolution.
 pub const PACKAGE_ID: &str = "nexa.stdlib";
 
 /// Version of the compiler-provided standard library.
-pub const VERSION: StandardLibraryVersion = StandardLibraryVersion::new(2, 0, 0);
+pub const VERSION: StandardLibraryVersion = StandardLibraryVersion::new(3, 0, 0);
 
 /// Versioned identity supplied to the compiler's canonical-symbol machinery.
-pub const CANONICAL_PACKAGE_ID: &str = "nexa.stdlib@2.0.0";
+pub const CANONICAL_PACKAGE_ID: &str = "nexa.stdlib@3.0.0";
 
 /// Domain and schema prefix for the exact standard-library identity embedded in build
 /// fingerprints.
-const DESCRIPTOR_IDENTITY_PREFIX: &[u8] = b"nexa.stdlib.descriptor.v1\0";
+const DESCRIPTOR_IDENTITY_PREFIX: &[u8] = b"nexa.stdlib.descriptor.v2\0";
 
 static MODULES: [ModuleDescriptor; 7] = [
     core::MODULE,
@@ -53,6 +55,7 @@ static STANDARD_LIBRARY: StandardLibrary = StandardLibrary::new(
     CANONICAL_PACKAGE_ID,
     VERSION,
     &MODULES,
+    methods::METHOD_GROUPS,
 );
 
 /// Returns the single immutable descriptor set compiled into this crate.

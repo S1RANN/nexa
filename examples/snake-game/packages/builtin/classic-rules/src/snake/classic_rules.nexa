@@ -1,10 +1,12 @@
 
+use game_common::generic as common;
+
 fn empty() -> Array<host::SnakeCommand> {
     return Array::new();
 }
 
 fn singleton<T>(value: T) -> Array<T> {
-    return [value];
+    return [common::identity(value)];
 }
 
 fn ready() -> Array<host::SnakeCommand> {

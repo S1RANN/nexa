@@ -395,6 +395,12 @@ function validateSyntaxContract() {
     "postfix_expression",
     "await_suffix",
     "attribute",
+    "generic_parameter_list",
+    "generic_parameter",
+    "generic_bound",
+    "where_clause",
+    "where_predicate",
+    "associated_output_binding",
   ]) {
     assert(
       nexaGrammar.rules[rule],
@@ -464,7 +470,7 @@ function validateSyntaxContract() {
     "Nexa Language v3 surface keywords are missing",
   );
   assert(
-    ["mut", "var", "module", "import", "task", "immediate", "migration", "activation", "cleanup", "stateful", "with"]
+    ["mut", "var", "module", "import", "task", "immediate", "migration", "activation", "cleanup", "stateful", "with", "new"]
       .filter((keyword) => !syntax.nexa.attributeKeywords.includes(keyword))
       .every(
         (keyword) =>

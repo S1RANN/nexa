@@ -12,7 +12,9 @@ use crate::project;
 #[path = "lsp_language_v3.rs"]
 mod language_v3;
 use language_v3::{
-    completion_items as language_v3_completion_items, hover as language_v3_hover,
+    completion_items as language_v3_completion_items,
+    completion_items_for_owner as language_v3_completion_items_for_owner,
+    completion_receiver_range as language_v3_completion_receiver_range, hover as language_v3_hover,
     semantic_tokens as language_v3_semantic_tokens,
 };
 
@@ -228,6 +230,10 @@ trait WorkspaceAnalyzer {
         snapshot: &WorkspaceSnapshot<'_>,
         changes: &[BuildInputChange],
     ) -> Result<AnalysisReport, String>;
+
+    fn semantic_for_path(&self, _path: &Path) -> Option<SemanticDocument> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -242,6 +248,56 @@ struct PackageAnalysisSession {
     build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     generation: u64,
     build: nexa::PackageBuildSession,
+    semantic: Option<SemanticSnapshot>,
+}
+
+#[derive(Clone)]
+struct SemanticDocument {
+    ir: Arc<nexa_analysis::TypedPackageIr>,
+    source: nexa_analysis::SourceKey,
+    paths_by_source: Arc<BTreeMap<nexa_analysis::SourceKey, PathBuf>>,
+}
+
+#[derive(Clone)]
+struct SemanticSnapshot {
+    ir: Arc<nexa_analysis::TypedPackageIr>,
+    sources_by_path: BTreeMap<PathBuf, nexa_analysis::SourceKey>,
+    paths_by_source: Arc<BTreeMap<nexa_analysis::SourceKey, PathBuf>>,
+}
+
+impl SemanticSnapshot {
+    fn from_build(build: &project::ResolvedBuild, ir: Arc<nexa_analysis::TypedPackageIr>) -> Self {
+        let mut sources_by_path = BTreeMap::new();
+        let mut paths_by_source = BTreeMap::new();
+        for package in build.packages.values() {
+            for source_set in [&package.production_sources, &package.test_sources] {
+                for key in source_set.units().keys() {
+                    let path = lexical_path(&package.directory.join(key.path.as_path()));
+                    sources_by_path.insert(path.clone(), key.clone());
+                    paths_by_source.insert(key.clone(), path);
+                }
+            }
+        }
+        if let Some(origin) = &build.virtual_source_origin {
+            let path = lexical_path(Path::new(origin.display_identity.path()));
+            sources_by_path.insert(path.clone(), origin.source_key.clone());
+            paths_by_source.insert(origin.source_key.clone(), path);
+        }
+        Self {
+            ir,
+            sources_by_path,
+            paths_by_source: Arc::new(paths_by_source),
+        }
+    }
+
+    fn document(&self, path: &Path) -> Option<SemanticDocument> {
+        let source = self.sources_by_path.get(&lexical_path(path))?.clone();
+        Some(SemanticDocument {
+            ir: Arc::clone(&self.ir),
+            source,
+            paths_by_source: Arc::clone(&self.paths_by_source),
+        })
+    }
 }
 
 impl PackageAnalysisSession {
@@ -252,11 +308,13 @@ impl PackageAnalysisSession {
                 build_fingerprint: None,
                 generation: 0,
                 build: nexa::PackageBuildSession::new(),
+                semantic: None,
             };
         }
         if self.build_fingerprint != Some(build.build_fingerprint) {
             self.build_fingerprint = Some(build.build_fingerprint);
             self.generation = self.generation.saturating_add(1).max(1);
+            self.semantic = None;
         }
         self.generation.max(1)
     }
@@ -335,6 +393,7 @@ fn run_session_with_analyzer(
                                 "triggerCharacters": [".", ":"]
                             },
                             "hoverProvider": true,
+                            "definitionProvider": true,
                             "semanticTokensProvider": {
                                 "legend": {
                                     "tokenTypes": [
@@ -528,7 +587,10 @@ fn run_session_with_analyzer(
                     == nexa_syntax::SourceProfile::Executable
                 {
                     let offset = request_byte_offset(&source, &message["params"]["position"])?;
-                    language_v3_completion_items(&source, offset)
+                    analyzer
+                        .semantic_for_path(&path)
+                        .and_then(|document| semantic_completion_items(&document, &source, offset))
+                        .unwrap_or_else(|| language_v3_completion_items(&source, offset))
                 } else {
                     Vec::new()
                 };
@@ -541,11 +603,29 @@ fn run_session_with_analyzer(
                     == nexa_syntax::SourceProfile::Executable
                 {
                     let offset = request_byte_offset(&source, &message["params"]["position"])?;
-                    language_v3_hover(&source, offset)
+                    analyzer
+                        .semantic_for_path(&path)
+                        .and_then(|document| semantic_hover(&document, &source, offset))
+                        .or_else(|| language_v3_hover(&source, offset))
                 } else {
                     None
                 };
                 respond(writer, id, hover.as_ref().unwrap_or(&Value::Null))?;
+            }
+            Some("textDocument/definition") => {
+                let (path, source) =
+                    request_document_source(&documents, &message["params"]["textDocument"])?;
+                let definition = if nexa_syntax::SourceProfile::from_path(&path.to_string_lossy())
+                    == nexa_syntax::SourceProfile::Executable
+                {
+                    let offset = request_byte_offset(&source, &message["params"]["position"])?;
+                    analyzer.semantic_for_path(&path).and_then(|document| {
+                        semantic_definition_location(&document, &source, offset, &documents)
+                    })
+                } else {
+                    None
+                };
+                respond(writer, id, definition.as_ref().unwrap_or(&Value::Null))?;
             }
             Some("textDocument/semanticTokens/full") => {
                 let (path, source) =
@@ -978,6 +1058,13 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
         deduplicate_diagnostics(&mut report.diagnostics);
         Ok(report)
     }
+
+    fn semantic_for_path(&self, path: &Path) -> Option<SemanticDocument> {
+        self.package_sessions
+            .values()
+            .chain(self.standalone_sessions.values())
+            .find_map(|session| session.semantic.as_ref()?.document(path))
+    }
 }
 
 fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path) -> Option<String> {
@@ -1259,6 +1346,36 @@ fn analyze_package_snapshot(
         }
     };
     let generation = session.prepare(&build);
+    let check = match session
+        .build
+        .check_package_with_contract(&build.input, &contract)
+    {
+        Ok(check) => check,
+        Err(nexa::PackageBuildError::AnalysisFailed(batch)) => {
+            session.semantic = None;
+            return Ok(located_diagnostic_batch(&build, &batch, &contract_path));
+        }
+        Err(error) => {
+            session.semantic = None;
+            let stage = package_build_error_stage(&error);
+            let code = package_build_error_code(&error);
+            return Ok(vec![LocatedDiagnostic::new(
+                EngineDiagnostic::without_source(
+                    Some(build.root.manifest.id.clone()),
+                    Some(build.source_id.clone()),
+                    stage,
+                    code,
+                    error.to_string(),
+                ),
+                package.to_path_buf(),
+                manifest_path,
+            )]);
+        }
+    };
+    session.semantic = Some(SemanticSnapshot::from_build(
+        &build,
+        Arc::clone(&check.semantic_ir),
+    ));
     match build.compile_with_contract_session(
         &mut session.build,
         generation,
@@ -1268,6 +1385,7 @@ fn analyze_package_snapshot(
     ) {
         Ok(_) => Ok(Vec::new()),
         Err(project::BuildCompileError::Facade(nexa::PackageBuildError::AnalysisFailed(batch))) => {
+            session.semantic = None;
             Ok(located_diagnostic_batch(&build, &batch, &contract_path))
         }
         Err(project::BuildCompileError::Facade(error)) => {
@@ -1820,6 +1938,190 @@ fn request_byte_offset(source: &str, position: &Value) -> Result<usize, String> 
         .ok_or_else(|| format!("LSP position {line}:{column} is outside the document"))
 }
 
+fn semantic_hover(document: &SemanticDocument, source: &str, offset: usize) -> Option<Value> {
+    let offset = u32::try_from(offset).ok()?;
+    if let Some(signature) =
+        nexa_analysis::call_signature_at(&document.ir, &document.source, offset)
+    {
+        let parameters = signature
+            .parameters
+            .iter()
+            .map(|parameter| {
+                format!(
+                    "{}: {}",
+                    parameter.name,
+                    nexa_analysis::display_type(&parameter.ty, &document.ir)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prefix = if signature.effect == nexa_analysis::IrEffect::Task {
+            "async "
+        } else {
+            ""
+        };
+        let value = format!(
+            "```nexa\n{prefix}fn {}({parameters}) -> {}\n```",
+            signature.name,
+            nexa_analysis::display_type(&signature.result, &document.ir)
+        );
+        return Some(hover_value(source, &signature.span, &value));
+    }
+
+    let definition = nexa_analysis::definition_at(&document.ir, &document.source, offset)
+        .and_then(|definition| document.ir.definition(definition))?;
+    let span = nexa_analysis::semantic_span_at(&document.ir, &document.source, offset)
+        .unwrap_or_else(|| definition.span.clone());
+    let ty = nexa_analysis::display_type(&definition.ty, &document.ir);
+    let value = match definition.kind {
+        nexa_analysis::DefinitionKind::Local | nexa_analysis::DefinitionKind::Parameter => {
+            format!("```nexa\n{}: {ty}\n```", definition.name)
+        }
+        nexa_analysis::DefinitionKind::Struct
+        | nexa_analysis::DefinitionKind::Enum
+        | nexa_analysis::DefinitionKind::Class => {
+            format!(
+                "```nexa\n{} {}\n```",
+                definition_kind_name(definition.kind),
+                definition.name
+            )
+        }
+        _ => format!(
+            "```nexa\n{} {}: {ty}\n```",
+            definition_kind_name(definition.kind),
+            definition.name
+        ),
+    };
+    Some(hover_value(source, &span, &value))
+}
+
+fn definition_kind_name(kind: nexa_analysis::DefinitionKind) -> &'static str {
+    match kind {
+        nexa_analysis::DefinitionKind::Function => "fn",
+        nexa_analysis::DefinitionKind::Task => "async fn",
+        nexa_analysis::DefinitionKind::Struct => "struct",
+        nexa_analysis::DefinitionKind::Enum => "enum",
+        nexa_analysis::DefinitionKind::Class => "class",
+        nexa_analysis::DefinitionKind::Const => "const",
+        nexa_analysis::DefinitionKind::Field => "field",
+        nexa_analysis::DefinitionKind::Variant => "variant",
+        nexa_analysis::DefinitionKind::Parameter => "parameter",
+        nexa_analysis::DefinitionKind::Local => "local",
+        nexa_analysis::DefinitionKind::HostContract => "contract",
+        nexa_analysis::DefinitionKind::HostFunction => "host fn",
+        nexa_analysis::DefinitionKind::StandardLibrary => "std fn",
+    }
+}
+
+fn hover_value(source: &str, span: &nexa_analysis::SourceRange, value: &str) -> Value {
+    let start = byte_offset_to_lsp_position(source, span.start as usize);
+    let end = byte_offset_to_lsp_position(source, span.end as usize);
+    json!({
+        "contents": {"kind": "markdown", "value": value},
+        "range": {
+            "start": {"line": start.line, "character": start.character},
+            "end": {"line": end.line, "character": end.character}
+        }
+    })
+}
+
+fn semantic_completion_items(
+    document: &SemanticDocument,
+    source: &str,
+    offset: usize,
+) -> Option<Vec<Value>> {
+    let (receiver_start, _, is_static) = language_v3_completion_receiver_range(source, offset)?;
+    if is_static {
+        return None;
+    }
+    let ty = nexa_analysis::type_at(
+        &document.ir,
+        &document.source,
+        u32::try_from(receiver_start).ok()?,
+    )?;
+    let owner = match &ty {
+        nexa_analysis::IrType::Array(_) => Some("Array"),
+        nexa_analysis::IrType::Map(_, _) => Some("Map"),
+        nexa_analysis::IrType::Set(_) => Some("Set"),
+        nexa_analysis::IrType::Buffer(_) => Some("Buffer"),
+        _ => None,
+    };
+    if let Some(owner) = owner {
+        return Some(language_v3_completion_items_for_owner(owner, false));
+    }
+    numeric_completion_items(&ty)
+}
+
+fn numeric_completion_items(ty: &nexa_analysis::IrType) -> Option<Vec<Value>> {
+    let owner = match ty {
+        nexa_analysis::IrType::I32 => "i32",
+        nexa_analysis::IrType::I64 => "i64",
+        nexa_analysis::IrType::F32 => "f32",
+        nexa_analysis::IrType::F64 => "f64",
+        _ => return None,
+    };
+    Some(
+        nexa_stdlib::standard_library()
+            .methods()
+            .filter(|method| method.receiver == owner)
+            .map(|method| {
+                let parameters = method
+                    .parameters
+                    .iter()
+                    .map(|parameter| format!("{}: {}", parameter.name, parameter.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                json!({
+                    "label": method.name,
+                    "kind": 2,
+                    "detail": format!(
+                        "{owner} · fn {}({parameters}) -> {}",
+                        method.name,
+                        method.result
+                    ),
+                    "documentation": method.contract,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn semantic_definition_location(
+    document: &SemanticDocument,
+    current_source: &str,
+    offset: usize,
+    documents: &BTreeMap<String, OpenDocument>,
+) -> Option<Value> {
+    let target =
+        nexa_analysis::definition_at(&document.ir, &document.source, u32::try_from(offset).ok()?)?;
+    let definition = document.ir.definition(target)?;
+    let path = document.paths_by_source.get(&definition.span.source)?;
+    let target_document = documents
+        .values()
+        .find(|open| same_file_path(&open.path, path));
+    let target_source = target_document
+        .map(|open| open.text.clone())
+        .or_else(|| std::fs::read_to_string(path).ok())?;
+    let uri = target_document
+        .map(|open| open.uri.clone())
+        .or_else(|| path_to_file_uri(path).ok())?;
+    let source = if definition.span.source == document.source {
+        current_source
+    } else {
+        target_source.as_str()
+    };
+    let start = byte_offset_to_lsp_position(source, definition.span.start as usize);
+    let end = byte_offset_to_lsp_position(source, definition.span.end as usize);
+    Some(json!({
+        "uri": uri,
+        "range": {
+            "start": {"line": start.line, "character": start.character},
+            "end": {"line": end.line, "character": end.character}
+        }
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
 fn diagnostics_for_nexa_source(
     path: &Path,
     source: &str,
@@ -1831,6 +2133,60 @@ fn diagnostics_for_nexa_source(
     let build =
         project::virtual_standalone_script(source, path).map_err(|error| error.to_string())?;
     let generation = session.prepare(&build);
+    let contract = build
+        .host_contract
+        .input()
+        .map_err(|error| format!("retained standalone Host contract is invalid: {error}"))?;
+    let check = match session
+        .build
+        .check_standalone_with_contract(&build.input, &contract)
+    {
+        Ok(check) => check,
+        Err(nexa::PackageBuildError::AnalysisFailed(batch)) => {
+            session.semantic = None;
+            let origin = build
+                .virtual_source_origin
+                .as_ref()
+                .ok_or("virtual snippet build has no source origin")?;
+            let internal_identity = nexa::SourceIdentity::package(
+                origin.source_key.package_id.as_str(),
+                origin.source_key.path.as_str(),
+            );
+            let source_paths = Arc::new(BTreeMap::from([(internal_identity, path.to_path_buf())]));
+            return Ok(locate_diagnostic_batch(
+                &build,
+                &batch,
+                &source_paths,
+                &root,
+                path,
+            ));
+        }
+        Err(error) => {
+            session.semantic = None;
+            let stage = package_build_error_stage(&error);
+            let code = package_build_error_code(&error);
+            return Ok(vec![LocatedDiagnostic::new(
+                EngineDiagnostic::without_source(
+                    Some(build.root.manifest.id.clone()),
+                    Some(build.source_id.clone()),
+                    stage,
+                    code,
+                    error.to_string(),
+                ),
+                root,
+                path.to_path_buf(),
+            )]);
+        }
+    };
+    let mut semantic = SemanticSnapshot::from_build(&build, Arc::clone(&check.semantic_ir));
+    if let Some(origin) = &build.virtual_source_origin {
+        let path = lexical_path(path);
+        semantic
+            .sources_by_path
+            .insert(path.clone(), origin.source_key.clone());
+        Arc::make_mut(&mut semantic.paths_by_source).insert(origin.source_key.clone(), path);
+    }
+    session.semantic = Some(semantic);
     match build.compile_standalone_with_session_and_limits(
         &mut session.build,
         generation,
@@ -1838,6 +2194,7 @@ fn diagnostics_for_nexa_source(
     ) {
         Ok(_) => Ok(Vec::new()),
         Err(project::BuildCompileError::Facade(nexa::PackageBuildError::AnalysisFailed(batch))) => {
+            session.semantic = None;
             let origin = build
                 .virtual_source_origin
                 .as_ref()
@@ -4365,6 +4722,84 @@ mod tests {
             .expect("semantic token data");
         assert_eq!(semantic.len() % 5, 0);
         assert!(!semantic.is_empty());
+    }
+
+    #[test]
+    fn lsp_semantic_queries_use_concrete_generic_types_and_source_declarations() {
+        let path = Path::new("/tmp/nexa-lsp-semantic-generics.nexa");
+        let uri = "file:///tmp/nexa-lsp-semantic-generics.nexa";
+        let source = r"
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn calculate() -> i32 {
+    return 10;
+}
+
+fn main() -> i32 {
+    let result = identity(calculate());
+    return result.abs();
+}
+";
+        let mut session = super::PackageAnalysisSession::default();
+        let diagnostics = super::diagnostics_for_nexa_source(path, source, &mut session)
+            .expect("standalone semantic analysis");
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "{}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.diagnostic.message.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let document = session
+            .semantic
+            .as_ref()
+            .and_then(|semantic| semantic.document(path))
+            .expect("fresh semantic document");
+
+        let call_offset = source.rfind("identity(").expect("generic call") + 2;
+        let hover = super::semantic_hover(&document, source, call_offset).expect("semantic hover");
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("identity<i32>(value: i32) -> i32")),
+            "{hover}"
+        );
+
+        let completion_offset = source.rfind("result.abs").expect("receiver") + "result.".len();
+        let completions = super::semantic_completion_items(&document, source, completion_offset)
+            .expect("semantic completion");
+        assert!(
+            completions.iter().any(|item| item["label"] == "abs"),
+            "{completions:?}"
+        );
+
+        let documents = BTreeMap::from([(
+            uri.to_owned(),
+            super::OpenDocument {
+                uri: uri.to_owned(),
+                path: path.to_path_buf(),
+                text: source.to_owned(),
+                version: 1,
+            },
+        )]);
+        let location =
+            super::semantic_definition_location(&document, source, call_offset, &documents)
+                .expect("generic definition location");
+        assert_eq!(location["uri"], uri);
+        assert_eq!(location["range"]["start"]["line"], 1);
+
+        let invalid = super::diagnostics_for_nexa_source(path, "fn main( {", &mut session)
+            .expect("invalid revision diagnostics");
+        assert!(!invalid.is_empty());
+        assert!(
+            session.semantic.is_none(),
+            "an invalid current revision must not retain last-known-good semantic data"
+        );
     }
 
     #[test]

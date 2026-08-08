@@ -13,6 +13,7 @@ nexa-embed = { path = "../nexa-embed" }
 nexa-machine = { path = "../nexa-machine" }
 nexa-migrate = { path = "../nexa-migrate" }
 nexa-model = { path = "../nexa-model" }
+nexa-stdlib = { path = "../nexa-stdlib" }
 nexa-syntax = { path = "../nexa-syntax" }
 serde_json.workspace = true
 serde.workspace = true

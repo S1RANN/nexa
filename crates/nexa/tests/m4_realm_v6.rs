@@ -28,6 +28,49 @@ const C_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/c.nexa
 const D_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/d.nexa");
 const WAIT_PARAMETERS: &[ValueType] = &[ValueType::I32];
 
+const GENERIC_GC_CONTRACT_URI: &str = "nidl://tests/m4-realm-v6/generic-gc.nidl";
+const GENERIC_GC_CONTRACT: &str = r"
+contract GenericGcContract;
+
+nexa {
+    fn recursive_generic() -> i32;
+    async fn generic_gc() -> i32;
+}
+";
+const GENERIC_GC_SOURCE: &str = r#"
+struct Entry<T> {
+    value: T,
+}
+
+class Player {
+    name: string,
+}
+
+fn countdown<T: Copy>(value: T, remaining: i32) -> T {
+    if remaining <= 0 {
+        return value;
+    }
+    return countdown(value, remaining - 1);
+}
+
+pub fn recursive_generic() -> i32 {
+    return countdown(42, 8);
+}
+
+async fn hold_after_yield<T>(value: Entry<T>) -> Entry<T> {
+    yield;
+    return value;
+}
+
+pub async fn generic_gc() -> i32 {
+    let entry = Entry {
+        value: Player { name: "Ada" },
+    };
+    let preserved = hold_after_yield(entry).await;
+    return preserved.value.name.len();
+}
+"#;
+
 const B_BASELINE: &str = r"
 @state(version = 1)
 class ModelState {
@@ -837,4 +880,62 @@ fn realm_v6_fixtures_cross_the_canonical_pipeline_and_execute_in_realm() {
         &[("value", 8), ("replacement", 9), ("generation", 3)],
         Vec::new(),
     );
+}
+
+#[test]
+fn generic_async_value_survives_yield_and_full_gc() {
+    let parsed_contract = nexa::parse_contract(GENERIC_GC_CONTRACT).expect("generic GC contract");
+    let contract = HostContractInput::with_source(
+        &parsed_contract,
+        SourceIdentity::standalone(GENERIC_GC_CONTRACT_URI),
+        GENERIC_GC_CONTRACT,
+    )
+    .expect("exact generic GC contract source");
+    let artifact = compile_fixture(
+        &mut PackageBuildSession::new(),
+        "realm.v6.generic_gc",
+        GENERIC_GC_SOURCE,
+        &contract,
+        1,
+    );
+    let mut loaded = load_fixture(&artifact, &artifact, &parsed_contract);
+    let recursive = loaded
+        .realm
+        .spawn_task(
+            loaded.module,
+            entrypoint_stable_id(&parsed_contract, "recursive_generic"),
+            &[],
+            task_config(loaded.owner),
+        )
+        .expect("spawn ordinary recursive generic call");
+    assert_eq!(
+        loaded.realm.poll_task(recursive, 50_000),
+        Ok(TaskPoll::Completed(RuntimeValue::I32(42)))
+    );
+    let task = loaded
+        .realm
+        .spawn_task(
+            loaded.module,
+            entrypoint_stable_id(&parsed_contract, "generic_gc"),
+            &[],
+            task_config(loaded.owner),
+        )
+        .expect("spawn generic async task");
+    assert_eq!(
+        loaded.realm.poll_task(task, 50_000),
+        Ok(TaskPoll::Yielded(YieldReason::Explicit))
+    );
+    let collection = loaded
+        .realm
+        .collect_garbage()
+        .expect("collect while concrete generic value is suspended");
+    assert!(
+        collection.live > 0,
+        "suspended generic roots must remain live"
+    );
+    assert_eq!(
+        loaded.realm.poll_task(task, 50_000),
+        Ok(TaskPoll::Completed(RuntimeValue::I32(3)))
+    );
+    loaded.shutdown();
 }

@@ -44,6 +44,7 @@ module.exports = grammar({
 
   conflicts: ($) => [
     [$.expression_path_segment, $.type_path_segment],
+    [$.primary_expression, $.generic_call_expression],
   ],
 
   rules: {
@@ -127,6 +128,8 @@ module.exports = grammar({
         optional(field("visibility", $.visibility)),
         field("keyword", $.struct_keyword),
         field("name", $.type_identifier),
+        optional(field("type_parameters", $.generic_parameter_list)),
+        optional(field("where_clause", $.where_clause)),
         field("body", $.field_declaration_block),
       ),
 
@@ -136,6 +139,8 @@ module.exports = grammar({
         optional(field("visibility", $.visibility)),
         field("keyword", $.class_keyword),
         field("name", $.type_identifier),
+        optional(field("type_parameters", $.generic_parameter_list)),
+        optional(field("where_clause", $.where_clause)),
         field("body", $.field_declaration_block),
       ),
 
@@ -145,6 +150,8 @@ module.exports = grammar({
         optional(field("visibility", $.visibility)),
         field("keyword", $.enum_keyword),
         field("name", $.type_identifier),
+        optional(field("type_parameters", $.generic_parameter_list)),
+        optional(field("where_clause", $.where_clause)),
         field("body", $.enum_variant_block),
       ),
 
@@ -196,6 +203,7 @@ module.exports = grammar({
         optional(field("effect", $.async_keyword)),
         field("keyword", $.function_keyword),
         field("name", $.identifier),
+        optional(field("type_parameters", $.generic_parameter_list)),
         field("parameters", $.parameter_list),
         optional(
           seq(
@@ -203,7 +211,46 @@ module.exports = grammar({
             field("return_type", $.type),
           ),
         ),
+        optional(field("where_clause", $.where_clause)),
         field("body", $.block),
+      ),
+
+    generic_parameter_list: ($) =>
+      seq("<", commaSep1($.generic_parameter), optional(","), ">"),
+
+    generic_parameter: ($) =>
+      seq(
+        field("name", $.type_identifier),
+        optional(seq(":", field("bounds", $.generic_bound_list))),
+      ),
+
+    generic_bound_list: ($) =>
+      seq($.generic_bound, repeat(seq("+", $.generic_bound))),
+
+    generic_bound: ($) =>
+      seq(
+        field("name", $.type_path),
+        optional(field("bindings", $.associated_output_binding_list)),
+      ),
+
+    associated_output_binding_list: ($) =>
+      seq("<", commaSep1($.associated_output_binding), optional(","), ">"),
+
+    associated_output_binding: ($) =>
+      seq(field("name", $.identifier), "=", field("type", $.type)),
+
+    where_clause: ($) =>
+      seq(
+        field("keyword", $.where_keyword),
+        commaSep1($.where_predicate),
+        optional(","),
+      ),
+
+    where_predicate: ($) =>
+      seq(
+        field("type", $.type),
+        ":",
+        field("bounds", $.generic_bound_list),
       ),
 
     parameter_list: ($) =>
@@ -407,10 +454,7 @@ module.exports = grammar({
       ),
 
     call_suffix: ($) =>
-      seq(
-        optional(field("type_arguments", $.type_argument_list)),
-        field("arguments", $.argument_list),
-      ),
+      field("arguments", $.argument_list),
 
     field_suffix: ($) => seq(".", field("property", $.identifier)),
     await_suffix: ($) => seq(".", field("keyword", $.await_keyword)),
@@ -422,6 +466,7 @@ module.exports = grammar({
 
     primary_expression: ($) =>
       choice(
+        $.generic_call_expression,
         $.aggregate_literal,
         $.array_literal,
         $.tuple_expression,
@@ -432,6 +477,16 @@ module.exports = grammar({
         $.integer_literal,
         $.rune_literal,
         $.string_literal,
+      ),
+
+    generic_call_expression: ($) =>
+      prec.dynamic(
+        1,
+        seq(
+          field("callee", $.path_expression),
+          field("type_arguments", $.type_argument_list),
+          field("arguments", $.argument_list),
+        ),
       ),
 
     array_literal: ($) =>
@@ -477,8 +532,7 @@ module.exports = grammar({
         repeat(seq("::", $.expression_path_segment)),
       ),
 
-    expression_path_segment: ($) =>
-      choice($.identifier, $.builtin_type, $.new_keyword),
+    expression_path_segment: ($) => choice($.identifier, $.builtin_type),
 
     type: ($) => choice($.generic_type, $.tuple_type, $.type_path),
 
@@ -498,7 +552,41 @@ module.exports = grammar({
       ),
 
     type_argument_list: ($) =>
-      seq("<", commaSep1($.type), optional(","), ">"),
+      seq("<", commaSep1($.type_argument), optional(","), ">"),
+
+    type_argument: ($) =>
+      choice(
+        $.generic_type_argument,
+        $.tuple_type_argument,
+        $.type_argument_path,
+      ),
+
+    generic_type_argument: ($) =>
+      seq(
+        field("name", $.type_argument_path),
+        field("arguments", $.type_argument_list),
+      ),
+
+    tuple_type_argument: ($) =>
+      seq(
+        "(",
+        field("element", $.type_argument),
+        ",",
+        optional(commaSep1(field("element", $.type_argument))),
+        ")",
+      ),
+
+    type_argument_path: ($) =>
+      choice(
+        $.builtin_type,
+        $.upper_identifier,
+        seq(
+          $.identifier,
+          repeat(seq("::", $.identifier)),
+          "::",
+          choice($.builtin_type, $.upper_identifier),
+        ),
+      ),
 
     type_path: ($) =>
       seq($.type_path_segment, repeat(seq("::", $.type_path_segment))),
@@ -544,6 +632,7 @@ module.exports = grammar({
     enum_keyword: (_) => keywords.enum,
     class_keyword: (_) => keywords.class,
     const_keyword: (_) => keywords.const,
+    where_keyword: (_) => keywords.where,
     pub_keyword: (_) => keywords.pub,
     package_keyword: (_) => keywords.package,
     async_keyword: (_) => keywords.async,
@@ -553,7 +642,6 @@ module.exports = grammar({
     else_keyword: (_) => keywords.else,
     while_keyword: (_) => keywords.while,
     match_keyword: (_) => keywords.match,
-    new_keyword: (_) => keywords.new,
     await_keyword: (_) => keywords.await,
     yield_keyword: (_) => keywords.yield,
     defer_keyword: (_) => keywords.defer,

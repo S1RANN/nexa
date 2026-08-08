@@ -1,0 +1,6 @@
+schema = 2
+kind = "library"
+id = "example.game-common"
+name = "Game Common"
+version = "1.0.0"
+source_root = "src"

@@ -2,7 +2,7 @@ use crate::CompilationLimits;
 
 /// Canonical Nexa language revision embedded in every build fingerprint.
 pub const NEXA_LANGUAGE_VERSION: u16 = 3;
-pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 = 4;
+pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_MAX_WHILE_ITERATIONS: u32 = 1_000_000;
 
 /// Source profile whose surface rules are applied by analysis.
@@ -61,6 +61,8 @@ pub fn canonical_compilation_options(options: &CompilationOptions) -> Vec<u8> {
         limits.module_edges,
         limits.dependency_packages,
         limits.diagnostics_per_revision,
+        limits.max_generic_instances,
+        limits.max_generic_instantiation_depth,
     ] {
         bytes.extend_from_slice(&u64::try_from(value).unwrap_or(u64::MAX).to_le_bytes());
     }
@@ -94,7 +96,7 @@ mod tests {
             PREFIX.len()
                 + std::mem::size_of::<u32>()
                 + std::mem::size_of::<u8>()
-                + 8 * std::mem::size_of::<u64>()
+                + 10 * std::mem::size_of::<u64>()
                 + 2 * std::mem::size_of::<u32>()
         );
         assert_eq!(
@@ -163,6 +165,20 @@ mod tests {
             CompilationOptions {
                 limits: CompilationLimits {
                     diagnostics_per_revision: limits.diagnostics_per_revision + 1,
+                    ..limits
+                },
+                ..options
+            },
+            CompilationOptions {
+                limits: CompilationLimits {
+                    max_generic_instances: limits.max_generic_instances + 1,
+                    ..limits
+                },
+                ..options
+            },
+            CompilationOptions {
+                limits: CompilationLimits {
+                    max_generic_instantiation_depth: limits.max_generic_instantiation_depth + 1,
                     ..limits
                 },
                 ..options

@@ -208,7 +208,7 @@
       "patterns": [
         {
           "name": "keyword.control.nexa",
-          "match": "\\b(?:use|as|fn|struct|enum|class|const|pub|package|async|return|let|if|else|while|match|new|await|yield|defer|for|in|break|continue)\\b"
+          "match": "\\b(?:use|as|fn|struct|enum|class|const|where|pub|package|async|return|let|if|else|while|match|await|yield|defer|for|in|break|continue)\\b"
         },
         {
           "name": "constant.language.boolean.nexa",

@@ -90,6 +90,8 @@ pub struct CompilationLimits {
     pub module_edges: usize,
     pub dependency_packages: usize,
     pub diagnostics_per_revision: usize,
+    pub max_generic_instances: usize,
+    pub max_generic_instantiation_depth: usize,
     pub max_loop_iterations: u32,
 }
 
@@ -104,6 +106,8 @@ impl Default for CompilationLimits {
             module_edges: 4_096,
             dependency_packages: 64,
             diagnostics_per_revision: 256,
+            max_generic_instances: 4_096,
+            max_generic_instantiation_depth: 64,
             max_loop_iterations: 1_000_000,
         }
     }
